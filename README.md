@@ -2,7 +2,7 @@
 
 Anvil Workbench is a private, tailnet-first **agent harness for software delivery**. Its web UI is the main entry point for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
 
-Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [harness foundations](docs/HARNESS-FOUNDATIONS.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
+Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [harness foundations](docs/HARNESS-FOUNDATIONS.md), [workflow operation-layer proposal](docs/WORKFLOW-OPERATION-LAYER.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
 
 It is deliberately a separate product:
 

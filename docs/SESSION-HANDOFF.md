@@ -7,6 +7,7 @@ Use this file to resume work in a new Anvil Workbench coding session.
 - Repository: `C:\Users\sdoum\ai-code\anvil-workbench`
 - Product overview: [PROJECT.md](PROJECT.md)
 - System contracts: [CONTRACTS.md](CONTRACTS.md)
+- Workflow operation-layer proposal: [WORKFLOW-OPERATION-LAYER.md](WORKFLOW-OPERATION-LAYER.md)
 - Immediate roadmap: [ROADMAP.md](ROADMAP.md)
 - Agent rules: [../AGENTS.md](../AGENTS.md)
 
@@ -67,3 +68,4 @@ rewrite it as part of Workbench work without a separate review of those changes.
 3. Add a Postgres/Neo4j Compose integration test that runs in CI or a dedicated release job.
 4. Build the published hub image and wire it to the Anvil Serving optional `workbench up` lifecycle command.
 5. Qualify a live Dark voice endpoint and two bridge-configured worktrees. The implementation and hermetic contracts exist; neither is a substitute for live hardware/State qualification.
+6. Implement the provider-owned workflow operation catalog proposed in [WORKFLOW-OPERATION-LAYER.md](WORKFLOW-OPERATION-LAYER.md) before adding more bespoke browser-to-bridge command paths.
