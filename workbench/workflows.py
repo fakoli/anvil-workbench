@@ -7,6 +7,7 @@ the only way to affect a worktree, GitHub, State, or Serving policy.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 
@@ -15,6 +16,7 @@ WORKFLOW_STEP_KINDS = frozenset({
     "evidence_submit", "reconcile", "cancel",
 })
 WORKFLOW_STATUSES = frozenset({"draft", "running", "waiting_approval", "completed", "reconciliation", "cancelled"})
+_SKILL_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,119}$")
 
 
 class WorkflowError(ValueError):
@@ -44,10 +46,18 @@ def validate_definition(value: dict[str, Any]) -> dict[str, Any]:
         next_steps = raw.get("next", [])
         if not isinstance(next_steps, list) or not all(isinstance(item, str) and item for item in next_steps):
             raise WorkflowError("workflow step next must be a list of step ids")
+        skill_ids = raw.get("skills", [])
+        if not isinstance(skill_ids, list) or len(skill_ids) > 16 or not all(
+            isinstance(item, str) and _SKILL_ID.fullmatch(item) for item in skill_ids
+        ):
+            raise WorkflowError("workflow step skills must be up to 16 configured skill names")
+        if len(set(skill_ids)) != len(skill_ids):
+            raise WorkflowError("workflow step skills must be unique")
         clean = copy.deepcopy(raw)
         clean["id"] = step_id.strip()
         clean["kind"] = kind
         clean["next"] = list(next_steps)
+        clean["skills"] = list(skill_ids)
         canonical_steps.append(clean)
         step_ids.add(step_id)
     entry = value.get("entry", canonical_steps[0]["id"])

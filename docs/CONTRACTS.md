@@ -50,6 +50,10 @@ For each Codex run the bridge includes these static request headers in the local
 
 Anvil Serving records the correlation in route and evaluation evidence. The headers are correlation metadata, not credentials or a policy override.
 
+### Operator sandbox
+
+The optional browser sandbox is a hub-owned, bounded `POST /v1/responses` call to the configured Anvil Serving endpoint. Its model must be present in `WORKBENCH_SANDBOX_MODELS`; the hub holds the router token, limits prompt and output sizes, redacts the returned text, and appends only request/output metadata to the immutable audit. It is not a delivery runner and cannot access bridge tools, State, worktrees, GitHub, approvals, or provider credentials. An unset allowlist makes the control unavailable, with no fallback.
+
 ### Retrieval
 
 When configured, Workbench retrieval calls Anvil Serving’s existing embeddings and reranking purpose routes. Redaction occurs before retrieval. If local retrieval is unavailable, graph retrieval may use redacted keyword and lineage material only; no external provider fallback is allowed.
@@ -74,6 +78,8 @@ A Workbench **session** is a resumable, Workbench-owned supervision context. It 
 - While a session run is active, the bridge renews the same lease epoch every minute. A renewal failure stops the delivery from submitting evidence and moves it to reconciliation; it never grants a new lease or silently changes worktrees.
 - A workflow is validated before it is persisted, cannot contain unknown step kinds or cycles, and cannot be revised after it starts. It records an append-only, per-session event sequence for browser catch-up.
 - V1 accepts only `agent`, `tool`, `condition`, `fan_out`, `join`, `approval_wait`, `evidence_submit`, `reconcile`, and `cancel` nodes. Models may propose a reviewed definition only; they do not execute arbitrary graph code or alter policy.
+- An `agent` step may name up to sixteen bridge-published skills. Workflow start rejects missing skill metadata before it creates a run or transitions the workflow. A skill name and digest are copied into the immutable queued command; the bridge resolves the body only from explicit local `--skills-root` directories and fails closed when its digest no longer matches. The hub and browser never receive a local skill path or body.
+- An operator direction is an append-only `operator.directive` session event. It is included in the **next** queued work packet for that session; it never interrupts or retargets an already-running Codex process.
 - Effects checkpoint before execution through a bridge command and remain idempotent at the State/approval boundary. A failed bridge operation or invalid lease path becomes reconciliation, never a silent retry of an external effect.
 
 The default delivery template is deliberately narrow: `agent -> approval_wait -> reconcile`. Its agent step owns local edit/test/evidence submission; it then pauses for a human review gate. PR creation, merge, State acceptance, deployment, and model-policy changes remain independent hash-bound approvals.
@@ -99,6 +105,8 @@ The bridge makes an outbound authenticated request to the hub and is the only pr
 Bridge commands are leased for delivery rather than deleted when fetched. A terminal run acknowledges its command only after its `evidenced` or `reconciliation` state is recorded; an interrupted fetch becomes eligible for recovery after its delivery lease expires. The hub checks that every bridge event and evidence projection belongs to the authenticated bridge's project/run.
 
 An approval is one-time, expires, is scoped to a bridge, and binds the canonical JSON payload hash. Any changed diff or replayed grant fails closed.
+
+`skill_probe` is the sole non-mutating bridge command outside a run or approved action. It resolves the hub-selected names locally, verifies their digests, projects redacted evaluation evidence, then acknowledges. A missing or changed digest is acknowledged only after a redacted reconciliation evidence artifact is projected; it does not retry forever. It never invokes Codex or executes skill content.
 
 ## Neo4j projection contract
 

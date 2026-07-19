@@ -20,6 +20,7 @@ class Settings:
     bridge_bootstrap_token: str
     anvil_router_base_url: str
     anvil_router_token: str
+    sandbox_models: frozenset[str] = frozenset()
     anvil_voice_realtime_url: str = ""
     anvil_voice_realtime_token: str = ""
     voice_retain_transcripts: bool = False
@@ -43,6 +44,7 @@ class Settings:
             bridge_bootstrap_token=values.get("WORKBENCH_BRIDGE_BOOTSTRAP_TOKEN", ""),
             anvil_router_base_url=values.get("ANVIL_ROUTER_BASE_URL", ""),
             anvil_router_token=values.get("ANVIL_ROUTER_TOKEN", ""),
+            sandbox_models=_csv("WORKBENCH_SANDBOX_MODELS", values),
             anvil_voice_realtime_url=values.get("ANVIL_VOICE_REALTIME_URL", "").strip(),
             anvil_voice_realtime_token=values.get("ANVIL_VOICE_REALTIME_TOKEN", ""),
             voice_retain_transcripts=values.get("WORKBENCH_VOICE_RETAIN_TRANSCRIPTS", "").lower() in {"1", "true", "yes"},

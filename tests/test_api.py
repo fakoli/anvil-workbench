@@ -120,3 +120,83 @@ def test_bridge_cannot_write_events_or_evidence_for_another_project_run():
         })
         assert evidence.status_code == 403
         assert first_bridge["bridge"]["id"] != bridge["id"]
+
+
+def test_bridge_published_skills_are_digest_bound_to_the_next_work_packet():
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "skills", "state_root": ".anvil"}).json()
+        registered = test_client.post(f"/api/projects/{project['id']}/bridges", json={"name": "skills bridge"}).json()
+        bridge, token = registered["bridge"], registered["bootstrap_token"]
+        headers = {"X-Workbench-Bridge": bridge["id"], "Authorization": f"Bearer {token}"}
+        digest = "a" * 64
+        published = test_client.post(f"/api/bridge/{bridge['id']}/skills", headers=headers, json={"skills": [{
+            "skill_id": "anvil:review", "description": "Review state evidence.", "content_sha256": digest,
+        }]})
+        assert published.status_code == 202
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "skill test", "worktree_id": "default", "skills": ["anvil:review"],
+        }).json()
+        directive = test_client.post(
+            f"/api/sessions/{session['session']['id']}/directives", json={"content": "Run the independent evidence check."},
+        )
+        assert directive.status_code == 202
+        started = test_client.post(f"/api/workflows/{session['workflow']['id']}/start", json={"task_id": "TASK-9"})
+        assert started.status_code == 201
+        command = test_client.get(f"/api/bridge/{bridge['id']}/commands/next", headers=headers).json()
+        assert command["action_type"] == "run_codex"
+        assert command["payload"]["skills"] == [{
+            "skill_id": "anvil:review", "description": "Review state evidence.", "content_sha256": digest,
+        }]
+        assert command["payload"]["directives"] == ["Run the independent evidence check."]
+
+
+def test_workflow_rejects_unpublished_skills_before_creating_a_run_or_starting_the_workflow():
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "missing skill", "state_root": ".anvil"}).json()
+        test_client.post(f"/api/projects/{project['id']}/bridges", json={"name": "bridge"})
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "needs a skill", "worktree_id": "default", "skills": ["anvil:review"],
+        }).json()
+
+        start = test_client.post(f"/api/workflows/{session['workflow']['id']}/start", json={"task_id": "TASK-10"})
+
+        assert start.status_code == 409
+        assert "publish every selected workflow skill" in start.json()["detail"]
+        store = test_client.app.state.store
+        assert store.get_workflow(session["workflow"]["id"]).status == "draft"
+        assert store.list_runs(project["id"]) == []
+
+
+def test_skills_probe_and_router_only_hub_actions_are_explicit(monkeypatch):
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://100.87.34.66:8000/v1", anvil_router_token="server-held",
+        sandbox_models=frozenset({"fast-local"}), identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    from workbench import api as api_module
+
+    monkeypatch.setattr(api_module, "route_decisions", lambda *_args: [
+        {"workbench_run_id": "known", "request_id": "req-1", "model": "fast-local"},
+        {"workbench_run_id": "not-workbench", "request_id": "req-2"},
+    ])
+    monkeypatch.setattr(api_module, "sandbox_response", lambda *_args: {"model": "fast-local", "status": "completed", "output_text": "safe"})
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as test_client:
+        project = test_client.post("/api/projects", json={"name": "router", "state_root": ".anvil"}).json()
+        bridge_response = test_client.post(f"/api/projects/{project['id']}/bridges", json={"name": "bridge"}).json()
+        bridge, token = bridge_response["bridge"], bridge_response["bootstrap_token"]
+        headers = {"X-Workbench-Bridge": bridge["id"], "Authorization": f"Bearer {token}"}
+        test_client.post(f"/api/bridge/{bridge['id']}/skills", headers=headers, json={"skills": [{
+            "skill_id": "anvil:review", "description": "Review.", "content_sha256": "b" * 64,
+        }]})
+        probe = test_client.post(f"/api/projects/{project['id']}/skills/probe")
+        assert probe.status_code == 202
+        queued = test_client.get(f"/api/bridge/{bridge['id']}/commands/next", headers=headers).json()
+        assert queued["action_type"] == "skill_probe"
+
+        run = test_client.post("/api/runs", json={"project_id": project["id"], "task_id": "TASK", "model": "fast-local"}).json()
+        store = test_client.app.state.store
+        store.runs["known"] = type(store.runs[run["id"]])("known", project["id"], "TASK", "fast-local", "queued")
+        assert test_client.get("/api/routes").json()["routes"] == [{"workbench_run_id": "known", "request_id": "req-1", "model": "fast-local"}]
+        assert test_client.post("/api/sandbox", json={"model": "fast-local", "input": "hello"}).json()["output_text"] == "safe"
+        assert test_client.post("/api/sandbox", json={"model": "heavy-local", "input": "hello"}).status_code == 409

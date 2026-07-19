@@ -10,11 +10,11 @@ import hashlib
 import json
 import secrets
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, Protocol
 
 from .models import (
-    Approval, AuditEvent, Bridge, Project, ResourceLease, Run, Session,
+    Approval, AuditEvent, Bridge, BridgeSkill, Project, ResourceLease, Run, Session,
     Workflow, WorkflowEvent, new_id, now_utc,
 )
 from .redaction import redact_value
@@ -47,6 +47,7 @@ class WorkbenchStore(Protocol):
     def create_project(self, name: str, state_root: str) -> Project: ...
     def list_projects(self) -> list[Project]: ...
     def list_runs(self, project_id: str | None = None) -> list[Run]: ...
+    def list_audit(self, limit: int = 20) -> list[AuditEvent]: ...
     def create_session(self, project_id: str, title: str, worktree_id: str, workflow_definition: dict[str, Any]) -> tuple[Session, Workflow]: ...
     def list_sessions(self, project_id: str | None = None) -> list[Session]: ...
     def get_session(self, session_id: str) -> Session: ...
@@ -63,6 +64,8 @@ class WorkbenchStore(Protocol):
     def list_approvals(self, project_id: str | None = None) -> list[Approval]: ...
     def register_bridge(self, project_id: str, name: str) -> tuple[Bridge, str]: ...
     def authenticate_bridge(self, bridge_id: str, token: str) -> Bridge: ...
+    def replace_bridge_skills(self, bridge_id: str, skills: list[dict[str, str]]) -> list[BridgeSkill]: ...
+    def list_bridge_skills(self, project_id: str | None = None) -> list[BridgeSkill]: ...
     def create_run(self, project_id: str, task_id: str | None, model: str, session_id: str | None = None, workflow_id: str | None = None, workflow_step_id: str | None = None, lease_epoch: int | None = None) -> Run: ...
     def update_run_status(self, run_id: str, status: str, bridge_id: str) -> Run: ...
     def add_transcript(self, run_id: str, role: str, content: Any, bridge_id: str | None = None) -> None: ...
@@ -72,6 +75,7 @@ class WorkbenchStore(Protocol):
     def consume(self, approval_id: str, action_payload_hash: str) -> Approval: ...
     def enqueue_command(self, bridge_id: str, approval: Approval) -> None: ...
     def enqueue_run(self, bridge_id: str, run: Run) -> None: ...
+    def enqueue_skill_probe(self, bridge_id: str) -> None: ...
     def next_command(self, bridge_id: str) -> dict[str, Any] | None: ...
     def acknowledge_command(self, bridge_id: str, command_id: str) -> None: ...
     def append_audit(self, kind: str, actor: str, project_id: str | None, data: dict[str, Any]) -> AuditEvent: ...
@@ -83,6 +87,7 @@ class MemoryStore:
     def __init__(self) -> None:
         self.projects: dict[str, Project] = {}
         self.bridges: dict[str, Bridge] = {}
+        self.bridge_skills: dict[str, dict[str, BridgeSkill]] = {}
         self.runs: dict[str, Run] = {}
         self.sessions: dict[str, Session] = {}
         self.workflows: dict[str, Workflow] = {}
@@ -110,6 +115,9 @@ class MemoryStore:
     def list_runs(self, project_id: str | None = None) -> list[Run]:
         values = list(self.runs.values())
         return [run for run in values if project_id is None or run.project_id == project_id]
+
+    def list_audit(self, limit: int = 20) -> list[AuditEvent]:
+        return list(reversed(self.audit[-max(1, min(limit, 100)):]))
 
     def create_session(
         self, project_id: str, title: str, worktree_id: str, workflow_definition: dict[str, Any],
@@ -265,6 +273,7 @@ class MemoryStore:
         raw = secrets.token_urlsafe(32)
         bridge = Bridge(new_id("bridge"), project_id, name, token_hash(raw))
         self.bridges[bridge.id] = bridge
+        self.bridge_skills[bridge.id] = {}
         self.commands[bridge.id] = []
         project = self.projects[project_id]
         self.projects[project_id] = Project(project.id, project.name, project.state_root, bridge.id, project.created_at)
@@ -276,6 +285,31 @@ class MemoryStore:
         if bridge is None or not secrets.compare_digest(bridge.token_hash, token_hash(token)):
             raise StoreError("invalid bridge credentials")
         return bridge
+
+    def replace_bridge_skills(self, bridge_id: str, skills: list[dict[str, str]]) -> list[BridgeSkill]:
+        bridge = self.bridges.get(bridge_id)
+        if bridge is None:
+            raise StoreError("unknown bridge")
+        clean: dict[str, BridgeSkill] = {}
+        for skill in skills:
+            skill_id = str(skill.get("skill_id", "")).strip()
+            description = str(skill.get("description", "")).strip()
+            digest = str(skill.get("content_sha256", "")).strip()
+            if not skill_id or not description or len(digest) != 64 or skill_id in clean:
+                raise StoreError("invalid bridge skill metadata")
+            clean[skill_id] = BridgeSkill(bridge_id, skill_id, description, digest)
+        self.bridge_skills[bridge_id] = clean
+        self.append_audit("bridge.skills_published", "bridge:" + bridge_id, bridge.project_id, {"skill_ids": sorted(clean)})
+        return list(clean.values())
+
+    def list_bridge_skills(self, project_id: str | None = None) -> list[BridgeSkill]:
+        bridge_ids = {
+            bridge.id for bridge in self.bridges.values()
+            if project_id is None or bridge.project_id == project_id
+        }
+        return [
+            skill for bridge_id in bridge_ids for skill in self.bridge_skills.get(bridge_id, {}).values()
+        ]
 
     def create_run(self, project_id: str, task_id: str | None, model: str, session_id: str | None = None, workflow_id: str | None = None, workflow_step_id: str | None = None, lease_epoch: int | None = None) -> Run:
         if project_id not in self.projects:
@@ -386,15 +420,49 @@ class MemoryStore:
         if bridge_id not in self.bridges:
             raise StoreError("unknown bridge")
         session = self.get_session(run.session_id) if run.session_id else None
+        skills: list[dict[str, str]] = []
+        if run.workflow_id and run.workflow_step_id:
+            step = step_by_id(self.get_workflow(run.workflow_id).definition, run.workflow_step_id)
+            published = self.bridge_skills.get(bridge_id, {})
+            for skill_id in step.get("skills", []):
+                skill = published.get(skill_id)
+                if skill is None:
+                    raise StoreError(f"workflow skill is not published by this bridge: {skill_id}")
+                skills.append({
+                    "skill_id": skill.skill_id,
+                    "description": skill.description,
+                    "content_sha256": skill.content_sha256,
+                })
+        directives = [
+            str(event.data.get("content", "")) for event in self.workflow_events.get(run.session_id or "", [])
+            if event.kind == "operator.directive" and isinstance(event.data.get("content"), str)
+        ]
         payload = {
             "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
             "model": run.model, "session_id": run.session_id,
             "workflow_id": run.workflow_id, "workflow_step_id": run.workflow_step_id,
             "lease_epoch": run.lease_epoch,
             "worktree_id": session.worktree_id if session else None,
+            "skills": skills,
+            "directives": directives[-32:],
         }
         self.commands.setdefault(bridge_id, []).append({
             "id": new_id("command"), "approval_id": None, "action_type": "run_codex",
+            "payload": payload, "payload_hash": payload_hash(payload),
+        })
+
+    def enqueue_skill_probe(self, bridge_id: str) -> None:
+        bridge = self.bridges.get(bridge_id)
+        if bridge is None:
+            raise StoreError("unknown bridge")
+        skills = sorted(self.bridge_skills.get(bridge_id, {}).values(), key=lambda item: item.skill_id)
+        if not skills:
+            raise StoreError("the bridge has not published any configured skills")
+        payload = {"project_id": bridge.project_id, "skills": [
+            {"skill_id": skill.skill_id, "content_sha256": skill.content_sha256} for skill in skills
+        ]}
+        self.commands.setdefault(bridge_id, []).append({
+            "id": new_id("command"), "approval_id": None, "action_type": "skill_probe",
             "payload": payload, "payload_hash": payload_hash(payload),
         })
 
@@ -446,6 +514,14 @@ class PostgresStore:
     @staticmethod
     def _bridge(row: dict[str, Any]) -> Bridge:
         return Bridge(row["id"], row["project_id"], row["name"], row["token_hash"], row["created_at"], row["last_seen_at"])
+
+    @staticmethod
+    def _bridge_skill(row: dict[str, Any]) -> BridgeSkill:
+        return BridgeSkill(row["bridge_id"], row["skill_id"], row["description"], row["content_sha256"], row["updated_at"])
+
+    @staticmethod
+    def _audit(row: dict[str, Any]) -> AuditEvent:
+        return AuditEvent(row["id"], row["kind"], row["actor"], row["project_id"], row["data"], row["created_at"])
 
     @staticmethod
     def _run(row: dict[str, Any]) -> Run:
@@ -511,6 +587,12 @@ class PostgresStore:
                     name TEXT NOT NULL, token_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
                     last_seen_at TIMESTAMPTZ
                 );
+                CREATE TABLE IF NOT EXISTS workbench_bridge_skills (
+                    bridge_id TEXT NOT NULL REFERENCES workbench_bridges(id),
+                    skill_id TEXT NOT NULL, description TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (bridge_id, skill_id)
+                );
                 CREATE TABLE IF NOT EXISTS workbench_runs (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES workbench_projects(id),
                     task_id TEXT, model TEXT NOT NULL, status TEXT NOT NULL,
@@ -561,6 +643,7 @@ class PostgresStore:
                     project_id TEXT, data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS workbench_commands_bridge_idx ON workbench_commands (bridge_id, created_at);
+                CREATE INDEX IF NOT EXISTS workbench_bridge_skills_bridge_idx ON workbench_bridge_skills (bridge_id, skill_id);
                 CREATE INDEX IF NOT EXISTS workbench_approvals_project_idx ON workbench_approvals (project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS workbench_sessions_project_idx ON workbench_sessions (project_id, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS workbench_workflow_events_session_idx ON workbench_workflow_events (session_id, sequence);
@@ -606,6 +689,11 @@ class PostgresStore:
         with self._connection().cursor() as cur:
             cur.execute(query, values)
             return [self._run(row) for row in cur.fetchall()]
+
+    def list_audit(self, limit: int = 20) -> list[AuditEvent]:
+        with self._connection().cursor() as cur:
+            cur.execute("SELECT * FROM workbench_audit ORDER BY created_at DESC LIMIT %s", (max(1, min(limit, 100)),))
+            return [self._audit(row) for row in cur.fetchall()]
 
     def _append_workflow_event(self, session_id: str, workflow_id: str | None, kind: str, data: dict[str, Any]) -> WorkflowEvent:
         event = WorkflowEvent(new_id("event"), session_id, workflow_id, 0, kind, redact_value(data))
@@ -887,6 +975,45 @@ class PostgresStore:
             row["last_seen_at"] = last_seen
             return self._bridge(row)
 
+    def replace_bridge_skills(self, bridge_id: str, skills: list[dict[str, str]]) -> list[BridgeSkill]:
+        connection = self._connection()
+        now = now_utc()
+        clean: list[BridgeSkill] = []
+        seen: set[str] = set()
+        for value in skills:
+            skill_id = str(value.get("skill_id", "")).strip()
+            description = str(value.get("description", "")).strip()
+            digest = str(value.get("content_sha256", "")).strip()
+            if not skill_id or not description or len(digest) != 64 or skill_id in seen:
+                raise StoreError("invalid bridge skill metadata")
+            seen.add(skill_id)
+            clean.append(BridgeSkill(bridge_id, skill_id, description, digest, now))
+        with connection.transaction():
+            with connection.cursor() as cur:
+                cur.execute("SELECT project_id FROM workbench_bridges WHERE id = %s FOR UPDATE", (bridge_id,))
+                bridge = cur.fetchone()
+                if bridge is None:
+                    raise StoreError("unknown bridge")
+                cur.execute("DELETE FROM workbench_bridge_skills WHERE bridge_id = %s", (bridge_id,))
+                for skill in clean:
+                    cur.execute(
+                        "INSERT INTO workbench_bridge_skills (bridge_id,skill_id,description,content_sha256,updated_at) VALUES (%s,%s,%s,%s,%s)",
+                        (skill.bridge_id, skill.skill_id, skill.description, skill.content_sha256, skill.updated_at),
+                    )
+        self.append_audit("bridge.skills_published", "bridge:" + bridge_id, bridge["project_id"], {"skill_ids": sorted(seen)})
+        return clean
+
+    def list_bridge_skills(self, project_id: str | None = None) -> list[BridgeSkill]:
+        query = "SELECT skills.* FROM workbench_bridge_skills skills JOIN workbench_bridges bridges ON bridges.id = skills.bridge_id"
+        values: tuple[Any, ...] = ()
+        if project_id is not None:
+            query += " WHERE bridges.project_id = %s"
+            values = (project_id,)
+        query += " ORDER BY skills.skill_id"
+        with self._connection().cursor() as cur:
+            cur.execute(query, values)
+            return [self._bridge_skill(row) for row in cur.fetchall()]
+
     def create_run(
         self,
         project_id: str,
@@ -1097,12 +1224,40 @@ class PostgresStore:
 
     def enqueue_run(self, bridge_id: str, run: Run) -> None:
         session = self.get_session(run.session_id) if run.session_id else None
+        skills: list[dict[str, str]] = []
+        if run.workflow_id and run.workflow_step_id:
+            step = step_by_id(self.get_workflow(run.workflow_id).definition, run.workflow_step_id)
+            requested = list(step.get("skills", []))
+            if requested:
+                published = {
+                    skill.skill_id: skill for skill in self.list_bridge_skills(run.project_id)
+                    if skill.bridge_id == bridge_id
+                }
+                for skill_id in requested:
+                    skill = published.get(skill_id)
+                    if skill is None:
+                        raise StoreError(f"workflow skill is not published by this bridge: {skill_id}")
+                    skills.append({
+                        "skill_id": skill.skill_id,
+                        "description": skill.description,
+                        "content_sha256": skill.content_sha256,
+                    })
+        directives: list[str] = []
+        if run.session_id:
+            with self._connection().cursor() as cur:
+                cur.execute(
+                    "SELECT data FROM workbench_workflow_events WHERE session_id = %s AND kind = 'operator.directive' ORDER BY sequence",
+                    (run.session_id,),
+                )
+                directives = [str(row["data"].get("content", "")) for row in cur.fetchall() if isinstance(row["data"], dict)]
         payload = {
             "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
             "model": run.model, "session_id": run.session_id,
             "workflow_id": run.workflow_id, "workflow_step_id": run.workflow_step_id,
             "lease_epoch": run.lease_epoch,
             "worktree_id": session.worktree_id if session else None,
+            "skills": skills,
+            "directives": directives[-32:],
         }
         with self._connection().cursor() as cur:
             cur.execute("SELECT id FROM workbench_bridges WHERE id = %s", (bridge_id,))
@@ -1111,6 +1266,24 @@ class PostgresStore:
             cur.execute(
                 "INSERT INTO workbench_commands (id,bridge_id,approval_id,action_type,payload,payload_hash,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                 (new_id("command"), bridge_id, None, "run_codex", self._json(payload), payload_hash(payload), now_utc()),
+            )
+
+    def enqueue_skill_probe(self, bridge_id: str) -> None:
+        with self._connection().cursor() as cur:
+            cur.execute("SELECT project_id FROM workbench_bridges WHERE id = %s", (bridge_id,))
+            bridge = cur.fetchone()
+        if bridge is None:
+            raise StoreError("unknown bridge")
+        skills = [skill for skill in self.list_bridge_skills(bridge["project_id"]) if skill.bridge_id == bridge_id]
+        if not skills:
+            raise StoreError("the bridge has not published any configured skills")
+        payload = {"project_id": bridge["project_id"], "skills": [
+            {"skill_id": skill.skill_id, "content_sha256": skill.content_sha256} for skill in skills
+        ]}
+        with self._connection().cursor() as cur:
+            cur.execute(
+                "INSERT INTO workbench_commands (id,bridge_id,approval_id,action_type,payload,payload_hash,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (new_id("command"), bridge_id, None, "skill_probe", self._json(payload), payload_hash(payload), now_utc()),
             )
 
     def next_command(self, bridge_id: str) -> dict[str, Any] | None:

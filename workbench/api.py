@@ -6,6 +6,7 @@ bridge credential.  An identity-aware tailnet proxy should set
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, status
@@ -16,17 +17,18 @@ from .config import Settings
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
-from .store import MemoryStore, PostgresStore, StoreError, WorkbenchStore
+from .router import RouterError, route_decisions, sandbox_response
+from .store import PostgresStore, StoreError, WorkbenchStore
 from .voice import relay_realtime
 from .workflows import step_by_id
 
 
-def default_delivery_workflow() -> dict[str, Any]:
+def default_delivery_workflow(skills: list[str] | None = None) -> dict[str, Any]:
     """Small reviewed workflow used when a session does not supply a template."""
     return {
         "entry": "implement",
         "steps": [
-            {"id": "implement", "kind": "agent", "model": "planning", "next": ["review"]},
+            {"id": "implement", "kind": "agent", "model": "planning", "skills": skills or [], "next": ["review"]},
             {"id": "review", "kind": "approval_wait", "next": ["reconcile"]},
             {"id": "reconcile", "kind": "reconcile", "next": []},
         ],
@@ -53,6 +55,7 @@ class SessionInput(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     worktree_id: str = Field(min_length=1, max_length=160)
     workflow_definition: dict[str, Any] | None = None
+    skills: list[str] = Field(default_factory=list, max_length=16)
 
 
 class WorkflowRevisionInput(BaseModel):
@@ -92,6 +95,25 @@ class EvidenceInput(BaseModel):
     source_id: str = Field(min_length=1, max_length=300)
     project_id: str
     payload: dict[str, Any]
+
+
+class DirectiveInput(BaseModel):
+    content: str = Field(min_length=1, max_length=8_000)
+
+
+class BridgeSkillInput(BaseModel):
+    skill_id: str = Field(pattern="^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,119}$")
+    description: str = Field(min_length=1, max_length=500)
+    content_sha256: str = Field(pattern="^[a-f0-9]{64}$")
+
+
+class BridgeSkillsInput(BaseModel):
+    skills: list[BridgeSkillInput] = Field(default_factory=list, max_length=128)
+
+
+class SandboxInput(BaseModel):
+    model: str = Field(min_length=1, max_length=240)
+    input: str = Field(min_length=1, max_length=8_000)
 
 
 def _error(exc: StoreError) -> HTTPException:
@@ -167,15 +189,25 @@ def create_app(
         return {"ok": True, "service": "anvil-workbench", "graph": type(graph).__name__}
 
     @app.get("/api/bootstrap")
-    def bootstrap(_: str = Depends(actor)) -> dict[str, Any]:
+    def bootstrap(current_actor: str = Depends(actor)) -> dict[str, Any]:
         projects = [as_json(project) for project in store.list_projects()]
+        sessions = store.list_sessions()
+        directives = [
+            as_json(event) for session in sessions for event in store.list_workflow_events(session.id)
+            if event.kind == "operator.directive"
+        ]
         return {
+            "actor": current_actor,
             "projects": projects,
             "runs": [as_json(run) for run in store.list_runs()],
-            "sessions": [as_json(session) for session in store.list_sessions()],
+            "sessions": [as_json(session) for session in sessions],
             "workflows": [as_json(workflow) for workflow in store.list_workflows()],
             "approvals": [as_json(approval) for approval in store.list_approvals()],
-            "router_configured": bool(settings.anvil_router_base_url),
+            "skills": [as_json(skill) for skill in store.list_bridge_skills()],
+            "directives": directives[-100:],
+            "audit": [as_json(event) for event in store.list_audit()],
+            "router_configured": bool(settings.anvil_router_base_url and settings.anvil_router_token),
+            "sandbox": {"available": bool(settings.anvil_router_base_url and settings.anvil_router_token and settings.sandbox_models), "models": sorted(settings.sandbox_models)},
             "voice": {
                 "available": bool(settings.anvil_voice_realtime_url),
                 "transport": "workbench-realtime-relay" if settings.anvil_voice_realtime_url else "not_configured",
@@ -197,12 +229,23 @@ def create_app(
     def create_session(payload: SessionInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
         session, workflow = store.create_session(
             payload.project_id, payload.title, payload.worktree_id,
-            payload.workflow_definition or default_delivery_workflow(),
+            payload.workflow_definition or default_delivery_workflow(payload.skills),
         )
         store.append_audit("session.requested", current_actor, payload.project_id, {
             "session_id": session.id, "workflow_id": workflow.id,
         })
         return {"session": as_json(session), "workflow": as_json(workflow)}
+
+    @app.post("/api/sessions/{session_id}/directives", status_code=status.HTTP_202_ACCEPTED)
+    def add_directive(session_id: str, payload: DirectiveInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
+        session = store.get_session(session_id)
+        workflow = next(iter(store.list_workflows(session_id)), None)
+        event = store.record_session_event(session.id, workflow.id if workflow else None, "operator.directive", {
+            "content": payload.content.strip(), "actor": current_actor,
+            "delivery": "included in the next bridge work packet for this session",
+        })
+        store.append_audit("session.directive_added", current_actor, session.project_id, {"session_id": session.id, "event_id": event.id})
+        return as_json(event)
 
     @app.get("/api/sessions/{session_id}/events")
     def session_events(session_id: str, after_sequence: int = 0, _: str = Depends(actor)) -> dict[str, Any]:
@@ -221,6 +264,19 @@ def create_app(
         step = step_by_id(workflow.definition, str(workflow.definition["entry"]))
         if step["kind"] != "agent":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="v1 workflows must begin with an agent step")
+        requested_skills = list(step.get("skills", []))
+        if requested_skills:
+            published = {
+                skill.skill_id for skill in store.list_bridge_skills(workflow.project_id)
+                if skill.bridge_id == project.bridge_id
+            }
+            missing = [skill_id for skill_id in requested_skills if skill_id not in published]
+            if missing:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="the bridge must publish every selected workflow skill before the workflow can start: "
+                    + ", ".join(missing),
+                )
         model = str(step.get("model") or payload.model)
         run = store.create_run(
             workflow.project_id, payload.task_id, model, session_id=workflow.session_id,
@@ -258,11 +314,29 @@ def create_app(
             store.enqueue_command(approval.bridge_id, approval)
         return as_json(approval)
 
+    @app.post("/api/projects/{project_id}/skills/probe", status_code=status.HTTP_202_ACCEPTED)
+    def probe_skills(project_id: str, current_actor: str = Depends(actor)) -> dict[str, Any]:
+        project = next((item for item in store.list_projects() if item.id == project_id), None)
+        if project is None or project.bridge_id is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a project bridge is required before skills can be checked")
+        store.enqueue_skill_probe(project.bridge_id)
+        store.append_audit("bridge.skills_probe_requested", current_actor, project.id, {"bridge_id": project.bridge_id})
+        return {"accepted": True, "bridge_id": project.bridge_id}
+
     @app.get("/api/bridge/{bridge_id}/commands/next")
     def next_command(bridge_id: str, authenticated_bridge: str = Depends(bridge_identity)) -> dict[str, Any] | None:
         if bridge_id != authenticated_bridge:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
         return store.next_command(bridge_id)
+
+    @app.post("/api/bridge/{bridge_id}/skills", status_code=status.HTTP_202_ACCEPTED)
+    def publish_bridge_skills(
+        bridge_id: str, payload: BridgeSkillsInput, authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        skills = store.replace_bridge_skills(bridge_id, [item.model_dump() for item in payload.skills])
+        return {"skills": [as_json(skill) for skill in skills]}
 
     @app.post("/api/bridge/{bridge_id}/approvals/{approval_id}/consume")
     def consume(
@@ -331,6 +405,30 @@ def create_app(
         citation = graph.project(evidence.source_kind, evidence.source_id, evidence.project_id, evidence.payload)
         store.append_audit("evidence.projected", "bridge:" + bridge_id, evidence.project_id, {"citation": citation, "source_kind": evidence.source_kind})
         return {"accepted": True, "citation": citation}
+
+    @app.get("/api/routes")
+    def routes(limit: int = 50, _: str = Depends(actor)) -> dict[str, Any]:
+        try:
+            rows = route_decisions(settings.anvil_router_base_url, settings.anvil_router_token, limit)
+        except RouterError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        known_runs = {run.id for run in store.list_runs()}
+        return {"routes": [row for row in rows if row.get("workbench_run_id") in known_runs]}
+
+    @app.post("/api/sandbox")
+    def sandbox(payload: SandboxInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
+        if payload.model not in settings.sandbox_models:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="the requested sandbox model is not allowed")
+        try:
+            response = sandbox_response(settings.anvil_router_base_url, settings.anvil_router_token, payload.model, payload.input)
+        except RouterError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        store.append_audit("sandbox.completed", current_actor, None, {
+            "model": payload.model,
+            "input_sha256": hashlib.sha256(payload.input.encode("utf-8")).hexdigest(),
+            "output_characters": len(str(response.get("output_text", ""))),
+        })
+        return response
 
     @app.post("/api/bridge/{bridge_id}/workflows/{workflow_id}/steps/{step_id}")
     def bridge_workflow_step(

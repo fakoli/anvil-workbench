@@ -125,6 +125,17 @@ class Bridge:
 
 
 @dataclass(frozen=True)
+class BridgeSkill:
+    """Safe metadata for one explicitly configured bridge skill."""
+
+    bridge_id: str
+    skill_id: str
+    description: str
+    content_sha256: str
+    updated_at: datetime = field(default_factory=now_utc)
+
+
+@dataclass(frozen=True)
 class AuditEvent:
     id: str
     kind: str

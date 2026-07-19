@@ -9,6 +9,7 @@ import pytest
 
 from workbench import bridge as bridge_module
 from workbench.bridge import Bridge, BridgeError, BridgeSettings, CodexRunner, StateReader, VerificationRunner
+from workbench.skills import SkillError, SkillRegistry
 
 
 def settings(tmp_path: Path, **overrides: object) -> BridgeSettings:
@@ -242,3 +243,86 @@ def test_bridge_resolves_only_named_operator_configured_worktrees(tmp_path: Path
     assert bridge._worktree_root({}) == tmp_path.resolve()
     with pytest.raises(BridgeError, match="not configured"):
         bridge._worktree_root({"worktree_id": "../../untrusted"})
+
+
+def test_bridge_skill_registry_never_reports_local_paths_and_rejects_duplicates(tmp_path: Path):
+    root = tmp_path / "skills"
+    first = root / "review"
+    first.mkdir(parents=True)
+    (first / "SKILL.md").write_text(
+        "---\nname: anvil:review\ndescription: Review redacted evidence.\n---\nUse cited evidence only.\n",
+        encoding="utf-8",
+    )
+    discovered = SkillRegistry([root]).discover()
+    assert discovered["anvil:review"].metadata() == {
+        "skill_id": "anvil:review", "description": "Review redacted evidence.",
+        "content_sha256": discovered["anvil:review"].content_sha256,
+    }
+    second = root / "duplicate"
+    second.mkdir()
+    (second / "SKILL.md").write_text(
+        "---\nname: anvil:review\ndescription: Duplicate.\n---\nDo not load me.\n", encoding="utf-8",
+    )
+    with pytest.raises(SkillError, match="duplicate"):
+        SkillRegistry([root]).discover()
+
+
+def test_bridge_skill_probe_attests_matching_local_digest_without_running_codex(tmp_path: Path):
+    root = tmp_path / "skills"
+    directory = root / "review"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        "---\nname: anvil:review\ndescription: Review.\n---\nUse the evidence packet.\n", encoding="utf-8",
+    )
+    skill = SkillRegistry([root]).discover()["anvil:review"]
+
+    class Hub:
+        def __init__(self):
+            self.evidence_events = []
+            self.acknowledged = []
+        def publish_skills(self, _metadata): return None
+        def next_command(self): return {"id": "command_1", "action_type": "skill_probe", "payload": {"skills": [{"skill_id": skill.skill_id, "content_sha256": skill.content_sha256}]}}
+        def evidence(self, kind, _id, _project, payload): self.evidence_events.append((kind, payload))
+        def acknowledge_command(self, command_id): self.acknowledged.append(command_id)
+
+    bridge = Bridge(settings(tmp_path, skill_roots=(root,)))
+    bridge.hub = Hub()  # type: ignore[assignment]
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(bridge, "project_state_events", lambda: 0)
+        assert bridge.poll_once() is True
+    finally:
+        monkeypatch.undo()
+    assert bridge.hub.evidence_events[0][0] == "evaluation"
+    assert bridge.hub.acknowledged == ["command_1"]
+
+
+def test_bridge_skill_probe_records_reconciliation_when_a_local_skill_digest_changes(tmp_path: Path):
+    root = tmp_path / "skills"
+    directory = root / "review"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        "---\nname: anvil:review\ndescription: Review.\n---\nUse the evidence packet.\n", encoding="utf-8",
+    )
+
+    class Hub:
+        def __init__(self):
+            self.evidence_events = []
+            self.acknowledged = []
+        def publish_skills(self, _metadata): return None
+        def next_command(self): return {"id": "command_1", "action_type": "skill_probe", "payload": {"skills": [{"skill_id": "anvil:review", "content_sha256": "f" * 64}]}}
+        def evidence(self, kind, _id, _project, payload): self.evidence_events.append((kind, payload))
+        def acknowledge_command(self, command_id): self.acknowledged.append(command_id)
+
+    bridge = Bridge(settings(tmp_path, skill_roots=(root,)))
+    bridge.hub = Hub()  # type: ignore[assignment]
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(bridge, "project_state_events", lambda: 0)
+        with pytest.raises(BridgeError, match="changed since it was selected"):
+            bridge.poll_once()
+    finally:
+        monkeypatch.undo()
+    assert bridge.hub.evidence_events[0][0] == "failure"
+    assert bridge.hub.evidence_events[0][1]["reconciliation_required"] is True
+    assert bridge.hub.acknowledged == ["command_1"]

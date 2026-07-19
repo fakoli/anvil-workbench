@@ -1,75 +1,67 @@
 # Workbench UI acceptance audit
 
 Date: 2026-07-19  
-Scope: current `codex/workbench-release-readiness` candidate, exercised against the React component suite and loopback Compose shell.
+Scope: `codex/workbench-release-readiness` candidate
 
-This is a control-level audit, not evidence that an external GitHub or model action occurred. Browser controls may review or request an action; the project-local bridge remains the only component permitted to perform GitHub actions.
+This audit distinguishes a functional hub-backed control from a configuration boundary. Nothing in this UI is a synthetic delivery, a raw-provider escape hatch, or a browser-side GitHub action.
 
 ## Result
 
 | Measure | Result |
 | --- | --- |
-| Existing delivery controls covered | 22 / 22 |
-| New harness controls covered | 6 / 6 |
-| Total interactive controls covered | **28 / 28 (100%)** |
-| UI scenarios | **10 / 10 passed** |
-| Browser build | passed |
-| Backend and bridge contract suite | 23 / 23 passed |
+| Main navigation surfaces covered | 8 / 8 |
+| Hub-backed interactive workflows covered | 7 / 7 |
+| Utility and onboarding controls covered | 5 / 5 |
+| Web component scenarios | **8 / 8 passed** |
+| Backend and bridge contract tests | **31 / 31 passed** |
+| Production web build | passed |
 
-The exhaustive control matrix is automated in `web/src/App.test.jsx`. The loopback browser check is a separate visual and console smoke test; it does not consume an approval or create an external project, PR, or merge.
+The component suites are [`web/src/App.test.jsx`](../web/src/App.test.jsx) and [`web/src/api.test.js`](../web/src/api.test.js). They mock only the HTTP boundary, then assert the request a real control makes; they do not rely on a delivery seed. Backend tests assert the corresponding durable commands and security checks.
 
 ## Control matrix
 
-| Surface | Control(s) | Expected result | Status |
+| Surface | Control | Backed operation or boundary | Test status |
 | --- | --- | --- | --- |
-| Live data | Hub bootstrap | Live runs replace seeded route and evidence placeholders; an unevidenced run says so explicitly. | Passed |
-| Navigation rail | Delivery, Runs, Routes, Approvals, Evidence, Sandbox | Each view renders its own review surface rather than an empty placeholder. | Passed |
-| Delivery | Task task_48 | Expands and collapses State task context. | Passed |
-| Delivery | Send delivery direction | Adds the note locally and shows a dismissible queued notice. | Passed |
-| Trace | Show correlation trace | Expands and collapses run, task, and request correlation IDs. | Passed |
-| Trace | View all | Opens Evidence review. | Passed |
-| Approval | Authorize action | Calls the approval API and releases the action only on success. | Passed |
-| Approval failure | Authorize action | Keeps the PR action pending and explains the failure when the hub rejects it. | Passed |
-| Project creation | New delivery, dialog close, Cancel, Create project | Opens and closes safely; creates only a hub project record through the API. | Passed |
-| Utilities | Operator menu, Help, Notifications, Mark all read, dialog/menu close | Reveals, updates, and closes the relevant utility surfaces. | Passed |
-| Notice | Dismiss notification | Clears the queued/failure notice. | Passed |
-| Harness sessions | Sessions, New concurrent session, Create session | Creates a durable named-worktree session without ever accepting a path from the browser. | Passed live against the loopback Compose stack |
-| Harness sessions | Start delivery, Cancel | Opens the version-pinned bridge-delivery form for the selected session; it stays disabled until a State task id is supplied. | Passed live; no bridge delivery was started |
-| Voice | Voice unavailable | Explicitly refuses microphone access until a private Anvil Voice Realtime endpoint is configured. | Passed live as an intentional guard |
+| Delivery | Send delivery direction | Persists an `operator.directive` event. It is copied into the next bridge work packet for that session. | Passed |
+| Sessions | New concurrent session; Start delivery | Creates a version-pinned session workflow, then queues a leased bridge run for a State task. | Passed |
+| Runs | Refresh runs | Reloads durable hub run state. | Passed |
+| Routes | Refresh decisions | Reads server-side Serving decision metadata filtered to known Workbench run IDs. | Passed |
+| Approvals | Review action; Authorize action | Brings the hash-bound action into view; calls the approval endpoint only for a pending grant. | Passed |
+| Evidence | Search evidence; Show lineage | Calls narrow cited evidence and lineage APIs. Graph output cannot approve actions. | Passed |
+| Skills | Select skills; Verify bridge skills | Sends selected bridge-published ids when creating a session, then queues a non-mutating local digest probe. Names/descriptions/digests only reach the hub. | Passed |
+| Sandbox | Run through Anvil Serving | Makes a bounded, audited Responses call through the server-held Serving token and allowlisted model. | Passed |
+| Voice | Connect / hold to talk | Available only when the private same-origin realtime relay is configured; otherwise microphone capture is disabled. | Guard passed; live Dark endpoint remains unqualified |
+| Project | New delivery | Creates only a hub project record. It never retrieves a bridge secret into the web UI after registration. | Passed |
+| Setup | Help / setup guide | Walks the operator to the next incomplete *live* setup gate; it cannot manufacture completion. | Passed |
+| Utilities | Operator menu; activity; mark viewed | Shows server-returned actor/audit metadata; “mark viewed” is browser-local read state only. | Passed |
 
-## Workflows exercised
+## Workflow coverage
 
-| Workflow | What was exercised | Status |
-| --- | --- | --- |
-| Orient and review a delivery | Navigation, task context, correlation trace, route metadata, evidence view. | Passed |
-| Give delivery direction | A new operator note appears in the conversation with a visible queued state. | Passed |
-| Create a Workbench project record | Form validation and the API request contract, without bridge credentials in the browser. | Passed |
-| Review and authorize a PR action | Success and hub-rejection paths; rejection must not make the UI look authorized. | Passed |
-| Inspect the sandbox policy | The sandbox is explicitly read-only and does not permit a browser-to-provider bypass. | Passed as an intentional boundary |
-| Supervise concurrent sessions | Two independently named bridge worktrees render at once; each has a separate Start delivery control. | Passed live against the loopback Compose stack |
-| Start a session workflow safely | The selected session opens a task-id-required bridge form; cancelling makes no run or State claim. | Passed live |
-| Voice policy guard | Voice is visibly disabled in the development stack until its private Realtime upstream is configured. | Passed as an intentional boundary |
+1. Empty hub → no seeded delivery is rendered; setup guide opens a real project-creation flow.
+2. Project with published skill metadata → session selects a skill → queued `run_codex` command contains matching digest and recorded directions.
+3. Router decision refresh → only correlated Workbench IDs appear.
+4. Evidence search/lineage → cited results render without a graph write or approval path.
+5. Skills probe → bridge resolves local content/digest without running Codex.
+6. Sandbox → explicit allowlisted Serving request returns redacted output; disallowed models are rejected server-side.
+7. Pending hash-bound approval → a browser request records approval only; the local bridge still owns the GitHub action.
 
-## Deliberately unavailable or still unqualified
+## Remaining live qualifications
 
-These are visible product boundaries, not broken buttons:
-
-- The model sandbox has no request button yet. It needs a server-side redaction and immutable-audit contract before it can make routed model calls.
-- The local Compose test stack intentionally has no Dark Anvil Voice Realtime endpoint. The push-to-talk relay and redaction policy are covered by contract tests; a live microphone/STT/TTS qualification still requires the Dark endpoint and tailnet identity configuration.
-- Creating a project does not auto-register a bridge, launch Codex, or receive a token. Those are local bridge operations and must stay outside the browser credential boundary.
-- The browser cannot commit, create a GitHub PR, merge, apply State acceptance, or change a model policy. It can only record a hash-bound approval; the local bridge performs the approved action.
-- Tailnet identity proxy, a live project bridge, non-production GitHub PR/merge, and Neo4j retrieval require separate live qualification.
-- The pinned Heavy route accepts the Responses subset but remains blocked for a complete Codex tool loop: it can emit the non-executable tool name `shell_command<|channel|>commentary`. The bridge correctly marks that run for reconciliation rather than submitting evidence or creating a PR.
+- The local Compose hub has no configured `ANVIL_VOICE_REALTIME_URL`, so a real microphone/STT/TTS turn through Dark is not yet evidence. The relay protocol and its guard are covered by unit tests.
+- The current pinned Heavy route reaches Anvil Serving and preserves correlation, but its full Codex tool loop still emits unsupported `shell_command<|channel|>commentary`; the bridge moves that attempt to reconciliation. Do not claim a successful PRD → edit → test → evidence run until a local model/template completes it.
+- The rebuilt loopback stack served the current bundle and all eight navigation views rendered in the in-app browser. The live Routes refresh reads Serving's safe `records` summary and correctly shows that there is not yet a Workbench-correlated decision. A bounded `chat-fast` sandbox request completed through Anvil Serving and rendered its exact response in the browser. A correlated Routes row still requires a bridge delivery after the router's current start.
+- A tailnet identity proxy, a real bridge with two worktrees, a non-production GitHub PR/merge fixture, and Neo4j retrieval still require separate live qualification.
 
 ## Re-run recipe
 
 ```powershell
-Set-Location C:\Users\sdoum\ai-code\anvil-workbench\web
-npm test
+Set-Location C:\Users\sdoum\ai-code\anvil-workbench
+python -m pytest -q
+Set-Location web
+npm test -- --run
 npm run build
 Set-Location ..
-python -m pytest -q
 docker compose up -d --build
 ```
 
-Then open `http://127.0.0.1:8090`, confirm the page renders without console errors, and perform a non-destructive smoke check such as create two disposable named sessions, open/cancel **Start delivery**, open/close **New delivery**, navigate to **Runs**, and submit/dismiss a local delivery direction. Do not use the browser to consume a real approval merely to smoke-test the visual shell.
+Then use the browser to inspect the guide, all eight navigation views, a persisted delivery direction, the deliberate voice/sandbox availability states, and console output. Do not consume a real approval or create an external PR for a UI smoke check.

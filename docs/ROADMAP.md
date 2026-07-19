@@ -8,13 +8,13 @@
 - Project-local bridge with State CLI/event read boundary, Codex runner, structured activity/evidence, and gated GitHub actions.
 - Anvil Serving Responses-compatible Codex configuration, correlation-header contract, and isolated Codex tool surface.
 - Derived Neo4j projection shape and narrow retrieval/lineage/failure tools.
-- React desktop workbench with purpose-specific delivery, run, route, approval, evidence, and policy-boundary views; Docker Compose deployment; and hermetic API/security tests.
+- React desktop workbench with hub-backed delivery, run, route, approval, evidence, skills, and Serving-only sandbox views; live-state onboarding; Docker Compose deployment; and hermetic API/security tests.
 - Harness kernel: durable concurrent sessions, named-worktree lease fencing, version-pinned allowlisted workflow definitions/events, bridge worktree resolution, and a session-bound private voice relay.
 
 ### Validated locally
 
 - Python API/security/bridge contract tests use `MemoryStore` and `NullGraph`.
-- The browser shell was exercised on the loopback Compose stack; its 22 interactive controls and eight UI scenarios are covered in the [UI acceptance audit](UI-ACCEPTANCE-AUDIT.md).
+- The browser shell and component suite cover each navigation/action surface and its API boundary in the [UI acceptance audit](UI-ACCEPTANCE-AUDIT.md). A fresh loopback visual smoke remains part of the release check.
 - State CLI qualification proved claim, packet retrieval, evidence capture, submit, strict review, and replay without opening `state.db`; State acceptance was intentionally not approved.
 - Serving qualification passed pinned Heavy/Fast preflights, Responses normal/function-continuation/JSON/SSE/cancellation checks, and a synthetic-silence STT -> Fast -> TTS voice pipeline.
 

@@ -24,6 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .redaction import redact_value
+from .skills import LocalSkill, SkillError, SkillRegistry
 
 
 class BridgeError(RuntimeError):
@@ -54,6 +55,7 @@ class BridgeSettings:
     router_token_env: str
     codex_config: tuple[str, ...]
     worktrees: Mapping[str, Path] = field(default_factory=dict)
+    skill_roots: tuple[Path, ...] = ()
 
 
 class HubTransport:
@@ -118,6 +120,9 @@ class HubTransport:
             "POST", f"/api/bridge/{self.bridge_id}/workflows/{workflow_id}/steps/{step_id}",
             {"outcome": outcome},
         )
+
+    def publish_skills(self, skills: list[dict[str, str]]) -> None:
+        self.request("POST", f"/api/bridge/{self.bridge_id}/skills", {"skills": skills})
 
 
 class StateReader:
@@ -290,16 +295,23 @@ class CodexRunner:
         self.emit = emit
         self.worktree_root = worktree_root or settings.project_root
 
-    def run(self, run_id: str, work_packet: dict[str, Any], model: str) -> int:
+    def run(self, run_id: str, work_packet: dict[str, Any], model: str, skills: Iterable[LocalSkill] = ()) -> int:
         token = os.environ.get(self.settings.router_token_env, "")
         if not self.settings.router_base_url or not token:
             raise BridgeError("Anvil router base URL and local router token environment variable are required")
         if not model.strip():
             raise BridgeError("Codex runs require a Workbench-selected Anvil model route")
+        selected_skills = tuple(skills)
+        skills_prompt = ""
+        if selected_skills:
+            skills_prompt = "\n\nUse only these operator-approved bridge skills when applicable:\n" + "\n\n".join(
+                f"### Skill: {skill.skill_id}\n{skill.instructions}" for skill in selected_skills
+            )
         prompt = (
             "You are executing an Anvil State work packet. Work only in the current project. "
             "Run the relevant tests, collect evidence, and do not create a GitHub PR or merge.\n\n"
             + json.dumps(work_packet, indent=2, ensure_ascii=True)
+            + skills_prompt
         )
         correlation_headers = {
             "X-Anvil-Workbench-Run-Id": run_id,
@@ -476,6 +488,8 @@ class Bridge:
         self.settings = settings
         self.hub = HubTransport(settings.hub, settings.bridge_id, settings.token)
         self.state = StateReader(settings)
+        self.skills = SkillRegistry(settings.skill_roots)
+        self._published_skill_hash = ""
 
     def _emit(self, run_id: str, role: str, content: Any) -> None:
         self.hub.event(run_id, role, content)
@@ -501,13 +515,66 @@ class Bridge:
             count += 1
         return count
 
+    def _publish_skills(self) -> dict[str, LocalSkill]:
+        """Publish only reviewed metadata; skill bodies and paths stay local."""
+        if not self.settings.skill_roots:
+            return {}
+        try:
+            discovered = self.skills.discover()
+        except SkillError as exc:
+            raise BridgeError(str(exc)) from exc
+        metadata = [skill.metadata() for _, skill in sorted(discovered.items())]
+        fingerprint = hashlib.sha256(_json_bytes(metadata)).hexdigest()
+        if fingerprint != self._published_skill_hash:
+            self.hub.publish_skills(metadata)
+            self._published_skill_hash = fingerprint
+        return discovered
+
+    def _selected_skills(self, payload: dict[str, Any], available: Mapping[str, LocalSkill]) -> tuple[LocalSkill, ...]:
+        requested = payload.get("skills", [])
+        if not isinstance(requested, list):
+            raise BridgeError("bridge skill payload is invalid")
+        selected: list[LocalSkill] = []
+        for expected in requested:
+            if not isinstance(expected, dict):
+                raise BridgeError("bridge skill payload is invalid")
+            skill_id = str(expected.get("skill_id", ""))
+            skill = available.get(skill_id)
+            if skill is None:
+                raise BridgeError(f"requested skill is not configured on this bridge: {skill_id}")
+            if str(expected.get("content_sha256", "")) != skill.content_sha256:
+                raise BridgeError(f"requested skill changed since it was selected: {skill_id}")
+            selected.append(skill)
+        return tuple(selected)
+
     def poll_once(self) -> bool:
+        available_skills = self._publish_skills()
         self.project_state_events()
         command = self.hub.next_command()
         if command is None:
             return False
         action = command["action_type"]
         payload = command["payload"]
+        if action == "skill_probe":
+            try:
+                selected = self._selected_skills(payload, available_skills)
+                if not selected:
+                    raise BridgeError("skill probe has no selected bridge skills")
+            except BridgeError as exc:
+                self.hub.evidence("failure", f"skills:{command['id']}:reconciliation", self.settings.project_id, {
+                    "kind": "bridge_skill_probe",
+                    "reconciliation_required": True,
+                    "error": str(exc),
+                })
+                self.hub.acknowledge_command(str(command["id"]))
+                raise
+            self.hub.evidence("evaluation", f"skills:{command['id']}", self.settings.project_id, {
+                "kind": "bridge_skill_probe",
+                "skills": [skill.metadata() for skill in selected],
+                "result": "all selected skills resolved with matching digests",
+            })
+            self.hub.acknowledge_command(str(command["id"]))
+            return True
         if action == "run_codex":
             run_id = payload["run_id"]
             task_id = str(payload.get("task_id") or "")
@@ -540,11 +607,15 @@ class Bridge:
                 self.hub.evidence("state_event", f"{run_id}:claim", self.settings.project_id, {"task_id": task_id, "claim": claim})
                 packet = self.state.work_packet(task_id)
                 packet.setdefault("task_id", payload.get("task_id"))
+                directives = payload.get("directives", [])
+                if isinstance(directives, list):
+                    packet["workbench_directives"] = [str(item) for item in directives if isinstance(item, str)][-32:]
                 self.hub.evidence("work_packet", run_id, self.settings.project_id, {"task_id": payload.get("task_id"), "packet": packet})
                 model = str(payload.get("model") or "")
+                selected_skills = self._selected_skills(payload, available_skills)
                 exit_code = CodexRunner(
                     self.settings, lambda role, content: self._emit(run_id, role, content), worktree_root,
-                ).run(run_id, packet, model)
+                ).run(run_id, packet, model, selected_skills)
                 require_live_lease()
                 if exit_code:
                     raise BridgeError(f"Codex exited with {exit_code}")
@@ -642,6 +713,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--router-token-env", default="ANVIL_ROUTER_TOKEN")
     parser.add_argument("--codex-config", action="append", default=[])
     parser.add_argument("--worktree", action="append", default=[], metavar="ID=PATH", help="allow a named local worktree for concurrent sessions")
+    parser.add_argument("--skills-root", action="append", default=[], type=Path, help="allow explicit local SKILL.md roots for this bridge")
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--once", action="store_true")
     return parser
@@ -673,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
         state_apply_command=args.state_apply_command,
         codex_binary=args.codex_binary, router_base_url=args.router_base_url,
         router_token_env=args.router_token_env, codex_config=tuple(args.codex_config),
-        worktrees=worktrees,
+        worktrees=worktrees, skill_roots=tuple(path.resolve() for path in args.skills_root),
     )
     bridge = Bridge(settings)
     while True:

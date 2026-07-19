@@ -56,6 +56,20 @@ workbench-bridge ... --worktree checkout-a=C:\path\to\project-a --worktree check
 
 The session engine permits one active run per session and leases each named worktree. A second session cannot start against an unexpired lease for the same worktree.
 
+### Bridge-local skills
+
+Skills are explicit operator-reviewed instructions, not browser-installed plugins. Configure the local bridge with one or more roots containing `SKILL.md` files:
+
+```powershell
+workbench-bridge ... --skills-root C:\path\to\project\.agents\skills --skills-root C:\path\to\reviewed-skills
+```
+
+The bridge publishes only each skill's name, short description, and SHA-256 digest. Its path and body stay local. A session selects from that published list; its selected skills and digests are bound into the next `run_codex` command. The bridge rejects a missing or changed skill before it launches Codex. **Verify bridge skills** queues a non-mutating local digest check and projects cited evidence; it does not run model code.
+
+### Serving-only sandbox
+
+`WORKBENCH_SANDBOX_MODELS` is an optional comma-separated allowlist. When it is set along with the hub's Serving URL and token, the Sandbox page makes a bounded, audited `/v1/responses` call through Anvil Serving. It has no raw-provider fallback and cannot access a worktree, State, GitHub, or approvals. With the variable unset, the button is explicitly unavailable rather than simulated.
+
 ## Voice
 
 Workbench supports session-bound push-to-talk through a private Anvil Voice Realtime endpoint. Set `ANVIL_VOICE_REALTIME_URL` on the hub (and `ANVIL_VOICE_REALTIME_TOKEN` only when the upstream requires it). The browser connects to a same-origin Workbench relay; it never receives the upstream URL or token. The relay filters model and tool controls, forwards only the narrow audio protocol, and stores lifecycle summaries rather than raw audio. Transcript retention is opt-in with `WORKBENCH_VOICE_RETAIN_TRANSCRIPTS=true`; it is off by default.
