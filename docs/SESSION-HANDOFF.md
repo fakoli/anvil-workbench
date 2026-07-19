@@ -69,7 +69,7 @@ rewrite it as part of Workbench work without a separate review of those changes.
 1. Resolve the Codex/local-model tool-call compatibility blocker recorded in [QUALIFICATION.md](QUALIFICATION.md); preserve the current Heavy as a qualified general Responses route but do not claim Codex harness parity.
 2. Add a local identity-proxy test fixture that proves browser header spoofing is rejected.
 3. Add a Postgres/Neo4j Compose integration test that runs in CI or a dedicated release job.
-4. Build the published hub image and wire it to the Anvil Serving optional `workbench up` lifecycle command.
+4. Merge and observe the hub-image publication workflow, then set the first GHCR package to public once. It builds `deploy/Dockerfile.hub`, publishes `latest`, `main`, and immutable SHA tags with an attestation, and supplies the image consumed by Anvil Serving's optional `workbench up` lifecycle command. Do not put registry credentials in `workbench.env`.
 5. Qualify a live Dark voice endpoint and two bridge-configured worktrees. The implementation and hermetic contracts exist; neither is a substitute for live hardware/State qualification.
 6. Implement the provider-owned workflow operation catalog proposed in [WORKFLOW-OPERATION-LAYER.md](WORKFLOW-OPERATION-LAYER.md) before adding more bespoke browser-to-bridge command paths.
 7. Start that implementation from the versioned resources in [contracts/README.md](contracts/README.md): catalog/profile discovery, `operation` workflow steps, run-context snapshot, typed receipts, and bridge preflight. Do not turn the design into a generic tool runner.
