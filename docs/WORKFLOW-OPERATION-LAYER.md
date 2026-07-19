@@ -10,6 +10,11 @@ Workbench should orchestrate a version-pinned workflow of **provider-owned,
 machine-readable operations**, not invoke arbitrary CLI text or absorb Anvil State
 and Anvil Serving as in-process libraries.
 
+The companion [contract resources](contracts/README.md) provide proposed JSON
+schemas and small fixtures for catalog, capability-profile, workflow,
+run-context, bridge-command, and receipt implementation work. They are not
+implemented API surfaces yet.
+
 State remains the authority for task/evidence transitions. Serving remains the
 authority for routing, evaluations, and operational policy. Workbench owns the
 workflow instance, approval boundaries, operator view, and reconciliation. The

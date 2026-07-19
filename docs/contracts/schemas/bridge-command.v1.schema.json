@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/bridge-command.v1.schema.json",
+  "title": "Anvil Workbench bridge command v1",
+  "description": "Authenticated hub-to-bridge delivery envelope. The payload identifies a reviewed adapter request; it is never an executable shell command or credential container.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command_id", "kind", "run_id", "bridge_id", "project_id", "workflow_snapshot", "idempotency_key", "issued_at", "payload"],
+  "properties": {
+    "schema_version": {"const": "workbench-bridge-command/v1"},
+    "command_id": {"type": "string", "pattern": "^cmd_[a-zA-Z0-9_-]{8,128}$"},
+    "kind": {"enum": ["run_codex", "invoke_operation", "skill_probe", "commit_pr", "merge_and_accept"]},
+    "run_id": {"type": "string"},
+    "bridge_id": {"type": "string"},
+    "project_id": {"type": "string"},
+    "workflow_snapshot": {"type": "object", "additionalProperties": false, "required": ["workflow_digest", "catalog_digest", "capability_profile_digest"], "properties": {"workflow_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "catalog_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "capability_profile_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}}},
+    "correlation": {"type": "object", "additionalProperties": false, "properties": {"task_id": {"type": "string"}, "request_id": {"type": "string"}, "traceparent": {"type": "string", "maxLength": 256}}},
+    "idempotency_key": {"type": "string", "pattern": "^[a-zA-Z0-9:._-]{8,256}$"},
+    "approval_grant_id": {"type": "string"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "payload": {"type": "object", "description": "Validated against the selected command/operation contract by the bridge."}
+  }
+}

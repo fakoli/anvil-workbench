@@ -2,7 +2,7 @@
 
 Anvil Workbench is a private, tailnet-first **agent harness for software delivery**. Its web UI is the main entry point for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
 
-Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [harness foundations](docs/HARNESS-FOUNDATIONS.md), [workflow operation-layer proposal](docs/WORKFLOW-OPERATION-LAYER.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
+Start with the [coding-session guide](CLAUDE.md), [architecture resources](docs/architecture/README.md), [contract resources](docs/contracts/README.md), [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [harness foundations](docs/HARNESS-FOUNDATIONS.md), [workflow operation-layer proposal](docs/WORKFLOW-OPERATION-LAYER.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
 
 It is deliberately a separate product:
 
@@ -112,6 +112,8 @@ When `WORKBENCH_EMBEDDING_MODEL` is configured, evidence retrieval uses Anvil Se
 | [Project brief](docs/PROJECT.md) | Product promise, boundaries, users, and the v1 delivery flow. |
 | [Contracts](docs/CONTRACTS.md) | The exact Anvil State, Anvil Serving, bridge, graph, and approval contracts. |
 | [Harness foundations](docs/HARNESS-FOUNDATIONS.md) | Research-backed requirements, V1 workflow vocabulary, session isolation, and voice boundaries. |
+| [Architecture resources](docs/architecture/README.md) | Research, alternatives, architecture decisions, and the runtime-inference design. |
+| [Contract resources](docs/contracts/README.md) | Versioned schemas and examples for the proposed operation, workflow, bridge, receipt, and runtime-context boundary. |
 | [Roadmap](docs/ROADMAP.md) | What is implemented, what requires a live qualification, and the next milestones. |
 | [Qualification](docs/QUALIFICATION.md) | Dated local test evidence, passed gates, and the remaining Codex/model compatibility blocker. |
 | [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md) | Button-level coverage, exercised workflows, and explicit UI boundaries. |

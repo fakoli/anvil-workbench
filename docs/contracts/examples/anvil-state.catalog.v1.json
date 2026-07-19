@@ -1,0 +1,43 @@
+{
+  "schema_version": "anvil-operation-catalog/v1",
+  "provider": "anvil-state",
+  "catalog_version": "1.0.0",
+  "catalog_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "generated_at": "2026-07-19T00:00:00Z",
+  "operations": [
+    {
+      "id": "state.task.claim",
+      "title": "Claim a State task",
+      "summary": "Acquire a task lease through the supported State CLI/MCP surface on the local bridge.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "effect": "state_mutation",
+      "execution": {"kind": "bridge_adapter", "bridge_adapter": "state.cli.claim", "transport": "state_cli"},
+      "input_schema": {"type": "object", "required": ["task_id", "actor"], "properties": {"task_id": {"type": "string"}, "actor": {"type": "string"}}, "additionalProperties": false},
+      "output_schema": {"type": "object", "required": ["claim_id", "event_id"], "properties": {"claim_id": {"type": "string"}, "event_id": {"type": "string"}}},
+      "preconditions": ["bridge.connected", "task.ready", "task.unclaimed_or_owned"],
+      "gates": {"preview": "not_supported", "confirmation": "not_required", "human_approval": "not_required"},
+      "idempotency": {"required": true, "replay": "return_prior_receipt", "max_attempts": 1},
+      "receipts": ["state_claim", "state_event"],
+      "failure": "reconcile",
+      "docs": "docs/CONTRACTS.md#anvil-state-contract"
+    },
+    {
+      "id": "state.evidence.submit",
+      "title": "Submit State evidence",
+      "summary": "Submit independently captured verification and declared changed-file evidence through the supported State surface.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "effect": "state_mutation",
+      "execution": {"kind": "bridge_adapter", "bridge_adapter": "state.cli.submit_evidence", "transport": "state_cli"},
+      "input_schema": {"type": "object", "required": ["task_id", "verification_receipt_ids"], "properties": {"task_id": {"type": "string"}, "verification_receipt_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}}}, "additionalProperties": false},
+      "output_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}},
+      "preconditions": ["bridge.lease_valid", "work_packet.digest_matches", "verification.passed", "packet.declared_change_exists"],
+      "gates": {"preview": "not_supported", "confirmation": "not_required", "human_approval": "not_required"},
+      "idempotency": {"required": true, "replay": "return_prior_receipt", "max_attempts": 1},
+      "receipts": ["state_evidence", "state_event"],
+      "failure": "reconcile",
+      "docs": "docs/CONTRACTS.md#state-writes"
+    }
+  ]
+}

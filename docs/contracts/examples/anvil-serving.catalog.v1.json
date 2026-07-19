@@ -1,0 +1,43 @@
+{
+  "schema_version": "anvil-operation-catalog/v1",
+  "provider": "anvil-serving",
+  "catalog_version": "1.0.0",
+  "catalog_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "generated_at": "2026-07-19T00:00:00Z",
+  "operations": [
+    {
+      "id": "serving.eval.preflight",
+      "title": "Preflight a declared routed model",
+      "summary": "Collect independent capability evidence for a declared model/profile through the Serving controller surface.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "effect": "read",
+      "execution": {"kind": "bridge_adapter", "bridge_adapter": "serving.mcp.preflight_probe", "transport": "serving_mcp"},
+      "input_schema": {"type": "object", "required": ["model", "profile"], "properties": {"model": {"type": "string"}, "profile": {"type": "string"}}, "additionalProperties": false},
+      "output_schema": {"type": "object", "required": ["artifact_id", "route_correlation"], "properties": {"artifact_id": {"type": "string"}, "route_correlation": {"type": "string"}}},
+      "preconditions": ["model.declared_route", "target.bounded"],
+      "gates": {"preview": "not_supported", "confirmation": "not_required", "human_approval": "not_required"},
+      "idempotency": {"required": true, "replay": "return_prior_receipt", "max_attempts": 1},
+      "receipts": ["preflight_artifact", "route_correlation"],
+      "failure": "fail",
+      "docs": "docs/OPERATOR-SKILLS-AND-SUBAGENTS.md#evaluation"
+    },
+    {
+      "id": "serving.model.policy",
+      "title": "Apply a reviewed Serving policy change",
+      "summary": "Request a declared model, route, or policy change through Serving's existing human-gated lifecycle contract.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "effect": "policy_mutation",
+      "execution": {"kind": "bridge_adapter", "bridge_adapter": "serving.mcp.policy_change", "transport": "serving_mcp"},
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object", "required": ["decision_id"], "properties": {"decision_id": {"type": "string"}}},
+      "preconditions": ["serving.preview_reviewed", "serving.human_gate_present"],
+      "gates": {"preview": "required", "confirmation": "required", "human_approval": "required"},
+      "idempotency": {"required": true, "replay": "reconcile", "max_attempts": 1},
+      "receipts": ["serving_decision", "evaluation_evidence"],
+      "failure": "reconcile",
+      "docs": "docs/CONTRACTS.md#anvil-serving-contract"
+    }
+  ]
+}

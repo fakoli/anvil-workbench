@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/operation-receipt.v1.schema.json",
+  "title": "Anvil Workbench operation receipt v1",
+  "description": "A redacted receipt for one bridge operation. Unknown means an effect may have occurred and requires reconciliation, not automatic retry.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "receipt_id", "command_id", "run_id", "operation", "status", "redaction", "started_at", "finished_at"],
+  "properties": {
+    "schema_version": {"const": "workbench-operation-receipt/v1"},
+    "receipt_id": {"type": "string", "pattern": "^rcpt_[a-zA-Z0-9_-]{8,128}$"},
+    "command_id": {"type": "string"},
+    "run_id": {"type": "string"},
+    "operation": {"type": "object", "additionalProperties": false, "required": ["provider", "id", "contract_version"], "properties": {"provider": {"type": "string"}, "id": {"type": "string"}, "contract_version": {"type": "string"}}},
+    "status": {"enum": ["succeeded", "failed", "denied", "unknown", "reconciliation_required"]},
+    "idempotency_key": {"type": "string", "maxLength": 256},
+    "external_ref": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
+    "evidence_refs": {"type": "array", "maxItems": 64, "items": {"type": "string"}},
+    "correlation": {"type": "object", "additionalProperties": false, "properties": {"task_id": {"type": "string"}, "request_id": {"type": "string"}, "traceparent": {"type": "string", "maxLength": 256}}},
+    "redaction": {"type": "object", "additionalProperties": false, "required": ["status"], "properties": {"status": {"enum": ["redacted", "metadata_only"]}, "ruleset": {"type": "string"}}},
+    "error": {"type": "object", "additionalProperties": false, "properties": {"code": {"type": "string", "maxLength": 128}, "message": {"type": "string", "maxLength": 2000}, "retryable": {"type": "boolean"}}},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"}
+  }
+}

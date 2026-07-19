@@ -1,0 +1,14 @@
+{
+  "schema_version": "workbench-workflow/v2",
+  "id": "delivery-pr-to-merge",
+  "revision": "1.0.0",
+  "description": "A narrow proposed delivery template. GitHub effects remain bridge-local and approval-bound.",
+  "entry": "claim",
+  "steps": [
+    {"id": "claim", "kind": "operation", "operation": {"provider": "anvil-state", "id": "state.task.claim", "contract_version": "1.0.0"}, "inputs": {"task_id": {"from": "run.task_id"}, "actor": {"from": "bridge.actor"}}, "next": ["implement"]},
+    {"id": "implement", "kind": "agent", "model_profile": "coding-local", "skills": [{"id": "anvil:execute", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"}], "next": ["evidence"]},
+    {"id": "evidence", "kind": "operation", "operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0"}, "inputs": {"task_id": {"from": "run.task_id"}, "verification_receipt_ids": {"from": "receipts.verification"}}, "next": ["pr_approval"]},
+    {"id": "pr_approval", "kind": "approval_wait", "approval_action": "commit_pr", "next": ["reconcile"]},
+    {"id": "reconcile", "kind": "reconcile", "next": []}
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": "workbench-run-context/v1",
+  "context_id": "ctx_example_0001",
+  "identity": {"run_id": "run_example", "session_id": "session_example", "task_id": "T001", "bridge_id": "bridge_example", "worktree_name": "checkout-a", "request_id": "req_example"},
+  "task": {"title": "Add a documented operation contract", "acceptance_criteria": ["Add a versioned resource", "Validate its JSON shape"], "scope": ["docs/contracts"], "verification_plan": ["python -m pytest -q", "parse JSON resources"], "work_packet_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"},
+  "workflow": {"id": "delivery-pr-to-merge", "revision": "1.0.0", "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999", "catalog_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "capability_profile_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+  "cursor": {"step_id": "implement", "attempt": 1, "completed_receipts": [{"receipt_id": "rcpt_claim", "summary": "State claim succeeded; event cited in evidence."}]},
+  "capabilities": [{"operation_id": "state.evidence.submit", "provider": "anvil-state", "effect": "state_mutation", "gate": "none", "summary": "Submit independently captured verification."}, {"operation_id": "github.pr.create", "provider": "project-bridge", "effect": "external_effect", "gate": "approval", "summary": "Requires a new hash-bound approval."}],
+  "skills": [{"id": "anvil:execute", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "purpose": "State-backed implementation and evidence guidance."}],
+  "constraints": {"turn_limit": 12, "tool_limit": 24, "stop_conditions": ["Do not submit evidence before verification passes.", "Request reconciliation for an unknown effect or digest mismatch.", "Do not create a PR without a consumed approval."]},
+  "evidence": [{"citation": "state-event:claim-example", "summary": "Task claim is active for this bridge/worktree."}]
+}

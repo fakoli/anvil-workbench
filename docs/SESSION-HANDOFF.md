@@ -5,6 +5,9 @@ Use this file to resume work in a new Anvil Workbench coding session.
 ## Where to start
 
 - Repository: `C:\Users\sdoum\ai-code\anvil-workbench`
+- Coding-session guide: [../CLAUDE.md](../CLAUDE.md)
+- Architecture resources: [architecture/README.md](architecture/README.md)
+- Contract resources: [contracts/README.md](contracts/README.md)
 - Product overview: [PROJECT.md](PROJECT.md)
 - System contracts: [CONTRACTS.md](CONTRACTS.md)
 - Workflow operation-layer proposal: [WORKFLOW-OPERATION-LAYER.md](WORKFLOW-OPERATION-LAYER.md)
@@ -69,3 +72,4 @@ rewrite it as part of Workbench work without a separate review of those changes.
 4. Build the published hub image and wire it to the Anvil Serving optional `workbench up` lifecycle command.
 5. Qualify a live Dark voice endpoint and two bridge-configured worktrees. The implementation and hermetic contracts exist; neither is a substitute for live hardware/State qualification.
 6. Implement the provider-owned workflow operation catalog proposed in [WORKFLOW-OPERATION-LAYER.md](WORKFLOW-OPERATION-LAYER.md) before adding more bespoke browser-to-bridge command paths.
+7. Start that implementation from the versioned resources in [contracts/README.md](contracts/README.md): catalog/profile discovery, `operation` workflow steps, run-context snapshot, typed receipts, and bridge preflight. Do not turn the design into a generic tool runner.

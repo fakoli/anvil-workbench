@@ -1,0 +1,14 @@
+{
+  "schema_version": "workbench-bridge-command/v1",
+  "command_id": "cmd_example_0001",
+  "kind": "invoke_operation",
+  "run_id": "run_example",
+  "bridge_id": "bridge_example",
+  "project_id": "project_example",
+  "workflow_snapshot": {"workflow_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999", "catalog_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "capability_profile_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+  "correlation": {"task_id": "T001", "request_id": "req_example"},
+  "idempotency_key": "run:run_example:step:evidence:attempt:1",
+  "issued_at": "2026-07-19T00:00:00Z",
+  "expires_at": "2026-07-19T00:05:00Z",
+  "payload": {"operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0"}, "inputs": {"task_id": "T001", "verification_receipt_ids": ["rcpt_verification"]}}
+}

@@ -2,6 +2,11 @@
 
 This document defines the boundaries Workbench relies on. These are product contracts, not suggestions for alternate implementation paths.
 
+The versioned resources in [contracts/README.md](contracts/README.md) are the
+proposed implementation aid for the next operation layer. They validate shape
+and provide fixtures; this document remains the authority for the currently
+implemented v1 boundary until production code adopts a newer contract.
+
 ## Anvil State contract
 
 ### Authority

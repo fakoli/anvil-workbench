@@ -1,0 +1,15 @@
+{
+  "schema_version": "workbench-capability-profile/v1",
+  "id": "private-delivery-default",
+  "revision": "1.0.0",
+  "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "operations": [
+    {"provider": "anvil-state", "id": "state.task.claim", "contract_version": "1.0.0"},
+    {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0"},
+    {"provider": "anvil-serving", "id": "serving.eval.preflight", "contract_version": "1.0.0"}
+  ],
+  "model_profiles": ["coding-local", "planning-local"],
+  "skills": [{"id": "anvil:execute", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"}],
+  "limits": {"max_parallel_runs": 2, "max_agent_turns": 12, "max_tool_calls": 24},
+  "approval_actions": ["commit_pr", "merge_and_accept"]
+}

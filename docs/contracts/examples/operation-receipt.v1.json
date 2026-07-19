@@ -1,0 +1,15 @@
+{
+  "schema_version": "workbench-operation-receipt/v1",
+  "receipt_id": "rcpt_example_0001",
+  "command_id": "cmd_example_0001",
+  "run_id": "run_example",
+  "operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0"},
+  "status": "succeeded",
+  "idempotency_key": "run:run_example:step:evidence:attempt:1",
+  "external_ref": {"state_event_id": "evt_example"},
+  "evidence_refs": ["evidence_example", "verification_example"],
+  "correlation": {"task_id": "T001", "request_id": "req_example"},
+  "redaction": {"status": "redacted", "ruleset": "workbench-default-v1"},
+  "started_at": "2026-07-19T00:00:00Z",
+  "finished_at": "2026-07-19T00:00:02Z"
+}
