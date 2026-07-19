@@ -2,7 +2,7 @@
 
 Anvil Workbench is a private, tailnet-only delivery cockpit for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
 
-Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
+Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [local qualification record](docs/QUALIFICATION.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
 
 It is deliberately a separate product:
 
@@ -61,6 +61,8 @@ For each project, explicitly configure the State work-packet and State-apply com
 
 For each Codex run the bridge writes only provider-local configuration overrides: `wire_api = "responses"`, the Anvil router base URL, `ANVIL_ROUTER_TOKEN` as the local credential source, and static `http_headers` carrying the workbench run/task correlation. It never writes a provider API key or a GitHub token to Codex configuration.
 
+The bridge starts Codex with a clean local tool surface: it ignores user configuration and project rules, disables plugins, apps, multi-agent, browser, computer-use, image generation, and hosted web search, and keeps the workspace-write sandbox. Those restrictions prevent a bridge run from inheriting arbitrary credential-bearing integrations from an operator desktop.
+
 ## Development
 
 ```powershell
@@ -84,6 +86,8 @@ When `WORKBENCH_EMBEDDING_MODEL` is configured, evidence retrieval uses Anvil Se
 | [Project brief](docs/PROJECT.md) | Product promise, boundaries, users, and the v1 delivery flow. |
 | [Contracts](docs/CONTRACTS.md) | The exact Anvil State, Anvil Serving, bridge, graph, and approval contracts. |
 | [Roadmap](docs/ROADMAP.md) | What is implemented, what requires a live qualification, and the next milestones. |
+| [Qualification](docs/QUALIFICATION.md) | Dated local test evidence, passed gates, and the remaining Codex/model compatibility blocker. |
+| [Article demo](docs/ARTICLE-DEMO.md) | An evidence-first outline and capture list for the future public walkthrough. |
 | [Session handoff](docs/SESSION-HANDOFF.md) | A concise restart point for the next coding session. |
 | [Contributing](CONTRIBUTING.md) | Local setup, test commands, Compose validation, and PR expectations. |
 | [Agent guide](AGENTS.md) | Non-negotiable product and safety rules for coding agents. |

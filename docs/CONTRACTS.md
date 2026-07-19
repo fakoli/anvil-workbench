@@ -10,18 +10,23 @@ Anvil State remains the only authority for PRDs, task dependencies, claims, subm
 
 ### Bridge inputs
 
-The project-local bridge requires two explicitly configured, project-specific inputs:
+The project-local bridge requires explicitly configured, project-specific inputs. Its v1 defaults are shown so a new project can validate the exact CLI surface before overriding it:
 
 | Input | Required behavior |
 | --- | --- |
 | State work-packet command | Runs in the project worktree and returns one JSON work packet for `{task_id}`. |
 | Canonical event stream | An append-only JSONL event file that the bridge tails from a local cursor. |
+| State status command | `anvil status`; resolves the canonical event path when no explicit event file is supplied. |
+| Claim command | `anvil claim {task_id} --actor {actor}`. |
+| Work-packet command | `anvil packet {task_id} --format json`; the bridge tolerates its leading `Wrote packet ...` status line. |
+| Verification capture | `anvil hook capture-evidence`; receives the bridge-observed exit code and captured stdout/stderr. |
+| Evidence submit command | `anvil submit {task_id}` with verification commands and packet-declared changed files. |
 
 The bridge may read the event stream and execute the work-packet command. It must not open, copy, remotely mount, or directly modify `state.db`.
 
 ### State writes
 
-State evidence and acceptance remain State CLI operations executed locally by the bridge. An apply command is configured separately and can run only after an approved `merge_and_accept` action has merged successfully. A failed State apply after merge is a visible reconciliation failure.
+The bridge performs `claim -> work packet -> Codex -> independent verification capture -> State evidence submit`. State evidence is not submitted when a verification command fails or no packet-declared file changed. An apply command is configured separately and can run only after an approved `merge_and_accept` action has merged successfully; a standalone `state_apply` command is rejected. A failed State apply after merge is a visible reconciliation failure.
 
 ## Anvil Serving contract
 
@@ -31,7 +36,7 @@ Every Workbench-managed model call goes through a configured Anvil Serving endpo
 
 ### Responses compatibility
 
-The first harness is Codex. The bridge configures Codex with an Anvil model provider using `wire_api = "responses"` and the configured router base URL. The required supported path is the stateless `/v1/responses` subset: input, instructions, function tools, function-call output continuation, normal responses, and SSE streaming. Unsupported Responses features must fail explicitly at Anvil Serving rather than silently falling back.
+The first harness is Codex. The bridge configures Codex with an Anvil model provider using `wire_api = "responses"` and the configured router base URL. The required supported path is the stateless `/v1/responses` subset: input, instructions, function tools, function-call output continuation, normal responses, and SSE streaming. `store: false`, `include: ["reasoning.encrypted_content"]`, bounded `reasoning`, `parallel_tool_calls: false`, and `truncation: "disabled"` are recognized for Codex compatibility; they never override the Serving profile. Provider-hosted tools, arbitrary namespaces, stateful response chaining, background work, and provider-side storage fail explicitly rather than silently falling back. The bridge suppresses the internal Codex `collaboration` namespace because Workbench does not permit model-delegated agents without a separately reviewed bridge contract.
 
 ### Correlation
 
@@ -56,6 +61,8 @@ The hub is a private service behind an identity-aware tailnet proxy. The proxy m
 `WORKBENCH_ALLOW_INSECURE_DEV_ACTOR=true` is a loopback-only local-development escape hatch. It lets the configured owner use the API without a proxy and must remain disabled in a deployed hub.
 
 The browser receives redacted run activity and approval metadata only. It does not receive database passwords, bridge bootstrap tokens after their one-time registration response, router tokens, model provider keys, or GitHub credentials.
+
+The bridge alone may transition a run from `queued` to `running`, then to `evidenced` after State evidence submission, or to `reconciliation` after Codex, verification, State submission, or an approved action fails. Terminal states include a completion timestamp and immutable audit event; a reconciliation is never represented as completed delivery.
 
 ## Bridge and GitHub action contract
 

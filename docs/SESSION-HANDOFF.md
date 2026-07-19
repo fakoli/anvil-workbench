@@ -14,6 +14,8 @@ Use this file to resume work in a new Anvil Workbench coding session.
 
 The repository contains the v1 hub, bridge, frontend shell, Compose stack, and contract tests. The Workbench code is intentionally separate from Anvil Serving and Anvil State. The separate hub is designed to be started by Anvil Serving as an optional product stack, but Workbench business logic must not move into the Serving router.
 
+The local qualification record is [QUALIFICATION.md](QUALIFICATION.md). On 2026-07-19 the pinned Heavy and Fast were independently preflighted; Dark STT/TTS completed a synthetic-silence pipeline; State claim/packet/evidence/replay passed through the CLI only; and the Workbench browser shell was exercised at `http://127.0.0.1:8090`. The remaining live harness blocker is explicit: the pinned GPT-OSS Puzzle Heavy routes Codex Responses traffic and preserves correlation, but its full Codex loop returns unsupported `shell_command<|channel|>commentary` calls. Do not mark the agentic delivery flow qualified until a local model/template passes a real edit/test/evidence submission.
+
 The browser shell is intentionally usable in two modes:
 
 - **Production:** a tailnet identity proxy injects an authenticated identity header. No insecure fallback is enabled.
@@ -36,11 +38,12 @@ The browser shell is intentionally usable in two modes:
 - No direct State database use.
 - No auto-PR, auto-merge, State apply, deploy, or model-policy update without a consumed approval.
 - No “completed” label when merge and State acceptance disagree.
+- No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 
 ## Best next engineering tasks
 
-1. Add an API-backed project/run/approval UI instead of the current Delivery seed content.
-2. Add a bridge fixture that exercises Codex event parsing and evidence upload against a test hub.
+1. Resolve the Codex/local-model tool-call compatibility blocker recorded in [QUALIFICATION.md](QUALIFICATION.md); preserve the current Heavy as a qualified general Responses route but do not claim Codex harness parity.
+2. Add an API-backed project/run/approval UI instead of the current Delivery seed content.
 3. Add a local identity-proxy test fixture that proves browser header spoofing is rejected.
 4. Add a Postgres/Neo4j Compose integration test that runs in CI or a dedicated release job.
 5. Build the published hub image and wire it to the Anvil Serving optional `workbench up` lifecycle command.

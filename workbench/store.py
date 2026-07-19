@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
@@ -18,6 +19,14 @@ from .redaction import redact_value
 
 class StoreError(RuntimeError):
     """A requested Workbench operation violates an immutable audit invariant."""
+
+
+_RUN_STATUS_TRANSITIONS = {
+    "queued": frozenset({"running", "reconciliation"}),
+    "running": frozenset({"evidenced", "reconciliation"}),
+    "evidenced": frozenset(),
+    "reconciliation": frozenset(),
+}
 
 
 def payload_hash(payload: dict[str, Any]) -> str:
@@ -38,6 +47,7 @@ class WorkbenchStore(Protocol):
     def register_bridge(self, project_id: str, name: str) -> tuple[Bridge, str]: ...
     def authenticate_bridge(self, bridge_id: str, token: str) -> Bridge: ...
     def create_run(self, project_id: str, task_id: str | None, model: str) -> Run: ...
+    def update_run_status(self, run_id: str, status: str, bridge_id: str) -> Run: ...
     def add_transcript(self, run_id: str, role: str, content: Any) -> None: ...
     def create_approval(self, project_id: str, action_type: str, payload: dict[str, Any], requested_by: str, ttl_seconds: int, bridge_id: str | None) -> Approval: ...
     def get_approval(self, approval_id: str) -> Approval: ...
@@ -109,6 +119,25 @@ class MemoryStore:
         self.transcripts[run.id] = []
         self.append_audit("run.created", "operator", project_id, {"run_id": run.id, "task_id": task_id, "model": model})
         return run
+
+    def update_run_status(self, run_id: str, status: str, bridge_id: str) -> Run:
+        run = self.runs.get(run_id)
+        if run is None:
+            raise StoreError("unknown run")
+        project = self.projects.get(run.project_id)
+        if project is None or project.bridge_id != bridge_id:
+            raise StoreError("bridge does not own this run")
+        if status not in _RUN_STATUS_TRANSITIONS:
+            raise StoreError("invalid run status")
+        if status == run.status:
+            return run
+        if status not in _RUN_STATUS_TRANSITIONS.get(run.status, frozenset()):
+            raise StoreError(f"invalid run status transition: {run.status} -> {status}")
+        completed_at = now_utc() if status in {"evidenced", "reconciliation"} else None
+        updated = replace(run, status=status, completed_at=completed_at)
+        self.runs[run_id] = updated
+        self.append_audit("run.status_changed", "bridge:" + bridge_id, run.project_id, {"run_id": run_id, "status": status})
+        return updated
 
     def add_transcript(self, run_id: str, role: str, content: Any) -> None:
         if run_id not in self.runs:
@@ -357,6 +386,34 @@ class PostgresStore:
                 (run.id, run.project_id, run.task_id, run.model, run.status, run.created_at, None),
             )
         self.append_audit("run.created", "operator", project_id, {"run_id": run.id, "task_id": task_id, "model": run.model})
+        return run
+
+    def update_run_status(self, run_id: str, status: str, bridge_id: str) -> Run:
+        if status not in _RUN_STATUS_TRANSITIONS:
+            raise StoreError("invalid run status")
+        with self._connection().cursor() as cur:
+            cur.execute(
+                "SELECT runs.*, projects.bridge_id FROM workbench_runs runs JOIN workbench_projects projects ON projects.id = runs.project_id WHERE runs.id = %s",
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise StoreError("unknown run")
+            if row["bridge_id"] != bridge_id:
+                raise StoreError("bridge does not own this run")
+            current = row["status"]
+            if status == current:
+                return self._run(row)
+            if status not in _RUN_STATUS_TRANSITIONS.get(current, frozenset()):
+                raise StoreError(f"invalid run status transition: {current} -> {status}")
+            completed_at = now_utc() if status in {"evidenced", "reconciliation"} else None
+            cur.execute(
+                "UPDATE workbench_runs SET status = %s, completed_at = %s WHERE id = %s RETURNING *",
+                (status, completed_at, run_id),
+            )
+            updated = cur.fetchone()
+        run = self._run(updated)
+        self.append_audit("run.status_changed", "bridge:" + bridge_id, run.project_id, {"run_id": run_id, "status": status})
         return run
 
     def add_transcript(self, run_id: str, role: str, content: Any) -> None:

@@ -26,7 +26,7 @@ function Status({ tone = 'green', children }) {
 function Rail({ active, setActive }) {
   return <aside className="rail">
     <div className="brand"><Mark /><span>Anvil<br /><em>Workbench</em></span></div>
-    <nav>{nav.map(([label, glyph]) => <button key={label} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => setActive(label)}><b>{glyph}</b>{label}</button>)}</nav>
+    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => setActive(label)}><b aria-hidden="true">{glyph}</b>{label}</button>)}</nav>
     <div className="rail-footer">
       <button className="new-run"><span>+</span> New delivery</button>
       <div className="profile"><span>SD</span><div><strong>Operator</strong><small>tailnet owner</small></div><b>···</b></div>
@@ -62,7 +62,7 @@ function Delivery({ data, append }) {
     <section className="conversation" aria-label="Delivery conversation">
       {messages.map((message, index) => <article className={`message ${message.type}`} key={`${message.who}-${index}`}><div className="message-head"><span>{message.type === 'human' ? 'SD' : 'A'}</span><b>{message.who}</b><small>{index === 0 ? '09:40' : index === 1 ? '09:42' : 'now'}</small></div><p>{message.text}</p></article>)}
     </section>
-    <form className="composer" onSubmit={submit}><textarea value={input} onChange={(event) => setInput(event.target.value)} rows="2" placeholder="Add direction to this delivery…" /><div><small>Routes through Anvil Serving · stateful actions stay local to the bridge</small><button type="submit">Send <span>↵</span></button></div></form>
+    <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} onChange={(event) => setInput(event.target.value)} rows="2" placeholder="Add direction to this delivery…" /><div><small>Routes through Anvil Serving · stateful actions stay local to the bridge</small><button type="submit" aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form>
   </main>
 }
 

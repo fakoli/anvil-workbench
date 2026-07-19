@@ -48,6 +48,10 @@ class BridgeEvent(BaseModel):
     content: Any
 
 
+class RunStatusInput(BaseModel):
+    status: str = Field(pattern="^(running|evidenced|reconciliation)$")
+
+
 class EvidenceInput(BaseModel):
     source_kind: str = Field(pattern="^(state_event|work_packet|route|evaluation|pull_request|approval|failure)$")
     source_id: str = Field(min_length=1, max_length=300)
@@ -198,6 +202,15 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
         store.add_transcript(event.run_id, event.role, event.content)
         return {"accepted": True}
+
+    @app.post("/api/bridge/{bridge_id}/runs/{run_id}/status")
+    def bridge_run_status(
+        bridge_id: str, run_id: str, payload: RunStatusInput,
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        return as_json(store.update_run_status(run_id, payload.status, bridge_id))
 
     @app.post("/api/bridge/{bridge_id}/evidence", status_code=status.HTTP_202_ACCEPTED)
     def project_evidence(bridge_id: str, evidence: EvidenceInput, authenticated_bridge: str = Depends(bridge_identity)) -> dict[str, Any]:

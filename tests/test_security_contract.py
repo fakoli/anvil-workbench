@@ -41,7 +41,10 @@ def test_state_reader_tails_canonical_events_without_database_access(tmp_path: P
     settings = BridgeSettings(
         hub="https://workbench.tailnet.example", bridge_id="bridge_1", token="token", project_root=tmp_path,
         project_id="project_1", state_events=events, cursor_file=tmp_path / ".workbench" / "cursor",
-        state_work_packet_command="anvil task show {task_id} --json", state_apply_command="", codex_binary="codex",
+        state_status_command="anvil status", state_claim_command="anvil claim {task_id} --actor {actor}",
+        state_work_packet_command="anvil packet {task_id} --format json",
+        state_hook_command="anvil hook capture-evidence", state_submit_command="anvil submit {task_id}",
+        state_apply_command="", codex_binary="codex",
         router_base_url="http://100.87.34.66:8000/v1", router_token_env="ANVIL_ROUTER_TOKEN", codex_config=(),
     )
     reader = StateReader(settings)

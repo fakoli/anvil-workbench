@@ -10,9 +10,11 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,9 +40,13 @@ class BridgeSettings:
     token: str
     project_root: Path
     project_id: str
-    state_events: Path
+    state_events: Path | None
     cursor_file: Path
+    state_status_command: str
+    state_claim_command: str
     state_work_packet_command: str
+    state_hook_command: str
+    state_submit_command: str
     state_apply_command: str
     codex_binary: str
     router_base_url: str
@@ -87,6 +93,9 @@ class HubTransport:
     def event(self, run_id: str, role: str, content: Any) -> None:
         self.request("POST", f"/api/bridge/{self.bridge_id}/events", {"run_id": run_id, "role": role, "content": redact_value(content)})
 
+    def run_status(self, run_id: str, status: str) -> None:
+        self.request("POST", f"/api/bridge/{self.bridge_id}/runs/{run_id}/status", {"status": status})
+
     def evidence(self, source_kind: str, source_id: str, project_id: str, payload: dict[str, Any]) -> None:
         self.request(
             "POST", f"/api/bridge/{self.bridge_id}/evidence",
@@ -100,33 +109,131 @@ class StateReader:
     def __init__(self, settings: BridgeSettings) -> None:
         self.settings = settings
 
-    def work_packet(self, task_id: str) -> dict[str, Any]:
-        if not task_id:
-            raise BridgeError("Codex runs require a State task id")
-        rendered = self.settings.state_work_packet_command.format(task_id=task_id)
+    @staticmethod
+    def _json_document(raw: str) -> dict[str, Any]:
+        """Parse a JSON document even when a State CLI emits a status line first."""
+        decoder = json.JSONDecoder()
+        for position, character in enumerate(raw):
+            if character not in "[{":
+                continue
+            try:
+                value, end = decoder.raw_decode(raw[position:])
+            except json.JSONDecodeError:
+                continue
+            if raw[position + end :].strip():
+                continue
+            if isinstance(value, dict):
+                return value
+        raise BridgeError("State command must return one JSON object")
+
+    def _command_args(self, command: str, **values: str) -> list[str]:
+        rendered = command.format(**values)
         args = shlex.split(rendered, posix=os.name != "nt")
+        if not args:
+            raise BridgeError("State command is not configured")
+        return args
+
+    def _run(self, args: list[str], action: str) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             args, cwd=self.settings.project_root, capture_output=True, text=True, check=False,
         )
         if completed.returncode != 0:
-            raise BridgeError(f"State work-packet command failed: {completed.stderr.strip()[:500]}")
+            detail = (completed.stderr or completed.stdout).strip()[:500]
+            raise BridgeError(f"State {action} command failed: {detail}")
+        return completed
+
+    def _event_path(self) -> Path:
+        if self.settings.state_events is not None:
+            return self.settings.state_events
+        legacy = self.settings.project_root / ".anvil" / "events.jsonl"
+        if legacy.exists():
+            return legacy
+        status = self._run(
+            self._command_args(self.settings.state_status_command), "status",
+        )
+        match = re.search(r"(?m)^Path:\s*(.+?)\s*$", status.stdout)
+        if match is None:
+            raise BridgeError(
+                "State event path could not be resolved; pass --state-events explicitly"
+            )
+        return Path(match.group(1)) / "events.jsonl"
+
+    def claim(self, task_id: str, actor: str) -> dict[str, Any]:
+        if not task_id:
+            raise BridgeError("State claim requires a task id")
+        if not self.settings.state_claim_command:
+            raise BridgeError("State claim command is not configured for this bridge")
+        completed = self._run(
+            self._command_args(self.settings.state_claim_command, task_id=task_id, actor=actor),
+            "claim",
+        )
         try:
-            return json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise BridgeError("State work-packet command must return JSON") from exc
+            return self._json_document(completed.stdout)
+        except BridgeError:
+            return {"stdout": completed.stdout[-1000:]}
+
+    def work_packet(self, task_id: str) -> dict[str, Any]:
+        if not task_id:
+            raise BridgeError("Codex runs require a State task id")
+        completed = self._run(
+            self._command_args(self.settings.state_work_packet_command, task_id=task_id, actor=""),
+            "work-packet",
+        )
+        return self._json_document(completed.stdout)
+
+    def capture_verification(
+        self, command: str, exit_code: int, stdout: str, stderr: str, actor: str,
+    ) -> None:
+        """Record the bridge's independently observed verification result in State."""
+        stdout_path: Path | None = None
+        stderr_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as stream:
+                stream.write(stdout)
+                stdout_path = Path(stream.name)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as stream:
+                stream.write(stderr)
+                stderr_path = Path(stream.name)
+            args = self._command_args(self.settings.state_hook_command, task_id="", actor=actor)
+            args.extend([
+                "--command", command,
+                "--exit-code", str(exit_code),
+                "--stdout-file", str(stdout_path),
+                "--stderr-file", str(stderr_path),
+                "--actor", actor,
+            ])
+            self._run(args, "verification capture")
+        finally:
+            for path in (stdout_path, stderr_path):
+                if path is not None:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+    def submit_evidence(
+        self, task_id: str, commands: Iterable[str], files_changed: Iterable[str], actor: str,
+    ) -> dict[str, Any]:
+        if not self.settings.state_submit_command:
+            raise BridgeError("State submit command is not configured for this bridge")
+        args = self._command_args(self.settings.state_submit_command, task_id=task_id, actor=actor)
+        for command in commands:
+            args.extend(["--commands", command])
+        for file_name in files_changed:
+            args.extend(["--files-changed", file_name])
+        args.extend(["--actor", actor, "--json"])
+        completed = self._run(args, "evidence submit")
+        return self._json_document(completed.stdout)
 
     def apply_acceptance(self, task_id: str) -> dict[str, Any]:
         if not task_id:
             raise BridgeError("State acceptance requires a task id")
         if not self.settings.state_apply_command:
             raise BridgeError("State apply command is not configured for this bridge")
-        rendered = self.settings.state_apply_command.format(task_id=task_id)
-        completed = subprocess.run(
-            shlex.split(rendered, posix=os.name != "nt"), cwd=self.settings.project_root,
-            capture_output=True, text=True, check=False,
+        completed = self._run(
+            self._command_args(self.settings.state_apply_command, task_id=task_id, actor=""),
+            "acceptance",
         )
-        if completed.returncode != 0:
-            raise BridgeError(f"State acceptance failed after merge: {completed.stderr.strip()[:500]}")
         return {"stdout": completed.stdout[-4000:]}
 
     def new_events(self) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -137,10 +244,11 @@ class StateReader:
                 offset = int(self.settings.cursor_file.read_text(encoding="utf-8").strip() or "0")
             except ValueError:
                 offset = 0
-        if not self.settings.state_events.exists():
+        events_path = self._event_path()
+        if not events_path.exists():
             return []
         events: list[tuple[int, dict[str, Any]]] = []
-        with self.settings.state_events.open("r", encoding="utf-8") as stream:
+        with events_path.open("r", encoding="utf-8") as stream:
             stream.seek(offset)
             while line := stream.readline():
                 next_offset = stream.tell()
@@ -164,10 +272,12 @@ class CodexRunner:
         self.settings = settings
         self.emit = emit
 
-    def run(self, run_id: str, work_packet: dict[str, Any]) -> int:
+    def run(self, run_id: str, work_packet: dict[str, Any], model: str) -> int:
         token = os.environ.get(self.settings.router_token_env, "")
         if not self.settings.router_base_url or not token:
             raise BridgeError("Anvil router base URL and local router token environment variable are required")
+        if not model.strip():
+            raise BridgeError("Codex runs require a Workbench-selected Anvil model route")
         prompt = (
             "You are executing an Anvil State work packet. Work only in the current project. "
             "Run the relevant tests, collect evidence, and do not create a GitHub PR or merge.\n\n"
@@ -184,19 +294,46 @@ class CodexRunner:
             f"{json.dumps(name)} = {json.dumps(value)}" for name, value in correlation_headers.items()
         )
         default_config = (
+            f"model={json.dumps(model)}",
             'model_provider="anvil"',
+            'model_providers.anvil.name="Anvil Serving"',
             f'model_providers.anvil.base_url="{self.settings.router_base_url.rstrip("/")}"',
             'model_providers.anvil.env_key="ANVIL_ROUTER_TOKEN"',
             'model_providers.anvil.wire_api="responses"',
+            # Hosted web search is represented as a non-function Responses
+            # tool and would bypass the project-local tool boundary. The
+            # bridge deliberately gives Codex local shell tools only; any
+            # future retrieval integration must be a reviewed bridge tool.
+            'web_search="disabled"',
+            # Do not inherit or inject user-oriented tools into a project
+            # bridge. Those integrations can carry their own credentials and
+            # tool namespaces; Workbench has a separate reviewed bridge
+            # contract for any future integration.
+            "features.plugins=false",
+            "features.apps=false",
+            "features.multi_agent=false",
+            "features.browser_use=false",
+            "features.computer_use=false",
+            "features.image_generation=false",
             f"model_providers.anvil.http_headers={{ {header_toml} }}",
         )
-        command = [self.settings.codex_binary, "exec", "--json", "-C", str(self.settings.project_root), "--sandbox", "workspace-write", "--ask-for-approval", "never"]
+        command = [
+            self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json", "-C", str(self.settings.project_root),
+            # The bridge's own sandbox/approval contract is authoritative.
+            # Project rules are unreviewed input to this supervisor and must
+            # not silently add external tool surfaces to a managed run.
+            "--sandbox", "workspace-write", "--ignore-user-config", "--ignore-rules",
+        ]
         for entry in (*default_config, *self.settings.codex_config):
             command.extend(["-c", entry])
         command.append(prompt)
         environment = dict(os.environ)
         environment["ANVIL_ROUTER_TOKEN"] = token
-        self.emit("bridge.codex.started", {"command": [self.settings.codex_binary, "exec", "--json"], "router": self.settings.router_base_url})
+        self.emit("bridge.codex.started", {
+            "command": [self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json"],
+            "router": self.settings.router_base_url,
+            "model": model,
+        })
         process = subprocess.Popen(
             command, cwd=self.settings.project_root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=environment,
@@ -212,6 +349,64 @@ class CodexRunner:
         code = process.wait()
         self.emit("bridge.codex.finished", {"exit_code": code})
         return code
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    command: str
+    exit_code: int
+    output_sha256: str
+
+
+class VerificationRunner:
+    """Run packet-declared checks outside Codex and attest their actual output to State."""
+
+    def __init__(self, settings: BridgeSettings, emit: Callable[[str, Any], None]) -> None:
+        self.settings = settings
+        self.emit = emit
+
+    @staticmethod
+    def _commands(work_packet: dict[str, Any]) -> tuple[str, ...]:
+        task = work_packet.get("task")
+        verification = task.get("verification") if isinstance(task, dict) else None
+        commands = verification.get("commands") if isinstance(verification, dict) else None
+        if not isinstance(commands, list) or not commands or not all(isinstance(item, str) and item.strip() for item in commands):
+            raise BridgeError("State work packet has no runnable verification commands")
+        return tuple(item.strip() for item in commands)
+
+    def run(self, work_packet: dict[str, Any], state: StateReader, actor: str) -> tuple[VerificationResult, ...]:
+        results: list[VerificationResult] = []
+        for command in self._commands(work_packet):
+            completed = subprocess.run(
+                command, cwd=self.settings.project_root, shell=True, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", check=False,
+            )
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            state.capture_verification(command, completed.returncode, stdout, stderr, actor)
+            digest = hashlib.sha256((stdout + stderr).encode("utf-8")).hexdigest()
+            result = VerificationResult(command, completed.returncode, digest)
+            results.append(result)
+            self.emit("bridge.verification.finished", {
+                "command": command, "exit_code": completed.returncode, "output_sha256": digest,
+            })
+            if completed.returncode != 0:
+                break
+        return tuple(results)
+
+    def changed_likely_files(self, work_packet: dict[str, Any]) -> tuple[str, ...]:
+        task = work_packet.get("task")
+        likely_files = task.get("likely_files") if isinstance(task, dict) else None
+        if not isinstance(likely_files, list):
+            return ()
+        completed = subprocess.run(
+            ["git", "diff", "--name-only", "--relative", "HEAD"], cwd=self.settings.project_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        )
+        if completed.returncode != 0:
+            raise BridgeError("bridge requires a committed project baseline before it can submit evidence")
+        changed = {line.strip().replace("\\", "/") for line in completed.stdout.splitlines() if line.strip()}
+        return tuple(str(item) for item in likely_files if isinstance(item, str) and item.replace("\\", "/") in changed)
 
 
 class ApprovedActionRunner:
@@ -284,30 +479,60 @@ class Bridge:
         payload = command["payload"]
         if action == "run_codex":
             run_id = payload["run_id"]
-            packet = self.state.work_packet(str(payload.get("task_id") or ""))
-            packet.setdefault("task_id", payload.get("task_id"))
-            self.hub.evidence("work_packet", run_id, self.settings.project_id, {"task_id": payload.get("task_id"), "packet": packet})
-            exit_code = CodexRunner(self.settings, lambda role, content: self._emit(run_id, role, content)).run(run_id, packet)
-            if exit_code:
-                self.hub.evidence("failure", run_id, self.settings.project_id, {"task_id": payload.get("task_id"), "fingerprint": "codex-exit", "exit_code": exit_code})
-                raise BridgeError(f"Codex exited with {exit_code}")
+            task_id = str(payload.get("task_id") or "")
+            actor = f"workbench-{self.settings.bridge_id}"
+            self.hub.run_status(run_id, "running")
+            try:
+                claim = self.state.claim(task_id, actor)
+                self.hub.evidence("state_event", f"{run_id}:claim", self.settings.project_id, {"task_id": task_id, "claim": claim})
+                packet = self.state.work_packet(task_id)
+                packet.setdefault("task_id", payload.get("task_id"))
+                self.hub.evidence("work_packet", run_id, self.settings.project_id, {"task_id": payload.get("task_id"), "packet": packet})
+                model = str(payload.get("model") or "")
+                exit_code = CodexRunner(self.settings, lambda role, content: self._emit(run_id, role, content)).run(run_id, packet, model)
+                if exit_code:
+                    raise BridgeError(f"Codex exited with {exit_code}")
+                verifier = VerificationRunner(self.settings, lambda role, content: self._emit(run_id, role, content))
+                verification = verifier.run(packet, self.state, actor)
+                failed = [result.command for result in verification if result.exit_code != 0]
+                if failed:
+                    raise BridgeError(f"independent verification failed: {failed[0]}")
+                files_changed = verifier.changed_likely_files(packet)
+                if not files_changed:
+                    raise BridgeError("no packet-declared changed files found; State evidence was not submitted")
+                submission = self.state.submit_evidence(
+                    task_id, (result.command for result in verification), files_changed, actor,
+                )
+                self.hub.evidence("state_event", f"{run_id}:evidence", self.settings.project_id, {
+                    "task_id": task_id,
+                    "files_changed": list(files_changed),
+                    "commands": [result.command for result in verification],
+                    "evidence_id": submission.get("data", {}).get("evidence_id") if isinstance(submission.get("data"), dict) else None,
+                })
+            except BridgeError as exc:
+                self.hub.evidence("failure", f"{run_id}:reconciliation", self.settings.project_id, {
+                    "task_id": task_id, "fingerprint": "bridge-reconciliation", "reconciliation_required": True, "error": str(exc),
+                })
+                self.hub.run_status(run_id, "reconciliation")
+                raise
+            self.hub.run_status(run_id, "evidenced")
             return True
         approval_id = command.get("approval_id")
         if not approval_id:
             raise BridgeError(f"unapproved bridge action rejected: {action}")
-        # Consumption is atomic and proves the exact approved payload can execute once.
-        self.hub.consume(approval_id, command["payload_hash"])
         runner = ApprovedActionRunner(self.settings)
         try:
             if action == "commit_pr":
+                if str(payload.get("diff_hash") or "") != runner.diff_hash():
+                    raise BridgeError("current diff differs from the hash that was approved")
+                # Consumption is atomic and proves the exact approved payload can execute once.
+                self.hub.consume(approval_id, command["payload_hash"])
                 result = runner.commit_pr(payload)
                 self.hub.evidence("pull_request", approval_id, self.settings.project_id, result)
             elif action == "merge_and_accept":
+                self.hub.consume(approval_id, command["payload_hash"])
                 result = runner.merge_and_accept(payload, self.state)
                 self.hub.evidence("pull_request", approval_id, self.settings.project_id, result)
-            elif action == "state_apply":
-                result = self.state.apply_acceptance(str(payload.get("task_id") or ""))
-                self.hub.evidence("state_event", approval_id, self.settings.project_id, {"task_id": payload.get("task_id"), "acceptance": result})
             else:
                 raise BridgeError(f"approval action is not implemented by the v1 bridge: {action}")
         except BridgeError as exc:
@@ -323,9 +548,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-env", default="WORKBENCH_BRIDGE_TOKEN")
     parser.add_argument("--project-root", required=True, type=Path)
     parser.add_argument("--project-id", required=True)
-    parser.add_argument("--state-events", type=Path)
+    parser.add_argument("--state-events", type=Path, help="canonical State events.jsonl; resolves through State CLI when omitted")
     parser.add_argument("--cursor-file", type=Path)
-    parser.add_argument("--state-work-packet-command", default="anvil task show {task_id} --json")
+    parser.add_argument("--state-status-command", default="anvil status")
+    parser.add_argument("--state-claim-command", default="anvil claim {task_id} --actor {actor}")
+    parser.add_argument("--state-work-packet-command", default="anvil packet {task_id} --format json")
+    parser.add_argument("--state-hook-command", default="anvil hook capture-evidence")
+    parser.add_argument("--state-submit-command", default="anvil submit {task_id}")
     parser.add_argument("--state-apply-command", default="")
     parser.add_argument("--codex-binary", default="codex")
     parser.add_argument("--router-base-url", required=True)
@@ -344,9 +573,13 @@ def main(argv: list[str] | None = None) -> int:
     root = args.project_root.resolve()
     settings = BridgeSettings(
         hub=args.hub, bridge_id=args.bridge_id, token=token, project_root=root, project_id=args.project_id,
-        state_events=args.state_events or root / ".anvil" / "events.jsonl",
+        state_events=args.state_events,
         cursor_file=args.cursor_file or root / ".workbench" / "state-events.cursor",
+        state_status_command=args.state_status_command,
+        state_claim_command=args.state_claim_command,
         state_work_packet_command=args.state_work_packet_command,
+        state_hook_command=args.state_hook_command,
+        state_submit_command=args.state_submit_command,
         state_apply_command=args.state_apply_command,
         codex_binary=args.codex_binary, router_base_url=args.router_base_url,
         router_token_env=args.router_token_env, codex_config=tuple(args.codex_config),

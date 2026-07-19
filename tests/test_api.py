@@ -28,6 +28,12 @@ def test_api_releases_only_an_approved_hash_bound_bridge_action():
         queued_run = test_client.get(f"/api/bridge/{bridge['id']}/commands/next", headers=bridge_headers).json()
         assert queued_run["action_type"] == "run_codex"
         assert queued_run["payload"]["run_id"] == run["id"]
+        running = test_client.post(f"/api/bridge/{bridge['id']}/runs/{run['id']}/status", headers=bridge_headers, json={"status": "running"})
+        assert running.status_code == 200
+        assert running.json()["status"] == "running"
+        reconciled = test_client.post(f"/api/bridge/{bridge['id']}/runs/{run['id']}/status", headers=bridge_headers, json={"status": "reconciliation"})
+        assert reconciled.status_code == 200
+        assert reconciled.json()["completed_at"] is not None
 
         approval = test_client.post("/api/approvals", json={
             "project_id": project["id"], "bridge_id": bridge["id"], "action_type": "commit_pr",
