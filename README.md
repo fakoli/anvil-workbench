@@ -2,7 +2,7 @@
 
 Anvil Workbench is a private, tailnet-only delivery cockpit for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
 
-Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [local qualification record](docs/QUALIFICATION.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
+Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
 
 It is deliberately a separate product:
 
@@ -87,6 +87,7 @@ When `WORKBENCH_EMBEDDING_MODEL` is configured, evidence retrieval uses Anvil Se
 | [Contracts](docs/CONTRACTS.md) | The exact Anvil State, Anvil Serving, bridge, graph, and approval contracts. |
 | [Roadmap](docs/ROADMAP.md) | What is implemented, what requires a live qualification, and the next milestones. |
 | [Qualification](docs/QUALIFICATION.md) | Dated local test evidence, passed gates, and the remaining Codex/model compatibility blocker. |
+| [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md) | Button-level coverage, exercised workflows, and explicit UI boundaries. |
 | [Article demo](docs/ARTICLE-DEMO.md) | An evidence-first outline and capture list for the future public walkthrough. |
 | [Session handoff](docs/SESSION-HANDOFF.md) | A concise restart point for the next coding session. |
 | [Contributing](CONTRIBUTING.md) | Local setup, test commands, Compose validation, and PR expectations. |
