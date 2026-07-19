@@ -7,21 +7,17 @@ import pytest
 
 from workbench.bridge import BridgeSettings, StateReader
 from workbench.graph import GraphError, NullGraph
-from workbench.store import MemoryStore, StoreError, payload_hash
+from workbench.store import MemoryStore, StoreError
 
 
-def test_hash_bound_approval_expires_on_payload_change_and_cannot_replay():
+def test_unimplemented_privileged_actions_cannot_create_a_dangling_bridge_command():
     store = MemoryStore()
     project = store.create_project("demo", ".anvil")
     bridge, _token = store.register_bridge(project.id, "project bridge")
-    approval = store.create_approval(project.id, "commit_pr", {"diff_hash": "before", "branch": "codex/demo"}, "operator", 60, bridge.id)
-    granted = store.approve(approval.id, "operator", frozenset({"operator"}))
-    with pytest.raises(StoreError, match="differs"):
-        store.consume(granted.id, payload_hash({"diff_hash": "after", "branch": "codex/demo"}))
-    consumed = store.consume(granted.id, granted.payload_hash)
-    assert consumed.status == "consumed"
-    with pytest.raises(StoreError, match="not valid"):
-        store.consume(granted.id, granted.payload_hash)
+    with pytest.raises(StoreError, match="not executable"):
+        store.create_approval(
+            project.id, "model_policy", {"profile": "different"}, "operator", 60, bridge.id,
+        )
 
 
 def test_graph_only_accepts_redacted_evidence_metadata():
@@ -41,7 +37,10 @@ def test_state_reader_tails_canonical_events_without_database_access(tmp_path: P
     settings = BridgeSettings(
         hub="https://workbench.tailnet.example", bridge_id="bridge_1", token="token", project_root=tmp_path,
         project_id="project_1", state_events=events, cursor_file=tmp_path / ".workbench" / "cursor",
-        state_work_packet_command="anvil task show {task_id} --json", state_apply_command="", codex_binary="codex",
+        state_status_command="anvil status", state_claim_command="anvil claim {task_id} --actor {actor}",
+        state_work_packet_command="anvil packet {task_id} --format json",
+        state_hook_command="anvil hook capture-evidence", state_submit_command="anvil submit {task_id}",
+        state_apply_command="", codex_binary="codex",
         router_base_url="http://100.87.34.66:8000/v1", router_token_env="ANVIL_ROUTER_TOKEN", codex_config=(),
     )
     reader = StateReader(settings)

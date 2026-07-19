@@ -20,6 +20,10 @@ class Settings:
     bridge_bootstrap_token: str
     anvil_router_base_url: str
     anvil_router_token: str
+    sandbox_models: frozenset[str] = frozenset()
+    anvil_voice_realtime_url: str = ""
+    anvil_voice_realtime_token: str = ""
+    voice_retain_transcripts: bool = False
     embedding_model: str = ""
     rerank_model: str = ""
     identity_header: str = "Tailscale-User-Login"
@@ -40,6 +44,10 @@ class Settings:
             bridge_bootstrap_token=values.get("WORKBENCH_BRIDGE_BOOTSTRAP_TOKEN", ""),
             anvil_router_base_url=values.get("ANVIL_ROUTER_BASE_URL", ""),
             anvil_router_token=values.get("ANVIL_ROUTER_TOKEN", ""),
+            sandbox_models=_csv("WORKBENCH_SANDBOX_MODELS", values),
+            anvil_voice_realtime_url=values.get("ANVIL_VOICE_REALTIME_URL", "").strip(),
+            anvil_voice_realtime_token=values.get("ANVIL_VOICE_REALTIME_TOKEN", ""),
+            voice_retain_transcripts=values.get("WORKBENCH_VOICE_RETAIN_TRANSCRIPTS", "").lower() in {"1", "true", "yes"},
             embedding_model=values.get("WORKBENCH_EMBEDDING_MODEL", ""),
             rerank_model=values.get("WORKBENCH_RERANK_MODEL", ""),
             identity_header=values.get("WORKBENCH_IDENTITY_HEADER", "Tailscale-User-Login").strip() or "Tailscale-User-Login",

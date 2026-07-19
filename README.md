@@ -1,6 +1,8 @@
 # Anvil Workbench
 
-Anvil Workbench is a private, tailnet-only delivery cockpit for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
+Anvil Workbench is a private, tailnet-first **agent harness for software delivery**. Its web UI is the main entry point for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
+
+Start with the [coding-session guide](CLAUDE.md), [architecture resources](docs/architecture/README.md), [contract resources](docs/contracts/README.md), [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [harness foundations](docs/HARNESS-FOUNDATIONS.md), [workflow operation-layer proposal](docs/WORKFLOW-OPERATION-LAYER.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
 
 It is deliberately a separate product:
 
@@ -43,8 +45,39 @@ workbench-bridge `
   --bridge-id bridge_example `
   --project-id project_example `
   --project-root C:\path\to\project `
+  --verification-command "python -m pytest -q" `
   --router-base-url http://100.87.34.66:8000/v1
 ```
+
+For concurrent sessions, assign each mutable worktree an operator-configured name. The browser sends only that name; it never supplies a path.
+
+```powershell
+workbench-bridge ... --worktree checkout-a=C:\path\to\project-a --worktree checkout-b=C:\path\to\project-b
+```
+
+The session engine permits one active run per session and leases each named worktree. A second session cannot start against an unexpired lease for the same worktree.
+
+Verification commands in a State work packet are untrusted declarations, not a
+remote shell. Configure every allowed exact command with
+`--verification-command`; an undeclared command is rejected and nothing runs.
+
+### Bridge-local skills
+
+Skills are explicit operator-reviewed instructions, not browser-installed plugins. Configure the local bridge with one or more roots containing `SKILL.md` files:
+
+```powershell
+workbench-bridge ... --skills-root C:\path\to\project\.agents\skills --skills-root C:\path\to\reviewed-skills
+```
+
+The bridge publishes only each skill's name, short description, and SHA-256 digest. Its path and body stay local. A session selects from that published list; its selected skills and digests are bound into the next `run_codex` command. The bridge rejects a missing or changed skill before it launches Codex. **Verify bridge skills** queues a non-mutating local digest check and projects cited evidence; it does not run model code.
+
+### Serving-only sandbox
+
+`WORKBENCH_SANDBOX_MODELS` is an optional comma-separated allowlist. When it is set along with the hub's Serving URL and token, the Sandbox page makes a bounded, audited `/v1/responses` call through Anvil Serving. It has no raw-provider fallback and cannot access a worktree, State, GitHub, or approvals. With the variable unset, the button is explicitly unavailable rather than simulated.
+
+## Voice
+
+Workbench supports session-bound push-to-talk through a private Anvil Voice Realtime endpoint. Set `ANVIL_VOICE_REALTIME_URL` on the hub (and `ANVIL_VOICE_REALTIME_TOKEN` only when the upstream requires it). The browser connects to a same-origin Workbench relay; it never receives the upstream URL or token. The relay filters model and tool controls, forwards only the narrow audio protocol, and stores lifecycle summaries rather than raw audio. Transcript retention is opt-in with `WORKBENCH_VOICE_RETAIN_TRANSCRIPTS=true`; it is off by default.
 
 For each project, explicitly configure the State work-packet and State-apply commands if its CLI syntax differs from the defaults. Both commands are executed locally in the project worktree; a State apply occurs only after an approved merge action has completed.
 
@@ -53,11 +86,13 @@ For each project, explicitly configure the State work-packet and State-apply com
 1. Workbench creates a run and the bridge reads the State work packet.
 2. Codex runs in the local worktree via Anvil Serving's Responses endpoint.
 3. The bridge returns redacted run activity and evidence. Route/evaluation/state metadata can be projected to Neo4j.
-4. A named approver authorizes a payload hash for `commit_pr`; the bridge checks the exact diff before committing, pushing, and creating the PR.
-5. A named approver authorizes `merge_and_accept`; the bridge verifies required GitHub checks, merges first, then applies State acceptance.
-6. If merge or State application fails after an approval is consumed, the bridge projects a reconciliation-required failure. It never silently marks a task complete.
+4. A named approver authorizes a payload hash for `commit_pr`; the bridge atomically revalidates and renews the bound run lease, checks the exact diff, then commits, pushes, and creates the PR. The lease remains held for the later merge approval.
+5. A named approver authorizes `merge_and_accept` with the PR's observed head SHA and the same State task; the bridge atomically revalidates and renews that bound lease, compare-and-swaps GitHub merge against that exact head, then applies State acceptance.
+6. Workbench records `completed` only through the consumed `merge_and_accept` finalization after the exact-head merge and State acceptance both succeed. If a PR, merge, or State application fails after an approval is consumed, it records and displays reconciliation; it never silently retries or marks delivery complete.
 
 For each Codex run the bridge writes only provider-local configuration overrides: `wire_api = "responses"`, the Anvil router base URL, `ANVIL_ROUTER_TOKEN` as the local credential source, and static `http_headers` carrying the workbench run/task correlation. It never writes a provider API key or a GitHub token to Codex configuration.
+
+The bridge starts Codex with a clean local tool surface: it ignores user configuration and project rules, disables plugins, apps, multi-agent, browser, computer-use, image generation, and hosted web search, and keeps the workspace-write sandbox. Those restrictions prevent a bridge run from inheriting arbitrary credential-bearing integrations from an operator desktop.
 
 ## Development
 
@@ -71,4 +106,23 @@ npm run dev
 
 `MemoryStore` and `NullGraph` make the API and bridge contract tests hermetic. Production startup always initializes Postgres; there is no silent in-memory fallback.
 
+For a loopback-only UI/API smoke test, set `WORKBENCH_ALLOW_INSECURE_DEV_ACTOR=true` in the untracked `.env` file. This permits the configured owner to use the browser shell without a tailnet identity proxy. It is deliberately passed through only by the local Compose stack and must remain `false` in a deployed hub.
+
 When `WORKBENCH_EMBEDDING_MODEL` is configured, evidence retrieval uses Anvil Serving's existing `/v1/embeddings` purpose route. If `WORKBENCH_RERANK_MODEL` is also configured, the fixed evidence-search tool reranks the vector/graph candidates through `/v1/rerank`. Raw transcripts are excluded before either request; an unavailable local retrieval serve falls back only to Neo4j's redacted keyword/lineage query, never a provider API.
+
+## Repository map
+
+| Document | Use it for |
+| --- | --- |
+| [Project brief](docs/PROJECT.md) | Product promise, boundaries, users, and the v1 delivery flow. |
+| [Contracts](docs/CONTRACTS.md) | The exact Anvil State, Anvil Serving, bridge, graph, and approval contracts. |
+| [Harness foundations](docs/HARNESS-FOUNDATIONS.md) | Research-backed requirements, V1 workflow vocabulary, session isolation, and voice boundaries. |
+| [Architecture resources](docs/architecture/README.md) | Research, alternatives, architecture decisions, and the runtime-inference design. |
+| [Contract resources](docs/contracts/README.md) | Versioned schemas and examples for the proposed operation, workflow, bridge, receipt, and runtime-context boundary. |
+| [Roadmap](docs/ROADMAP.md) | What is implemented, what requires a live qualification, and the next milestones. |
+| [Qualification](docs/QUALIFICATION.md) | Dated local test evidence, passed gates, and the remaining Codex/model compatibility blocker. |
+| [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md) | Button-level coverage, exercised workflows, and explicit UI boundaries. |
+| [Article demo](docs/ARTICLE-DEMO.md) | An evidence-first outline and capture list for the future public walkthrough. |
+| [Session handoff](docs/SESSION-HANDOFF.md) | A concise restart point for the next coding session. |
+| [Contributing](CONTRIBUTING.md) | Local setup, test commands, Compose validation, and PR expectations. |
+| [Agent guide](AGENTS.md) | Non-negotiable product and safety rules for coding agents. |

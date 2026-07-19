@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/operation-receipt.v1.schema.json",
+  "title": "Anvil Workbench operation receipt v1",
+  "description": "A redacted receipt for one bridge operation. Unknown means an effect may have occurred and requires reconciliation, not automatic retry. Schema shape is not proof of redaction: bridge ingress and hub persistence each apply and verify the configured redaction policy.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "receipt_id", "command_id", "run_id", "operation", "status", "redaction", "started_at", "finished_at"],
+  "properties": {
+    "schema_version": {"const": "workbench-operation-receipt/v1"},
+    "receipt_id": {"type": "string", "pattern": "^rcpt_[a-zA-Z0-9_-]{8,128}$"},
+    "command_id": {"type": "string"},
+    "run_id": {"type": "string"},
+    "operation": {"type": "object", "additionalProperties": false, "required": ["provider", "id", "contract_version", "operation_digest"], "properties": {"provider": {"type": "string"}, "id": {"type": "string"}, "contract_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"}, "operation_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}}},
+    "status": {"enum": ["succeeded", "failed", "denied", "unknown", "reconciliation_required"]},
+    "idempotency_key": {"type": "string", "maxLength": 256},
+    "external_ref": {"type": "object", "maxProperties": 16, "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"}, "additionalProperties": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,160}$"}},
+    "evidence_refs": {"type": "array", "maxItems": 64, "items": {"type": "string", "pattern": "^(?:evidence|artifact|state_event|route|verification)_[A-Za-z0-9._-]{1,128}$"}},
+    "correlation": {"type": "object", "additionalProperties": false, "properties": {"task_id": {"type": "string"}, "request_id": {"type": "string"}, "traceparent": {"type": "string", "maxLength": 256}}},
+    "redaction": {"type": "object", "additionalProperties": false, "required": ["status", "ruleset"], "properties": {"status": {"enum": ["redacted", "metadata_only"]}, "ruleset": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}}},
+    "error": {"type": "object", "additionalProperties": false, "required": ["code", "safe_summary", "retryable"], "properties": {"code": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}, "safe_summary": {"type": "string", "maxLength": 500, "not": {"pattern": "(?i:authorization|bearer|api[_ -]?key|github[_ -]?token|password|secret)"}}, "retryable": {"type": "boolean"}}},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"}
+  }
+}

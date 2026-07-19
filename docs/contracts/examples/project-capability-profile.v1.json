@@ -1,0 +1,17 @@
+{
+  "schema_version": "workbench-capability-profile/v1",
+  "id": "private-delivery-default",
+  "revision": "1.0.0",
+  "digest": "sha256:375632a096ee8bc75fa6b42975f374a028029572cab7d724243fbba2ff77a163",
+  "operations": [
+    {"provider": "anvil-state", "id": "state.task.claim", "contract_version": "1.0.0", "operation_digest": "sha256:ec20c724a2da09f742621ad779ea3a61a106b4939e8cfb62e9426706299c9c28"},
+    {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0", "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"},
+    {"provider": "anvil-serving", "id": "serving.eval.preflight", "contract_version": "1.0.0", "operation_digest": "sha256:a5563505e4b241032f326707fb1840ac366b3905c8f23b91fe3742d2f822e98d"},
+    {"provider": "project-bridge", "id": "bridge.github.commit_pr", "contract_version": "1.0.0", "operation_digest": "sha256:8aef716c52d7bf33f19a2829b56e7ad8f19cd5f1cce6cc6d5a10320410e512c3"},
+    {"provider": "project-bridge", "id": "bridge.github.merge_and_accept", "contract_version": "1.0.0", "operation_digest": "sha256:0e7d2a035662c0224014ca2576c78a9b7d717812f47700b5314cc426b9896f9e"}
+  ],
+  "model_profiles": ["coding-local", "planning-local"],
+  "skills": [{"id": "anvil:execute", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"}],
+  "limits": {"max_parallel_runs": 2, "max_agent_turns": 12, "max_tool_calls": 24},
+  "approval_actions": ["commit_pr", "merge_and_accept"]
+}

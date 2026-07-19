@@ -34,6 +34,63 @@ class Run:
     status: str
     created_at: datetime = field(default_factory=now_utc)
     completed_at: datetime | None = None
+    session_id: str | None = None
+    workflow_id: str | None = None
+    workflow_step_id: str | None = None
+    lease_epoch: int | None = None
+
+
+@dataclass(frozen=True)
+class Session:
+    """A resumable harness context, independent from Anvil State task authority."""
+
+    id: str
+    project_id: str
+    title: str
+    worktree_id: str
+    status: str = "active"
+    voice_enabled: bool = False
+    created_at: datetime = field(default_factory=now_utc)
+    updated_at: datetime = field(default_factory=now_utc)
+
+
+@dataclass(frozen=True)
+class Workflow:
+    """A version-pinned, allowlisted workflow graph for one Workbench session."""
+
+    id: str
+    project_id: str
+    session_id: str
+    version: int
+    definition: dict[str, Any]
+    status: str = "draft"
+    cursor: tuple[str, ...] = ()
+    created_at: datetime = field(default_factory=now_utc)
+    updated_at: datetime = field(default_factory=now_utc)
+
+
+@dataclass(frozen=True)
+class WorkflowEvent:
+    """Append-only redacted session event used for browser catch-up and audit."""
+
+    id: str
+    session_id: str
+    workflow_id: str | None
+    sequence: int
+    kind: str
+    data: dict[str, Any]
+    created_at: datetime = field(default_factory=now_utc)
+
+
+@dataclass(frozen=True)
+class ResourceLease:
+    """A fenced single-writer lease for a worktree or other mutable resource."""
+
+    resource_key: str
+    session_id: str
+    epoch: int
+    expires_at: datetime
+    created_at: datetime = field(default_factory=now_utc)
 
 
 @dataclass(frozen=True)
@@ -68,6 +125,17 @@ class Bridge:
 
 
 @dataclass(frozen=True)
+class BridgeSkill:
+    """Safe metadata for one explicitly configured bridge skill."""
+
+    bridge_id: str
+    skill_id: str
+    description: str
+    content_sha256: str
+    updated_at: datetime = field(default_factory=now_utc)
+
+
+@dataclass(frozen=True)
 class AuditEvent:
     id: str
     kind: str
@@ -88,4 +156,3 @@ def as_json(value: object) -> dict[str, Any]:
         if isinstance(item, datetime):
             result[key] = item.isoformat()
     return result
-
