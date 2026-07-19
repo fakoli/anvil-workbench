@@ -19,7 +19,7 @@ from .models import (
     Workflow, WorkflowEvent, new_id, now_utc,
 )
 from .redaction import redact_value
-from .workflows import WorkflowError, next_cursor, step_by_id, validate_definition
+from .workflows import WorkflowError, advance_cursor, step_by_id, validate_definition
 
 
 class StoreError(RuntimeError):
@@ -64,6 +64,7 @@ class WorkbenchStore(Protocol):
     def record_session_event(self, session_id: str, workflow_id: str | None, kind: str, data: dict[str, Any]) -> WorkflowEvent: ...
     def revise_workflow(self, workflow_id: str, expected_version: int, definition: dict[str, Any], actor: str) -> Workflow: ...
     def start_workflow(self, workflow_id: str, actor: str) -> Workflow: ...
+    def start_workflow_run(self, workflow_id: str, task_id: str, model: str, actor: str) -> tuple[Workflow, Run]: ...
     def complete_workflow_step(self, workflow_id: str, step_id: str, outcome: str, actor: str) -> Workflow: ...
     def acquire_lease(self, resource_key: str, session_id: str, ttl_seconds: int) -> ResourceLease: ...
     def validate_run_lease(self, run_id: str, bridge_id: str) -> Run: ...
@@ -76,6 +77,7 @@ class WorkbenchStore(Protocol):
     def list_bridge_skills(self, project_id: str | None = None) -> list[BridgeSkill]: ...
     def create_run(self, project_id: str, task_id: str | None, model: str, session_id: str | None = None, workflow_id: str | None = None, workflow_step_id: str | None = None, lease_epoch: int | None = None) -> Run: ...
     def update_run_status(self, run_id: str, status: str, bridge_id: str) -> Run: ...
+    def finalize_run_command(self, run_id: str, status: str, bridge_id: str, command_id: str) -> Run: ...
     def add_transcript(self, run_id: str, role: str, content: Any, bridge_id: str | None = None) -> None: ...
     def create_approval(self, project_id: str, action_type: str, payload: dict[str, Any], requested_by: str, ttl_seconds: int, bridge_id: str | None) -> Approval: ...
     def get_approval(self, approval_id: str) -> Approval: ...
@@ -207,6 +209,96 @@ class MemoryStore:
         self._append_workflow_event(workflow.session_id, workflow.id, "workflow.started", {"step_id": entry, "actor": actor})
         return updated
 
+    def start_workflow_run(
+        self, workflow_id: str, task_id: str, model: str, actor: str,
+    ) -> tuple[Workflow, Run]:
+        """Start a draft and enqueue its first run as one memory-store mutation."""
+        workflow = self.get_workflow(workflow_id)
+        if workflow.status != "draft":
+            raise StoreError("workflow is not a draft")
+        project = self.projects.get(workflow.project_id)
+        if project is None or project.bridge_id is None or project.bridge_id not in self.bridges:
+            raise StoreError("a project bridge is required before a workflow can start")
+        session = self.get_session(workflow.session_id)
+        if session.status != "active":
+            raise StoreError("session is not active for this project")
+        entry = str(workflow.definition["entry"])
+        step = step_by_id(workflow.definition, entry)
+        if step["kind"] != "agent":
+            raise StoreError("v1 workflows must begin with an agent step")
+        published = self.bridge_skills.get(project.bridge_id, {})
+        skills: list[dict[str, str]] = []
+        for skill_id in step.get("skills", []):
+            skill = published.get(skill_id)
+            if skill is None:
+                raise StoreError(
+                    "the bridge must publish every selected workflow skill before the workflow can start: "
+                    + skill_id
+                )
+            skills.append({
+                "skill_id": skill.skill_id,
+                "description": skill.description,
+                "content_sha256": skill.content_sha256,
+            })
+        if any(
+            run.session_id == session.id and run.status in {"queued", "running"}
+            for run in self.runs.values()
+        ):
+            raise StoreError("a session may have only one active run")
+        resource_key = "worktree:" + session.worktree_id
+        now = now_utc()
+        existing = self.leases.get(resource_key)
+        if existing is not None and existing.expires_at > now and existing.session_id != session.id:
+            raise StoreError("resource is leased by another active session")
+        lease = ResourceLease(
+            resource_key, session.id, (existing.epoch + 1) if existing else 1,
+            now + timedelta(seconds=300), now,
+        )
+        selected_model = str(step.get("model") or model).strip()
+        run = Run(
+            new_id("run"), workflow.project_id, task_id, selected_model, "queued",
+            session_id=session.id, workflow_id=workflow.id,
+            workflow_step_id=entry, lease_epoch=lease.epoch,
+        )
+        directives = [
+            str(event.data["content"])
+            for event in self.workflow_events.get(session.id, [])
+            if event.kind == "operator.directive" and isinstance(event.data.get("content"), str)
+        ]
+        command_payload = {
+            "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
+            "model": run.model, "session_id": run.session_id,
+            "workflow_id": run.workflow_id, "workflow_step_id": run.workflow_step_id,
+            "lease_epoch": run.lease_epoch, "worktree_id": session.worktree_id,
+            "skills": skills, "directives": directives[-32:],
+        }
+        started = replace(workflow, status="running", cursor=(entry,), updated_at=now)
+
+        # Every fallible validation above precedes this mutation block.
+        self.leases[resource_key] = lease
+        self.runs[run.id] = run
+        self.transcripts[run.id] = []
+        self.workflows[workflow.id] = started
+        self.commands[project.bridge_id].append({
+            "id": new_id("command"), "approval_id": None, "action_type": "run_codex",
+            "payload": command_payload, "payload_hash": payload_hash(command_payload),
+        })
+        self._append_workflow_event(session.id, workflow.id, "lease.acquired", {
+            "resource_key": resource_key, "epoch": lease.epoch,
+        })
+        self._append_workflow_event(session.id, workflow.id, "workflow.started", {
+            "step_id": entry, "actor": actor, "run_id": run.id,
+        })
+        self.append_audit("run.created", actor, workflow.project_id, {
+            "run_id": run.id, "task_id": task_id, "model": run.model,
+            "session_id": session.id, "workflow_id": workflow.id,
+            "lease_epoch": lease.epoch,
+        })
+        self.append_audit("workflow.run_requested", actor, workflow.project_id, {
+            "workflow_id": workflow.id, "step_id": entry, "run_id": run.id,
+        })
+        return started, run
+
     def complete_workflow_step(self, workflow_id: str, step_id: str, outcome: str, actor: str) -> Workflow:
         workflow = self.get_workflow(workflow_id)
         if workflow.status not in {"running", "waiting_approval"} or step_id not in workflow.cursor:
@@ -218,7 +310,7 @@ class MemoryStore:
         elif outcome == "cancelled":
             status_value, cursor = "cancelled", ()
         else:
-            cursor = next_cursor(workflow.definition, step_id)
+            cursor = advance_cursor(workflow.definition, workflow.cursor, step_id)
             next_kinds = {step_by_id(workflow.definition, next_step)["kind"] for next_step in cursor}
             status_value = "completed" if not cursor else "waiting_approval" if "approval_wait" in next_kinds else "reconciliation" if "reconcile" in next_kinds else "running"
         updated = replace(workflow, status=status_value, cursor=tuple(cursor), updated_at=now_utc())
@@ -385,6 +477,63 @@ class MemoryStore:
                     "run_id": updated.id, "status": "reconciliation",
                 })
         self.append_audit("run.status_changed", "bridge:" + bridge_id, run.project_id, {"run_id": run_id, "status": status})
+        return updated
+
+    def finalize_run_command(
+        self, run_id: str, status: str, bridge_id: str, command_id: str,
+    ) -> Run:
+        if status not in {"evidenced", "reconciliation"}:
+            raise StoreError("run finalization status is invalid")
+        commands = self.commands.get(bridge_id)
+        if commands is None:
+            raise StoreError("unknown bridge")
+        command = next((item for item in commands if item["id"] == command_id), None)
+        if (
+            command is None or command.get("action_type") != "run_codex"
+            or command.get("payload", {}).get("run_id") != run_id
+        ):
+            raise StoreError("run finalization command does not match this run")
+        run = self.runs.get(run_id)
+        if run is None:
+            raise StoreError("unknown run")
+        project = self.projects.get(run.project_id)
+        if project is None or project.bridge_id != bridge_id:
+            raise StoreError("bridge does not own this run")
+        if run.status != status and status not in _RUN_STATUS_TRANSITIONS.get(run.status, frozenset()):
+            raise StoreError(f"invalid run status transition: {run.status} -> {status}")
+
+        completed_at = run.completed_at or now_utc()
+        updated = replace(run, status=status, completed_at=completed_at)
+        if (
+            status == "evidenced" and run.status != "evidenced"
+            and run.workflow_id is not None and run.workflow_step_id is not None
+        ):
+            self.complete_workflow_step(
+                run.workflow_id, run.workflow_step_id, "succeeded", "bridge:" + bridge_id,
+            )
+        if status == "reconciliation" and run.session_id is not None:
+            session = self.get_session(run.session_id)
+            resource_key = "worktree:" + session.worktree_id
+            lease = self.leases.get(resource_key)
+            if lease is not None and lease.session_id == session.id and lease.epoch == run.lease_epoch:
+                self.leases[resource_key] = replace(lease, expires_at=completed_at)
+                self._append_workflow_event(session.id, run.workflow_id, "lease.released", {
+                    "resource_key": resource_key, "epoch": lease.epoch,
+                })
+        if status == "reconciliation" and run.workflow_id is not None and run.session_id is not None:
+            workflow = self.get_workflow(run.workflow_id)
+            if workflow.status not in {"completed", "reconciliation", "cancelled"}:
+                self.workflows[workflow.id] = replace(
+                    workflow, status="reconciliation", cursor=(), updated_at=completed_at,
+                )
+                self._append_workflow_event(run.session_id, workflow.id, "workflow.delivery_finished", {
+                    "run_id": run.id, "status": "reconciliation",
+                })
+        self.runs[run_id] = updated
+        self.commands[bridge_id] = [item for item in commands if item["id"] != command_id]
+        self.append_audit("run.finalized", "bridge:" + bridge_id, run.project_id, {
+            "run_id": run_id, "status": status, "command_id": command_id,
+        })
         return updated
 
     def add_transcript(self, run_id: str, role: str, content: Any, bridge_id: str | None = None) -> None:
@@ -638,9 +787,12 @@ class MemoryStore:
         commands = self.commands.get(bridge_id)
         if commands is None:
             raise StoreError("unknown bridge")
-        remaining = [command for command in commands if command["id"] != command_id]
-        if len(remaining) == len(commands):
+        command = next((item for item in commands if item["id"] == command_id), None)
+        if command is None:
             raise StoreError("unknown bridge command")
+        if command["action_type"] == "run_codex":
+            raise StoreError("run commands must be acknowledged through terminal finalization")
+        remaining = [item for item in commands if item["id"] != command_id]
         self.commands[bridge_id] = remaining
 
 
@@ -981,27 +1133,219 @@ class PostgresStore:
         self._append_workflow_event(started.session_id, started.id, "workflow.started", {"step_id": entry, "actor": actor})
         return started
 
+    def start_workflow_run(
+        self, workflow_id: str, task_id: str, model: str, actor: str,
+    ) -> tuple[Workflow, Run]:
+        """Atomically fence a worktree, start a workflow, and queue its run."""
+        connection = self._connection()
+        with connection.transaction():
+            with connection.cursor() as cur:
+                # Discover ids first, then take locks in the same
+                # project -> session -> workflow order as run creation.
+                cur.execute("SELECT * FROM workbench_workflows WHERE id = %s", (workflow_id,))
+                workflow_row = cur.fetchone()
+                if workflow_row is None:
+                    raise StoreError("unknown workflow")
+                workflow = self._workflow(workflow_row)
+                cur.execute("SELECT bridge_id FROM workbench_projects WHERE id = %s FOR UPDATE", (workflow.project_id,))
+                project = cur.fetchone()
+                bridge_id = project["bridge_id"] if project is not None else None
+                if bridge_id is None:
+                    raise StoreError("a project bridge is required before a workflow can start")
+                cur.execute("SELECT * FROM workbench_sessions WHERE id = %s FOR UPDATE", (workflow.session_id,))
+                session = cur.fetchone()
+                if session is None or session["status"] != "active":
+                    raise StoreError("session is not active for this project")
+                cur.execute("SELECT * FROM workbench_workflows WHERE id = %s FOR UPDATE", (workflow_id,))
+                workflow_row = cur.fetchone()
+                if workflow_row is None:
+                    raise StoreError("unknown workflow")
+                if workflow_row["status"] != "draft":
+                    raise StoreError("workflow is not a draft")
+                workflow = self._workflow(workflow_row)
+
+                entry = str(workflow.definition["entry"])
+                step = step_by_id(workflow.definition, entry)
+                if step["kind"] != "agent":
+                    raise StoreError("v1 workflows must begin with an agent step")
+                skills: list[dict[str, str]] = []
+                missing: list[str] = []
+                for skill_id in step.get("skills", []):
+                    cur.execute(
+                        "SELECT * FROM workbench_bridge_skills WHERE bridge_id = %s AND skill_id = %s",
+                        (bridge_id, skill_id),
+                    )
+                    skill_row = cur.fetchone()
+                    if skill_row is None:
+                        missing.append(skill_id)
+                    else:
+                        skill = self._bridge_skill(skill_row)
+                        skills.append({
+                            "skill_id": skill.skill_id,
+                            "description": skill.description,
+                            "content_sha256": skill.content_sha256,
+                        })
+                if missing:
+                    raise StoreError(
+                        "the bridge must publish every selected workflow skill before the workflow can start: "
+                        + ", ".join(missing)
+                    )
+                cur.execute(
+                    "SELECT id FROM workbench_runs WHERE session_id = %s AND status IN ('queued', 'running') FOR UPDATE",
+                    (workflow.session_id,),
+                )
+                if cur.fetchone() is not None:
+                    raise StoreError("a session may have only one active run")
+
+                now = now_utc()
+                resource_key = "worktree:" + str(session["worktree_id"])
+                cur.execute(
+                    "SELECT * FROM workbench_resource_leases WHERE resource_key = %s FOR UPDATE",
+                    (resource_key,),
+                )
+                existing = cur.fetchone()
+                if existing is not None and existing["expires_at"] > now and existing["session_id"] != workflow.session_id:
+                    raise StoreError("resource is leased by another active session")
+                lease = ResourceLease(
+                    resource_key, workflow.session_id, (int(existing["epoch"]) + 1) if existing else 1,
+                    now + timedelta(seconds=300), now,
+                )
+                cur.execute(
+                    "INSERT INTO workbench_resource_leases (resource_key,session_id,epoch,expires_at,created_at) "
+                    "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (resource_key) DO UPDATE SET "
+                    "session_id = EXCLUDED.session_id, epoch = EXCLUDED.epoch, "
+                    "expires_at = EXCLUDED.expires_at, created_at = EXCLUDED.created_at",
+                    (lease.resource_key, lease.session_id, lease.epoch, lease.expires_at, lease.created_at),
+                )
+
+                selected_model = str(step.get("model") or model).strip()
+                run = Run(
+                    new_id("run"), workflow.project_id, task_id, selected_model, "queued",
+                    session_id=workflow.session_id, workflow_id=workflow.id,
+                    workflow_step_id=entry, lease_epoch=lease.epoch,
+                )
+                cur.execute(
+                    "INSERT INTO workbench_runs "
+                    "(id,project_id,task_id,model,status,created_at,completed_at,session_id,workflow_id,workflow_step_id,lease_epoch) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        run.id, run.project_id, run.task_id, run.model, run.status,
+                        run.created_at, None, run.session_id, run.workflow_id,
+                        run.workflow_step_id, run.lease_epoch,
+                    ),
+                )
+                cur.execute(
+                    "UPDATE workbench_workflows SET status = 'running', cursor = %s, updated_at = %s "
+                    "WHERE id = %s AND status = 'draft' RETURNING *",
+                    (self._json([entry]), now, workflow.id),
+                )
+                started_row = cur.fetchone()
+                if started_row is None:
+                    raise StoreError("workflow is not a draft")
+                cur.execute(
+                    "SELECT data FROM workbench_workflow_events "
+                    "WHERE session_id = %s AND kind = 'operator.directive' ORDER BY sequence",
+                    (workflow.session_id,),
+                )
+                directives = [
+                    str(row["data"].get("content", "")) for row in cur.fetchall()
+                    if isinstance(row["data"], dict)
+                ]
+                command_payload = {
+                    "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
+                    "model": run.model, "session_id": run.session_id,
+                    "workflow_id": run.workflow_id, "workflow_step_id": run.workflow_step_id,
+                    "lease_epoch": run.lease_epoch, "worktree_id": str(session["worktree_id"]),
+                    "skills": skills, "directives": directives[-32:],
+                }
+                cur.execute(
+                    "INSERT INTO workbench_commands "
+                    "(id,bridge_id,approval_id,action_type,payload,payload_hash,created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        new_id("command"), bridge_id, None, "run_codex",
+                        self._json(command_payload), payload_hash(command_payload), now,
+                    ),
+                )
+
+                cur.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
+                    "FROM workbench_workflow_events WHERE session_id = %s",
+                    (workflow.session_id,),
+                )
+                sequence = int(cur.fetchone()["sequence"])
+                event_values = (
+                    ("lease.acquired", {"resource_key": resource_key, "epoch": lease.epoch}),
+                    ("workflow.started", {"step_id": entry, "actor": actor, "run_id": run.id}),
+                )
+                for offset, (kind, data) in enumerate(event_values):
+                    cur.execute(
+                        "INSERT INTO workbench_workflow_events "
+                        "(id,session_id,workflow_id,sequence,kind,data,created_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (
+                            new_id("event"), workflow.session_id, workflow.id, sequence + offset,
+                            kind, self._json(redact_value(data)), now,
+                        ),
+                    )
+                cur.execute(
+                    "UPDATE workbench_sessions SET updated_at = %s WHERE id = %s",
+                    (now, workflow.session_id),
+                )
+                audits = (
+                    ("run.created", {
+                        "run_id": run.id, "task_id": task_id, "model": run.model,
+                        "session_id": run.session_id, "workflow_id": run.workflow_id,
+                        "lease_epoch": run.lease_epoch,
+                    }),
+                    ("workflow.run_requested", {
+                        "workflow_id": workflow.id, "step_id": entry, "run_id": run.id,
+                    }),
+                )
+                for kind, data in audits:
+                    cur.execute(
+                        "INSERT INTO workbench_audit (id,kind,actor,project_id,data,created_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s)",
+                        (
+                            new_id("audit"), kind, actor, workflow.project_id,
+                            self._json(redact_value(data)), now,
+                        ),
+                    )
+        return self._workflow(started_row), run
+
     def complete_workflow_step(self, workflow_id: str, step_id: str, outcome: str, actor: str) -> Workflow:
-        workflow = self.get_workflow(workflow_id)
-        if workflow.status not in {"running", "waiting_approval"} or step_id not in workflow.cursor:
-            raise StoreError("workflow step is not runnable")
         if outcome not in {"succeeded", "failed", "cancelled"}:
             raise StoreError("workflow outcome is invalid")
-        if outcome == "failed":
-            status_value, cursor = "reconciliation", ()
-        elif outcome == "cancelled":
-            status_value, cursor = "cancelled", ()
-        else:
-            cursor = next_cursor(workflow.definition, step_id)
-            next_kinds = {step_by_id(workflow.definition, next_step)["kind"] for next_step in cursor}
-            status_value = "completed" if not cursor else "waiting_approval" if "approval_wait" in next_kinds else "reconciliation" if "reconcile" in next_kinds else "running"
-        now = now_utc()
-        with self._connection().cursor() as cur:
-            cur.execute(
-                "UPDATE workbench_workflows SET status = %s, cursor = %s, updated_at = %s WHERE id = %s RETURNING *",
-                (status_value, self._json(list(cursor)), now, workflow_id),
-            )
-            row = cur.fetchone()
+        connection = self._connection()
+        with connection.transaction():
+            with connection.cursor() as cur:
+                cur.execute("SELECT * FROM workbench_workflows WHERE id = %s FOR UPDATE", (workflow_id,))
+                row = cur.fetchone()
+                if row is None:
+                    raise StoreError("unknown workflow")
+                workflow = self._workflow(row)
+                if workflow.status not in {"running", "waiting_approval"} or step_id not in workflow.cursor:
+                    raise StoreError("workflow step is not runnable")
+                if outcome == "failed":
+                    status_value, cursor = "reconciliation", ()
+                elif outcome == "cancelled":
+                    status_value, cursor = "cancelled", ()
+                else:
+                    cursor = advance_cursor(workflow.definition, workflow.cursor, step_id)
+                    next_kinds = {step_by_id(workflow.definition, next_step)["kind"] for next_step in cursor}
+                    status_value = "completed" if not cursor else "waiting_approval" if "approval_wait" in next_kinds else "reconciliation" if "reconcile" in next_kinds else "running"
+                now = now_utc()
+                cur.execute(
+                    "UPDATE workbench_workflows SET status = %s, cursor = %s, updated_at = %s "
+                    "WHERE id = %s AND status = %s AND cursor = %s RETURNING *",
+                    (
+                        status_value, self._json(list(cursor)), now, workflow_id,
+                        workflow.status, self._json(list(workflow.cursor)),
+                    ),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise StoreError("workflow cursor changed; retry the step transition")
         updated = self._workflow(row)
         self._append_workflow_event(updated.session_id, updated.id, "workflow.step.finished", {"step_id": step_id, "outcome": outcome, "next": list(cursor), "actor": actor})
         return updated
@@ -1331,6 +1675,151 @@ class PostgresStore:
             })
         self.append_audit("run.status_changed", "bridge:" + bridge_id, run.project_id, {"run_id": run_id, "status": status})
         return run
+
+    def finalize_run_command(
+        self, run_id: str, status: str, bridge_id: str, command_id: str,
+    ) -> Run:
+        """Commit a terminal run/workflow transition and exact command ack together."""
+        if status not in {"evidenced", "reconciliation"}:
+            raise StoreError("run finalization status is invalid")
+        connection = self._connection()
+        with connection.transaction():
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM workbench_commands WHERE id = %s AND bridge_id = %s FOR UPDATE",
+                    (command_id, bridge_id),
+                )
+                command = cur.fetchone()
+                if (
+                    command is None or command["action_type"] != "run_codex"
+                    or command["payload"].get("run_id") != run_id
+                ):
+                    raise StoreError("run finalization command does not match this run")
+                cur.execute(
+                    "SELECT runs.*, projects.bridge_id FROM workbench_runs runs "
+                    "JOIN workbench_projects projects ON projects.id = runs.project_id "
+                    "WHERE runs.id = %s FOR UPDATE OF runs",
+                    (run_id,),
+                )
+                run_row = cur.fetchone()
+                if run_row is None:
+                    raise StoreError("unknown run")
+                if run_row["bridge_id"] != bridge_id:
+                    raise StoreError("bridge does not own this run")
+                if run_row["status"] != status and status not in _RUN_STATUS_TRANSITIONS.get(run_row["status"], frozenset()):
+                    raise StoreError(f"invalid run status transition: {run_row['status']} -> {status}")
+
+                completed_at = run_row["completed_at"] or now_utc()
+                if run_row["status"] != status:
+                    cur.execute(
+                        "UPDATE workbench_runs SET status = %s, completed_at = %s WHERE id = %s RETURNING *",
+                        (status, completed_at, run_id),
+                    )
+                    updated_row = cur.fetchone()
+                else:
+                    updated_row = run_row
+
+                pending_events: list[tuple[str, str | None, dict[str, Any]]] = []
+                workflow_id = run_row["workflow_id"]
+                workflow_step_id = run_row["workflow_step_id"]
+                session_id = run_row["session_id"]
+                session_row = None
+                if session_id is not None:
+                    # Serialize the append-only event sequence before any
+                    # workflow transition contributes terminal events.
+                    cur.execute("SELECT * FROM workbench_sessions WHERE id = %s FOR UPDATE", (session_id,))
+                    session_row = cur.fetchone()
+                    if session_row is None:
+                        raise StoreError("unknown session")
+                if status == "evidenced" and workflow_id is not None and workflow_step_id is not None:
+                    cur.execute("SELECT * FROM workbench_workflows WHERE id = %s FOR UPDATE", (workflow_id,))
+                    workflow_row = cur.fetchone()
+                    if workflow_row is None:
+                        raise StoreError("unknown workflow")
+                    workflow = self._workflow(workflow_row)
+                    if workflow_step_id in workflow.cursor:
+                        if workflow.status not in {"running", "waiting_approval"}:
+                            raise StoreError("workflow step is not runnable")
+                        cursor = advance_cursor(workflow.definition, workflow.cursor, workflow_step_id)
+                        next_kinds = {
+                            step_by_id(workflow.definition, next_step)["kind"] for next_step in cursor
+                        }
+                        workflow_status = "completed" if not cursor else "waiting_approval" if "approval_wait" in next_kinds else "reconciliation" if "reconcile" in next_kinds else "running"
+                        cur.execute(
+                            "UPDATE workbench_workflows SET status = %s, cursor = %s, updated_at = %s "
+                            "WHERE id = %s",
+                            (workflow_status, self._json(list(cursor)), completed_at, workflow_id),
+                        )
+                        pending_events.append(("workflow.step.finished", workflow_id, {
+                            "step_id": workflow_step_id, "outcome": "succeeded",
+                            "next": list(cursor), "actor": "bridge:" + bridge_id,
+                        }))
+                elif status == "reconciliation":
+                    if session_id is not None:
+                        resource_key = "worktree:" + str(session_row["worktree_id"])
+                        cur.execute(
+                            "UPDATE workbench_resource_leases SET expires_at = %s "
+                            "WHERE resource_key = %s AND session_id = %s AND epoch = %s RETURNING epoch",
+                            (completed_at, resource_key, session_id, run_row["lease_epoch"]),
+                        )
+                        released = cur.fetchone()
+                        if released is not None:
+                            pending_events.append(("lease.released", workflow_id, {
+                                "resource_key": resource_key, "epoch": int(released["epoch"]),
+                            }))
+                    if workflow_id is not None:
+                        cur.execute("SELECT * FROM workbench_workflows WHERE id = %s FOR UPDATE", (workflow_id,))
+                        workflow_row = cur.fetchone()
+                        if workflow_row is None:
+                            raise StoreError("unknown workflow")
+                        if workflow_row["status"] not in {"completed", "reconciliation", "cancelled"}:
+                            cur.execute(
+                                "UPDATE workbench_workflows SET status = 'reconciliation', cursor = %s, updated_at = %s "
+                                "WHERE id = %s",
+                                (self._json([]), completed_at, workflow_id),
+                            )
+                            pending_events.append(("workflow.delivery_finished", workflow_id, {
+                                "run_id": run_id, "status": "reconciliation",
+                            }))
+
+                cur.execute(
+                    "DELETE FROM workbench_commands WHERE id = %s AND bridge_id = %s RETURNING id",
+                    (command_id, bridge_id),
+                )
+                if cur.fetchone() is None:
+                    raise StoreError("run finalization command does not match this run")
+                if session_id is not None and pending_events:
+                    cur.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
+                        "FROM workbench_workflow_events WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    sequence = int(cur.fetchone()["sequence"])
+                    for offset, (kind, event_workflow_id, data) in enumerate(pending_events):
+                        cur.execute(
+                            "INSERT INTO workbench_workflow_events "
+                            "(id,session_id,workflow_id,sequence,kind,data,created_at) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                            (
+                                new_id("event"), session_id, event_workflow_id, sequence + offset,
+                                kind, self._json(redact_value(data)), completed_at,
+                            ),
+                        )
+                    cur.execute(
+                        "UPDATE workbench_sessions SET updated_at = %s WHERE id = %s",
+                        (completed_at, session_id),
+                    )
+                cur.execute(
+                    "INSERT INTO workbench_audit (id,kind,actor,project_id,data,created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)",
+                    (
+                        new_id("audit"), "run.finalized", "bridge:" + bridge_id,
+                        run_row["project_id"], self._json(redact_value({
+                            "run_id": run_id, "status": status, "command_id": command_id,
+                        })), completed_at,
+                    ),
+                )
+        return self._run(updated_row)
 
     def add_transcript(self, run_id: str, role: str, content: Any, bridge_id: str | None = None) -> None:
         clean = redact_value(content)
@@ -1701,8 +2190,16 @@ class PostgresStore:
     def acknowledge_command(self, bridge_id: str, command_id: str) -> None:
         with self._connection().cursor() as cur:
             cur.execute(
-                "DELETE FROM workbench_commands WHERE id = %s AND bridge_id = %s RETURNING id",
+                "DELETE FROM workbench_commands WHERE id = %s AND bridge_id = %s "
+                "AND action_type <> 'run_codex' RETURNING id",
                 (command_id, bridge_id),
             )
             if cur.fetchone() is None:
+                cur.execute(
+                    "SELECT action_type FROM workbench_commands WHERE id = %s AND bridge_id = %s",
+                    (command_id, bridge_id),
+                )
+                command = cur.fetchone()
+                if command is not None and command["action_type"] == "run_codex":
+                    raise StoreError("run commands must be acknowledged through terminal finalization")
                 raise StoreError("unknown bridge command")

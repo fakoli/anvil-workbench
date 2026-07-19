@@ -9,9 +9,10 @@ import pytest
 
 from workbench import bridge as bridge_module
 from workbench.bridge import (
-    ApprovedActionRunner, Bridge, BridgeError, BridgeSettings, CodexRunner, StateReader,
-    VerificationRunner,
+    ApprovedActionRunner, Bridge, BridgeError, BridgeSettings, CodexRunner,
+    CodexTokenBroker, StateReader, VerificationRunner,
 )
+from workbench.codex_auth import fetch_token
 from workbench.skills import SkillError, SkillRegistry
 
 
@@ -140,6 +141,29 @@ def test_verification_rejects_packet_shell_text_not_in_the_local_allowlist(monke
         ).run(packet, reader, "bridge-actor")
 
 
+def test_independent_verification_does_not_inherit_bridge_credentials(monkeypatch, tmp_path: Path):
+    observed: list[dict[str, str]] = []
+    reader = StateReader(settings(tmp_path))
+    monkeypatch.setattr(reader, "capture_verification", lambda *_args: None)
+    monkeypatch.setenv("WORKBENCH_BRIDGE_TOKEN", "bridge-secret")
+    monkeypatch.setenv("GH_TOKEN", "github-secret")
+    monkeypatch.setattr(
+        bridge_module.subprocess,
+        "run",
+        lambda args, **kwargs: observed.append(kwargs["env"])
+        or subprocess.CompletedProcess(args, 0, "ok\n", ""),
+    )
+    command = "python -m pytest -q"
+
+    VerificationRunner(
+        settings(tmp_path, verification_commands=(command,)),
+        lambda _role, _content: None,
+    ).run({"task": {"verification": {"commands": [command]}}}, reader, "bridge-actor")
+
+    assert "WORKBENCH_BRIDGE_TOKEN" not in observed[0]
+    assert "GH_TOKEN" not in observed[0]
+
+
 def test_state_reader_rejects_task_id_argument_injection(tmp_path: Path):
     with pytest.raises(BridgeError, match="unsupported characters"):
         StateReader(settings(tmp_path)).work_packet("T001 --force")
@@ -147,16 +171,21 @@ def test_state_reader_rejects_task_id_argument_injection(tmp_path: Path):
 
 def test_codex_runner_passes_the_workbench_selected_route_to_codex(monkeypatch, tmp_path: Path):
     commands: list[list[str]] = []
+    environments: list[dict[str, str]] = []
 
     class Process:
-        def __init__(self, command, **_kwargs):
+        def __init__(self, command, **kwargs):
             commands.append(command)
+            environments.append(kwargs["env"])
             self.stdout = iter(())
 
         def wait(self):
             return 0
 
     monkeypatch.setenv("ANVIL_ROUTER_TOKEN", "local-only-token")
+    monkeypatch.setenv("WORKBENCH_BRIDGE_TOKEN", "must-not-reach-codex")
+    monkeypatch.setenv("GH_TOKEN", "must-not-reach-codex")
+    monkeypatch.setenv("PROVIDER_SECRET", "must-not-reach-codex")
     monkeypatch.setattr(bridge_module.subprocess, "Popen", Process)
 
     assert CodexRunner(settings(tmp_path), lambda _role, _content: None).run("run_1", {"task_id": "T001"}, "heavy-local") == 0
@@ -168,7 +197,36 @@ def test_codex_runner_passes_the_workbench_selected_route_to_codex(monkeypatch, 
     assert "features.plugins=false" in commands[0]
     assert "features.apps=false" in commands[0]
     assert "features.multi_agent=false" in commands[0]
+    assert 'shell_environment_policy.inherit="none"' in commands[0]
+    assert "shell_environment_policy.ignore_default_excludes=false" in commands[0]
+    assert "sandbox_workspace_write.network_access=false" in commands[0]
     assert commands[0][:4] == ["codex", "--ask-for-approval", "never", "exec"]
+    assert "ANVIL_ROUTER_TOKEN" not in environments[0]
+    assert "WORKBENCH_BRIDGE_TOKEN" not in environments[0]
+    assert "GH_TOKEN" not in environments[0]
+    assert "PROVIDER_SECRET" not in environments[0]
+    shell_set = next(item for item in commands[0] if item.startswith("shell_environment_policy.set="))
+    assert "ANVIL_ROUTER_TOKEN" not in shell_set
+    assert not any('model_providers.anvil.env_key=' in item for item in commands[0])
+    assert any(item.startswith("model_providers.anvil.auth.command=") for item in commands[0])
+    auth_args = next(item for item in commands[0] if item.startswith("model_providers.anvil.auth.args="))
+    assert '"-I", "-m", "workbench.codex_auth"' in auth_args
+
+
+def test_codex_token_broker_keeps_the_router_token_out_of_process_environment(tmp_path: Path):
+    shadow = tmp_path / "workbench"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("", encoding="utf-8")
+    (shadow / "codex_auth.py").write_text('print("shadowed worktree helper")\n', encoding="utf-8")
+    with CodexTokenBroker("run-scoped-router-token") as broker:
+        assert fetch_token(broker.endpoint) == "run-scoped-router-token"
+        completed = subprocess.run(
+            [sys.executable, "-I", "-m", "workbench.codex_auth", broker.endpoint],
+            cwd=tmp_path, capture_output=True, text=True, check=True,
+        )
+        assert completed.stdout == "run-scoped-router-token"
+    with pytest.raises(RuntimeError, match="run-scoped loopback"):
+        fetch_token("https://provider.example/token/not-loopback")
 
 
 def test_codex_runner_rejects_an_unselected_model_route(monkeypatch, tmp_path: Path):
@@ -183,6 +241,7 @@ def test_bridge_run_claims_verifies_and_submits_before_needs_review(monkeypatch,
         def __init__(self) -> None:
             self.evidence_events: list[tuple[str, dict[str, object]]] = []
             self.statuses: list[tuple[str, str]] = []
+            self.finalizations: list[tuple[str, str, str]] = []
 
         def next_command(self):
             return {"id": "command_1", "action_type": "run_codex", "payload": {"run_id": "run_1", "task_id": "T001"}}
@@ -198,6 +257,9 @@ def test_bridge_run_claims_verifies_and_submits_before_needs_review(monkeypatch,
 
         def run_status(self, run_id, status):
             self.statuses.append((run_id, status))
+
+        def finalize_run(self, run_id, status, command_id):
+            self.finalizations.append((run_id, status, command_id))
 
     class Verifier:
         def __init__(self, *_args) -> None:
@@ -230,7 +292,8 @@ def test_bridge_run_claims_verifies_and_submits_before_needs_review(monkeypatch,
     assert bridge.poll_once() is True
     assert submitted == [("T001", ("pytest tests/test_extract.py -v",), ("src/mdlinks/extract.py",), "workbench-bridge_1")]
     assert [kind for kind, _payload in hub.evidence_events] == ["state_event", "work_packet", "state_event"]
-    assert hub.statuses == [("run_1", "running"), ("run_1", "evidenced")]
+    assert hub.statuses == [("run_1", "running")]
+    assert hub.finalizations == [("run_1", "evidenced", "command_1")]
 
 
 def test_bridge_marks_a_failed_verification_for_reconciliation(monkeypatch, tmp_path: Path):
@@ -238,6 +301,7 @@ def test_bridge_marks_a_failed_verification_for_reconciliation(monkeypatch, tmp_
         def __init__(self) -> None:
             self.statuses: list[tuple[str, str]] = []
             self.evidence_events: list[tuple[str, dict[str, object]]] = []
+            self.finalizations: list[tuple[str, str, str]] = []
 
         def next_command(self):
             return {"id": "command_1", "action_type": "run_codex", "payload": {"run_id": "run_1", "task_id": "T001", "model": "heavy-local"}}
@@ -253,6 +317,9 @@ def test_bridge_marks_a_failed_verification_for_reconciliation(monkeypatch, tmp_
 
         def run_status(self, run_id, status):
             self.statuses.append((run_id, status))
+
+        def finalize_run(self, run_id, status, command_id):
+            self.finalizations.append((run_id, status, command_id))
 
     class Verifier:
         def __init__(self, *_args) -> None:
@@ -271,7 +338,8 @@ def test_bridge_marks_a_failed_verification_for_reconciliation(monkeypatch, tmp_
 
     with pytest.raises(BridgeError, match="independent verification failed"):
         bridge.poll_once()
-    assert hub.statuses == [("run_1", "running"), ("run_1", "reconciliation")]
+    assert hub.statuses == [("run_1", "running")]
+    assert hub.finalizations == [("run_1", "reconciliation", "command_1")]
     assert hub.evidence_events[-1][0] == "failure"
     assert hub.evidence_events[-1][1]["reconciliation_required"] is True
 
@@ -320,6 +388,71 @@ def test_approved_github_action_runner_uses_only_the_bound_worktree(monkeypatch,
     runner = ApprovedActionRunner(settings(default), checkout)
     runner._run("git", "status", "--short")
     assert observed == [checkout]
+
+
+def test_git_snapshot_includes_untracked_files_for_evidence_and_approval(tmp_path: Path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "workbench@example.test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Workbench Test"], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=tmp_path, check=True, capture_output=True)
+
+    before = ApprovedActionRunner(settings(tmp_path)).diff_hash()
+    (tmp_path / "new-evidence.txt").write_text("new evidence\n", encoding="utf-8")
+    packet = {"task": {"likely_files": ["new-evidence.txt"]}}
+
+    changed = VerificationRunner(
+        settings(tmp_path), lambda _role, _content: None,
+    ).changed_likely_files(packet)
+    after = ApprovedActionRunner(settings(tmp_path)).diff_hash()
+
+    assert changed == ("new-evidence.txt",)
+    assert before != after
+    assert subprocess.run(
+        ["git", "status", "--short"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout == "?? new-evidence.txt\n"
+
+
+def test_commit_uses_the_verified_tree_even_if_the_working_file_changes(monkeypatch, tmp_path: Path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "workbench@example.test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Workbench Test"], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=tmp_path, check=True, capture_output=True)
+    evidence = tmp_path / "new-evidence.txt"
+    evidence.write_text("approved content\n", encoding="utf-8")
+    runner = ApprovedActionRunner(settings(tmp_path))
+    approved_hash = runner.diff_hash()
+    real_snapshot = bridge_module._git_snapshot
+    real_run = runner._run
+
+    def snapshot_then_change(root):
+        snapshot = real_snapshot(root)
+        evidence.write_text("changed after verification\n", encoding="utf-8")
+        return snapshot
+
+    def local_effects(*args: str, **kwargs):
+        if args[:2] == ("git", "push"):
+            return ""
+        if args[:3] == ("gh", "pr", "create"):
+            return "https://github.test/pull/1"
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_module, "_git_snapshot", snapshot_then_change)
+    monkeypatch.setattr(runner, "_run", local_effects)
+    receipt = runner.commit_pr({
+        "diff_hash": approved_hash, "title": "approved tree", "branch": "codex/approved-tree",
+    })
+
+    assert receipt["pr_url"] == "https://github.test/pull/1"
+    assert subprocess.run(
+        ["git", "show", "HEAD:new-evidence.txt"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout == "approved content\n"
+    assert evidence.read_text(encoding="utf-8") == "changed after verification\n"
 
 
 def test_merge_rejects_a_pull_request_head_that_changed_after_approval(monkeypatch, tmp_path: Path):

@@ -99,3 +99,40 @@ def step_by_id(definition: dict[str, Any], step_id: str) -> dict[str, Any]:
 def next_cursor(definition: dict[str, Any], step_id: str) -> tuple[str, ...]:
     """Resolve a completed node's explicit next nodes without executing them."""
     return tuple(step_by_id(definition, step_id)["next"])
+
+
+def _can_reach(definition: dict[str, Any], start: str, target: str) -> bool:
+    pending = [start]
+    visited: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == target:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(step_by_id(definition, current)["next"])
+    return False
+
+
+def advance_cursor(
+    definition: dict[str, Any], cursor: tuple[str, ...], completed_step_id: str,
+) -> tuple[str, ...]:
+    """Remove one finished branch and merge successors without dropping siblings.
+
+    A join becomes runnable only after no other unfinished cursor branch can
+    still reach it. This gives fan-out branches a small durable barrier without
+    executing model-authored logic in the store.
+    """
+    remaining = [step_id for step_id in cursor if step_id != completed_step_id]
+    successors = next_cursor(definition, completed_step_id)
+    merged = list(remaining)
+    for successor in successors:
+        if successor in merged:
+            continue
+        if step_by_id(definition, successor)["kind"] == "join" and any(
+            _can_reach(definition, active_step, successor) for active_step in remaining
+        ):
+            continue
+        merged.append(successor)
+    return tuple(merged)
