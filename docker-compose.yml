@@ -5,7 +5,7 @@ services:
       dockerfile: deploy/Dockerfile.web
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "${ANVIL_WORKBENCH_BIND:-127.0.0.1}:${ANVIL_WORKBENCH_PORT:-8090}:8080"
     networks: [workbench]
@@ -23,6 +23,9 @@ services:
       WORKBENCH_OWNER: ${WORKBENCH_OWNER:?set in .env}
       WORKBENCH_APPROVERS: ${WORKBENCH_APPROVERS:-}
       WORKBENCH_IDENTITY_HEADER: ${WORKBENCH_IDENTITY_HEADER:-Tailscale-User-Login}
+      # Loopback-only development escape hatch. Production must remain false and
+      # receive identity exclusively from the tailnet proxy.
+      WORKBENCH_ALLOW_INSECURE_DEV_ACTOR: ${WORKBENCH_ALLOW_INSECURE_DEV_ACTOR:-false}
       ANVIL_ROUTER_BASE_URL: ${ANVIL_ROUTER_BASE_URL:?set in .env}
       ANVIL_ROUTER_TOKEN: ${ANVIL_ROUTER_TOKEN:?set in the host environment}
       WORKBENCH_EMBEDDING_MODEL: ${WORKBENCH_EMBEDDING_MODEL:-}
@@ -34,6 +37,11 @@ services:
         condition: service_healthy
     networks: [workbench]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8090/healthz', timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   db:
     image: postgres:17-alpine

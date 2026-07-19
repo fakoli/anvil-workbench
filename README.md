@@ -2,6 +2,8 @@
 
 Anvil Workbench is a private, tailnet-only delivery cockpit for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
 
+Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
+
 It is deliberately a separate product:
 
 - **Anvil State** is canonical for PRDs, claims, tasks, evidence, and acceptance.
@@ -71,4 +73,17 @@ npm run dev
 
 `MemoryStore` and `NullGraph` make the API and bridge contract tests hermetic. Production startup always initializes Postgres; there is no silent in-memory fallback.
 
+For a loopback-only UI/API smoke test, set `WORKBENCH_ALLOW_INSECURE_DEV_ACTOR=true` in the untracked `.env` file. This permits the configured owner to use the browser shell without a tailnet identity proxy. It is deliberately passed through only by the local Compose stack and must remain `false` in a deployed hub.
+
 When `WORKBENCH_EMBEDDING_MODEL` is configured, evidence retrieval uses Anvil Serving's existing `/v1/embeddings` purpose route. If `WORKBENCH_RERANK_MODEL` is also configured, the fixed evidence-search tool reranks the vector/graph candidates through `/v1/rerank`. Raw transcripts are excluded before either request; an unavailable local retrieval serve falls back only to Neo4j's redacted keyword/lineage query, never a provider API.
+
+## Repository map
+
+| Document | Use it for |
+| --- | --- |
+| [Project brief](docs/PROJECT.md) | Product promise, boundaries, users, and the v1 delivery flow. |
+| [Contracts](docs/CONTRACTS.md) | The exact Anvil State, Anvil Serving, bridge, graph, and approval contracts. |
+| [Roadmap](docs/ROADMAP.md) | What is implemented, what requires a live qualification, and the next milestones. |
+| [Session handoff](docs/SESSION-HANDOFF.md) | A concise restart point for the next coding session. |
+| [Contributing](CONTRIBUTING.md) | Local setup, test commands, Compose validation, and PR expectations. |
+| [Agent guide](AGENTS.md) | Non-negotiable product and safety rules for coding agents. |
