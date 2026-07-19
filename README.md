@@ -27,6 +27,8 @@ docker compose up -d --build
 
 The `deploy/Dockerfile.hub` target creates the single `ghcr.io/fakoli/anvil-workbench` image consumed by Anvil Serving's packaged lifecycle template. It bundles the browser shell and API at one private port.
 
+Pushes to `main` that change the hub build inputs publish that image as `latest`, `main`, and an immutable `sha-<commit>` tag through [the hub-image workflow](.github/workflows/publish-hub-image.yml). The workflow builds the existing Dockerfile, links the package back to this repository, and publishes a build attestation. GitHub Container packages are private on first publish, so set the package visibility to **Public** once in its GitHub package settings before an unauthenticated Anvil Serving host pulls `:latest`; no deployment credential belongs in `workbench.env`.
+
 The optional lifecycle wrapper from Anvil Serving runs the same stack:
 
 ```powershell
