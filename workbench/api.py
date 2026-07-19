@@ -20,7 +20,6 @@ from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
 from .store import PostgresStore, StoreError, WorkbenchStore
 from .voice import relay_realtime
-from .workflows import step_by_id
 
 
 def default_delivery_workflow(skills: list[str] | None = None) -> dict[str, Any]:
@@ -87,7 +86,12 @@ class BridgeEvent(BaseModel):
 
 
 class RunStatusInput(BaseModel):
-    status: str = Field(pattern="^(running|evidenced|reconciliation)$")
+    status: str = Field(pattern="^(running|reconciliation)$")
+
+
+class RunFinalizationInput(BaseModel):
+    status: str = Field(pattern="^(evidenced|reconciliation)$")
+    command_id: str = Field(min_length=1, max_length=300)
 
 
 class EvidenceInput(BaseModel):
@@ -257,36 +261,9 @@ def create_app(
 
     @app.post("/api/workflows/{workflow_id}/start", status_code=status.HTTP_201_CREATED)
     def start_workflow(workflow_id: str, payload: WorkflowStartInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
-        workflow = store.get_workflow(workflow_id)
-        project = next((item for item in store.list_projects() if item.id == workflow.project_id), None)
-        if project is None or project.bridge_id is None:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a project bridge is required before a workflow can start")
-        step = step_by_id(workflow.definition, str(workflow.definition["entry"]))
-        if step["kind"] != "agent":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="v1 workflows must begin with an agent step")
-        requested_skills = list(step.get("skills", []))
-        if requested_skills:
-            published = {
-                skill.skill_id for skill in store.list_bridge_skills(workflow.project_id)
-                if skill.bridge_id == project.bridge_id
-            }
-            missing = [skill_id for skill_id in requested_skills if skill_id not in published]
-            if missing:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="the bridge must publish every selected workflow skill before the workflow can start: "
-                    + ", ".join(missing),
-                )
-        model = str(step.get("model") or payload.model)
-        run = store.create_run(
-            workflow.project_id, payload.task_id, model, session_id=workflow.session_id,
-            workflow_id=workflow.id, workflow_step_id=step["id"],
+        started, run = store.start_workflow_run(
+            workflow_id, payload.task_id, payload.model, current_actor,
         )
-        started = store.start_workflow(workflow_id, current_actor)
-        store.enqueue_run(project.bridge_id, run)
-        store.append_audit("workflow.run_requested", current_actor, started.project_id, {
-            "workflow_id": started.id, "step_id": step["id"], "run_id": run.id,
-        })
         return {"workflow": as_json(started), "run": as_json(run)}
 
     @app.post("/api/runs", status_code=status.HTTP_201_CREATED)
@@ -406,6 +383,17 @@ def create_app(
         if bridge_id != authenticated_bridge:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
         return as_json(store.update_run_status(run_id, payload.status, bridge_id))
+
+    @app.post("/api/bridge/{bridge_id}/runs/{run_id}/finalize")
+    def finalize_bridge_run(
+        bridge_id: str, run_id: str, payload: RunFinalizationInput,
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        return as_json(store.finalize_run_command(
+            run_id, payload.status, bridge_id, payload.command_id,
+        ))
 
     @app.get("/api/bridge/{bridge_id}/runs/{run_id}/lease")
     def bridge_run_lease(

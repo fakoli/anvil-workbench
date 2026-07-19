@@ -57,7 +57,7 @@ def test_fenced_run_cannot_start_after_its_worktree_lease_changes():
         store.validate_run_lease(run.id, bridge.id)
 
 
-def test_bridge_command_is_leased_until_acknowledged_not_destroyed_on_delivery():
+def test_run_command_is_leased_until_atomic_terminal_finalization():
     store = MemoryStore()
     project = store.create_project("demo", ".anvil")
     bridge, _ = store.register_bridge(project.id, "bridge")
@@ -70,7 +70,9 @@ def test_bridge_command_is_leased_until_acknowledged_not_destroyed_on_delivery()
     assert store.next_command(bridge.id) is None
     assert len(store.commands[bridge.id]) == 1
 
-    store.acknowledge_command(bridge.id, command["id"])
+    with pytest.raises(StoreError, match="terminal finalization"):
+        store.acknowledge_command(bridge.id, command["id"])
+    store.finalize_run_command(run.id, "reconciliation", bridge.id, command["id"])
     assert store.next_command(bridge.id) is None
 
 
@@ -90,6 +92,69 @@ def test_workflows_are_version_pinned_and_wait_at_approval_boundary():
     events = store.list_workflow_events(session.id)
     assert [event.sequence for event in events] == list(range(1, len(events) + 1))
     assert events[-1].kind == "workflow.step.finished"
+
+
+def test_workflow_start_is_one_retry_safe_run_lease_and_command_operation():
+    store = MemoryStore()
+    project = store.create_project("demo", ".anvil")
+    bridge, _ = store.register_bridge(project.id, "bridge")
+    session, workflow = store.create_session(project.id, "atomic", "checkout-a", delivery_workflow())
+
+    started, run = store.start_workflow_run(workflow.id, "TASK-1", "planning", "operator")
+    command = store.next_command(bridge.id)
+    assert started.status == "running"
+    assert run.lease_epoch == 1
+    assert command is not None and command["payload"]["run_id"] == run.id
+
+    with pytest.raises(StoreError, match="not a draft"):
+        store.start_workflow_run(workflow.id, "TASK-1", "planning", "operator")
+    assert len(store.list_runs(project.id)) == 1
+    assert store.leases["worktree:" + session.worktree_id].epoch == 1
+    assert len(store.commands[bridge.id]) == 1
+
+
+def test_fan_out_completion_preserves_siblings_and_waits_for_join_barrier():
+    store = MemoryStore()
+    project = store.create_project("demo", ".anvil")
+    definition = {
+        "entry": "fork",
+        "steps": [
+            {"id": "fork", "kind": "fan_out", "next": ["left", "right"]},
+            {"id": "left", "kind": "agent", "next": ["join"]},
+            {"id": "right", "kind": "agent", "next": ["join"]},
+            {"id": "join", "kind": "join", "next": []},
+        ],
+    }
+    _session, workflow = store.create_session(project.id, "fan out", "default", definition)
+    store.start_workflow(workflow.id, "operator")
+    forked = store.complete_workflow_step(workflow.id, "fork", "succeeded", "bridge")
+    after_left = store.complete_workflow_step(workflow.id, "left", "succeeded", "bridge")
+    after_right = store.complete_workflow_step(workflow.id, "right", "succeeded", "bridge")
+
+    assert forked.cursor == ("left", "right")
+    assert after_left.cursor == ("right",)
+    assert after_right.cursor == ("join",)
+
+
+def test_run_finalizer_advances_workflow_and_acknowledges_exact_command_atomically():
+    store = MemoryStore()
+    project = store.create_project("demo", ".anvil")
+    bridge, _ = store.register_bridge(project.id, "bridge")
+    _session, workflow = store.create_session(project.id, "finalize", "checkout-a", delivery_workflow())
+    _started, run = store.start_workflow_run(workflow.id, "TASK-1", "planning", "operator")
+    command = store.next_command(bridge.id)
+    assert command is not None
+    store.update_run_status(run.id, "running", bridge.id)
+
+    with pytest.raises(StoreError, match="does not match"):
+        store.finalize_run_command(run.id, "evidenced", bridge.id, "command_wrong")
+    assert store.runs[run.id].status == "running"
+    assert len(store.commands[bridge.id]) == 1
+
+    evidenced = store.finalize_run_command(run.id, "evidenced", bridge.id, command["id"])
+    assert evidenced.status == "evidenced"
+    assert store.get_workflow(workflow.id).status == "waiting_approval"
+    assert store.next_command(bridge.id) is None
 
 
 def test_delivery_actions_hold_the_leased_worktree_until_merge_and_reconcile_failures():

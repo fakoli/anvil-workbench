@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib.error import HTTPError, URLError
@@ -33,9 +35,76 @@ class BridgeError(RuntimeError):
 
 _SAFE_STATE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
+_CODEX_RUNTIME_ENV = frozenset({
+    "COMSPEC", "LANG", "LC_ALL", "PATH", "PATHEXT", "PYTHONIOENCODING",
+    "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "WINDIR",
+})
+
+
+def _allowlisted_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Return only non-credential process variables needed to launch Codex."""
+    allowed = {name.casefold() for name in _CODEX_RUNTIME_ENV}
+    return {name: value for name, value in source.items() if name.casefold() in allowed}
+
+
+def _toml_inline_table(values: Mapping[str, str]) -> str:
+    return "{ " + ", ".join(
+        f"{json.dumps(name)} = {json.dumps(value)}" for name, value in sorted(values.items())
+    ) + " }"
+
 
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+class _CodexTokenHandler(BaseHTTPRequestHandler):
+    server_version = "WorkbenchCodexToken/1"
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        server = self.server
+        if (
+            self.client_address[0] != "127.0.0.1"
+            or self.path != f"/token/{server.nonce}"
+        ):
+            self.send_error(404)
+            return
+        body = server.token.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        # A credential endpoint must never log its nonce or request path.
+        return
+
+
+class CodexTokenBroker:
+    """Expose one run-scoped router token only to Codex provider auth."""
+
+    def __init__(self, token: str) -> None:
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _CodexTokenHandler)
+        self._server.daemon_threads = True
+        self._server.token = token
+        self._server.nonce = secrets.token_urlsafe(32)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, name="workbench-codex-token", daemon=True,
+        )
+
+    @property
+    def endpoint(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}/token/{self._server.nonce}"
+
+    def __enter__(self) -> CodexTokenBroker:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
 
 
 @dataclass(frozen=True)
@@ -112,6 +181,12 @@ class HubTransport:
 
     def run_status(self, run_id: str, status: str) -> None:
         self.request("POST", f"/api/bridge/{self.bridge_id}/runs/{run_id}/status", {"status": status})
+
+    def finalize_run(self, run_id: str, status: str, command_id: str) -> None:
+        self.request(
+            "POST", f"/api/bridge/{self.bridge_id}/runs/{run_id}/finalize",
+            {"status": status, "command_id": command_id},
+        )
 
     def validate_run_lease(self, run_id: str) -> dict[str, Any]:
         result = self.request("GET", f"/api/bridge/{self.bridge_id}/runs/{run_id}/lease")
@@ -365,12 +440,13 @@ class CodexRunner:
         header_toml = ", ".join(
             f"{json.dumps(name)} = {json.dumps(value)}" for name, value in correlation_headers.items()
         )
+        environment = _allowlisted_environment(os.environ)
+        tool_environment = dict(environment)
         default_config = (
             f"model={json.dumps(model)}",
             'model_provider="anvil"',
             'model_providers.anvil.name="Anvil Serving"',
             f'model_providers.anvil.base_url="{self.settings.router_base_url.rstrip("/")}"',
-            'model_providers.anvil.env_key="ANVIL_ROUTER_TOKEN"',
             'model_providers.anvil.wire_api="responses"',
             # Hosted web search is represented as a non-function Responses
             # tool and would bypass the project-local tool boundary. The
@@ -389,36 +465,54 @@ class CodexRunner:
             "features.image_generation=false",
             f"model_providers.anvil.http_headers={{ {header_toml} }}",
         )
-        command = [
-            self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json", "-C", str(self.worktree_root),
-            # The bridge's own sandbox/approval contract is authoritative.
-            # Project rules are unreviewed input to this supervisor and must
-            # not silently add external tool surfaces to a managed run.
-            "--sandbox", "workspace-write", "--ignore-user-config", "--ignore-rules",
-        ]
-        for entry in (*default_config, *self.settings.codex_config):
-            command.extend(["-c", entry])
-        command.append(prompt)
-        environment = dict(os.environ)
-        environment["ANVIL_ROUTER_TOKEN"] = token
-        self.emit("bridge.codex.started", {
-            "command": [self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json"],
-            "router": self.settings.router_base_url,
-            "model": model,
-        })
-        process = subprocess.Popen(
-            command, cwd=self.worktree_root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=environment,
+        security_config = (
+            # The router bearer token exists only in the Codex supervisor
+            # process. Managed shell tools inherit no ambient environment and
+            # receive only this non-credential runtime allowlist.
+            'shell_environment_policy.inherit="none"',
+            f"shell_environment_policy.set={_toml_inline_table(tool_environment)}",
+            "shell_environment_policy.ignore_default_excludes=false",
+            "sandbox_workspace_write.network_access=false",
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.rstrip("\n")
-            try:
-                event: Any = json.loads(line)
-            except json.JSONDecodeError:
-                event = {"type": "codex.output", "text": line}
-            self.emit("codex.event", event)
-        code = process.wait()
+        with CodexTokenBroker(token) as broker:
+            auth_config = (
+                f"model_providers.anvil.auth.command={json.dumps(sys.executable)}",
+                "model_providers.anvil.auth.args=["
+                + ", ".join(
+                    json.dumps(value) for value in ("-I", "-m", "workbench.codex_auth", broker.endpoint)
+                )
+                + "]",
+                "model_providers.anvil.auth.timeout_ms=5000",
+                "model_providers.anvil.auth.refresh_interval_ms=0",
+            )
+            command = [
+                self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json", "-C", str(self.worktree_root),
+                # The bridge's own sandbox/approval contract is authoritative.
+                # Project rules are unreviewed input to this supervisor and must
+                # not silently add external tool surfaces to a managed run.
+                "--sandbox", "workspace-write", "--ignore-user-config", "--ignore-rules",
+            ]
+            for entry in (*default_config, *auth_config, *self.settings.codex_config, *security_config):
+                command.extend(["-c", entry])
+            command.append(prompt)
+            self.emit("bridge.codex.started", {
+                "command": [self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json"],
+                "router": self.settings.router_base_url,
+                "model": model,
+            })
+            process = subprocess.Popen(
+                command, cwd=self.worktree_root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=environment,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                line = line.rstrip("\n")
+                try:
+                    event: Any = json.loads(line)
+                except json.JSONDecodeError:
+                    event = {"type": "codex.output", "text": line}
+                self.emit("codex.event", event)
+            code = process.wait()
         self.emit("bridge.codex.finished", {"exit_code": code})
         return code
 
@@ -428,6 +522,53 @@ class VerificationResult:
     command: str
     exit_code: int
     output_sha256: str
+
+
+@dataclass(frozen=True)
+class GitSnapshot:
+    """Exact working-tree state represented by an isolated Git index."""
+
+    diff_sha256: str
+    tree_sha: str
+    changed_files: tuple[str, ...]
+
+
+def _git_snapshot(worktree_root: Path) -> GitSnapshot:
+    """Stage the complete working tree in a temporary index without mutating it."""
+    index_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            index_path = Path(stream.name)
+        index_path.unlink()
+        environment = dict(os.environ)
+        environment["GIT_INDEX_FILE"] = str(index_path)
+
+        def git(*args: str) -> bytes:
+            completed = subprocess.run(
+                ("git", *args), cwd=worktree_root, env=environment,
+                capture_output=True, check=False,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.decode("utf-8", errors="replace").strip()[:500]
+                raise BridgeError(f"Git snapshot failed ({args[0]}): {detail}")
+            return completed.stdout
+
+        git("read-tree", "HEAD")
+        git("add", "-A")
+        diff = git("diff", "--binary", "--no-ext-diff", "--cached", "HEAD")
+        names = git("diff", "--name-only", "-z", "--relative", "--cached", "HEAD")
+        tree_sha = git("write-tree").decode("ascii").strip()
+        changed = tuple(
+            item.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+            for item in names.split(b"\0") if item
+        )
+        return GitSnapshot(hashlib.sha256(diff).hexdigest(), tree_sha, changed)
+    finally:
+        if index_path is not None:
+            try:
+                index_path.unlink()
+            except OSError:
+                pass
 
 
 class VerificationRunner:
@@ -476,6 +617,7 @@ class VerificationRunner:
             completed = subprocess.run(
                 argv, cwd=self.worktree_root, shell=False, capture_output=True,
                 text=True, encoding="utf-8", errors="replace", check=False,
+                env=_allowlisted_environment(os.environ),
             )
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
@@ -497,13 +639,7 @@ class VerificationRunner:
         likely_files = task.get("likely_files") if isinstance(task, dict) else None
         if not isinstance(likely_files, list):
             return ()
-        completed = subprocess.run(
-            ["git", "diff", "--name-only", "--relative", "HEAD"], cwd=self.worktree_root,
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
-        )
-        if completed.returncode != 0:
-            raise BridgeError("bridge requires a committed project baseline before it can submit evidence")
-        changed = {line.strip().replace("\\", "/") for line in completed.stdout.splitlines() if line.strip()}
+        changed = set(_git_snapshot(self.worktree_root).changed_files)
         return tuple(str(item) for item in likely_files if isinstance(item, str) and item.replace("\\", "/") in changed)
 
 
@@ -514,19 +650,22 @@ class ApprovedActionRunner:
         self.settings = settings
         self.worktree_root = worktree_root or settings.project_root
 
-    def _run(self, *args: str) -> str:
-        completed = subprocess.run(args, cwd=self.worktree_root, capture_output=True, text=True, check=False)
+    def _run(self, *args: str, environment: Mapping[str, str] | None = None) -> str:
+        completed = subprocess.run(
+            args, cwd=self.worktree_root, capture_output=True, text=True,
+            check=False, env=environment,
+        )
         if completed.returncode != 0:
             raise BridgeError(f"command failed ({args[0]}): {completed.stderr.strip()[:500]}")
         return completed.stdout.strip()
 
     def diff_hash(self) -> str:
-        diff = self._run("git", "diff", "--binary", "--no-ext-diff", "HEAD")
-        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        return _git_snapshot(self.worktree_root).diff_sha256
 
     def commit_pr(self, payload: dict[str, Any]) -> dict[str, Any]:
         expected = str(payload.get("diff_hash", ""))
-        actual = self.diff_hash()
+        snapshot = _git_snapshot(self.worktree_root)
+        actual = snapshot.diff_sha256
         if not expected or expected != actual:
             raise BridgeError("current diff differs from the hash that was approved")
         title = str(payload.get("title", "Anvil Workbench delivery"))
@@ -534,7 +673,10 @@ class ApprovedActionRunner:
         if not branch:
             raise BridgeError("approved PR action is missing its target branch")
         base = str(payload.get("base", "main"))
-        self._run("git", "add", "-A")
+        # Populate the real index with the exact tree that was just verified.
+        # A file-system change after this point cannot broaden the approved
+        # commit, because no second `git add` reads from the working tree.
+        self._run("git", "read-tree", snapshot.tree_sha)
         self._run("git", "commit", "-m", title)
         self._run("git", "push", "-u", "origin", branch)
         pr_url = self._run("gh", "pr", "create", "--base", base, "--head", branch, "--title", title, "--fill")
@@ -731,29 +873,14 @@ class Bridge:
                     "commands": [result.command for result in verification],
                     "evidence_id": submission.get("data", {}).get("evidence_id") if isinstance(submission.get("data"), dict) else None,
                 })
-                workflow_id = payload.get("workflow_id")
-                workflow_step_id = payload.get("workflow_step_id")
-                if isinstance(workflow_id, str) and isinstance(workflow_step_id, str):
-                    self.hub.workflow_step(workflow_id, workflow_step_id, "succeeded")
             except BridgeError as exc:
                 self.hub.evidence("failure", f"{run_id}:reconciliation", self.settings.project_id, {
                     "task_id": task_id, "fingerprint": "bridge-reconciliation", "reconciliation_required": True, "error": str(exc),
                 })
-                workflow_id = payload.get("workflow_id")
-                workflow_step_id = payload.get("workflow_step_id")
-                if isinstance(workflow_id, str) and isinstance(workflow_step_id, str):
-                    try:
-                        self.hub.workflow_step(workflow_id, workflow_step_id, "failed")
-                    except BridgeError:
-                        # Run reconciliation remains the durable source if the
-                        # workflow transition itself cannot be recorded.
-                        pass
-                self.hub.run_status(run_id, "reconciliation")
-                self.hub.acknowledge_command(str(command["id"]))
+                self.hub.finalize_run(run_id, "reconciliation", str(command["id"]))
                 raise
             else:
-                self.hub.run_status(run_id, "evidenced")
-                self.hub.acknowledge_command(str(command["id"]))
+                self.hub.finalize_run(run_id, "evidenced", str(command["id"]))
                 return True
             finally:
                 lease_stop.set()

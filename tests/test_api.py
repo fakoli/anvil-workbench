@@ -31,12 +31,13 @@ def test_api_releases_only_an_approved_hash_bound_bridge_action():
         running = test_client.post(f"/api/bridge/{bridge['id']}/runs/{run['id']}/status", headers=bridge_headers, json={"status": "running"})
         assert running.status_code == 200
         assert running.json()["status"] == "running"
-        reconciled = test_client.post(f"/api/bridge/{bridge['id']}/runs/{run['id']}/status", headers=bridge_headers, json={"status": "reconciliation"})
+        reconciled = test_client.post(
+            f"/api/bridge/{bridge['id']}/runs/{run['id']}/finalize", headers=bridge_headers,
+            json={"status": "reconciliation", "command_id": queued_run["id"]},
+        )
         assert reconciled.status_code == 200
         assert reconciled.json()["completed_at"] is not None
-        assert test_client.post(
-            f"/api/bridge/{bridge['id']}/commands/{queued_run['id']}/ack", headers=bridge_headers,
-        ).status_code == 202
+        assert test_client.get(f"/api/bridge/{bridge['id']}/commands/next", headers=bridge_headers).json() is None
 
         session_response = test_client.post("/api/sessions", json={
             "project_id": project["id"], "title": "approval delivery", "worktree_id": "checkout-a",
@@ -54,17 +55,21 @@ def test_api_releases_only_an_approved_hash_bound_bridge_action():
             f"/api/bridge/{bridge['id']}/runs/{delivery_run['id']}/status",
             headers=bridge_headers, json={"status": "running"},
         ).status_code == 200
+        finalized = test_client.post(
+            f"/api/bridge/{bridge['id']}/runs/{delivery_run['id']}/finalize",
+            headers=bridge_headers,
+            json={"status": "evidenced", "command_id": queued_delivery["id"]},
+        )
+        assert finalized.status_code == 200
+        assert finalized.json()["status"] == "evidenced"
         assert test_client.post(
             f"/api/bridge/{bridge['id']}/runs/{delivery_run['id']}/status",
             headers=bridge_headers, json={"status": "evidenced"},
-        ).status_code == 200
+        ).status_code == 422
         assert test_client.post(
             f"/api/bridge/{bridge['id']}/runs/{delivery_run['id']}/status",
             headers=bridge_headers, json={"status": "completed"},
         ).status_code == 422
-        assert test_client.post(
-            f"/api/bridge/{bridge['id']}/commands/{queued_delivery['id']}/ack", headers=bridge_headers,
-        ).status_code == 202
 
         approval = test_client.post("/api/approvals", json={
             "project_id": project["id"], "bridge_id": bridge["id"], "action_type": "commit_pr",
@@ -131,15 +136,18 @@ def test_api_starts_a_version_pinned_session_workflow_with_a_fenced_bridge_comma
         renewed = test_client.post(f"/api/bridge/{bridge['id']}/runs/{run['id']}/lease/renew", headers=bridge_headers)
         assert renewed.status_code == 200
         assert renewed.json()["id"] == run["id"]
-        acknowledged = test_client.post(f"/api/bridge/{bridge['id']}/commands/{command['id']}/ack", headers=bridge_headers)
-        assert acknowledged.status_code == 202
-
+        assert test_client.post(
+            f"/api/bridge/{bridge['id']}/runs/{run['id']}/status",
+            headers=bridge_headers, json={"status": "running"},
+        ).status_code == 200
         completed = test_client.post(
-            f"/api/bridge/{bridge['id']}/workflows/{workflow['id']}/steps/implement",
-            headers=bridge_headers, json={"outcome": "succeeded"},
+            f"/api/bridge/{bridge['id']}/runs/{run['id']}/finalize",
+            headers=bridge_headers,
+            json={"status": "evidenced", "command_id": command["id"]},
         )
         assert completed.status_code == 200
-        assert completed.json()["status"] == "waiting_approval"
+        assert completed.json()["status"] == "evidenced"
+        assert test_client.app.state.store.get_workflow(workflow["id"]).status == "waiting_approval"
         events = test_client.get(f"/api/sessions/{session['id']}/events").json()["events"]
         assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
 

@@ -85,14 +85,14 @@ For each project, explicitly configure the State work-packet and State-apply com
 
 ## V1 delivery gates
 
-1. Workbench creates a run and the bridge reads the State work packet.
+1. Workbench atomically starts the draft workflow, fences its named worktree, creates the run, and queues the exact bridge command; the bridge then reads the State work packet.
 2. Codex runs in the local worktree via Anvil Serving's Responses endpoint.
 3. The bridge returns redacted run activity and evidence. Route/evaluation/state metadata can be projected to Neo4j.
-4. A named approver authorizes a payload hash for `commit_pr`; the bridge atomically revalidates and renews the bound run lease, checks the exact diff, then commits, pushes, and creates the PR. The lease remains held for the later merge approval.
+4. A named approver explicitly selects and reviews one complete safe payload before authorizing its hash for `commit_pr`; the bridge atomically revalidates and renews the bound run lease, builds an isolated Git index containing tracked and untracked changes, checks that exact tree snapshot, then commits that same tree, pushes, and creates the PR. The lease remains held for the later merge approval.
 5. A named approver authorizes `merge_and_accept` with the PR's observed head SHA and the same State task; the bridge atomically revalidates and renews that bound lease, compare-and-swaps GitHub merge against that exact head, then applies State acceptance.
 6. Workbench records `completed` only through the consumed `merge_and_accept` finalization after the exact-head merge and State acceptance both succeed. If a PR, merge, or State application fails after an approval is consumed, it records and displays reconciliation; it never silently retries or marks delivery complete.
 
-For each Codex run the bridge writes only provider-local configuration overrides: `wire_api = "responses"`, the Anvil router base URL, `ANVIL_ROUTER_TOKEN` as the local credential source, and static `http_headers` carrying the workbench run/task correlation. It never writes a provider API key or a GitHub token to Codex configuration.
+For each Codex run the bridge writes only provider-local configuration overrides: `wire_api = "responses"`, the Anvil router base URL, command-backed authentication, and static `http_headers` carrying the workbench run/task correlation. The bridge keeps `ANVIL_ROUTER_TOKEN` in its own process and exposes it during that run through an ephemeral, nonce-bearing loopback broker used by Codex's provider-auth helper. The Codex supervisor receives only a strict non-credential runtime-variable allowlist; its network-disabled managed shell tools inherit no ambient environment and cannot reach the broker. Bridge, GitHub, and provider credentials are never copied into the child or its tool subprocesses.
 
 The bridge starts Codex with a clean local tool surface: it ignores user configuration and project rules, disables plugins, apps, multi-agent, browser, computer-use, image generation, and hosted web search, and keeps the workspace-write sandbox. Those restrictions prevent a bridge run from inheriting arbitrary credential-bearing integrations from an operator desktop.
 
