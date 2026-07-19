@@ -2,12 +2,15 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
-import { approve, bootstrap, createProject } from './api'
+import { approve, bootstrap, createProject, createSession, startWorkflow } from './api'
 
 vi.mock('./api', () => ({
   approve: vi.fn(),
   bootstrap: vi.fn(),
   createProject: vi.fn(),
+  createSession: vi.fn(),
+  startWorkflow: vi.fn(),
+  voiceSocketUrl: vi.fn(() => 'ws://workbench.test/api/sessions/session_test/voice/realtime'),
 }))
 
 describe('Workbench delivery cockpit', () => {
@@ -20,6 +23,14 @@ describe('Workbench delivery cockpit', () => {
       state_root: '.anvil',
       bridge_id: null,
     })
+    createSession.mockResolvedValue({
+      session: { id: 'session_checkout', project_id: 'project_anvil', title: 'Checkout fix', worktree_id: 'checkout', status: 'active' },
+      workflow: { id: 'workflow_checkout', project_id: 'project_anvil', session_id: 'session_checkout', version: 1, status: 'draft', cursor: [] },
+    })
+    startWorkflow.mockResolvedValue({
+      workflow: { id: 'workflow_7f2a', project_id: 'project_anvil', session_id: 'session_7f2a', version: 1, status: 'running', cursor: ['implement'] },
+      run: { id: 'run_checkout', project_id: 'project_anvil', session_id: 'session_7f2a', task_id: 'task_checkout', model: 'planning', status: 'queued' },
+    })
   })
 
   it('opens each workspace with a purpose-specific review surface', async () => {
@@ -28,6 +39,7 @@ describe('Workbench delivery cockpit', () => {
 
     const views = [
       ['Delivery', 'Responses compatibility'],
+      ['Sessions', 'Concurrent sessions'],
       ['Runs', 'Runs'],
       ['Routes', 'Routes'],
       ['Approvals', 'Approvals'],
@@ -39,6 +51,35 @@ describe('Workbench delivery cockpit', () => {
       await user.click(screen.getByRole('button', { name: control }))
       expect(screen.getByRole('heading', { name: heading })).toBeTruthy()
     }
+  })
+
+  it('creates and starts isolated sessions through the harness API', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: 'Sessions' }))
+    await user.click(screen.getByRole('button', { name: 'New concurrent session' }))
+    await user.type(screen.getByRole('textbox', { name: 'Session title' }), 'Checkout fix')
+    await user.clear(screen.getByRole('textbox', { name: 'Configured worktree id' }))
+    await user.type(screen.getByRole('textbox', { name: 'Configured worktree id' }), 'checkout')
+    await user.click(screen.getByRole('button', { name: 'Create session' }))
+
+    expect(createSession).toHaveBeenCalledWith({ project_id: 'project_anvil', title: 'Checkout fix', worktree_id: 'checkout' })
+    expect(screen.getByText(/Created Checkout fix/)).toBeTruthy()
+
+    await user.click(screen.getByRole('button', { name: 'Start delivery Checkout fix' }))
+    await user.type(screen.getByRole('textbox', { name: 'State task id' }), 'task_checkout')
+    await user.click(screen.getByRole('button', { name: 'Start bridge delivery' }))
+
+    expect(startWorkflow).toHaveBeenCalledWith('workflow_checkout', { task_id: 'task_checkout', model: 'planning' })
+    expect(screen.getByText(/Started task_checkout through the local bridge/)).toBeTruthy()
+  })
+
+  it('does not offer microphone access until the private voice relay is configured', () => {
+    render(<App />)
+    const voice = screen.getByRole('button', { name: 'Voice not configured' })
+    expect(voice.disabled).toBe(true)
+    expect(screen.getByText(/Configure a private Anvil Voice Realtime endpoint/)).toBeTruthy()
   })
 
   it('uses live hub data instead of displaying seeded route or evidence artifacts', async () => {

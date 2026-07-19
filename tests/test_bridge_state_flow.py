@@ -124,7 +124,10 @@ def test_bridge_run_claims_verifies_and_submits_before_needs_review(monkeypatch,
             self.statuses: list[tuple[str, str]] = []
 
         def next_command(self):
-            return {"action_type": "run_codex", "payload": {"run_id": "run_1", "task_id": "T001"}}
+            return {"id": "command_1", "action_type": "run_codex", "payload": {"run_id": "run_1", "task_id": "T001"}}
+
+        def acknowledge_command(self, _command_id):
+            return None
 
         def evidence(self, source_kind, _source_id, _project_id, payload):
             self.evidence_events.append((source_kind, payload))
@@ -176,7 +179,10 @@ def test_bridge_marks_a_failed_verification_for_reconciliation(monkeypatch, tmp_
             self.evidence_events: list[tuple[str, dict[str, object]]] = []
 
         def next_command(self):
-            return {"action_type": "run_codex", "payload": {"run_id": "run_1", "task_id": "T001", "model": "heavy-local"}}
+            return {"id": "command_1", "action_type": "run_codex", "payload": {"run_id": "run_1", "task_id": "T001", "model": "heavy-local"}}
+
+        def acknowledge_command(self, _command_id):
+            return None
 
         def evidence(self, source_kind, _source_id, _project_id, payload):
             self.evidence_events.append((source_kind, payload))
@@ -212,7 +218,7 @@ def test_bridge_marks_a_failed_verification_for_reconciliation(monkeypatch, tmp_
 def test_bridge_rejects_standalone_state_apply_even_with_an_approval(tmp_path: Path):
     class Hub:
         def next_command(self):
-            return {"action_type": "state_apply", "approval_id": "approval_1", "payload_hash": "hash", "payload": {"task_id": "T001"}}
+            return {"id": "command_1", "action_type": "state_apply", "approval_id": "approval_1", "payload_hash": "hash", "payload": {"task_id": "T001"}}
 
         def consume(self, *_args):
             raise AssertionError("standalone State apply must not consume approval")
@@ -225,3 +231,14 @@ def test_bridge_rejects_standalone_state_apply_even_with_an_approval(tmp_path: P
 
     with pytest.raises(BridgeError, match="not implemented"):
         bridge.poll_once()
+
+
+def test_bridge_resolves_only_named_operator_configured_worktrees(tmp_path: Path):
+    checkout = tmp_path / "checkout-b"
+    checkout.mkdir()
+    bridge = Bridge(settings(tmp_path, worktrees={"checkout-b": checkout}))
+
+    assert bridge._worktree_root({"worktree_id": "checkout-b"}) == checkout.resolve()
+    assert bridge._worktree_root({}) == tmp_path.resolve()
+    with pytest.raises(BridgeError, match="not configured"):
+        bridge._worktree_root({"worktree_id": "../../untrusted"})

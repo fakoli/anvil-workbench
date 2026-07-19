@@ -15,10 +15,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -52,6 +53,7 @@ class BridgeSettings:
     router_base_url: str
     router_token_env: str
     codex_config: tuple[str, ...]
+    worktrees: Mapping[str, Path] = field(default_factory=dict)
 
 
 class HubTransport:
@@ -84,6 +86,9 @@ class HubTransport:
     def next_command(self) -> dict[str, Any] | None:
         return self.request("GET", f"/api/bridge/{self.bridge_id}/commands/next")
 
+    def acknowledge_command(self, command_id: str) -> None:
+        self.request("POST", f"/api/bridge/{self.bridge_id}/commands/{command_id}/ack", {})
+
     def consume(self, approval_id: str, approved_hash: str) -> None:
         self.request(
             "POST", f"/api/bridge/{self.bridge_id}/approvals/{approval_id}/consume",
@@ -96,10 +101,22 @@ class HubTransport:
     def run_status(self, run_id: str, status: str) -> None:
         self.request("POST", f"/api/bridge/{self.bridge_id}/runs/{run_id}/status", {"status": status})
 
+    def validate_run_lease(self, run_id: str) -> None:
+        self.request("GET", f"/api/bridge/{self.bridge_id}/runs/{run_id}/lease")
+
+    def renew_run_lease(self, run_id: str) -> None:
+        self.request("POST", f"/api/bridge/{self.bridge_id}/runs/{run_id}/lease/renew", {})
+
     def evidence(self, source_kind: str, source_id: str, project_id: str, payload: dict[str, Any]) -> None:
         self.request(
             "POST", f"/api/bridge/{self.bridge_id}/evidence",
             {"source_kind": source_kind, "source_id": source_id, "project_id": project_id, "payload": redact_value(payload)},
+        )
+
+    def workflow_step(self, workflow_id: str, step_id: str, outcome: str) -> None:
+        self.request(
+            "POST", f"/api/bridge/{self.bridge_id}/workflows/{workflow_id}/steps/{step_id}",
+            {"outcome": outcome},
         )
 
 
@@ -268,9 +285,10 @@ class StateReader:
 class CodexRunner:
     """Launch Codex only through an Anvil Serving Responses-compatible route."""
 
-    def __init__(self, settings: BridgeSettings, emit: Callable[[str, Any], None]) -> None:
+    def __init__(self, settings: BridgeSettings, emit: Callable[[str, Any], None], worktree_root: Path | None = None) -> None:
         self.settings = settings
         self.emit = emit
+        self.worktree_root = worktree_root or settings.project_root
 
     def run(self, run_id: str, work_packet: dict[str, Any], model: str) -> int:
         token = os.environ.get(self.settings.router_token_env, "")
@@ -318,7 +336,7 @@ class CodexRunner:
             f"model_providers.anvil.http_headers={{ {header_toml} }}",
         )
         command = [
-            self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json", "-C", str(self.settings.project_root),
+            self.settings.codex_binary, "--ask-for-approval", "never", "exec", "--json", "-C", str(self.worktree_root),
             # The bridge's own sandbox/approval contract is authoritative.
             # Project rules are unreviewed input to this supervisor and must
             # not silently add external tool surfaces to a managed run.
@@ -335,7 +353,7 @@ class CodexRunner:
             "model": model,
         })
         process = subprocess.Popen(
-            command, cwd=self.settings.project_root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            command, cwd=self.worktree_root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=environment,
         )
         assert process.stdout is not None
@@ -361,9 +379,10 @@ class VerificationResult:
 class VerificationRunner:
     """Run packet-declared checks outside Codex and attest their actual output to State."""
 
-    def __init__(self, settings: BridgeSettings, emit: Callable[[str, Any], None]) -> None:
+    def __init__(self, settings: BridgeSettings, emit: Callable[[str, Any], None], worktree_root: Path | None = None) -> None:
         self.settings = settings
         self.emit = emit
+        self.worktree_root = worktree_root or settings.project_root
 
     @staticmethod
     def _commands(work_packet: dict[str, Any]) -> tuple[str, ...]:
@@ -378,7 +397,7 @@ class VerificationRunner:
         results: list[VerificationResult] = []
         for command in self._commands(work_packet):
             completed = subprocess.run(
-                command, cwd=self.settings.project_root, shell=True, capture_output=True,
+                command, cwd=self.worktree_root, shell=True, capture_output=True,
                 text=True, encoding="utf-8", errors="replace", check=False,
             )
             stdout = completed.stdout or ""
@@ -400,7 +419,7 @@ class VerificationRunner:
         if not isinstance(likely_files, list):
             return ()
         completed = subprocess.run(
-            ["git", "diff", "--name-only", "--relative", "HEAD"], cwd=self.settings.project_root,
+            ["git", "diff", "--name-only", "--relative", "HEAD"], cwd=self.worktree_root,
             capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
         if completed.returncode != 0:
@@ -461,6 +480,18 @@ class Bridge:
     def _emit(self, run_id: str, role: str, content: Any) -> None:
         self.hub.event(run_id, role, content)
 
+    def _worktree_root(self, payload: dict[str, Any]) -> Path:
+        """Resolve a bridge-configured worktree id, never a browser-supplied path."""
+        worktree_id = str(payload.get("worktree_id") or "default")
+        roots = {"default": self.settings.project_root, **self.settings.worktrees}
+        root = roots.get(worktree_id)
+        if root is None:
+            raise BridgeError(f"worktree is not configured on this bridge: {worktree_id}")
+        root = root.resolve()
+        if not root.is_dir():
+            raise BridgeError(f"configured worktree is unavailable: {worktree_id}")
+        return root
+
     def project_state_events(self) -> int:
         count = 0
         for offset, event in self.state.new_events():
@@ -481,19 +512,47 @@ class Bridge:
             run_id = payload["run_id"]
             task_id = str(payload.get("task_id") or "")
             actor = f"workbench-{self.settings.bridge_id}"
-            self.hub.run_status(run_id, "running")
+            lease_stop = threading.Event()
+            lease_errors: list[str] = []
+            lease_thread: threading.Thread | None = None
+
+            def keep_lease_alive() -> None:
+                while not lease_stop.wait(60):
+                    try:
+                        self.hub.renew_run_lease(run_id)
+                    except BridgeError as exc:
+                        lease_errors.append(str(exc))
+                        return
+
+            def require_live_lease() -> None:
+                if lease_errors:
+                    raise BridgeError("run worktree lease renewal failed; reconciliation is required")
+
             try:
+                worktree_root = self._worktree_root(payload)
+                if payload.get("session_id"):
+                    self.hub.validate_run_lease(run_id)
+                self.hub.run_status(run_id, "running")
+                if payload.get("session_id"):
+                    lease_thread = threading.Thread(target=keep_lease_alive, name=f"workbench-lease-{run_id}", daemon=True)
+                    lease_thread.start()
                 claim = self.state.claim(task_id, actor)
                 self.hub.evidence("state_event", f"{run_id}:claim", self.settings.project_id, {"task_id": task_id, "claim": claim})
                 packet = self.state.work_packet(task_id)
                 packet.setdefault("task_id", payload.get("task_id"))
                 self.hub.evidence("work_packet", run_id, self.settings.project_id, {"task_id": payload.get("task_id"), "packet": packet})
                 model = str(payload.get("model") or "")
-                exit_code = CodexRunner(self.settings, lambda role, content: self._emit(run_id, role, content)).run(run_id, packet, model)
+                exit_code = CodexRunner(
+                    self.settings, lambda role, content: self._emit(run_id, role, content), worktree_root,
+                ).run(run_id, packet, model)
+                require_live_lease()
                 if exit_code:
                     raise BridgeError(f"Codex exited with {exit_code}")
-                verifier = VerificationRunner(self.settings, lambda role, content: self._emit(run_id, role, content))
+                verifier = VerificationRunner(
+                    self.settings, lambda role, content: self._emit(run_id, role, content), worktree_root,
+                )
                 verification = verifier.run(packet, self.state, actor)
+                require_live_lease()
                 failed = [result.command for result in verification if result.exit_code != 0]
                 if failed:
                     raise BridgeError(f"independent verification failed: {failed[0]}")
@@ -503,20 +562,41 @@ class Bridge:
                 submission = self.state.submit_evidence(
                     task_id, (result.command for result in verification), files_changed, actor,
                 )
+                require_live_lease()
                 self.hub.evidence("state_event", f"{run_id}:evidence", self.settings.project_id, {
                     "task_id": task_id,
                     "files_changed": list(files_changed),
                     "commands": [result.command for result in verification],
                     "evidence_id": submission.get("data", {}).get("evidence_id") if isinstance(submission.get("data"), dict) else None,
                 })
+                workflow_id = payload.get("workflow_id")
+                workflow_step_id = payload.get("workflow_step_id")
+                if isinstance(workflow_id, str) and isinstance(workflow_step_id, str):
+                    self.hub.workflow_step(workflow_id, workflow_step_id, "succeeded")
             except BridgeError as exc:
                 self.hub.evidence("failure", f"{run_id}:reconciliation", self.settings.project_id, {
                     "task_id": task_id, "fingerprint": "bridge-reconciliation", "reconciliation_required": True, "error": str(exc),
                 })
+                workflow_id = payload.get("workflow_id")
+                workflow_step_id = payload.get("workflow_step_id")
+                if isinstance(workflow_id, str) and isinstance(workflow_step_id, str):
+                    try:
+                        self.hub.workflow_step(workflow_id, workflow_step_id, "failed")
+                    except BridgeError:
+                        # Run reconciliation remains the durable source if the
+                        # workflow transition itself cannot be recorded.
+                        pass
                 self.hub.run_status(run_id, "reconciliation")
+                self.hub.acknowledge_command(str(command["id"]))
                 raise
-            self.hub.run_status(run_id, "evidenced")
-            return True
+            else:
+                self.hub.run_status(run_id, "evidenced")
+                self.hub.acknowledge_command(str(command["id"]))
+                return True
+            finally:
+                lease_stop.set()
+                if lease_thread is not None:
+                    lease_thread.join(timeout=2)
         approval_id = command.get("approval_id")
         if not approval_id:
             raise BridgeError(f"unapproved bridge action rejected: {action}")
@@ -538,6 +618,7 @@ class Bridge:
         except BridgeError as exc:
             self.hub.evidence("failure", approval_id, self.settings.project_id, {"action": action, "reconciliation_required": True, "error": str(exc)})
             raise
+        self.hub.acknowledge_command(str(command["id"]))
         return True
 
 
@@ -560,6 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--router-base-url", required=True)
     parser.add_argument("--router-token-env", default="ANVIL_ROUTER_TOKEN")
     parser.add_argument("--codex-config", action="append", default=[])
+    parser.add_argument("--worktree", action="append", default=[], metavar="ID=PATH", help="allow a named local worktree for concurrent sessions")
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--once", action="store_true")
     return parser
@@ -571,6 +653,14 @@ def main(argv: list[str] | None = None) -> int:
     if not token:
         raise SystemExit(f"{args.token_env} is required in the local bridge environment")
     root = args.project_root.resolve()
+    worktrees: dict[str, Path] = {}
+    for item in args.worktree:
+        worktree_id, separator, raw_path = item.partition("=")
+        if not separator or not worktree_id.strip() or not raw_path.strip():
+            raise SystemExit("--worktree must use ID=PATH")
+        if worktree_id.strip() == "default":
+            raise SystemExit("default is reserved for --project-root")
+        worktrees[worktree_id.strip()] = Path(raw_path.strip()).resolve()
     settings = BridgeSettings(
         hub=args.hub, bridge_id=args.bridge_id, token=token, project_root=root, project_id=args.project_id,
         state_events=args.state_events,
@@ -583,6 +673,7 @@ def main(argv: list[str] | None = None) -> int:
         state_apply_command=args.state_apply_command,
         codex_binary=args.codex_binary, router_base_url=args.router_base_url,
         router_token_env=args.router_token_env, codex_config=tuple(args.codex_config),
+        worktrees=worktrees,
     )
     bridge = Bridge(settings)
     while True:

@@ -1,8 +1,8 @@
 # Anvil Workbench
 
-Anvil Workbench is a private, tailnet-only delivery cockpit for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
+Anvil Workbench is a private, tailnet-first **agent harness for software delivery**. Its web UI is the main entry point for moving one project from a PRD and Anvil State task plan through a local Codex implementation, evidence review, approved GitHub PR, merge, and State acceptance.
 
-Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
+Start with the [project brief](docs/PROJECT.md), [integration contracts](docs/CONTRACTS.md), [harness foundations](docs/HARNESS-FOUNDATIONS.md), [local qualification record](docs/QUALIFICATION.md), [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md), and [session handoff](docs/SESSION-HANDOFF.md). They are the canonical orientation set for a new operator or coding session.
 
 It is deliberately a separate product:
 
@@ -48,6 +48,18 @@ workbench-bridge `
   --router-base-url http://100.87.34.66:8000/v1
 ```
 
+For concurrent sessions, assign each mutable worktree an operator-configured name. The browser sends only that name; it never supplies a path.
+
+```powershell
+workbench-bridge ... --worktree checkout-a=C:\path\to\project-a --worktree checkout-b=C:\path\to\project-b
+```
+
+The session engine permits one active run per session and leases each named worktree. A second session cannot start against an unexpired lease for the same worktree.
+
+## Voice
+
+Workbench supports session-bound push-to-talk through a private Anvil Voice Realtime endpoint. Set `ANVIL_VOICE_REALTIME_URL` on the hub (and `ANVIL_VOICE_REALTIME_TOKEN` only when the upstream requires it). The browser connects to a same-origin Workbench relay; it never receives the upstream URL or token. The relay filters model and tool controls, forwards only the narrow audio protocol, and stores lifecycle summaries rather than raw audio. Transcript retention is opt-in with `WORKBENCH_VOICE_RETAIN_TRANSCRIPTS=true`; it is off by default.
+
 For each project, explicitly configure the State work-packet and State-apply commands if its CLI syntax differs from the defaults. Both commands are executed locally in the project worktree; a State apply occurs only after an approved merge action has completed.
 
 ## V1 delivery gates
@@ -85,6 +97,7 @@ When `WORKBENCH_EMBEDDING_MODEL` is configured, evidence retrieval uses Anvil Se
 | --- | --- |
 | [Project brief](docs/PROJECT.md) | Product promise, boundaries, users, and the v1 delivery flow. |
 | [Contracts](docs/CONTRACTS.md) | The exact Anvil State, Anvil Serving, bridge, graph, and approval contracts. |
+| [Harness foundations](docs/HARNESS-FOUNDATIONS.md) | Research-backed requirements, V1 workflow vocabulary, session isolation, and voice boundaries. |
 | [Roadmap](docs/ROADMAP.md) | What is implemented, what requires a live qualification, and the next milestones. |
 | [Qualification](docs/QUALIFICATION.md) | Dated local test evidence, passed gates, and the remaining Codex/model compatibility blocker. |
 | [UI acceptance audit](docs/UI-ACCEPTANCE-AUDIT.md) | Button-level coverage, exercised workflows, and explicit UI boundaries. |

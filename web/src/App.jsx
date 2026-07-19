@@ -1,18 +1,21 @@
-import { useEffect, useMemo, useState } from 'react'
-import { approve, bootstrap, createProject } from './api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { approve, bootstrap, createProject, createSession, startWorkflow, voiceSocketUrl } from './api'
 
 const seed = {
   projects: [{ id: 'project_anvil', name: 'Anvil Workbench', state_root: '.anvil', bridge_id: 'bridge_dark' }],
   runs: [{ id: 'run_7f2a', task_id: 'task_48', model: 'heavy-local', status: 'running' }],
+  sessions: [{ id: 'session_7f2a', project_id: 'project_anvil', title: 'Responses qualification', worktree_id: 'default', status: 'active' }],
+  workflows: [{ id: 'workflow_7f2a', project_id: 'project_anvil', session_id: 'session_7f2a', version: 1, status: 'running', cursor: ['implement'] }],
   approvals: [{
     id: 'approval_7c4e', project_id: 'project_anvil', action_type: 'commit_pr', status: 'pending',
     payload_hash: '83d94b4a…9a1f', expires_at: '14 minutes',
   }],
   router_configured: true,
+  voice: { available: false, transport: 'not_configured', retains_transcripts: false },
 }
 
 const nav = [
-  ['Delivery', '⌘'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'], ['Evidence', '◈'], ['Sandbox', '□'],
+  ['Delivery', '⌘'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'], ['Evidence', '◈'], ['Sandbox', '□'],
 ]
 
 function Mark() {
@@ -32,6 +35,105 @@ function Rail({ active, setActive, onNewDelivery, onProfile }) {
       <button className="profile" aria-label="Operator menu" onClick={onProfile}><span>SD</span><div><strong>Operator</strong><small>tailnet owner</small></div><b aria-hidden="true">···</b></button>
     </div>
   </aside>
+}
+
+function encodePcm16(samples) {
+  const bytes = new Uint8Array(samples.length * 2)
+  const view = new DataView(bytes.buffer)
+  samples.forEach((sample, index) => view.setInt16(index * 2, Math.max(-1, Math.min(1, sample)) * 0x7fff, true))
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
+  return window.btoa(binary)
+}
+
+function VoiceDock({ data, append }) {
+  const session = data.sessions?.[0]
+  const configured = Boolean(data.voice?.available && session)
+  const [state, setState] = useState('disconnected')
+  const socketRef = useRef(null)
+  const captureRef = useRef(null)
+
+  const releaseCapture = () => {
+    const capture = captureRef.current
+    if (!capture) return
+    capture.processor.disconnect()
+    capture.source.disconnect()
+    capture.stream.getTracks().forEach((track) => track.stop())
+    capture.context.close().catch(() => undefined)
+    captureRef.current = null
+  }
+  const playAudio = (encoded) => {
+    if (typeof encoded !== 'string' || !encoded || !window.AudioContext) return
+    try {
+      const binary = window.atob(encoded)
+      const context = new window.AudioContext({ sampleRate: 24000 })
+      const buffer = context.createBuffer(1, binary.length / 2, 24000)
+      const channel = buffer.getChannelData(0)
+      const view = new DataView(new ArrayBuffer(binary.length))
+      for (let index = 0; index < binary.length; index += 1) view.setUint8(index, binary.charCodeAt(index))
+      for (let index = 0; index < channel.length; index += 1) channel[index] = view.getInt16(index * 2, true) / 0x8000
+      const source = context.createBufferSource()
+      source.buffer = buffer
+      source.connect(context.destination)
+      source.start()
+      source.onended = () => context.close().catch(() => undefined)
+    } catch { append('Voice output could not be played in this browser.') }
+  }
+  const connect = () => {
+    if (!configured) return
+    setState('connecting')
+    const socket = new WebSocket(voiceSocketUrl(session.id))
+    socketRef.current = socket
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ type: 'session.update', session: { modalities: ['audio', 'text'] } }))
+      setState('ready')
+    }
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data)
+        if (message.type === 'response.output_audio.delta') playAudio(message.delta)
+        if (message.type === 'error') append('Voice relay rejected an event; no delivery action was started.')
+      } catch { /* Upstream text is not required for the push-to-talk control. */ }
+    }
+    socket.onclose = () => { releaseCapture(); setState('disconnected') }
+    socket.onerror = () => { append('Voice relay is unavailable. The session and workflow remain unchanged.') }
+  }
+  const startCapture = async () => {
+    if (state !== 'ready' || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return
+    if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) {
+      append('This browser cannot capture microphone audio for the Workbench voice relay.')
+      return
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const context = new window.AudioContext({ sampleRate: 24000 })
+      const source = context.createMediaStreamSource(stream)
+      const processor = context.createScriptProcessor(4096, 1, 1)
+      processor.onaudioprocess = (event) => {
+        const socket = socketRef.current
+        if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: encodePcm16(event.inputBuffer.getChannelData(0)) }))
+      }
+      source.connect(processor)
+      processor.connect(context.destination)
+      captureRef.current = { stream, context, source, processor }
+      setState('listening')
+    } catch { append('Microphone access was not granted. No audio left this browser.') }
+  }
+  const finishCapture = () => {
+    if (state !== 'listening') return
+    releaseCapture()
+    const socket = socketRef.current
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
+      socket.send(JSON.stringify({ type: 'response.create' }))
+    }
+    setState('ready')
+  }
+  const disconnect = () => { releaseCapture(); socketRef.current?.close(); socketRef.current = null; setState('disconnected') }
+  return <section className="voice-dock" aria-label="Voice controls">
+    <div><b>Voice, session-bound</b><small>{configured ? 'Push to talk · audio is relayed privately and is not retained' : 'Configure a private Anvil Voice Realtime endpoint to enable push to talk'}</small></div>
+    {!configured ? <button disabled aria-label="Voice not configured">Voice unavailable</button> : state === 'disconnected' || state === 'connecting' ? <button onClick={connect} disabled={state === 'connecting'}>{state === 'connecting' ? 'Connecting…' : 'Connect voice'}</button> : <><button className={state === 'listening' ? 'speaking' : ''} onPointerDown={startCapture} onPointerUp={finishCapture} onPointerCancel={finishCapture} aria-label="Hold to talk">{state === 'listening' ? 'Listening… release to send' : 'Hold to talk'}</button><button className="voice-close" onClick={disconnect}>Disconnect</button></>}
+  </section>
 }
 
 function Delivery({ data, append }) {
@@ -66,6 +168,7 @@ function Delivery({ data, append }) {
       {messages.map((message, index) => <article className={`message ${message.type}`} key={`${message.who}-${index}`}><div className="message-head"><span>{message.type === 'human' ? 'SD' : 'A'}</span><b>{message.who}</b><small>{index === 0 ? '09:40' : index === 1 ? '09:42' : 'now'}</small></div><p>{message.text}</p></article>)}
     </section>
     <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} onChange={(event) => setInput(event.target.value)} rows="2" placeholder="Add direction to this delivery…" /><div><small>Routes through Anvil Serving · stateful actions stay local to the bridge</small><button type="submit" aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form>
+    <VoiceDock data={data} append={append} />
   </main>
 }
 
@@ -111,7 +214,18 @@ function TraceStep({ label, value, detail, done, current, green }) {
   return <div className={`trace-step ${done ? 'done' : ''} ${current ? 'current' : ''}`}><i>{done ? '✓' : current ? '●' : '○'}</i><div><small>{label}</small><b className={green ? 'green-text' : ''}>{value}</b><span>{detail}</span></div></div>
 }
 
-function WorkspaceView({ active, data }) {
+function SessionsView({ data, onNewSession, onStartSession }) {
+  const sessions = data.sessions || []
+  const workflows = data.workflows || []
+  return <section className="workspace-view"><span className="crumb">Sessions / durable harness contexts</span><div className="view-heading"><div><h1>Concurrent sessions</h1><p>Each session has its own run trace and workflow cursor. Worktree leases prevent two active sessions from editing the same configured worktree.</p></div><button className="session-action" onClick={onNewSession}>New concurrent session</button></div><div className="session-list">{sessions.length ? sessions.map((session) => {
+    const workflow = workflows.find((item) => item.session_id === session.id)
+    const running = data.runs?.some((run) => run.session_id === session.id && ['queued', 'running'].includes(run.status))
+    return <article key={session.id}><div><b>{session.title}</b><small>{session.worktree_id} · {session.id}</small></div><span>{workflow ? `workflow v${workflow.version} · ${workflow.status}` : 'workflow pending'}</span><Status tone={running ? 'green' : workflow?.status === 'reconciliation' ? 'amber' : 'green'}>{running ? 'active run' : session.status}</Status><button aria-label={`Start delivery ${session.title}`} disabled={!workflow || running || workflow.status !== 'draft'} onClick={() => onStartSession(session, workflow)}>Start delivery</button></article>
+  }) : <article className="session-empty"><b>No harness session yet</b><span>Create one before starting a bridge-supervised delivery.</span></article>}</div></section>
+}
+
+function WorkspaceView({ active, data, onNewSession, onStartSession }) {
+  if (active === 'Sessions') return <SessionsView data={data} onNewSession={onNewSession} onStartSession={onStartSession} />
   if (active === 'Runs') return <section className="workspace-view"><span className="crumb">Runs / bridge-supervised</span><h1>Runs</h1><p>Every delivery run is linked to its State task and routed model.</p><div className="data-list">{data.runs.map((run) => <article key={run.id}><b>{run.task_id || 'Unassigned task'}</b><span>{run.model}</span><Status tone={run.status === 'reconciliation' ? 'amber' : 'green'}>{run.status}</Status></article>)}</div></section>
   if (active === 'Routes') return <section className="workspace-view"><span className="crumb">Routes / Anvil Serving</span><h1>Routes</h1><p>Run, task, and request correlation stay visible without exposing router credentials.</p><div className="data-list"><article><b>{data.runs[0]?.model || 'No routed run yet'}</b><span>{data.runs[0] ? 'workbench_run_id · task_id · request_id' : 'Start a run to record model-route correlation.'}</span><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'configured' : 'not configured'}</Status></article></div></section>
   if (active === 'Approvals') return <section className="workspace-view"><span className="crumb">Approvals / hash-bound</span><h1>Approvals</h1><p>Approval alone does not execute a GitHub action; only the matching bridge can consume it once.</p><div className="data-list">{data.approvals.map((approval) => <article key={approval.id}><b>{approval.action_type.replaceAll('_', ' ')}</b><span>{approval.payload_hash}</span><Status tone={approval.status === 'pending' ? 'amber' : 'green'}>{approval.status}</Status></article>)}</div></section>
@@ -136,6 +250,32 @@ function NewDelivery({ onClose, onCreate }) {
   return <Modal title="New delivery" onClose={onClose}><p>Create the Workbench project record first. A project bridge remains local and must be registered outside the browser credential boundary.</p><form className="modal-form" onSubmit={submit}><label>Project name<input value={name} onChange={(event) => setName(event.target.value)} /></label><label>State root<input value={stateRoot} onChange={(event) => setStateRoot(event.target.value)} /></label><div><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button type="submit" disabled={busy || !name.trim()}>{busy ? 'Creating…' : 'Create project'}</button></div></form></Modal>
 }
 
+function NewSession({ project, onClose, onCreate }) {
+  const [title, setTitle] = useState('')
+  const [worktree, setWorktree] = useState('default')
+  const [busy, setBusy] = useState(false)
+  const submit = async (event) => {
+    event.preventDefault()
+    if (!project || !title.trim() || !worktree.trim()) return
+    setBusy(true)
+    try { await onCreate({ project_id: project.id, title: title.trim(), worktree_id: worktree.trim() }) } finally { setBusy(false) }
+  }
+  return <Modal title="New concurrent session" onClose={onClose}><p>A session is a durable harness context. Its worktree id must match a bridge <code>--worktree ID=PATH</code> configuration before a delivery can start.</p><form className="modal-form" onSubmit={submit}><label>Session title<input value={title} onChange={(event) => setTitle(event.target.value)} /></label><label>Configured worktree id<input value={worktree} onChange={(event) => setWorktree(event.target.value)} /></label><div><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button type="submit" disabled={busy || !project || !title.trim() || !worktree.trim()}>{busy ? 'Creating…' : 'Create session'}</button></div></form></Modal>
+}
+
+function StartSession({ session, workflow, onClose, onStart }) {
+  const [taskId, setTaskId] = useState('')
+  const [model, setModel] = useState('planning')
+  const [busy, setBusy] = useState(false)
+  const submit = async (event) => {
+    event.preventDefault()
+    if (!taskId.trim()) return
+    setBusy(true)
+    try { await onStart(workflow.id, { task_id: taskId.trim(), model: model.trim() || 'planning' }) } finally { setBusy(false) }
+  }
+  return <Modal title={`Start ${session.title}`} onClose={onClose}><p>This starts the workflow’s pinned agent step through the local bridge. State will claim the task; the bridge selects only the configured worktree.</p><form className="modal-form" onSubmit={submit}><label>State task id<input value={taskId} onChange={(event) => setTaskId(event.target.value)} /></label><label>Requested route<input value={model} onChange={(event) => setModel(event.target.value)} /></label><div><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button type="submit" disabled={busy || !taskId.trim()}>{busy ? 'Starting…' : 'Start bridge delivery'}</button></div></form></Modal>
+}
+
 function Help({ onClose }) {
   return <Modal title="Delivery cockpit help" onClose={onClose}><p>State is canonical. Workbench supervises redacted runs and approvals. The project-local bridge is the only component that may use GitHub credentials.</p><ul><li>Use Delivery to provide direction and inspect the current task.</li><li>Use Runs, Routes, Approvals, and Evidence to review execution context.</li><li>Only authorize a hash after reviewing the diff and evidence.</li></ul></Modal>
 }
@@ -153,6 +293,8 @@ function App() {
   const [data, setData] = useState(seed)
   const [notice, setNotice] = useState('')
   const [newDeliveryOpen, setNewDeliveryOpen] = useState(false)
+  const [newSessionOpen, setNewSessionOpen] = useState(false)
+  const [startSession, setStartSession] = useState(null)
   const [helpOpen, setHelpOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
   const [notificationsOpen, setNotificationsOpen] = useState(false)
@@ -175,8 +317,36 @@ function App() {
       setNotice('Project could not be created. No bridge or run was started.')
     }
   }
+  const createConcurrentSession = async (payload) => {
+    try {
+      const created = await createSession(payload)
+      setData((current) => ({
+        ...current,
+        sessions: [created.session, ...(current.sessions || [])],
+        workflows: [created.workflow, ...(current.workflows || [])],
+      }))
+      setNewSessionOpen(false)
+      setActive('Sessions')
+      setNotice(`Created ${created.session.title}. Start it only after its named worktree is configured on the bridge.`)
+      load().catch(() => undefined)
+    } catch { setNotice('Session could not be created. No bridge run was started.') }
+  }
+  const startConcurrentSession = async (workflowId, payload) => {
+    try {
+      const result = await startWorkflow(workflowId, payload)
+      setData((current) => ({
+        ...current,
+        workflows: (current.workflows || []).map((workflow) => workflow.id === result.workflow.id ? result.workflow : workflow),
+        runs: [result.run, ...(current.runs || [])],
+      }))
+      setStartSession(null)
+      setActive('Delivery')
+      setNotice(`Started ${payload.task_id} through the local bridge. The workflow is now traceable in this session.`)
+      load().catch(() => undefined)
+    } catch { setNotice('Workflow did not start. Check that the project bridge and named worktree are configured.') }
+  }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
-  return <div className="app-shell"><Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />{profileOpen && <ProfileMenu onClose={() => setProfileOpen(false)} />}<div className="workspace"><header className="topbar"><span>{context}</span><div><Status>{data.router_configured ? 'private route ready' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setHelpOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>{notificationsOpen && <Notifications read={notificationsRead} onRead={() => setNotificationsRead(true)} />}<div className="main-grid">{active === 'Delivery' ? <Delivery data={data} append={setNotice} /> : <WorkspaceView active={active} data={data} />}<Trace data={data} onViewEvidence={() => setActive('Evidence')} append={setNotice} /></div>{notice && <div className="toast" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button></div>}</div>{newDeliveryOpen && <NewDelivery onClose={() => setNewDeliveryOpen(false)} onCreate={createDelivery} />}{helpOpen && <Help onClose={() => setHelpOpen(false)} />}</div>
+  return <div className="app-shell"><Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />{profileOpen && <ProfileMenu onClose={() => setProfileOpen(false)} />}<div className="workspace"><header className="topbar"><span>{context}</span><div><Status>{data.router_configured ? 'private route ready' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setHelpOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>{notificationsOpen && <Notifications read={notificationsRead} onRead={() => setNotificationsRead(true)} />}<div className="main-grid">{active === 'Delivery' ? <Delivery data={data} append={setNotice} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} />}<Trace data={data} onViewEvidence={() => setActive('Evidence')} append={setNotice} /></div>{notice && <div className="toast" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button></div>}</div>{newDeliveryOpen && <NewDelivery onClose={() => setNewDeliveryOpen(false)} onCreate={createDelivery} />}{newSessionOpen && <NewSession project={data.projects[0]} onClose={() => setNewSessionOpen(false)} onCreate={createConcurrentSession} />}{startSession && <StartSession session={startSession.session} workflow={startSession.workflow} onClose={() => setStartSession(null)} onStart={startConcurrentSession} />}{helpOpen && <Help onClose={() => setHelpOpen(false)} />}</div>
 }
 
 export default App

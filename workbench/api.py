@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -17,6 +17,20 @@ from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
 from .store import MemoryStore, PostgresStore, StoreError, WorkbenchStore
+from .voice import relay_realtime
+from .workflows import step_by_id
+
+
+def default_delivery_workflow() -> dict[str, Any]:
+    """Small reviewed workflow used when a session does not supply a template."""
+    return {
+        "entry": "implement",
+        "steps": [
+            {"id": "implement", "kind": "agent", "model": "planning", "next": ["review"]},
+            {"id": "review", "kind": "approval_wait", "next": ["reconcile"]},
+            {"id": "reconcile", "kind": "reconcile", "next": []},
+        ],
+    }
 
 
 class ProjectInput(BaseModel):
@@ -32,6 +46,27 @@ class RunInput(BaseModel):
     project_id: str
     task_id: str | None = None
     model: str = Field(min_length=1, max_length=240)
+
+
+class SessionInput(BaseModel):
+    project_id: str
+    title: str = Field(min_length=1, max_length=160)
+    worktree_id: str = Field(min_length=1, max_length=160)
+    workflow_definition: dict[str, Any] | None = None
+
+
+class WorkflowRevisionInput(BaseModel):
+    expected_version: int = Field(ge=1)
+    definition: dict[str, Any]
+
+
+class WorkflowStartInput(BaseModel):
+    task_id: str = Field(min_length=1, max_length=300)
+    model: str = Field(default="planning", min_length=1, max_length=240)
+
+
+class WorkflowStepInput(BaseModel):
+    outcome: str = Field(pattern="^(succeeded|failed|cancelled)$")
 
 
 class ApprovalInput(BaseModel):
@@ -137,8 +172,15 @@ def create_app(
         return {
             "projects": projects,
             "runs": [as_json(run) for run in store.list_runs()],
+            "sessions": [as_json(session) for session in store.list_sessions()],
+            "workflows": [as_json(workflow) for workflow in store.list_workflows()],
             "approvals": [as_json(approval) for approval in store.list_approvals()],
             "router_configured": bool(settings.anvil_router_base_url),
+            "voice": {
+                "available": bool(settings.anvil_voice_realtime_url),
+                "transport": "workbench-realtime-relay" if settings.anvil_voice_realtime_url else "not_configured",
+                "retains_transcripts": settings.voice_retain_transcripts,
+            },
         }
 
     @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
@@ -150,6 +192,46 @@ def create_app(
         bridge, token = store.register_bridge(project_id, payload.name)
         # Deliberately the single opportunity to retrieve the bridge secret.
         return {"bridge": as_json(bridge), "bootstrap_token": token}
+
+    @app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
+    def create_session(payload: SessionInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
+        session, workflow = store.create_session(
+            payload.project_id, payload.title, payload.worktree_id,
+            payload.workflow_definition or default_delivery_workflow(),
+        )
+        store.append_audit("session.requested", current_actor, payload.project_id, {
+            "session_id": session.id, "workflow_id": workflow.id,
+        })
+        return {"session": as_json(session), "workflow": as_json(workflow)}
+
+    @app.get("/api/sessions/{session_id}/events")
+    def session_events(session_id: str, after_sequence: int = 0, _: str = Depends(actor)) -> dict[str, Any]:
+        return {"events": [as_json(event) for event in store.list_workflow_events(session_id, max(after_sequence, 0))]}
+
+    @app.post("/api/workflows/{workflow_id}/revise")
+    def revise_workflow(workflow_id: str, payload: WorkflowRevisionInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
+        return as_json(store.revise_workflow(workflow_id, payload.expected_version, payload.definition, current_actor))
+
+    @app.post("/api/workflows/{workflow_id}/start", status_code=status.HTTP_201_CREATED)
+    def start_workflow(workflow_id: str, payload: WorkflowStartInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
+        workflow = store.get_workflow(workflow_id)
+        project = next((item for item in store.list_projects() if item.id == workflow.project_id), None)
+        if project is None or project.bridge_id is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a project bridge is required before a workflow can start")
+        step = step_by_id(workflow.definition, str(workflow.definition["entry"]))
+        if step["kind"] != "agent":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="v1 workflows must begin with an agent step")
+        model = str(step.get("model") or payload.model)
+        run = store.create_run(
+            workflow.project_id, payload.task_id, model, session_id=workflow.session_id,
+            workflow_id=workflow.id, workflow_step_id=step["id"],
+        )
+        started = store.start_workflow(workflow_id, current_actor)
+        store.enqueue_run(project.bridge_id, run)
+        store.append_audit("workflow.run_requested", current_actor, started.project_id, {
+            "workflow_id": started.id, "step_id": step["id"], "run_id": run.id,
+        })
+        return {"workflow": as_json(started), "run": as_json(run)}
 
     @app.post("/api/runs", status_code=status.HTTP_201_CREATED)
     def create_run(payload: RunInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
@@ -200,8 +282,17 @@ def create_app(
     def bridge_event(bridge_id: str, event: BridgeEvent, authenticated_bridge: str = Depends(bridge_identity)) -> dict[str, bool]:
         if bridge_id != authenticated_bridge:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
-        store.add_transcript(event.run_id, event.role, event.content)
+        store.add_transcript(event.run_id, event.role, event.content, bridge_id)
         return {"accepted": True}
+
+    @app.post("/api/bridge/{bridge_id}/commands/{command_id}/ack", status_code=status.HTTP_202_ACCEPTED)
+    def acknowledge_bridge_command(
+        bridge_id: str, command_id: str, authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, bool]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        store.acknowledge_command(bridge_id, command_id)
+        return {"acknowledged": True}
 
     @app.post("/api/bridge/{bridge_id}/runs/{run_id}/status")
     def bridge_run_status(
@@ -212,13 +303,47 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
         return as_json(store.update_run_status(run_id, payload.status, bridge_id))
 
+    @app.get("/api/bridge/{bridge_id}/runs/{run_id}/lease")
+    def bridge_run_lease(
+        bridge_id: str, run_id: str,
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        return as_json(store.validate_run_lease(run_id, bridge_id))
+
+    @app.post("/api/bridge/{bridge_id}/runs/{run_id}/lease/renew")
+    def renew_bridge_run_lease(
+        bridge_id: str, run_id: str,
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        return as_json(store.renew_run_lease(run_id, bridge_id))
+
     @app.post("/api/bridge/{bridge_id}/evidence", status_code=status.HTTP_202_ACCEPTED)
     def project_evidence(bridge_id: str, evidence: EvidenceInput, authenticated_bridge: str = Depends(bridge_identity)) -> dict[str, Any]:
         if bridge_id != authenticated_bridge:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        project = next((item for item in store.list_projects() if item.id == evidence.project_id), None)
+        if project is None or project.bridge_id != bridge_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge does not own this project")
         citation = graph.project(evidence.source_kind, evidence.source_id, evidence.project_id, evidence.payload)
         store.append_audit("evidence.projected", "bridge:" + bridge_id, evidence.project_id, {"citation": citation, "source_kind": evidence.source_kind})
         return {"accepted": True, "citation": citation}
+
+    @app.post("/api/bridge/{bridge_id}/workflows/{workflow_id}/steps/{step_id}")
+    def bridge_workflow_step(
+        bridge_id: str, workflow_id: str, step_id: str, payload: WorkflowStepInput,
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        workflow = store.get_workflow(workflow_id)
+        project = next((item for item in store.list_projects() if item.id == workflow.project_id), None)
+        if project is None or project.bridge_id != bridge_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge does not own this workflow")
+        return as_json(store.complete_workflow_step(workflow_id, step_id, payload.outcome, "bridge:" + bridge_id))
 
     @app.get("/api/evidence/search")
     def evidence_search(project_id: str, query: str, _: str = Depends(actor)) -> dict[str, Any]:
@@ -231,5 +356,31 @@ def create_app(
     @app.get("/api/failures/related")
     def related_failures(fingerprint: str, _: str = Depends(actor)) -> dict[str, Any]:
         return {"results": graph.related_failures(fingerprint)}
+
+    @app.websocket("/api/sessions/{session_id}/voice/realtime")
+    async def session_voice(session_id: str, websocket: WebSocket) -> None:
+        current_actor = (websocket.headers.get(settings.identity_header) or "").strip()
+        if not current_actor and settings.allow_insecure_dev_actor:
+            current_actor = settings.owner
+        if not current_actor or current_actor not in settings.approvers:
+            await websocket.close(code=1008)
+            return
+        if not settings.anvil_voice_realtime_url:
+            await websocket.close(code=1013)
+            return
+        try:
+            session = store.get_session(session_id)
+        except StoreError:
+            await websocket.close(code=1008)
+            return
+        workflow = next(iter(store.list_workflows(session_id)), None)
+
+        async def record(kind: str, data: dict[str, Any]) -> None:
+            store.record_session_event(session.id, workflow.id if workflow else None, kind, data)
+
+        await relay_realtime(
+            websocket, settings.anvil_voice_realtime_url, settings.anvil_voice_realtime_token,
+            record, settings.voice_retain_transcripts,
+        )
 
     return app

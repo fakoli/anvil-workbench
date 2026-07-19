@@ -2,7 +2,7 @@
 
 ## Product promise
 
-Anvil Workbench is the private delivery cockpit for one project’s path from a product requirement to a merged, evidenced change. It makes the model route, local agent activity, evidence, and approval gates visible without taking authority away from the systems that already own them.
+Anvil Workbench is the private, tailnet-first agent harness for one project’s path from a product requirement to a merged, evidenced change. The web UI is its primary operator entry point. It makes the model route, local agent activity, evidence, and approval gates visible without taking authority away from the systems that already own them.
 
 The v1 path is:
 
@@ -34,6 +34,9 @@ If either the merge or State acceptance fails, Workbench records a reconciliatio
 ## V1 surface
 
 - Delivery, Runs, Routes, Approvals, Evidence, and a secondary Sandbox UI.
+- Durable, concurrent harness sessions: one active run per session, a named worktree lease, a version-pinned workflow cursor, and an append-only redacted event sequence.
+- An allowlisted workflow vocabulary (`agent`, `tool`, `condition`, `fan_out`, `join`, `approval_wait`, `evidence_submit`, `reconcile`, `cancel`), not arbitrary model-authored executable graphs.
+- Session-bound push-to-talk through a Workbench relay to private Anvil Voice Realtime; raw audio is never retained and transcript retention is disabled by default.
 - Postgres persistence for run state, approvals, audits, bridge registration, and redacted transcripts.
 - A project-local bridge that polls the hub, tails canonical State events, invokes Codex against Anvil Serving, and carries out approved local GitHub actions.
 - Narrow graph tools for evidence search with citations, task-to-PR lineage, model/profile rationale, and related-failure lookup.

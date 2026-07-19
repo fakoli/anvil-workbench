@@ -64,6 +64,29 @@ The browser receives redacted run activity and approval metadata only. It does n
 
 The bridge alone may transition a run from `queued` to `running`, then to `evidenced` after State evidence submission, or to `reconciliation` after Codex, verification, State submission, or an approved action fails. Terminal states include a completion timestamp and immutable audit event; a reconciliation is never represented as completed delivery.
 
+## Harness session and workflow contract
+
+A Workbench **session** is a resumable, Workbench-owned supervision context. It links a project, a browser-visible title, a named bridge worktree, one version-pinned workflow, redacted event sequence, and the run/route trace. It is not an Anvil State task and cannot replace State claim or acceptance authority.
+
+- A session permits one `queued` or `running` run at a time.
+- The hub takes a fenced, expiring lease on `worktree:{name}` before it queues a run. An unexpired lease held by a different session fails closed. The bridge receives the lease epoch for traceability and resolves the name only from its local `--worktree ID=PATH` configuration.
+- Before a session run can transition to `running`, the bridge calls the hub's authenticated lease preflight. The hub rejects an expired, reassigned, or epoch-mismatched lease, so a stale command cannot touch a newly leased worktree. Terminal run states release their matching lease epoch.
+- While a session run is active, the bridge renews the same lease epoch every minute. A renewal failure stops the delivery from submitting evidence and moves it to reconciliation; it never grants a new lease or silently changes worktrees.
+- A workflow is validated before it is persisted, cannot contain unknown step kinds or cycles, and cannot be revised after it starts. It records an append-only, per-session event sequence for browser catch-up.
+- V1 accepts only `agent`, `tool`, `condition`, `fan_out`, `join`, `approval_wait`, `evidence_submit`, `reconcile`, and `cancel` nodes. Models may propose a reviewed definition only; they do not execute arbitrary graph code or alter policy.
+- Effects checkpoint before execution through a bridge command and remain idempotent at the State/approval boundary. A failed bridge operation or invalid lease path becomes reconciliation, never a silent retry of an external effect.
+
+The default delivery template is deliberately narrow: `agent -> approval_wait -> reconcile`. Its agent step owns local edit/test/evidence submission; it then pauses for a human review gate. PR creation, merge, State acceptance, deployment, and model-policy changes remain independent hash-bound approvals.
+
+## Voice transport contract
+
+Voice is a transport into a specific Workbench session, not a browser-side model route. The browser opens a same-origin WebSocket to `/api/sessions/{session_id}/voice/realtime`; the hub authenticates the configured private `ANVIL_VOICE_REALTIME_URL` with its own environment-held token when required.
+
+- The relay accepts only `session.update`, input-audio append/commit/clear, `response.create`, and `response.cancel`. It strips model, tool, tool-choice, instructions, and arbitrary prompt controls.
+- Input/output audio frames are forwarded in memory only. The hub stores redacted lifecycle summaries (`voice.started`, utterance/response state, interruption, error) but not audio payloads.
+- Transcript text is omitted from stored events by default. `WORKBENCH_VOICE_RETAIN_TRANSCRIPTS=true` is an explicit retention choice and remains subject to existing redaction before storage.
+- Voice can start, cancel, or add a turn to a session, but cannot create a PR, merge, apply State, deploy, or change model policy. Those actions retain their normal approval path.
+
 ## Bridge and GitHub action contract
 
 The bridge makes an outbound authenticated request to the hub and is the only process with access to the project worktree and local GitHub authentication. Its runner contract is intentionally small:
@@ -72,6 +95,8 @@ The bridge makes an outbound authenticated request to the hub and is the only pr
 2. Read the State work packet, run Codex locally, and stream redacted activity/evidence.
 3. For `commit_pr`, recalculate the repository diff hash and consume the matching approval exactly once before committing, pushing, and creating a PR.
 4. For `merge_and_accept`, verify required GitHub checks, merge first, then invoke the configured State acceptance command.
+
+Bridge commands are leased for delivery rather than deleted when fetched. A terminal run acknowledges its command only after its `evidenced` or `reconciliation` state is recorded; an interrupted fetch becomes eligible for recovery after its delivery lease expires. The hub checks that every bridge event and evidence projection belongs to the authenticated bridge's project/run.
 
 An approval is one-time, expires, is scoped to a bridge, and binds the canonical JSON payload hash. Any changed diff or replayed grant fails closed.
 

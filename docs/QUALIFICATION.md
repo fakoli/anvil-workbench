@@ -8,8 +8,8 @@ This is an evidence record, not a promotion decision. It distinguishes the teste
 
 | Area | Evidence | Result |
 | --- | --- | --- |
-| Workbench API and bridge contracts | `python -m pytest -q` | 13 passed; covers State packet/event isolation, independent verification capture, evidence-submit ordering, approval replay/diff invalidation, and reconciliation status. |
-| Browser shell | Loopback stack at `http://127.0.0.1:8090` | Delivery feedback and Runs navigation rendered; browser console had no warnings or errors. |
+| Workbench API and bridge contracts | `python -m pytest -q` | 23 passed; covers State packet/event isolation, independent verification capture, evidence-submit ordering, approval replay/diff invalidation, fenced/renewed worktree leases, bridge command recovery, bridge-project isolation, version-pinned workflows, and voice redaction/error behavior. |
+| Browser shell | Loopback stack at `http://127.0.0.1:8090` | Delivery and Sessions views rendered; two durable session cards were created and the start-workflow form and disabled voice guard were exercised. Browser console had no warnings or errors. |
 | State CLI | Disposable `anvil-workbench-state-e2e-proven` fixture | Claim, packet, verification capture, evidence submit, strict review, and replay passed. No State database was opened or modified directly. State accept/approve was intentionally not performed. |
 | Heavy model plane | `nvidia/gpt-oss-puzzle-88B@9c0e0746a0d2218b28cc7b2cb3ce4e1a2f50fdb2` on the pinned Anvil vLLM image | Smoke, JSON, 120K needle, and 20-tool preflight passed. This is not evidence of general quality superiority. |
 | Fast model plane | `leon-se/gemma-4-E4B-it-FP8-Dynamic@56e30bf603d18a4972caffafa1bb4a4f9a841dee` | Smoke, JSON, 30K context, and 12-tool preflight passed. |
@@ -26,6 +26,7 @@ The remaining blocker is model/harness tool compatibility: the pinned Heavy prod
 
 - No GitHub commit, push, PR creation, merge, or State acceptance was executed. Those actions require a human approval and a non-production remote fixture.
 - No tailnet identity proxy was deployed; the local stack used the explicitly development-only loopback actor override.
+- Workbench push-to-talk did not connect to a live Dark Realtime endpoint in this loopback stack. Its same-origin relay, allowlist, no-raw-audio persistence, and invalid-event rejection are contract-tested, but microphone/STT/TTS quality needs a tailnet qualification.
 - Neo4j's live projection/search was not certified; graph write-denial and redaction boundaries remain contract-tested.
 
 ## Requalification recipe

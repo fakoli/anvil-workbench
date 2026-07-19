@@ -9,6 +9,7 @@
 - Anvil Serving Responses-compatible Codex configuration, correlation-header contract, and isolated Codex tool surface.
 - Derived Neo4j projection shape and narrow retrieval/lineage/failure tools.
 - React desktop workbench with purpose-specific delivery, run, route, approval, evidence, and policy-boundary views; Docker Compose deployment; and hermetic API/security tests.
+- Harness kernel: durable concurrent sessions, named-worktree lease fencing, version-pinned allowlisted workflow definitions/events, bridge worktree resolution, and a session-bound private voice relay.
 
 ### Validated locally
 
@@ -20,11 +21,12 @@
 ### Still requiring a live qualification
 
 1. Start the hub behind a tailnet identity proxy and verify the injected identity header is stripped and re-injected correctly.
-2. Register one real project bridge and verify State work packet retrieval and event tailing without opening `state.db`.
+2. Register one real project bridge and verify State work packet retrieval and event tailing without opening `state.db`, including two separate named worktrees running in parallel.
 3. Requalify Codex-through-Serving tool execution using a local model/tool template combination that emits executable Codex shell calls. The pinned Heavy accepts and traces Responses turns but emits unsupported `shell_command<|channel|>commentary` calls in a full Codex loop; it is not a passing delivery harness yet.
 4. Exercise a full approved PR and merge flow against a non-production GitHub repository.
 5. Verify State apply-after-merge failure creates a reconciliation item.
 6. Enable Neo4j and local embeddings/reranking only after redaction and citation checks pass.
+7. Configure Dark Anvil Voice Realtime and qualify browser microphone input, interruption, TTS output, and transcript-retention-off behavior through the Workbench relay.
 
 ## Near-term milestones
 
