@@ -34,10 +34,45 @@ def test_api_releases_only_an_approved_hash_bound_bridge_action():
         reconciled = test_client.post(f"/api/bridge/{bridge['id']}/runs/{run['id']}/status", headers=bridge_headers, json={"status": "reconciliation"})
         assert reconciled.status_code == 200
         assert reconciled.json()["completed_at"] is not None
+        assert test_client.post(
+            f"/api/bridge/{bridge['id']}/commands/{queued_run['id']}/ack", headers=bridge_headers,
+        ).status_code == 202
+
+        session_response = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "approval delivery", "worktree_id": "checkout-a",
+        }).json()
+        started = test_client.post(
+            f"/api/workflows/{session_response['workflow']['id']}/start",
+            json={"task_id": "TASK-APPROVAL", "model": "heavy-local"},
+        ).json()
+        delivery_run = started["run"]
+        queued_delivery = test_client.get(
+            f"/api/bridge/{bridge['id']}/commands/next", headers=bridge_headers,
+        ).json()
+        assert queued_delivery["payload"]["run_id"] == delivery_run["id"]
+        assert test_client.post(
+            f"/api/bridge/{bridge['id']}/runs/{delivery_run['id']}/status",
+            headers=bridge_headers, json={"status": "running"},
+        ).status_code == 200
+        assert test_client.post(
+            f"/api/bridge/{bridge['id']}/runs/{delivery_run['id']}/status",
+            headers=bridge_headers, json={"status": "evidenced"},
+        ).status_code == 200
+        assert test_client.post(
+            f"/api/bridge/{bridge['id']}/runs/{delivery_run['id']}/status",
+            headers=bridge_headers, json={"status": "completed"},
+        ).status_code == 422
+        assert test_client.post(
+            f"/api/bridge/{bridge['id']}/commands/{queued_delivery['id']}/ack", headers=bridge_headers,
+        ).status_code == 202
 
         approval = test_client.post("/api/approvals", json={
             "project_id": project["id"], "bridge_id": bridge["id"], "action_type": "commit_pr",
-            "payload": {"diff_hash": "before", "branch": "codex/demo"},
+            "payload": {
+                "diff_hash": "before", "branch": "codex/demo",
+                "run_id": delivery_run["id"], "session_id": session_response["session"]["id"],
+                "worktree_id": "checkout-a", "lease_epoch": delivery_run["lease_epoch"],
+            },
         }).json()
         denied = test_client.post(f"/api/bridge/{bridge['id']}/approvals/{approval['id']}/consume", headers=bridge_headers, json={"payload_hash": approval["payload_hash"]})
         assert denied.status_code == 409
@@ -46,7 +81,15 @@ def test_api_releases_only_an_approved_hash_bound_bridge_action():
         assert queued_action["approval_id"] == approval["id"]
         changed = test_client.post(f"/api/bridge/{bridge['id']}/approvals/{approval['id']}/consume", headers=bridge_headers, json={"payload_hash": "changed"})
         assert changed.status_code == 409
-        consumed = test_client.post(f"/api/bridge/{bridge['id']}/approvals/{approval['id']}/consume", headers=bridge_headers, json={"payload_hash": approval["payload_hash"]})
+        direct_delivery_consume = test_client.post(
+            f"/api/bridge/{bridge['id']}/approvals/{approval['id']}/consume",
+            headers=bridge_headers, json={"payload_hash": approval["payload_hash"]},
+        )
+        assert direct_delivery_consume.status_code == 409
+        consumed = test_client.post(
+            f"/api/bridge/{bridge['id']}/approvals/{approval['id']}/consume-for-run",
+            headers=bridge_headers, json={"payload_hash": approval["payload_hash"]},
+        )
         assert consumed.status_code == 200
         assert consumed.json()["status"] == "consumed"
 

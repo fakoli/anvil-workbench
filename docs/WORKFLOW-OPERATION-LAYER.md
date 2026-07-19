@@ -20,6 +20,10 @@ authority for routing, evaluations, and operational policy. Workbench owns the
 workflow instance, approval boundaries, operator view, and reconciliation. The
 bridge is the only executor that can touch a worktree or local credentials.
 
+This is a V2 target. Current Workbench V1 does not yet execute `operation`
+steps or persist these catalog snapshots; [CONTRACTS.md](CONTRACTS.md) remains
+the current behavior contract.
+
 ## Problem
 
 The current integration is intentionally safe but still hand-shaped:
@@ -88,32 +92,12 @@ Each provider publishes a compact, versioned catalog of the operations it
 explicitly permits Workbench to orchestrate. The catalog is not a copy of every
 CLI leaf. It is a reviewed projection with product intent.
 
-An operation descriptor needs at least:
-
-```json
-{
-  "schema_version": "anvil-operation/v1",
-  "provider": "anvil-serving",
-  "id": "serving.eval.preflight",
-  "title": "Preflight a declared routed model",
-  "contract_version": "1",
-  "input_schema": {"type": "object"},
-  "execution": {
-    "bridge_adapter": "serving.mcp.preflight_probe",
-    "fallback": "none"
-  },
-  "effect": "read",
-  "gates": {
-    "preview": "required",
-    "confirmation": "not_required",
-    "human_approval": "not_required"
-  },
-  "preconditions": ["declared-model-route", "bounded-target"],
-  "receipts": ["preflight-artifact", "route-correlation"],
-  "failure": "reconcile",
-  "docs": "docs/OPERATOR-SKILLS-AND-SUBAGENTS.md#evaluation"
-}
-```
+An operation descriptor needs a stable ID/version/digest, typed input and
+output, a bridge adapter/deadline, effect class, gates, idempotency, required
+receipts, failure behavior, and documentation. The schema-validated examples
+are the [State catalog](contracts/examples/anvil-state.catalog.v1.json),
+[Serving catalog](contracts/examples/anvil-serving.catalog.v1.json), and
+[bridge catalog](contracts/examples/project-bridge.catalog.v1.json).
 
 The descriptor describes an operation; it does not include a shell string,
 secret, host path, or provider credential. The bridge adapter owns the local
@@ -145,13 +129,21 @@ needs a template/UI mapping, not a bespoke end-to-end implementation.
 
 State's catalog should expose task-level intent, never database implementation:
 
+The fixture catalog intentionally starts with `claim` and `evidence.submit`.
+The proposed claim adapter resolves a bridge-configured leased worktree name,
+runs the State command there, and records the observed branch before Codex may
+start; it never accepts a browser-supplied path or lets State claim a different
+checkout silently.
+The remaining rows are implementation candidates and must be added only with a
+supported State adapter, schema, and tests.
+
 | Operation | Effect | Required result |
 | --- | --- | --- |
 | `state.task.claim` | bounded task transition | State claim receipt and canonical event ID |
 | `state.task.packet` | read | Immutable work-packet digest and declared verification plan |
 | `state.verification.capture` | evidence capture | Redacted verification receipt with exit status |
 | `state.evidence.submit` | task evidence transition | State evidence/event ID; refuses failed verification or undeclared changes |
-| `state.task.accept_merged` | acceptance transition | Requires merged-PR receipt plus consumed `merge_and_accept` approval |
+| `state.task.apply_review_decision` | acceptance transition | The bridge may invoke it only after observing a merged PR and consuming the `merge_and_accept` approval; State itself owns only its native apply/review decision |
 
 The bridge still calls the supported State CLI and tails canonical events. An
 operation catalog does not permit Workbench to write State directly, duplicate
@@ -160,6 +152,14 @@ its state machine, or apply acceptance before a merge.
 ### Anvil Serving
 
 Serving should project only operations that have an existing declared contract:
+
+The fixture catalog intentionally starts only with the confirmed, bounded
+preflight adapter. The adapter forces Serving's `confirm=true`, translates a
+typed check list to the current MCP tool, enforces its bounded workload
+deadline, and turns the tool's command/stdout/stderr into a redacted Workbench
+artifact receipt. Serving does not currently emit a Workbench route correlation
+for preflight, so that field is optional rather than invented. The remaining rows are candidates, not currently published
+Workbench operations.
 
 | Operation family | Typical use in a workflow | Gate expectation |
 | --- | --- | --- |
@@ -187,55 +187,20 @@ step as a precise replacement for the ambiguous use of a generic `tool` step.
 The existing `agent`, `approval_wait`, `evidence_submit`, `reconcile`,
 `fan_out`, `join`, `condition`, and `cancel` semantics remain useful.
 
-```json
-{
-  "schema_version": "workbench-workflow/v2",
-  "entry": "claim",
-  "steps": [
-    {
-      "id": "claim",
-      "kind": "operation",
-      "operation": {
-        "provider": "anvil-state",
-        "id": "state.task.claim",
-        "contract_version": "1"
-      },
-      "inputs": {"task_id": {"from": "run.task_id"}},
-      "next": ["implement"]
-    },
-    {
-      "id": "implement",
-      "kind": "agent",
-      "model": "planning",
-      "skills": ["anvil:execute"],
-      "next": ["evidence"]
-    },
-    {
-      "id": "evidence",
-      "kind": "operation",
-      "operation": {
-        "provider": "anvil-state",
-        "id": "state.evidence.submit",
-        "contract_version": "1"
-      },
-      "inputs": {"task_id": {"from": "run.task_id"}},
-      "next": ["pr_approval"]
-    },
-    {
-      "id": "pr_approval",
-      "kind": "approval_wait",
-      "approval_action": "commit_pr",
-      "next": ["reconcile"]
-    },
-    {"id": "reconcile", "kind": "reconcile", "next": []}
-  ]
-}
-```
+The schema-validated [delivery example](contracts/examples/delivery.workflow.v2.json)
+is the canonical V2 template. It makes both bridge-owned GitHub effects
+explicit: `commit_pr` approval -> bridge PR operation -> `merge_and_accept`
+approval -> bridge composite that observes the merge and then requests State
+application. The bridge composite owns that ordering; State does not gain a
+GitHub receipt API.
 
-`inputs` is a deliberately small binding language: literals plus allowlisted
-references to the run, selected work packet, or earlier redacted receipt. It is
-not a template engine, JavaScript expression, shell interpolation, or arbitrary
-JSONPath evaluator. Output fields must be declared by the operation descriptor.
+`inputs` is a deliberately small binding language: each field is either
+`{"kind":"literal","value":...}` or
+`{"kind":"reference","source":"run|task|work_packet|receipt","field":"declared.path"}`.
+The exact schema lives in [workflow.v2.schema.json](contracts/schemas/workflow.v2.schema.json).
+It is not a template engine, JavaScript expression, shell interpolation, or
+arbitrary JSONPath evaluator. The compiler verifies that a reference source and
+field are declared by the selected operation descriptor before queuing a run.
 
 ## Compile and execution protocol
 
@@ -249,11 +214,16 @@ JSONPath evaluator. Output fields must be declared by the operation descriptor.
    profile. The profile names which provider operations are allowed for that
    project/worktree.
 4. **Compile.** Starting a session resolves each operation to an exact provider
-   descriptor and records a catalog snapshot digest in the immutable workflow
-   version and queued bridge command.
+   descriptor and records every provider catalog digest, the selected operation
+   digest, and the capability-profile digest in the immutable workflow version
+   and queued bridge command.
 5. **Preflight.** Before every effect, the bridge rechecks its local catalog
-   digest, project ownership, lease epoch, typed inputs, declared target, and any
-   required preview or approval receipt. A mismatch blocks the run; it never
+   digests, project ownership, lease epoch, typed inputs, declared target, and any
+   required preview or approval receipt. The bridge recomputes its configured
+   local catalog digest, validates the typed operation input against the pinned
+   descriptor schema, and refuses an unknown or mismatched snapshot. An
+   approval-gated operation also needs a hub-backed atomic approval consumer;
+   command fields that merely claim a grant are not authority. A mismatch blocks the run; it never
    falls back to a newer command shape or a raw shell command.
 6. **Execute.** The bridge invokes the named adapter once with an idempotency key
    where the provider supports one. It stores a redacted, typed receipt before

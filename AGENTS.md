@@ -21,7 +21,7 @@ Anvil Workbench is a private delivery-control product. It is not the owner of pr
 - **The project bridge is the worktree authority.** Git operations, Codex invocation, State CLI calls, and local credentials remain on the bridge host. The hub has neither a worktree nor GitHub credentials.
 - **Approvals are data, not decoration.** PR creation, merge, State apply, deployment, and model/policy changes require a one-time, hash-bound approval. A changed payload invalidates its grant.
 - **Neo4j is a derived projection.** Index only redacted evidence/lineage metadata. Never index raw transcripts, expose generic Cypher to an agent, or let graph output approve an action.
-- **Model output is a proposal.** A model can select only capability-profiled, version-pinned operations. The bridge must independently validate the workflow/catalog/skill/lease/approval snapshot before every effect.
+- **V2 model output is a proposal.** When the proposed operation layer is implemented, a model may select only capability-profiled, version-pinned operations. The bridge must independently validate the workflow/catalog/skill/lease/approval snapshot before every effect. Until then, describe the existing v1 behavior from [docs/CONTRACTS.md](docs/CONTRACTS.md), not this target invariant.
 
 ## Development rules
 

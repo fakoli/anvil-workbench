@@ -1,0 +1,43 @@
+{
+  "schema_version": "anvil-operation-catalog/v1",
+  "provider": "project-bridge",
+  "catalog_version": "1.0.0",
+  "catalog_digest": "sha256:3dfc186c36622578b586a586b6161897d103225bf83dfef51702b1b7fe784b32",
+  "generated_at": "2026-07-19T00:00:00Z",
+  "operations": [
+    {
+      "id": "bridge.github.commit_pr",
+      "title": "Commit, push, and create a pull request",
+      "summary": "Execute the existing bridge-local GitHub action only with a consumed commit_pr approval bound to the observed diff and target branch; return the committed head SHA for later merge approval.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:8aef716c52d7bf33f19a2829b56e7ad8f19cd5f1cce6cc6d5a10320410e512c3",
+      "effect": "external_effect",
+      "execution": {"kind": "bridge_adapter", "bridge_adapter": "bridge.github.commit_pr", "transport": "bridge_local", "deadline_seconds": 600},
+      "input_schema": {"type": "object", "required": ["diff_hash", "branch", "title", "base"], "properties": {"diff_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "branch": {"type": "string", "minLength": 1, "maxLength": 160}, "title": {"type": "string", "minLength": 1, "maxLength": 240}, "base": {"type": "string", "minLength": 1, "maxLength": 160}}, "additionalProperties": false},
+      "output_schema": {"type": "object", "required": ["pr_url", "diff_hash", "head_sha"], "properties": {"pr_url": {"type": "string"}, "diff_hash": {"type": "string"}, "head_sha": {"type": "string", "pattern": "^[a-f0-9]{40,64}$"}}},
+      "preconditions": ["bridge.lease_valid", "approval.commit_pr_consumed", "diff.hash_matches_approval"],
+      "gates": {"preview": "not_supported", "confirmation": "required", "human_approval": "required", "approval_action": "commit_pr"},
+      "idempotency": {"key_scope": "approval_payload", "replay": "reconcile", "max_attempts": 1},
+      "receipts": ["github_pr", "diff_hash", "head_sha"],
+      "failure": "reconcile",
+      "docs": "docs/CONTRACTS.md#bridge-and-github-action-contract"
+    },
+    {
+      "id": "bridge.github.merge_and_accept",
+      "title": "Merge a pull request and request State acceptance",
+      "summary": "Execute the bridge-local composite: verify the approved PR head and required checks, merge with a head compare-and-swap, then invoke the configured State apply command. A partial outcome becomes reconciliation.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:0e7d2a035662c0224014ca2576c78a9b7d717812f47700b5314cc426b9896f9e",
+      "effect": "external_effect",
+      "execution": {"kind": "bridge_adapter", "bridge_adapter": "bridge.github.merge_and_accept", "transport": "bridge_local", "deadline_seconds": 900},
+      "input_schema": {"type": "object", "required": ["pr", "task_id", "expected_head_sha"], "properties": {"pr": {"type": "string", "minLength": 1, "maxLength": 500}, "task_id": {"type": "string", "minLength": 1, "maxLength": 160}, "expected_head_sha": {"type": "string", "pattern": "^[a-f0-9]{40,64}$"}}, "additionalProperties": false},
+      "output_schema": {"type": "object", "required": ["pr", "task_id", "head_sha", "state_acceptance"], "properties": {"pr": {"type": "string"}, "task_id": {"type": "string"}, "head_sha": {"type": "string", "pattern": "^[a-f0-9]{40,64}$"}, "state_acceptance": {"type": "object", "description": "Redacted State apply result or opaque receipt reference."}}},
+      "preconditions": ["bridge.lease_valid", "approval.merge_and_accept_consumed", "github.head_matches_approval", "github.required_checks_pass", "github.merge_observed"],
+      "gates": {"preview": "not_supported", "confirmation": "required", "human_approval": "required", "approval_action": "merge_and_accept"},
+      "idempotency": {"key_scope": "approval_payload", "replay": "reconcile", "max_attempts": 1},
+      "receipts": ["github_merge", "state_acceptance"],
+      "failure": "reconcile",
+      "docs": "docs/CONTRACTS.md#bridge-and-github-action-contract"
+    }
+  ]
+}

@@ -22,7 +22,7 @@ The project-local bridge requires explicitly configured, project-specific inputs
 | State work-packet command | Runs in the project worktree and returns one JSON work packet for `{task_id}`. |
 | Canonical event stream | An append-only JSONL event file that the bridge tails from a local cursor. |
 | State status command | `anvil status`; resolves the canonical event path when no explicit event file is supplied. |
-| Claim command | `anvil claim {task_id} --actor {actor}`. |
+| Claim command | `anvil claim {task_id} --actor {actor} --json`; the bridge compares its returned branch with the checked-out branch of the leased worktree. |
 | Work-packet command | `anvil packet {task_id} --format json`; the bridge tolerates its leading `Wrote packet ...` status line. |
 | Verification capture | `anvil hook capture-evidence`; receives the bridge-observed exit code and captured stdout/stderr. |
 | Evidence submit command | `anvil submit {task_id}` with verification commands and packet-declared changed files. |
@@ -31,7 +31,7 @@ The bridge may read the event stream and execute the work-packet command. It mus
 
 ### State writes
 
-The bridge performs `claim -> work packet -> Codex -> independent verification capture -> State evidence submit`. State evidence is not submitted when a verification command fails or no packet-declared file changed. An apply command is configured separately and can run only after an approved `merge_and_accept` action has merged successfully; a standalone `state_apply` command is rejected. A failed State apply after merge is a visible reconciliation failure.
+The bridge performs `claim -> work packet -> Codex -> independent verification capture -> State evidence submit` in the same bridge-resolved, leased worktree. It never receives a browser path; the worktree name must resolve from its local `--worktree ID=PATH` configuration. State packet verification prose is untrusted task data: a packet command must exactly match a local operator-configured `--verification-command` entry and is executed as an argv list with no shell. An unknown command fails closed. State evidence is not submitted when a verification command fails or no packet-declared file changed. An apply command is configured separately and can run only after an approved `merge_and_accept` action has merged successfully; a standalone `state_apply` command is rejected. A failed State apply after merge is a visible reconciliation failure.
 
 ## Anvil Serving contract
 
@@ -71,7 +71,7 @@ The hub is a private service behind an identity-aware tailnet proxy. The proxy m
 
 The browser receives redacted run activity and approval metadata only. It does not receive database passwords, bridge bootstrap tokens after their one-time registration response, router tokens, model provider keys, or GitHub credentials.
 
-The bridge alone may transition a run from `queued` to `running`, then to `evidenced` after State evidence submission, or to `reconciliation` after Codex, verification, State submission, or an approved action fails. Terminal states include a completion timestamp and immutable audit event; a reconciliation is never represented as completed delivery.
+The bridge alone may transition a run from `queued` to `running`, then to `evidenced` after State evidence submission. `evidenced` is a delivery checkpoint, not completion: it may move to `completed` only after merge and State acceptance both succeed, or to `reconciliation` after Codex, verification, State submission, or an approved action fails. Terminal states include a completion timestamp and immutable audit event; reconciliation is never represented as completed delivery.
 
 ## Harness session and workflow contract
 
@@ -79,7 +79,7 @@ A Workbench **session** is a resumable, Workbench-owned supervision context. It 
 
 - A session permits one `queued` or `running` run at a time.
 - The hub takes a fenced, expiring lease on `worktree:{name}` before it queues a run. An unexpired lease held by a different session fails closed. The bridge receives the lease epoch for traceability and resolves the name only from its local `--worktree ID=PATH` configuration.
-- Before a session run can transition to `running`, the bridge calls the hub's authenticated lease preflight. The hub rejects an expired, reassigned, or epoch-mismatched lease, so a stale command cannot touch a newly leased worktree. Terminal run states release their matching lease epoch.
+- Before a session run can transition to `running`, the bridge calls the hub's authenticated lease preflight. The hub rejects an expired, reassigned, or epoch-mismatched lease, so a stale command cannot touch a newly leased worktree. A reconciliation releases its matching lease epoch. An `evidenced` delivery run retains it until its bound PR/merge action completes, the bridge explicitly releases it, or it expires; this prevents a later action from being redirected to a reused checkout.
 - While a session run is active, the bridge renews the same lease epoch every minute. A renewal failure stops the delivery from submitting evidence and moves it to reconciliation; it never grants a new lease or silently changes worktrees.
 - A workflow is validated before it is persisted, cannot contain unknown step kinds or cycles, and cannot be revised after it starts. It records an append-only, per-session event sequence for browser catch-up.
 - V1 accepts only `agent`, `tool`, `condition`, `fan_out`, `join`, `approval_wait`, `evidence_submit`, `reconcile`, and `cancel` nodes. Models may propose a reviewed definition only; they do not execute arbitrary graph code or alter policy.
@@ -104,12 +104,12 @@ The bridge makes an outbound authenticated request to the hub and is the only pr
 
 1. Poll for a queued `run_codex` or approved action.
 2. Read the State work packet, run Codex locally, and stream redacted activity/evidence.
-3. For `commit_pr`, recalculate the repository diff hash and consume the matching approval exactly once before committing, pushing, and creating a PR.
-4. For `merge_and_accept`, verify required GitHub checks, merge first, then invoke the configured State acceptance command.
+3. For `commit_pr`, require an evidenced session run plus its active `run_id`, `session_id`, `worktree_id`, and lease epoch; atomically revalidate that binding, consume the approval, and renew the exact lease immediately before recalculating the repository diff hash and performing the effect. Commit, push, and PR creation run only in that bridge-configured worktree. Its receipt records the committed head SHA. A successful PR keeps that lease for the later merge approval.
+4. For `merge_and_accept`, require that receipt's exact head SHA and the run's exact State task ID. Atomically revalidate and renew the same bound worktree lease, compare the current PR head, verify required GitHub checks, and use GitHub's head compare-and-swap merge. Only after that succeeds may the bridge invoke the configured State acceptance command in that same worktree. The dedicated consumed-merge finalizer releases the lease, marks delivery complete, and acknowledges that exact bridge command in one durable operation, so an interrupted response cannot redeliver the completed merge.
 
 Bridge commands are leased for delivery rather than deleted when fetched. A terminal run acknowledges its command only after its `evidenced` or `reconciliation` state is recorded; an interrupted fetch becomes eligible for recovery after its delivery lease expires. The hub checks that every bridge event and evidence projection belongs to the authenticated bridge's project/run.
 
-An approval is one-time, expires, is scoped to a bridge, and binds the canonical JSON payload hash. Any changed diff or replayed grant fails closed.
+An approval is one-time, expires, is scoped to a bridge, and binds the canonical JSON payload hash. GitHub delivery approvals additionally bind an evidenced session run, its worktree name, lease epoch, and, for merge, the run's task ID and approved PR head SHA. Their consumption is a hub-side transaction that validates the approval/run/lease together and renews the fence before the bridge begins the external effect. Any changed diff/head, stale worktree binding, mismatched task, expired/replayed grant, or action failure fails closed into reconciliation.
 
 `skill_probe` is the sole non-mutating bridge command outside a run or approved action. It resolves the hub-selected names locally, verifies their digests, projects redacted evaluation evidence, then acknowledges. A missing or changed digest is acknowledged only after a redacted reconciliation evidence artifact is projected; it does not retry forever. It never invokes Codex or executes skill content.
 

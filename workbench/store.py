@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from dataclasses import replace
 from datetime import timedelta
@@ -25,10 +26,16 @@ class StoreError(RuntimeError):
     """A requested Workbench operation violates an immutable audit invariant."""
 
 
+_GIT_HEAD_SHA = re.compile(r"^[0-9a-f]{40,64}$")
+
+
 _RUN_STATUS_TRANSITIONS = {
     "queued": frozenset({"running", "reconciliation"}),
     "running": frozenset({"evidenced", "reconciliation"}),
-    "evidenced": frozenset(),
+    # Evidence proves the implementation phase only.  A delivery is complete
+    # only after the bridge has observed merge and State acceptance.
+    "evidenced": frozenset({"reconciliation"}),
+    "completed": frozenset(),
     "reconciliation": frozenset(),
 }
 
@@ -61,6 +68,7 @@ class WorkbenchStore(Protocol):
     def acquire_lease(self, resource_key: str, session_id: str, ttl_seconds: int) -> ResourceLease: ...
     def validate_run_lease(self, run_id: str, bridge_id: str) -> Run: ...
     def renew_run_lease(self, run_id: str, bridge_id: str, ttl_seconds: int = 300) -> Run: ...
+    def release_run_lease(self, run_id: str, bridge_id: str) -> Run: ...
     def list_approvals(self, project_id: str | None = None) -> list[Approval]: ...
     def register_bridge(self, project_id: str, name: str) -> tuple[Bridge, str]: ...
     def authenticate_bridge(self, bridge_id: str, token: str) -> Bridge: ...
@@ -73,6 +81,8 @@ class WorkbenchStore(Protocol):
     def get_approval(self, approval_id: str) -> Approval: ...
     def approve(self, approval_id: str, actor: str, approvers: frozenset[str]) -> Approval: ...
     def consume(self, approval_id: str, action_payload_hash: str) -> Approval: ...
+    def consume_approval_for_run(self, approval_id: str, action_payload_hash: str, bridge_id: str) -> Approval: ...
+    def complete_approved_merge(self, approval_id: str, action_payload_hash: str, bridge_id: str, command_id: str | None = None) -> Run: ...
     def enqueue_command(self, bridge_id: str, approval: Approval) -> None: ...
     def enqueue_run(self, bridge_id: str, run: Run) -> None: ...
     def enqueue_skill_probe(self, bridge_id: str) -> None: ...
@@ -263,6 +273,20 @@ class MemoryStore:
         })
         return run
 
+    def release_run_lease(self, run_id: str, bridge_id: str) -> Run:
+        run = self.validate_run_lease(run_id, bridge_id)
+        if run.session_id is None:
+            return run
+        session = self.get_session(run.session_id)
+        resource_key = "worktree:" + session.worktree_id
+        lease = self.leases.get(resource_key)
+        if lease is not None and lease.session_id == session.id and lease.epoch == run.lease_epoch:
+            self.leases[resource_key] = replace(lease, expires_at=now_utc())
+            self._append_workflow_event(session.id, run.workflow_id, "lease.released", {
+                "resource_key": resource_key, "epoch": lease.epoch,
+            })
+        return run
+
     def list_approvals(self, project_id: str | None = None) -> list[Approval]:
         values = list(self.approvals.values())
         return [approval for approval in values if project_id is None or approval.project_id == project_id]
@@ -344,13 +368,22 @@ class MemoryStore:
         completed_at = now_utc() if status in {"evidenced", "reconciliation"} else None
         updated = replace(run, status=status, completed_at=completed_at)
         self.runs[run_id] = updated
-        if completed_at is not None and updated.session_id is not None:
+        if status == "reconciliation" and updated.session_id is not None:
             session = self.get_session(updated.session_id)
             resource_key = "worktree:" + session.worktree_id
             lease = self.leases.get(resource_key)
             if lease is not None and lease.session_id == session.id and lease.epoch == updated.lease_epoch:
                 self.leases[resource_key] = replace(lease, expires_at=completed_at)
                 self._append_workflow_event(session.id, None, "lease.released", {"resource_key": resource_key, "epoch": lease.epoch})
+        if updated.workflow_id is not None and updated.session_id is not None and status == "reconciliation":
+            workflow = self.get_workflow(updated.workflow_id)
+            if workflow.status not in {"completed", "reconciliation", "cancelled"}:
+                self.workflows[workflow.id] = replace(
+                    workflow, status="reconciliation", cursor=(), updated_at=now_utc(),
+                )
+                self._append_workflow_event(updated.session_id, workflow.id, "workflow.delivery_finished", {
+                    "run_id": updated.id, "status": "reconciliation",
+                })
         self.append_audit("run.status_changed", "bridge:" + bridge_id, run.project_id, {"run_id": run_id, "status": status})
         return updated
 
@@ -369,6 +402,29 @@ class MemoryStore:
             raise StoreError("unknown project")
         if bridge_id is not None and bridge_id not in self.bridges:
             raise StoreError("unknown bridge")
+        if action_type not in {"commit_pr", "merge_and_accept"}:
+            raise StoreError("approval action is not executable by the v1 bridge")
+        if action_type in {"commit_pr", "merge_and_accept"}:
+            if bridge_id is None:
+                raise StoreError("GitHub delivery approval requires a project bridge")
+            run_id = payload.get("run_id")
+            session_id = payload.get("session_id")
+            worktree_id = payload.get("worktree_id")
+            lease_epoch = payload.get("lease_epoch")
+            if not all(isinstance(value, str) and value for value in (run_id, session_id, worktree_id)) or not isinstance(lease_epoch, int):
+                raise StoreError("GitHub delivery approval must bind run, session, worktree, and lease epoch")
+            run = self.validate_run_lease(run_id, bridge_id)
+            if run.project_id != project_id or run.session_id != session_id or run.lease_epoch != lease_epoch:
+                raise StoreError("GitHub delivery approval binding does not match the active run")
+            session = self.get_session(session_id)
+            if session.worktree_id != worktree_id or run.status != "evidenced":
+                raise StoreError("GitHub delivery approval requires an evidenced run in its leased worktree")
+            if action_type == "merge_and_accept":
+                if payload.get("task_id") != run.task_id:
+                    raise StoreError("merge approval task id must match the evidenced run")
+                expected_head_sha = payload.get("expected_head_sha")
+                if not isinstance(expected_head_sha, str) or _GIT_HEAD_SHA.fullmatch(expected_head_sha) is None:
+                    raise StoreError("merge approval requires the expected pull request head SHA")
         clean = redact_value(payload)
         approval = Approval(
             new_id("approval"), project_id, action_type, clean, payload_hash(clean), requested_by,
@@ -399,6 +455,8 @@ class MemoryStore:
 
     def consume(self, approval_id: str, action_payload_hash: str) -> Approval:
         approval = self.get_approval(approval_id)
+        if approval.action_type in {"commit_pr", "merge_and_accept"}:
+            raise StoreError("GitHub delivery approvals require an active run lease")
         if approval.status != "approved" or approval.expired:
             raise StoreError("approval is not valid for execution")
         if not secrets.compare_digest(approval.payload_hash, action_payload_hash):
@@ -407,6 +465,104 @@ class MemoryStore:
         self.approvals[approval.id] = used
         self.append_audit("approval.consumed", approval.approved_by or "unknown", approval.project_id, {"approval_id": approval.id, "payload_hash": approval.payload_hash})
         return used
+
+    def consume_approval_for_run(self, approval_id: str, action_payload_hash: str, bridge_id: str) -> Approval:
+        """Atomically revalidate and consume a GitHub grant while extending its lease."""
+        approval = self.get_approval(approval_id)
+        if approval.action_type not in {"commit_pr", "merge_and_accept"}:
+            raise StoreError("approval is not a GitHub delivery action")
+        if approval.bridge_id != bridge_id or approval.status != "approved" or approval.expired:
+            raise StoreError("approval is not valid for this bridge action")
+        if not secrets.compare_digest(approval.payload_hash, action_payload_hash):
+            raise StoreError("action payload differs from the approved hash")
+        binding = approval.payload
+        run_id = binding.get("run_id")
+        session_id = binding.get("session_id")
+        worktree_id = binding.get("worktree_id")
+        lease_epoch = binding.get("lease_epoch")
+        if not all(isinstance(value, str) and value for value in (run_id, session_id, worktree_id)) or not isinstance(lease_epoch, int):
+            raise StoreError("GitHub delivery approval has an invalid run binding")
+        run = self.validate_run_lease(run_id, bridge_id)
+        if (
+            run.project_id != approval.project_id
+            or run.session_id != session_id
+            or run.lease_epoch != lease_epoch
+            or self.get_session(session_id).worktree_id != worktree_id
+            or run.status != "evidenced"
+        ):
+            raise StoreError("GitHub delivery approval binding no longer matches the active evidenced run")
+        if approval.action_type == "merge_and_accept" and binding.get("task_id") != run.task_id:
+            raise StoreError("merge approval task id no longer matches the evidenced run")
+        self.renew_run_lease(run_id, bridge_id)
+        used = Approval(**{**approval.__dict__, "status": "consumed", "consumed_at": now_utc()})
+        self.approvals[approval.id] = used
+        self.append_audit("approval.consumed", approval.approved_by or "unknown", approval.project_id, {
+            "approval_id": approval.id, "payload_hash": approval.payload_hash,
+        })
+        return used
+
+    def complete_approved_merge(
+        self, approval_id: str, action_payload_hash: str, bridge_id: str, command_id: str | None = None,
+    ) -> Run:
+        """Finalize only the already-consumed merge/State-acceptance action."""
+        approval = self.get_approval(approval_id)
+        if (
+            approval.action_type != "merge_and_accept"
+            or approval.bridge_id != bridge_id
+            or approval.status != "consumed"
+            or not secrets.compare_digest(approval.payload_hash, action_payload_hash)
+        ):
+            raise StoreError("merge approval is not valid for delivery completion")
+        binding = approval.payload
+        run_id = binding.get("run_id")
+        session_id = binding.get("session_id")
+        worktree_id = binding.get("worktree_id")
+        lease_epoch = binding.get("lease_epoch")
+        if not all(isinstance(value, str) and value for value in (run_id, session_id, worktree_id)) or not isinstance(lease_epoch, int):
+            raise StoreError("merge approval has an invalid run binding")
+        run = self.validate_run_lease(run_id, bridge_id)
+        if (
+            run.status != "evidenced"
+            or run.project_id != approval.project_id
+            or run.session_id != session_id
+            or run.lease_epoch != lease_epoch
+            or self.get_session(session_id).worktree_id != worktree_id
+        ):
+            raise StoreError("merge approval binding no longer matches the active evidenced run")
+        if binding.get("task_id") != run.task_id:
+            raise StoreError("merge approval task id no longer matches the evidenced run")
+        completed_at = now_utc()
+        completed = replace(run, status="completed", completed_at=completed_at)
+        self.runs[run.id] = completed
+        resource_key = "worktree:" + worktree_id
+        lease = self.leases.get(resource_key)
+        if lease is not None and lease.session_id == session_id and lease.epoch == lease_epoch:
+            self.leases[resource_key] = replace(lease, expires_at=completed_at)
+            self._append_workflow_event(session_id, run.workflow_id, "lease.released", {
+                "resource_key": resource_key, "epoch": lease_epoch,
+            })
+        if run.workflow_id is not None:
+            workflow = self.get_workflow(run.workflow_id)
+            if workflow.status not in {"completed", "reconciliation", "cancelled"}:
+                self.workflows[workflow.id] = replace(workflow, status="completed", cursor=(), updated_at=completed_at)
+                self._append_workflow_event(session_id, workflow.id, "workflow.delivery_finished", {
+                    "run_id": run.id, "status": "completed",
+                })
+        if command_id is not None:
+            commands = self.commands.get(bridge_id)
+            if commands is None:
+                raise StoreError("unknown bridge")
+            remaining = [
+                command for command in commands
+                if not (command["id"] == command_id and command.get("approval_id") == approval_id)
+            ]
+            if len(remaining) == len(commands):
+                raise StoreError("merge completion command is not owned by this approval")
+            self.commands[bridge_id] = remaining
+        self.append_audit("run.completed", "bridge:" + bridge_id, run.project_id, {
+            "run_id": run.id, "approval_id": approval_id,
+        })
+        return completed
 
     def enqueue_command(self, bridge_id: str, approval: Approval) -> None:
         if approval.status != "approved":
@@ -936,6 +1092,38 @@ class PostgresStore:
         })
         return run
 
+    def release_run_lease(self, run_id: str, bridge_id: str) -> Run:
+        connection = self._connection()
+        with connection.transaction():
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT runs.*, projects.bridge_id, sessions.worktree_id FROM workbench_runs runs "
+                    "JOIN workbench_projects projects ON projects.id = runs.project_id "
+                    "LEFT JOIN workbench_sessions sessions ON sessions.id = runs.session_id "
+                    "WHERE runs.id = %s FOR UPDATE",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise StoreError("unknown run")
+                if row["bridge_id"] != bridge_id:
+                    raise StoreError("bridge does not own this run")
+                run = self._run(row)
+                if run.session_id is None:
+                    return run
+                resource_key = "worktree:" + str(row["worktree_id"])
+                cur.execute(
+                    "UPDATE workbench_resource_leases SET expires_at = %s "
+                    "WHERE resource_key = %s AND session_id = %s AND epoch = %s RETURNING epoch",
+                    (now_utc(), resource_key, run.session_id, run.lease_epoch),
+                )
+                released = cur.fetchone()
+        if released is not None:
+            self._append_workflow_event(run.session_id, run.workflow_id, "lease.released", {
+                "resource_key": resource_key, "epoch": run.lease_epoch,
+            })
+        return run
+
     def list_approvals(self, project_id: str | None = None) -> list[Approval]:
         query = "SELECT * FROM workbench_approvals"
         values: tuple[Any, ...] = ()
@@ -1115,7 +1303,7 @@ class PostgresStore:
                     (status, completed_at, run_id),
                 )
                 updated = cur.fetchone()
-                if completed_at is not None and updated["session_id"] is not None:
+                if status == "reconciliation" and updated["session_id"] is not None:
                     cur.execute("SELECT worktree_id FROM workbench_sessions WHERE id = %s", (updated["session_id"],))
                     session = cur.fetchone()
                     if session is not None:
@@ -1124,12 +1312,22 @@ class PostgresStore:
                             "WHERE resource_key = %s AND session_id = %s AND epoch = %s",
                             (completed_at, "worktree:" + str(session["worktree_id"]), updated["session_id"], updated["lease_epoch"]),
                         )
+                if status == "reconciliation" and updated["workflow_id"] is not None:
+                    cur.execute(
+                        "UPDATE workbench_workflows SET status = %s, cursor = %s, updated_at = %s "
+                        "WHERE id = %s AND status NOT IN ('completed', 'reconciliation', 'cancelled')",
+                        ("reconciliation", self._json([]), completed_at, updated["workflow_id"]),
+                    )
         run = self._run(updated)
-        if completed_at is not None and run.session_id is not None:
+        if status == "reconciliation" and run.session_id is not None:
             session = self.get_session(run.session_id)
             self._append_workflow_event(session.id, None, "lease.released", {
                 "resource_key": "worktree:" + session.worktree_id,
                 "epoch": run.lease_epoch,
+            })
+        if status == "reconciliation" and run.workflow_id is not None and run.session_id is not None:
+            self._append_workflow_event(run.session_id, run.workflow_id, "workflow.delivery_finished", {
+                "run_id": run.id, "status": status,
             })
         self.append_audit("run.status_changed", "bridge:" + bridge_id, run.project_id, {"run_id": run_id, "status": status})
         return run
@@ -1154,6 +1352,29 @@ class PostgresStore:
 
     def create_approval(self, project_id: str, action_type: str, payload: dict[str, Any], requested_by: str, ttl_seconds: int, bridge_id: str | None) -> Approval:
         clean = redact_value(payload)
+        if action_type not in {"commit_pr", "merge_and_accept"}:
+            raise StoreError("approval action is not executable by the v1 bridge")
+        if action_type in {"commit_pr", "merge_and_accept"}:
+            if bridge_id is None:
+                raise StoreError("GitHub delivery approval requires a project bridge")
+            run_id = payload.get("run_id")
+            session_id = payload.get("session_id")
+            worktree_id = payload.get("worktree_id")
+            lease_epoch = payload.get("lease_epoch")
+            if not all(isinstance(value, str) and value for value in (run_id, session_id, worktree_id)) or not isinstance(lease_epoch, int):
+                raise StoreError("GitHub delivery approval must bind run, session, worktree, and lease epoch")
+            run = self.validate_run_lease(run_id, bridge_id)
+            if run.project_id != project_id or run.session_id != session_id or run.lease_epoch != lease_epoch:
+                raise StoreError("GitHub delivery approval binding does not match the active run")
+            session = self.get_session(session_id)
+            if session.worktree_id != worktree_id or run.status != "evidenced":
+                raise StoreError("GitHub delivery approval requires an evidenced run in its leased worktree")
+            if action_type == "merge_and_accept":
+                if payload.get("task_id") != run.task_id:
+                    raise StoreError("merge approval task id must match the evidenced run")
+                expected_head_sha = payload.get("expected_head_sha")
+                if not isinstance(expected_head_sha, str) or _GIT_HEAD_SHA.fullmatch(expected_head_sha) is None:
+                    raise StoreError("merge approval requires the expected pull request head SHA")
         approval = Approval(
             new_id("approval"), project_id, action_type, clean, payload_hash(clean), requested_by,
             now_utc() + timedelta(seconds=ttl_seconds), bridge_id=bridge_id,
@@ -1199,6 +1420,9 @@ class PostgresStore:
         return approval
 
     def consume(self, approval_id: str, action_payload_hash: str) -> Approval:
+        approval = self.get_approval(approval_id)
+        if approval.action_type in {"commit_pr", "merge_and_accept"}:
+            raise StoreError("GitHub delivery approvals require an active run lease")
         consumed_at = now_utc()
         with self._connection().cursor() as cur:
             cur.execute(
@@ -1211,6 +1435,176 @@ class PostgresStore:
         approval = self._approval(row)
         self.append_audit("approval.consumed", approval.approved_by or "unknown", approval.project_id, {"approval_id": approval.id, "payload_hash": approval.payload_hash})
         return approval
+
+    def consume_approval_for_run(self, approval_id: str, action_payload_hash: str, bridge_id: str) -> Approval:
+        """Consume a delivery approval and renew its fenced worktree lease atomically."""
+        now = now_utc()
+        connection = self._connection()
+        with connection.transaction():
+            with connection.cursor() as cur:
+                cur.execute("SELECT * FROM workbench_approvals WHERE id = %s FOR UPDATE", (approval_id,))
+                approval_row = cur.fetchone()
+                if approval_row is None:
+                    raise StoreError("unknown approval")
+                approval = self._approval(approval_row)
+                if (
+                    approval.action_type not in {"commit_pr", "merge_and_accept"}
+                    or approval.bridge_id != bridge_id
+                    or approval.status != "approved"
+                    or approval.expires_at <= now
+                    or not secrets.compare_digest(approval.payload_hash, action_payload_hash)
+                ):
+                    raise StoreError("approval is not valid for this bridge action")
+                binding = approval.payload
+                run_id = binding.get("run_id")
+                session_id = binding.get("session_id")
+                worktree_id = binding.get("worktree_id")
+                lease_epoch = binding.get("lease_epoch")
+                if not all(isinstance(value, str) and value for value in (run_id, session_id, worktree_id)) or not isinstance(lease_epoch, int):
+                    raise StoreError("GitHub delivery approval has an invalid run binding")
+                cur.execute(
+                    "SELECT runs.*, projects.bridge_id, sessions.worktree_id FROM workbench_runs runs "
+                    "JOIN workbench_projects projects ON projects.id = runs.project_id "
+                    "LEFT JOIN workbench_sessions sessions ON sessions.id = runs.session_id "
+                    "WHERE runs.id = %s FOR UPDATE",
+                    (run_id,),
+                )
+                run_row = cur.fetchone()
+                if (
+                    run_row is None
+                    or run_row["bridge_id"] != bridge_id
+                    or run_row["project_id"] != approval.project_id
+                    or run_row["status"] != "evidenced"
+                    or run_row["session_id"] != session_id
+                    or run_row["worktree_id"] != worktree_id
+                    or run_row["lease_epoch"] != lease_epoch
+                ):
+                    raise StoreError("GitHub delivery approval binding no longer matches the active evidenced run")
+                if approval.action_type == "merge_and_accept" and binding.get("task_id") != run_row["task_id"]:
+                    raise StoreError("merge approval task id no longer matches the evidenced run")
+                resource_key = "worktree:" + str(worktree_id)
+                cur.execute("SELECT * FROM workbench_resource_leases WHERE resource_key = %s FOR UPDATE", (resource_key,))
+                lease = cur.fetchone()
+                if (
+                    lease is None
+                    or lease["expires_at"] <= now
+                    or lease["session_id"] != session_id
+                    or int(lease["epoch"]) != lease_epoch
+                ):
+                    raise StoreError("run worktree lease is stale or no longer owned by its session")
+                cur.execute(
+                    "UPDATE workbench_resource_leases SET expires_at = %s WHERE resource_key = %s AND session_id = %s AND epoch = %s",
+                    (now + timedelta(seconds=300), resource_key, session_id, lease_epoch),
+                )
+                cur.execute(
+                    "UPDATE workbench_approvals SET status = 'consumed', consumed_at = %s "
+                    "WHERE id = %s AND status = 'approved' AND expires_at > %s RETURNING *",
+                    (now, approval_id, now),
+                )
+                consumed_row = cur.fetchone()
+                if consumed_row is None:
+                    raise StoreError("approval is not valid for execution")
+        consumed = self._approval(consumed_row)
+        self._append_workflow_event(session_id, run_row["workflow_id"], "lease.renewed", {
+            "resource_key": resource_key, "epoch": lease_epoch,
+        })
+        self.append_audit("approval.consumed", consumed.approved_by or "unknown", consumed.project_id, {
+            "approval_id": consumed.id, "payload_hash": consumed.payload_hash,
+        })
+        return consumed
+
+    def complete_approved_merge(
+        self, approval_id: str, action_payload_hash: str, bridge_id: str, command_id: str | None = None,
+    ) -> Run:
+        """Finalize a consumed merge grant only while its exact lease is live."""
+        now = now_utc()
+        connection = self._connection()
+        with connection.transaction():
+            with connection.cursor() as cur:
+                cur.execute("SELECT * FROM workbench_approvals WHERE id = %s FOR UPDATE", (approval_id,))
+                approval_row = cur.fetchone()
+                if approval_row is None:
+                    raise StoreError("unknown approval")
+                approval = self._approval(approval_row)
+                if (
+                    approval.action_type != "merge_and_accept"
+                    or approval.bridge_id != bridge_id
+                    or approval.status != "consumed"
+                    or not secrets.compare_digest(approval.payload_hash, action_payload_hash)
+                ):
+                    raise StoreError("merge approval is not valid for delivery completion")
+                binding = approval.payload
+                run_id = binding.get("run_id")
+                session_id = binding.get("session_id")
+                worktree_id = binding.get("worktree_id")
+                lease_epoch = binding.get("lease_epoch")
+                if not all(isinstance(value, str) and value for value in (run_id, session_id, worktree_id)) or not isinstance(lease_epoch, int):
+                    raise StoreError("merge approval has an invalid run binding")
+                cur.execute(
+                    "SELECT runs.*, projects.bridge_id, sessions.worktree_id FROM workbench_runs runs "
+                    "JOIN workbench_projects projects ON projects.id = runs.project_id "
+                    "LEFT JOIN workbench_sessions sessions ON sessions.id = runs.session_id "
+                    "WHERE runs.id = %s FOR UPDATE",
+                    (run_id,),
+                )
+                run_row = cur.fetchone()
+                if (
+                    run_row is None
+                    or run_row["bridge_id"] != bridge_id
+                    or run_row["project_id"] != approval.project_id
+                    or run_row["status"] != "evidenced"
+                    or run_row["session_id"] != session_id
+                    or run_row["worktree_id"] != worktree_id
+                    or run_row["lease_epoch"] != lease_epoch
+                ):
+                    raise StoreError("merge approval binding no longer matches the active evidenced run")
+                if binding.get("task_id") != run_row["task_id"]:
+                    raise StoreError("merge approval task id no longer matches the evidenced run")
+                resource_key = "worktree:" + str(worktree_id)
+                cur.execute("SELECT * FROM workbench_resource_leases WHERE resource_key = %s FOR UPDATE", (resource_key,))
+                lease = cur.fetchone()
+                if (
+                    lease is None
+                    or lease["expires_at"] <= now
+                    or lease["session_id"] != session_id
+                    or int(lease["epoch"]) != lease_epoch
+                ):
+                    raise StoreError("run worktree lease is stale or no longer owned by its session")
+                cur.execute(
+                    "UPDATE workbench_runs SET status = 'completed', completed_at = %s WHERE id = %s RETURNING *",
+                    (now, run_id),
+                )
+                completed_row = cur.fetchone()
+                cur.execute(
+                    "UPDATE workbench_resource_leases SET expires_at = %s WHERE resource_key = %s AND session_id = %s AND epoch = %s",
+                    (now, resource_key, session_id, lease_epoch),
+                )
+                workflow_id = completed_row["workflow_id"]
+                if workflow_id is not None:
+                    cur.execute(
+                        "UPDATE workbench_workflows SET status = 'completed', cursor = %s, updated_at = %s "
+                        "WHERE id = %s AND status NOT IN ('completed', 'reconciliation', 'cancelled')",
+                        (self._json([]), now, workflow_id),
+                    )
+                if command_id is not None:
+                    cur.execute(
+                        "DELETE FROM workbench_commands WHERE id = %s AND bridge_id = %s AND approval_id = %s RETURNING id",
+                        (command_id, bridge_id, approval_id),
+                    )
+                    if cur.fetchone() is None:
+                        raise StoreError("merge completion command is not owned by this approval")
+        completed = self._run(completed_row)
+        self._append_workflow_event(session_id, completed.workflow_id, "lease.released", {
+            "resource_key": resource_key, "epoch": lease_epoch,
+        })
+        if completed.workflow_id is not None:
+            self._append_workflow_event(session_id, completed.workflow_id, "workflow.delivery_finished", {
+                "run_id": completed.id, "status": "completed",
+            })
+        self.append_audit("run.completed", "bridge:" + bridge_id, completed.project_id, {
+            "run_id": completed.id, "approval_id": approval_id,
+        })
+        return completed
 
     def enqueue_command(self, bridge_id: str, approval: Approval) -> None:
         if approval.status != "approved":

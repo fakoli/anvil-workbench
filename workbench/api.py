@@ -352,6 +352,36 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="approval belongs to another bridge")
         return as_json(store.consume(approval_id, payload.get("payload_hash", "")))
 
+    @app.post("/api/bridge/{bridge_id}/approvals/{approval_id}/consume-for-run")
+    def consume_for_run(
+        bridge_id: str,
+        approval_id: str,
+        payload: dict[str, str],
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        approval = store.get_approval(approval_id)
+        if approval.bridge_id != bridge_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="approval belongs to another bridge")
+        return as_json(store.consume_approval_for_run(approval_id, payload.get("payload_hash", ""), bridge_id))
+
+    @app.post("/api/bridge/{bridge_id}/approvals/{approval_id}/complete-merge")
+    def complete_merge(
+        bridge_id: str,
+        approval_id: str,
+        payload: dict[str, str],
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        command_id = payload.get("command_id", "")
+        if not command_id:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="command id is required for merge completion")
+        return as_json(store.complete_approved_merge(
+            approval_id, payload.get("payload_hash", ""), bridge_id, command_id,
+        ))
+
     @app.post("/api/bridge/{bridge_id}/events", status_code=status.HTTP_202_ACCEPTED)
     def bridge_event(bridge_id: str, event: BridgeEvent, authenticated_bridge: str = Depends(bridge_identity)) -> dict[str, bool]:
         if bridge_id != authenticated_bridge:
@@ -384,7 +414,16 @@ def create_app(
     ) -> dict[str, Any]:
         if bridge_id != authenticated_bridge:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
-        return as_json(store.validate_run_lease(run_id, bridge_id))
+        run = store.validate_run_lease(run_id, bridge_id)
+        if run.session_id is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="approved delivery actions require a session-bound run")
+        session = store.get_session(run.session_id)
+        return {
+            "run_id": run.id,
+            "session_id": session.id,
+            "worktree_id": session.worktree_id,
+            "lease_epoch": run.lease_epoch,
+        }
 
     @app.post("/api/bridge/{bridge_id}/runs/{run_id}/lease/renew")
     def renew_bridge_run_lease(
@@ -394,6 +433,15 @@ def create_app(
         if bridge_id != authenticated_bridge:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
         return as_json(store.renew_run_lease(run_id, bridge_id))
+
+    @app.post("/api/bridge/{bridge_id}/runs/{run_id}/lease/release")
+    def release_bridge_run_lease(
+        bridge_id: str, run_id: str,
+        authenticated_bridge: str = Depends(bridge_identity),
+    ) -> dict[str, Any]:
+        if bridge_id != authenticated_bridge:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bridge id mismatch")
+        return as_json(store.release_run_lease(run_id, bridge_id))
 
     @app.post("/api/bridge/{bridge_id}/evidence", status_code=status.HTTP_202_ACCEPTED)
     def project_evidence(bridge_id: str, evidence: EvidenceInput, authenticated_bridge: str = Depends(bridge_identity)) -> dict[str, Any]:

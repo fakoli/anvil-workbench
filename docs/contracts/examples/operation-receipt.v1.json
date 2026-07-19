@@ -3,7 +3,7 @@
   "receipt_id": "rcpt_example_0001",
   "command_id": "cmd_example_0001",
   "run_id": "run_example",
-  "operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0"},
+  "operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0", "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"},
   "status": "succeeded",
   "idempotency_key": "run:run_example:step:evidence:attempt:1",
   "external_ref": {"state_event_id": "evt_example"},

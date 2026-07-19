@@ -7,21 +7,17 @@ import pytest
 
 from workbench.bridge import BridgeSettings, StateReader
 from workbench.graph import GraphError, NullGraph
-from workbench.store import MemoryStore, StoreError, payload_hash
+from workbench.store import MemoryStore, StoreError
 
 
-def test_hash_bound_approval_expires_on_payload_change_and_cannot_replay():
+def test_unimplemented_privileged_actions_cannot_create_a_dangling_bridge_command():
     store = MemoryStore()
     project = store.create_project("demo", ".anvil")
     bridge, _token = store.register_bridge(project.id, "project bridge")
-    approval = store.create_approval(project.id, "commit_pr", {"diff_hash": "before", "branch": "codex/demo"}, "operator", 60, bridge.id)
-    granted = store.approve(approval.id, "operator", frozenset({"operator"}))
-    with pytest.raises(StoreError, match="differs"):
-        store.consume(granted.id, payload_hash({"diff_hash": "after", "branch": "codex/demo"}))
-    consumed = store.consume(granted.id, granted.payload_hash)
-    assert consumed.status == "consumed"
-    with pytest.raises(StoreError, match="not valid"):
-        store.consume(granted.id, granted.payload_hash)
+    with pytest.raises(StoreError, match="not executable"):
+        store.create_approval(
+            project.id, "model_policy", {"profile": "different"}, "operator", 60, bridge.id,
+        )
 
 
 def test_graph_only_accepts_redacted_evidence_metadata():

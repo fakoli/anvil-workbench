@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from workbench import bridge as bridge_module
-from workbench.bridge import Bridge, BridgeError, BridgeSettings, CodexRunner, StateReader, VerificationRunner
+from workbench.bridge import (
+    ApprovedActionRunner, Bridge, BridgeError, BridgeSettings, CodexRunner, StateReader,
+    VerificationRunner,
+)
 from workbench.skills import SkillError, SkillRegistry
 
 
@@ -22,7 +25,7 @@ def settings(tmp_path: Path, **overrides: object) -> BridgeSettings:
         "state_events": tmp_path / ".anvil" / "events.jsonl",
         "cursor_file": tmp_path / ".workbench" / "cursor",
         "state_status_command": "anvil status",
-        "state_claim_command": "anvil claim {task_id} --actor {actor}",
+        "state_claim_command": "anvil claim {task_id} --actor {actor} --json",
         "state_work_packet_command": "anvil packet {task_id} --format json",
         "state_hook_command": "anvil hook capture-evidence",
         "state_submit_command": "anvil submit {task_id}",
@@ -31,6 +34,7 @@ def settings(tmp_path: Path, **overrides: object) -> BridgeSettings:
         "router_base_url": "http://100.87.34.66:8000/v1",
         "router_token_env": "ANVIL_ROUTER_TOKEN",
         "codex_config": (),
+        "verification_commands": (),
     }
     values.update(overrides)
     return BridgeSettings(**values)  # type: ignore[arg-type]
@@ -49,6 +53,44 @@ def test_state_packet_uses_the_supported_cli_and_parses_its_status_line(monkeypa
 
     assert packet == {"task_id": "T001"}
     assert calls == [["anvil", "packet", "T001", "--format", "json"]]
+
+
+def test_state_commands_follow_the_bridge_selected_worktree(monkeypatch, tmp_path: Path):
+    checkout = tmp_path / "checkout-a"
+    checkout.mkdir()
+    observed: list[Path] = []
+
+    def fake_run(args, **kwargs):
+        observed.append(kwargs["cwd"])
+        return subprocess.CompletedProcess(args, 0, '{"task_id":"T001"}\n', "")
+
+    monkeypatch.setattr(bridge_module.subprocess, "run", fake_run)
+    reader = StateReader(settings(tmp_path))
+    assert reader.work_packet("T001", checkout) == {"task_id": "T001"}
+    assert observed == [checkout]
+
+
+def test_state_claim_requires_the_returned_branch_to_match_the_leased_worktree(monkeypatch, tmp_path: Path):
+    checkout = tmp_path / "checkout-a"
+    checkout.mkdir()
+    calls: list[tuple[list[str], Path]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs["cwd"]))
+        if args[0] == "anvil":
+            return subprocess.CompletedProcess(
+                args, 0,
+                '{"ok":true,"command":"claim","data":{"branch":"agent/t001-example"}}\n', "",
+            )
+        return subprocess.CompletedProcess(args, 0, "agent/t001-example\n", "")
+
+    monkeypatch.setattr(bridge_module.subprocess, "run", fake_run)
+    reader = StateReader(settings(tmp_path))
+    assert reader.claim("T001", "bridge", checkout)["data"]["branch"] == "agent/t001-example"
+    assert calls == [
+        (["anvil", "claim", "T001", "--actor", "bridge", "--json"], checkout),
+        (["git", "branch", "--show-current"], checkout),
+    ]
 
 
 def test_state_event_path_resolves_via_cli_without_opening_state_db(monkeypatch, tmp_path: Path):
@@ -73,16 +115,34 @@ def test_verification_runner_records_the_observed_exit_code_with_state(monkeypat
     monkeypatch.setattr(
         reader,
         "capture_verification",
-        lambda command, exit_code, stdout, stderr, actor: captured.append((command, exit_code, stdout, stderr, actor)),
+        lambda command, exit_code, stdout, stderr, actor, _worktree: captured.append((command, exit_code, stdout, stderr, actor)),
     )
     command = f'"{sys.executable}" -c "print(42)"'
     packet = {"task": {"verification": {"commands": [command]}}}
 
-    results = VerificationRunner(settings(tmp_path), lambda _role, _content: None).run(packet, reader, "bridge-actor")
+    results = VerificationRunner(
+        settings(tmp_path, verification_commands=(command,)), lambda _role, _content: None,
+    ).run(packet, reader, "bridge-actor")
 
     assert results[0].exit_code == 0
     assert len(results[0].output_sha256) == 64
     assert captured == [(command, 0, "42\n", "", "bridge-actor")]
+
+
+def test_verification_rejects_packet_shell_text_not_in_the_local_allowlist(monkeypatch, tmp_path: Path):
+    reader = StateReader(settings(tmp_path))
+    monkeypatch.setattr(bridge_module.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("must not execute"))
+    packet = {"task": {"verification": {"commands": ["python -m pytest -q; git push --force"]}}}
+    with pytest.raises(BridgeError, match="not in the bridge allowlist"):
+        VerificationRunner(
+            settings(tmp_path, verification_commands=("python -m pytest -q",)),
+            lambda _role, _content: None,
+        ).run(packet, reader, "bridge-actor")
+
+
+def test_state_reader_rejects_task_id_argument_injection(tmp_path: Path):
+    with pytest.raises(BridgeError, match="unsupported characters"):
+        StateReader(settings(tmp_path)).work_packet("T001 --force")
 
 
 def test_codex_runner_passes_the_workbench_selected_route_to_codex(monkeypatch, tmp_path: Path):
@@ -154,17 +214,17 @@ def test_bridge_run_claims_verifies_and_submits_before_needs_review(monkeypatch,
     bridge = Bridge(settings(tmp_path))
     hub = Hub()
     bridge.hub = hub  # type: ignore[assignment]
-    monkeypatch.setattr(bridge.state, "claim", lambda task_id, actor: {"task_id": task_id, "actor": actor})
+    monkeypatch.setattr(bridge.state, "claim", lambda task_id, actor, _worktree: {"task_id": task_id, "actor": actor})
     monkeypatch.setattr(
         bridge.state,
         "work_packet",
-        lambda task_id: {"task_id": task_id, "task": {"likely_files": ["src/mdlinks/extract.py"]}},
+        lambda task_id, _worktree: {"task_id": task_id, "task": {"likely_files": ["src/mdlinks/extract.py"]}},
     )
     submitted: list[tuple[str, tuple[str, ...], tuple[str, ...], str]] = []
     monkeypatch.setattr(
         bridge.state,
         "submit_evidence",
-        lambda task_id, commands, files_changed, actor: submitted.append((task_id, tuple(commands), tuple(files_changed), actor)) or {"data": {"evidence_id": "EV1"}},
+        lambda task_id, commands, files_changed, actor, _worktree: submitted.append((task_id, tuple(commands), tuple(files_changed), actor)) or {"data": {"evidence_id": "EV1"}},
     )
 
     assert bridge.poll_once() is True
@@ -243,6 +303,180 @@ def test_bridge_resolves_only_named_operator_configured_worktrees(tmp_path: Path
     assert bridge._worktree_root({}) == tmp_path.resolve()
     with pytest.raises(BridgeError, match="not configured"):
         bridge._worktree_root({"worktree_id": "../../untrusted"})
+
+
+def test_approved_github_action_runner_uses_only_the_bound_worktree(monkeypatch, tmp_path: Path):
+    default = tmp_path / "default"
+    checkout = tmp_path / "checkout-b"
+    default.mkdir()
+    checkout.mkdir()
+    observed: list[Path] = []
+
+    def fake_run(_args, **kwargs):
+        observed.append(kwargs["cwd"])
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(bridge_module.subprocess, "run", fake_run)
+    runner = ApprovedActionRunner(settings(default), checkout)
+    runner._run("git", "status", "--short")
+    assert observed == [checkout]
+
+
+def test_merge_rejects_a_pull_request_head_that_changed_after_approval(monkeypatch, tmp_path: Path):
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(*args: str) -> str:
+        commands.append(args)
+        if args[:4] == ("gh", "pr", "view", "1"):
+            return "b" * 40
+        raise AssertionError(f"unexpected command: {args}")
+
+    runner = ApprovedActionRunner(settings(tmp_path))
+    monkeypatch.setattr(runner, "_run", fake_run)
+    state = object()
+    with pytest.raises(BridgeError, match="head differs"):
+        runner.merge_and_accept(
+            {"pr": "1", "task_id": "TASK-1", "expected_head_sha": "a" * 40}, state,  # type: ignore[arg-type]
+        )
+    assert commands == [("gh", "pr", "view", "1", "--json", "headRefOid", "--jq", ".headRefOid")]
+
+
+def test_approved_action_requires_the_matching_live_session_lease_and_configured_checkout(tmp_path: Path):
+    default = tmp_path / "default"
+    checkout = tmp_path / "checkout-b"
+    default.mkdir()
+    checkout.mkdir()
+
+    class Hub:
+        def validate_run_lease(self, run_id):
+            assert run_id == "run_delivery"
+            return {"session_id": "session_delivery", "worktree_id": "checkout-b", "lease_epoch": 7}
+
+    bridge = Bridge(settings(default, worktrees={"checkout-b": checkout}))
+    bridge.hub = Hub()  # type: ignore[assignment]
+    assert bridge._approved_action_worktree({
+        "run_id": "run_delivery", "session_id": "session_delivery", "worktree_id": "checkout-b", "lease_epoch": 7,
+    }) == ("run_delivery", checkout.resolve())
+
+    with pytest.raises(BridgeError, match="differs from the active run worktree lease"):
+        bridge._approved_action_worktree({
+            "run_id": "run_delivery", "session_id": "session_delivery", "worktree_id": "default", "lease_epoch": 7,
+        })
+
+
+def test_failed_approved_action_reconciles_and_acknowledges_without_releasing_a_retry(monkeypatch, tmp_path: Path):
+    class Hub:
+        def __init__(self) -> None:
+            self.statuses: list[tuple[str, str]] = []
+            self.acknowledged: list[str] = []
+            self.evidence_events: list[tuple[str, dict[str, object]]] = []
+
+        def next_command(self):
+            return {
+                "id": "command_pr", "approval_id": "approval_pr", "payload_hash": "approved-hash",
+                "action_type": "commit_pr",
+                "payload": {
+                    "run_id": "run_delivery", "session_id": "session_delivery", "worktree_id": "default",
+                    "lease_epoch": 2, "diff_hash": "a" * 64, "branch": "codex/demo",
+                },
+            }
+
+        def validate_run_lease(self, _run_id):
+            return {"session_id": "session_delivery", "worktree_id": "default", "lease_epoch": 2}
+
+        def consume_approval_for_run(self, _approval_id, _payload_hash):
+            return None
+
+        def renew_run_lease(self, _run_id):
+            return None
+
+        def evidence(self, kind, _source_id, _project_id, payload):
+            self.evidence_events.append((kind, payload))
+
+        def run_status(self, run_id, status):
+            self.statuses.append((run_id, status))
+
+        def acknowledge_command(self, command_id):
+            self.acknowledged.append(command_id)
+
+    class FailingRunner:
+        def __init__(self, *_args) -> None:
+            pass
+
+        def diff_hash(self):
+            return "a" * 64
+
+        def commit_pr(self, _payload):
+            raise BridgeError("git push failed after approval consumption")
+
+    monkeypatch.setattr(bridge_module, "ApprovedActionRunner", FailingRunner)
+    bridge = Bridge(settings(tmp_path))
+    hub = Hub()
+    bridge.hub = hub  # type: ignore[assignment]
+
+    with pytest.raises(BridgeError, match="git push failed"):
+        bridge.poll_once()
+    assert hub.statuses == [("run_delivery", "reconciliation")]
+    assert hub.acknowledged == ["command_pr"]
+    assert hub.evidence_events[-1][0] == "failure"
+    assert hub.evidence_events[-1][1]["reconciliation_required"] is True
+
+
+def test_successful_merge_and_state_acceptance_marks_delivery_completed_and_releases_lease(monkeypatch, tmp_path: Path):
+    class Hub:
+        def __init__(self) -> None:
+            self.statuses: list[tuple[str, str]] = []
+            self.acknowledged: list[str] = []
+            self.released: list[str] = []
+            self.evidence_events: list[tuple[str, dict[str, object]]] = []
+
+        def next_command(self):
+            return {
+                "id": "command_merge", "approval_id": "approval_merge", "payload_hash": "approved-hash",
+                "action_type": "merge_and_accept",
+                "payload": {
+                    "run_id": "run_delivery", "session_id": "session_delivery", "worktree_id": "default",
+                    "lease_epoch": 2, "pr": "1", "task_id": "TASK-1", "expected_head_sha": "a" * 40,
+                },
+            }
+
+        def validate_run_lease(self, _run_id):
+            return {"session_id": "session_delivery", "worktree_id": "default", "lease_epoch": 2}
+
+        def consume_approval_for_run(self, _approval_id, _payload_hash):
+            return None
+
+        def renew_run_lease(self, _run_id):
+            return None
+
+        def evidence(self, kind, _source_id, _project_id, payload):
+            self.evidence_events.append((kind, payload))
+
+        def complete_approved_merge(self, approval_id, payload_hash, command_id):
+            self.statuses.append((approval_id, payload_hash))
+            self.acknowledged.append(command_id)
+
+        def acknowledge_command(self, command_id):
+            self.acknowledged.append(command_id)
+
+    class SuccessfulRunner:
+        def __init__(self, *_args) -> None:
+            pass
+
+        def merge_and_accept(self, payload, _state):
+            assert payload["pr"] == "1"
+            return {"pr": "1", "task_id": "TASK-1", "state_acceptance": {"ok": True}}
+
+    monkeypatch.setattr(bridge_module, "ApprovedActionRunner", SuccessfulRunner)
+    bridge = Bridge(settings(tmp_path))
+    hub = Hub()
+    bridge.hub = hub  # type: ignore[assignment]
+
+    assert bridge.poll_once() is True
+    assert hub.statuses == [("approval_merge", "approved-hash")]
+    assert hub.released == []
+    assert hub.acknowledged == ["command_merge"]
+    assert hub.evidence_events == [("pull_request", {"pr": "1", "task_id": "TASK-1", "state_acceptance": {"ok": True}})]
 
 
 def test_bridge_skill_registry_never_reports_local_paths_and_rejects_duplicates(tmp_path: Path):

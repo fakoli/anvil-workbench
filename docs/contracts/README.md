@@ -16,7 +16,7 @@ These resources are the implementation-facing companion to
 
 | Need | Schema | Example |
 | --- | --- | --- |
-| Publish a reviewed State, Serving, or bridge operation | [operation catalog](schemas/operation-catalog.v1.schema.json) | [State catalog](examples/anvil-state.catalog.v1.json), [Serving catalog](examples/anvil-serving.catalog.v1.json) |
+| Publish a reviewed State, Serving, or bridge operation | [operation catalog](schemas/operation-catalog.v1.schema.json) | [State catalog](examples/anvil-state.catalog.v1.json), [Serving catalog](examples/anvil-serving.catalog.v1.json), [bridge catalog](examples/project-bridge.catalog.v1.json) |
 | Define which operations, skills, and model profiles one project may use | [capability profile](schemas/capability-profile.v1.schema.json) | [project profile](examples/project-capability-profile.v1.json) |
 | Add a durable declarative workflow | [workflow v2](schemas/workflow.v2.schema.json) | [delivery workflow](examples/delivery.workflow.v2.json) |
 | Improve a coding model’s next inference turn | [run context](schemas/run-context.v1.schema.json) | [run context](examples/run-context.v1.json) |
@@ -28,23 +28,41 @@ These resources are the implementation-facing companion to
 
 1. All contract identifiers are stable lowercase dot-separated strings. The
    owner controls a provider operation ID; Workbench cannot redefine it.
-2. Versioning has two levels: a **contract version** for payload compatibility
-   and a **catalog/workflow revision plus SHA-256 digest** for a run snapshot.
-3. A run pins catalog, profile, workflow, selected-skill, and route identifiers
-   before bridge delivery. A changed digest blocks execution; it never silently
-   upgrades a paused workflow.
-4. The browser sends intent and selected IDs only. It never sends an executable
+2. A digest is trusted only when the bridge recomputes it from its configured
+   local catalog/profile and recognizes the provider. The hub cannot introduce a
+   catalog merely by sending a schema-valid payload. The required canonical
+   algorithm and provider-snapshot rules are in [DIGESTING.md](DIGESTING.md).
+3. Versioning has two levels: a **contract version** for payload compatibility
+   and a **catalog/workflow revision plus mandatory SHA-256 digest** for a run snapshot.
+4. A run pins every provider catalog, selected operation, profile, workflow,
+   selected skill, and route identifier before bridge delivery. A changed or
+   unknown digest blocks execution; it never silently
+   upgrades a paused workflow. The selected operation's provider occurs exactly
+   once in the snapshot, at the same digest as the bridge's configured local
+   catalog, and the operation must be present at that exact digest in the
+   pinned capability profile.
+5. The browser sends intent and selected IDs only. It never sends an executable
    shell command, filesystem path, credential, arbitrary HTTP URL, raw Cypher,
    or approval payload to the bridge.
-5. Every effect has an idempotency key, bounded delivery attempt, redacted typed
+   Model proposals are held to the same rule: their inputs must validate against
+   the selected operation's typed schema, and a bridge rejects raw command and
+   secret fields before an adapter sees them.
+6. Every non-read effect has a deadline, bounded delivery attempt, idempotency
+   key, redacted typed
    receipt, and `unknown`/reconciliation behavior. Do not claim distributed
-   exactly-once execution.
-6. State transitions remain State CLI/MCP operations on the bridge. Serving
+   exactly-once execution. An operation whose catalog gate requires human
+   approval additionally needs the catalog-declared approval action, an
+   unexpired one-time grant, and a payload digest binding its exact typed inputs.
+   A bridge-injected atomic approval consumer must consume that grant; command
+   fields that merely claim a grant are never authority to execute.
+7. State transitions remain State CLI/MCP operations on the bridge. Serving
    routes and policy remain Serving operations. GitHub credentials remain local.
-7. Add `traceparent` when telemetry supports it, alongside the existing
+8. Add `traceparent` when telemetry supports it, alongside the existing
    `workbench_run_id`, `task_id`, and `request_id`; correlation fields are not
    credentials or policy overrides.
-8. Store and project only redacted receipts/evidence. Never put raw transcript,
+9. Schema validation does not prove a value has been redacted. Redact at bridge
+   ingress and again before hub persistence/projection; store only allowlisted
+   opaque references and short safe summaries. Never put raw transcript,
    local skill body/path, token, or unredacted provider payload in a contract
    artifact.
 

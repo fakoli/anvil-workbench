@@ -74,7 +74,13 @@ The full model-facing design is [runtime inference](docs/architecture/RUNTIME-IN
 Read the target file and its tests before editing. Prefer extending an existing
 boundary over adding an unreviewed browser-to-bridge path.
 
-## Runtime and workflow rules
+## V2 target runtime and workflow invariants
+
+The rules in this section are the implementation target for the proposed
+operation layer. They are not a claim that the current v1 bridge dispatches
+`operation` steps or persists catalog/profile snapshots. For current behavior,
+read [CONTRACTS.md](docs/CONTRACTS.md) and the implementation map before making
+an assertion or a code change.
 
 - A workflow is a reviewed, version-pinned definition. A running definition and
   its provider-catalog snapshot are immutable.

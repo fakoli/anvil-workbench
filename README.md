@@ -45,6 +45,7 @@ workbench-bridge `
   --bridge-id bridge_example `
   --project-id project_example `
   --project-root C:\path\to\project `
+  --verification-command "python -m pytest -q" `
   --router-base-url http://100.87.34.66:8000/v1
 ```
 
@@ -55,6 +56,10 @@ workbench-bridge ... --worktree checkout-a=C:\path\to\project-a --worktree check
 ```
 
 The session engine permits one active run per session and leases each named worktree. A second session cannot start against an unexpired lease for the same worktree.
+
+Verification commands in a State work packet are untrusted declarations, not a
+remote shell. Configure every allowed exact command with
+`--verification-command`; an undeclared command is rejected and nothing runs.
 
 ### Bridge-local skills
 
@@ -81,9 +86,9 @@ For each project, explicitly configure the State work-packet and State-apply com
 1. Workbench creates a run and the bridge reads the State work packet.
 2. Codex runs in the local worktree via Anvil Serving's Responses endpoint.
 3. The bridge returns redacted run activity and evidence. Route/evaluation/state metadata can be projected to Neo4j.
-4. A named approver authorizes a payload hash for `commit_pr`; the bridge checks the exact diff before committing, pushing, and creating the PR.
-5. A named approver authorizes `merge_and_accept`; the bridge verifies required GitHub checks, merges first, then applies State acceptance.
-6. If merge or State application fails after an approval is consumed, the bridge projects a reconciliation-required failure. It never silently marks a task complete.
+4. A named approver authorizes a payload hash for `commit_pr`; the bridge atomically revalidates and renews the bound run lease, checks the exact diff, then commits, pushes, and creates the PR. The lease remains held for the later merge approval.
+5. A named approver authorizes `merge_and_accept` with the PR's observed head SHA and the same State task; the bridge atomically revalidates and renews that bound lease, compare-and-swaps GitHub merge against that exact head, then applies State acceptance.
+6. Workbench records `completed` only through the consumed `merge_and_accept` finalization after the exact-head merge and State acceptance both succeed. If a PR, merge, or State application fails after an approval is consumed, it records and displays reconciliation; it never silently retries or marks delivery complete.
 
 For each Codex run the bridge writes only provider-local configuration overrides: `wire_api = "responses"`, the Anvil router base URL, `ANVIL_ROUTER_TOKEN` as the local credential source, and static `http_headers` carrying the workbench run/task correlation. It never writes a provider API key or a GitHub token to Codex configuration.
 

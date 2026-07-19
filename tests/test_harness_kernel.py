@@ -92,6 +92,81 @@ def test_workflows_are_version_pinned_and_wait_at_approval_boundary():
     assert events[-1].kind == "workflow.step.finished"
 
 
+def test_delivery_actions_hold_the_leased_worktree_until_merge_and_reconcile_failures():
+    store = MemoryStore()
+    project = store.create_project("demo", ".anvil")
+    bridge, _ = store.register_bridge(project.id, "bridge")
+    session, workflow = store.create_session(project.id, "delivery", "checkout-a", delivery_workflow())
+    run = store.create_run(
+        project.id, "TASK-1", "heavy-local", session_id=session.id,
+        workflow_id=workflow.id, workflow_step_id="implement",
+    )
+    store.start_workflow(workflow.id, "operator")
+    store.update_run_status(run.id, "running", bridge.id)
+    evidenced = store.update_run_status(run.id, "evidenced", bridge.id)
+    binding = {
+        "run_id": run.id, "session_id": session.id, "worktree_id": "checkout-a",
+        "lease_epoch": evidenced.lease_epoch,
+    }
+    commit = store.create_approval(
+        project.id, "commit_pr", {"diff_hash": "a" * 64, "branch": "codex/demo", **binding},
+        "operator", 60, bridge.id,
+    )
+    approved_commit = store.approve(commit.id, "operator", frozenset({"operator"}))
+    store.consume_approval_for_run(approved_commit.id, approved_commit.payload_hash, bridge.id)
+    # PR creation does not release the checkout: a later merge approval must
+    # bind the same evidenced State task and fenced worktree.
+    with pytest.raises(StoreError, match="task id"):
+        store.create_approval(
+            project.id, "merge_and_accept", {"pr": "1", "task_id": "TASK-OTHER", "expected_head_sha": "a" * 40, **binding},
+            "operator", 60, bridge.id,
+        )
+    merge = store.create_approval(
+        project.id, "merge_and_accept", {"pr": "1", "task_id": "TASK-1", "expected_head_sha": "a" * 40, **binding},
+        "operator", 60, bridge.id,
+    )
+    assert merge.status == "pending"
+
+    reconciled = store.update_run_status(run.id, "reconciliation", bridge.id)
+    assert reconciled.status == "reconciliation"
+    assert store.get_workflow(workflow.id).status == "reconciliation"
+    with pytest.raises(StoreError, match="stale"):
+        store.create_approval(
+            project.id, "merge_and_accept", {"pr": "1", "task_id": "TASK-1", "expected_head_sha": "a" * 40, **binding},
+            "operator", 60, bridge.id,
+        )
+
+
+def test_delivery_completes_only_after_the_bridge_reports_merge_and_state_success():
+    store = MemoryStore()
+    project = store.create_project("demo", ".anvil")
+    bridge, _ = store.register_bridge(project.id, "bridge")
+    session, workflow = store.create_session(project.id, "delivery", "checkout-a", delivery_workflow())
+    run = store.create_run(
+        project.id, "TASK-1", "heavy-local", session_id=session.id,
+        workflow_id=workflow.id, workflow_step_id="implement",
+    )
+    store.start_workflow(workflow.id, "operator")
+    store.update_run_status(run.id, "running", bridge.id)
+    evidenced = store.update_run_status(run.id, "evidenced", bridge.id)
+    approval = store.create_approval(
+        project.id, "merge_and_accept", {
+            "pr": "1", "task_id": "TASK-1", "expected_head_sha": "a" * 40, "run_id": run.id,
+            "session_id": session.id, "worktree_id": "checkout-a", "lease_epoch": evidenced.lease_epoch,
+        }, "operator", 60, bridge.id,
+    )
+    approved = store.approve(approval.id, "operator", frozenset({"operator"}))
+    store.enqueue_command(bridge.id, approved)
+    command = store.next_command(bridge.id)
+    assert command is not None
+    consumed = store.consume_approval_for_run(approved.id, approved.payload_hash, bridge.id)
+
+    completed = store.complete_approved_merge(consumed.id, consumed.payload_hash, bridge.id, command["id"])
+    assert completed.status == "completed"
+    assert store.get_workflow(workflow.id).status == "completed"
+    assert store.next_command(bridge.id) is None
+
+
 def test_workflow_definition_rejects_unbounded_or_unallowlisted_control_flow():
     with pytest.raises(WorkflowError, match="allowlisted"):
         validate_definition({"steps": [{"id": "deploy", "kind": "shell", "next": []}]})

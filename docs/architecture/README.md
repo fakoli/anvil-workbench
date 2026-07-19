@@ -11,6 +11,7 @@ loading every design note into a model context.
 | [Workflow operation layer](../WORKFLOW-OPERATION-LAYER.md) | Implementing the cross-product State/Serving operation catalog and workflow v2. |
 | [Integration contracts](../CONTRACTS.md) | Changing an implemented boundary or checking an authority rule. |
 | [Contract resources](../contracts/README.md) | Adding a typed catalog, workflow, bridge command, receipt, or run-context resource. |
+| [Digesting and snapshots](../contracts/DIGESTING.md) | Implementing or reviewing immutable catalog/profile/workflow snapshots. |
 
 ## Architecture position
 

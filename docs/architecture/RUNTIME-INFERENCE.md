@@ -53,6 +53,16 @@ workflow snapshot, bridge-local capability/profile proof, independently captured
 verification, then redacted model activity. Model prose is never the authority
 for a task state or a prior external effect.
 
+### Prompt-injection boundary
+
+PRDs, State work-packet prose, repository files, tool output, and prior evidence
+are **untrusted task data**, even when they are relevant to the task. The context
+renderer must place that material in a visibly delimited data section and keep
+the trusted execution policy, capability menu, and stop conditions in a separate
+control section. Task data cannot add an operation, change a route, relax a
+budget, reveal a credential, or override an approval. A future qualifier must
+include malicious packet/repository fixtures that attempt each of those changes.
+
 ## Inference loop
 
 ```text
@@ -99,10 +109,16 @@ in [run-context and model proposal resources](../contracts/README.md).
 
 ```json
 {
+  "schema_version": "workbench-model-proposal/v1",
   "kind": "operation_request",
-  "operation_id": "state.verification.capture",
-  "input": {"verification_id": "pytest"},
-  "reason": "The work packet requires this verification before evidence submission."
+  "operation": {
+    "provider": "anvil-state",
+    "id": "state.evidence.submit",
+    "contract_version": "1.0.0",
+    "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"
+  },
+  "input": {"task_id": "T001", "verification_receipt_ids": ["rcpt_verification"]},
+  "reason": "The work packet requires evidence submission after its independent verification passed."
 }
 ```
 
