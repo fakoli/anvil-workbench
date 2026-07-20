@@ -24,6 +24,7 @@ render it as lowercase `sha256:<64 hex>`.
 | Provider catalog | `anvil-workbench/catalog/v1\0` | Omit `catalog_digest` and volatile `generated_at`; sort `operations` by `(id, contract_version, operation_digest)`. |
 | Capability profile | `anvil-workbench/capability-profile/v1\0` | Omit `digest`; sort operation allowlist entries, skill entries, model profiles, and approval actions. |
 | Workflow | `anvil-workbench/workflow/v2\0` | Omit an optional future `digest`; preserve step and edge order. |
+| Workflow snapshot | `anvil-workbench/workflow-snapshot/v1\0` | Omit `snapshot_digest`; sort `catalogs` by `provider`, `operations` by `(provider, id, contract_version, operation_digest)`, `skills` by `(id, digest)`, and sort `model_profiles` and `approval_actions`. |
 | Skill | `anvil-workbench/skill/v1\0` | Omit its declared digest; the bridge hashes configured reviewed skill metadata/content before it publishes a reference. |
 | Approved operation inputs | `anvil-workbench/approval-payload/v1\0` | Hash the exact typed `inputs` object attached to the approval-gated operation. |
 | State project snapshot | `anvil-workbench/state-snapshot/v1\0` | Omit `snapshot_digest` and volatile `generated_at`; sort `prds` by `prd_id` and `tasks` by `(ref.prd_id, ref.task_id)`. |

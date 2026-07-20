@@ -102,6 +102,52 @@ def _reset_profile_contract_validator_cache() -> None:
     _profile_contract_validator_cache = None
 
 
+_WORKFLOW_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "workflow.v2.schema.json"
+)
+_workflow_contract_validator_cache: Draft202012Validator | None = None
+
+
+def workflow_contract_validator() -> Draft202012Validator:
+    """Load the workflow v2 contract schema once; fail closed if absent.
+
+    Shared by every workflow consumer (snapshot compilation, future queueing)
+    so there is exactly one interpretation of the contract schema.  The
+    closed-root and bounded-steps guards refuse a schema edit that would let a
+    workflow smuggle unreviewed extension fields or an unbounded step list.
+    """
+    global _workflow_contract_validator_cache
+    if _workflow_contract_validator_cache is None:
+        try:
+            schema = json.loads(_WORKFLOW_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "workflow contract schema is unavailable; refusing to validate workflows"
+            ) from exc
+        steps = schema.get("properties", {}).get("steps", {})
+        if schema.get("additionalProperties") is not False or not isinstance(steps.get("maxItems"), int):
+            raise ContractValidationError(
+                "workflow contract schema no longer closes its root object or bounds steps; "
+                "refusing to validate workflows"
+            )
+        defs = schema.get("$defs", {})
+        for name in ("operation_ref", "operation_step", "agent_step", "approval_step", "control_step"):
+            node = defs.get(name)
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"workflow contract schema no longer closes its {name} object; "
+                    "refusing to validate workflows"
+                )
+        _workflow_contract_validator_cache = Draft202012Validator(schema)
+    return _workflow_contract_validator_cache
+
+
+def _reset_workflow_contract_validator_cache() -> None:
+    """Test hook: force the next workflow validation to reload the on-disk schema."""
+    global _workflow_contract_validator_cache
+    _workflow_contract_validator_cache = None
+
+
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -189,6 +235,7 @@ _PREFIXES = {
     "catalog": b"anvil-workbench/catalog/v1\0",
     "profile": b"anvil-workbench/capability-profile/v1\0",
     "workflow": b"anvil-workbench/workflow/v2\0",
+    "workflow-snapshot": b"anvil-workbench/workflow-snapshot/v1\0",
     "skill": b"anvil-workbench/skill/v1\0",
     "approval-payload": b"anvil-workbench/approval-payload/v1\0",
     "state-snapshot": b"anvil-workbench/state-snapshot/v1\0",
@@ -266,6 +313,24 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
             payload["skills"] = sorted(copy.deepcopy(skills), key=lambda item: (str(item.get("id", "")), str(item.get("digest", ""))))
     elif kind == "workflow":
         payload = _without(value, "digest")
+    elif kind == "workflow-snapshot":
+        payload = _without(value, "snapshot_digest")
+        catalogs = payload.get("catalogs")
+        if isinstance(catalogs, list):
+            payload["catalogs"] = sorted(
+                copy.deepcopy(catalogs), key=lambda item: str(item.get("provider", ""))
+            )
+        operations = payload.get("operations")
+        if isinstance(operations, list):
+            payload["operations"] = sorted(copy.deepcopy(operations), key=_profile_operation_sort_key)
+        skills = payload.get("skills")
+        if isinstance(skills, list):
+            payload["skills"] = sorted(
+                copy.deepcopy(skills), key=lambda item: (str(item.get("id", "")), str(item.get("digest", "")))
+            )
+        for field in ("model_profiles", "approval_actions"):
+            if isinstance(payload.get(field), list):
+                payload[field] = sorted(copy.deepcopy(payload[field]))
     elif kind == "skill":
         payload = _without(value, "digest")
     elif kind == "state-snapshot":
