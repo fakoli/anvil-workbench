@@ -358,3 +358,20 @@ def test_audit_projections_keep_lifecycle_lineage_and_hash_metadata_only():
     assert row.parent_turn_id == "turn_root_0001" and row.sibling_index == 0 and row.lineage_kind == "initial"
     assert row.content_hash == partial.content_hash
     assert row.content_block_count == 1 and row.voice_event_count == 0
+
+
+def test_tts_only_voice_output_never_relaxes_the_text_retention_policy():
+    tts_only = (VoiceEvent("tts_start", NOW),)
+    transcript = (ContentBlock("transcript", "secret words"),)
+    text_metadata_only = conversation(retention=retention(transcript="metadata_only"))
+
+    with pytest.raises(ConversationError, match="transcript_text=metadata_only"):
+        validate_turn_append(
+            text_metadata_only, [], turn("turn_root_0001", content=transcript, voice_events=tts_only)
+        )
+
+    # Voice-INPUT events still route governance to the voice policy.
+    stt = (VoiceEvent("stt_commit", NOW, transcript_chars=12),)
+    assert validate_turn_append(
+        text_metadata_only, [], turn("turn_root_0001", content=transcript, voice_events=stt)
+    )

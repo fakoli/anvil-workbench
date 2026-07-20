@@ -16,12 +16,24 @@ Two rule families the JSON Schemas cannot express live here instead:
   :func:`validate_turn_append` before the hub store persists an append.
 * The retention mapping — a conversation whose ``transcript_text`` or
   ``voice_transcript_text`` policy is ``metadata_only`` may never persist a
-  ``kind: "transcript"`` content block for that content kind.
+  ``kind: "transcript"`` content block for that content kind.  Voice-input
+  provenance is inferred from the voice-INPUT events attached to the turn
+  (``VOICE_INPUT_EVENT_KINDS``); voice-output events never relax the text
+  policy.  PRECONDITION for the hub store: persist a voice transcript in the
+  same append as its voice events — a caller that strips the events routes
+  the transcript to the ``transcript_text`` policy.
 
 There is deliberately no field able to carry raw audio frames or
 hidden/encrypted model reasoning, on the turn records or on the safe audit
 shapes.  The audit models expose lifecycle, lineage, hash, and bounded count
 metadata only — never message content.
+
+Deliberate scope omissions versus ``chat-turn.v1``: the ``route`` (with its
+assistant-requires-route/request_id conditional), ``usage``,
+``advanced_controls``, and context blocks are Serving-integration concerns
+owned by the streaming/route tasks; these models neither carry nor enforce
+them, so an assistant ``Turn`` here is a subset of the schema shape until
+that slice lands.
 """
 from __future__ import annotations
 
@@ -53,6 +65,9 @@ CONTENT_KINDS = frozenset({"text", "transcript", "summary"})
 CONTENT_TRUST = "untrusted_task_data"
 REDACTION_STATUSES = frozenset({"redacted", "metadata_only"})
 VOICE_EVENT_KINDS = frozenset({"utterance_start", "stt_commit", "tts_start", "tts_stop", "interruption"})
+#: Voice-INPUT events: only these make a turn voice-governed for retention.
+#: Voice-output (tts_*) or interruption events never relax the text policy.
+VOICE_INPUT_EVENT_KINDS = frozenset({"utterance_start", "stt_commit"})
 
 MAX_CONTENT_BLOCKS = 64
 MAX_CONTENT_TEXT_CHARS = 20000
@@ -234,10 +249,13 @@ def turn_content_hash(content: tuple[ContentBlock, ...] | list[ContentBlock]) ->
 
 @dataclass(frozen=True)
 class Turn:
-    """One append-only turn.  After creation the record never mutates: a
-    correction is a new sibling turn, and streaming resolves by persisting a
-    successor record in exactly one terminal state (an interrupted response
-    keeps the partial text actually delivered, never fabricated as complete).
+    """One append-only turn.  Per the contract, after creation only ``status``
+    and ``completed_at`` may advance, from ``streaming`` to exactly one
+    terminal state — the store advances those two fields in place; everything
+    else is immutable, and a correction is a new sibling turn (an interrupted
+    response keeps the partial text actually delivered, never fabricated as
+    complete).  These frozen values model one observed state; the store owns
+    the status advance.
     """
 
     id: str
@@ -399,10 +417,19 @@ def validate_turn_append(
 
     # Retention mapping: metadata_only means no transcript content block may
     # persist for that content kind; only bounded counters/metadata survive.
+    # A turn is voice-INPUT governed only when a voice-input event is present;
+    # voice-output events (tts_*) never relax the text policy. When BOTH input
+    # kinds are conceivable the stricter policy wins, and provenance is
+    # inferred from the events the caller attached — the hub store must
+    # persist voice events with their transcript in the same append (see the
+    # module docstring), or the text policy governs.
+    has_voice_input = any(
+        event.event in VOICE_INPUT_EVENT_KINDS for event in new_turn.voice_events
+    )
     for block in new_turn.content:
         if block.kind != "transcript":
             continue
-        governing = "voice_transcript_text" if new_turn.voice_events else "transcript_text"
+        governing = "voice_transcript_text" if has_voice_input else "transcript_text"
         _require(
             getattr(conversation.retention, governing) == "retained_redacted",
             f"conversation retention {governing}=metadata_only forbids persisting transcript content",
