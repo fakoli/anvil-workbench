@@ -54,6 +54,37 @@ def catalog_contract_validator() -> Draft202012Validator:
     return _catalog_contract_validator_cache
 
 
+_PROFILE_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "capability-profile.v1.schema.json"
+)
+_profile_contract_validator_cache: Draft202012Validator | None = None
+
+
+def profile_contract_validator() -> Draft202012Validator:
+    """Load the capability-profile contract schema once; fail closed if absent.
+
+    Shared by every profile consumer so there is exactly one interpretation of
+    the contract schema.  The closed-object guard refuses a schema edit that
+    would reopen the profile to unreviewed extension fields: a profile must
+    stay a closed allowlist, never an extensible envelope.
+    """
+    global _profile_contract_validator_cache
+    if _profile_contract_validator_cache is None:
+        try:
+            schema = json.loads(_PROFILE_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "capability-profile contract schema is unavailable; refusing to validate profiles"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "capability-profile contract schema no longer closes the profile object; "
+                "refusing to validate profiles"
+            )
+        _profile_contract_validator_cache = Draft202012Validator(schema)
+    return _profile_contract_validator_cache
+
+
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
