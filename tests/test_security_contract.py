@@ -30,18 +30,27 @@ _PROHIBITION_DOC = re.compile(
 #: only supported State read paths are the State CLI and the canonical event
 #: stream. Any SQLite use in hub, bridge, or browser source is therefore a
 #: candidate direct ``state.db`` access and fails this scan outright.
-_SQLITE = re.compile(r"\bsqlite3?\b", re.IGNORECASE)
+_SQLITE = re.compile(r"sqlite|\bapsw\b", re.IGNORECASE)
+
+#: Bulk-copy primitives copy State storage without ever naming it (a
+#: directory-level copy of a supervised worktree includes ``.anvil``), so
+#: Workbench Python sources may not use them at all; a legitimate future need
+#: must consciously revise this boundary test.
+_BULK_COPY = re.compile(r"\bcopytree\b|\bmake_archive\b|\bZipFile\b|\btarfile\b")
 
 
 def _scanned_sources() -> list[Path]:
-    sources = sorted((_REPO_ROOT / "workbench").rglob("*.py"))
-    web_src = _REPO_ROOT / "web" / "src"
+    workbench_sources = sorted((_REPO_ROOT / "workbench").rglob("*.py"))
+    web_sources: list[Path] = []
+    web_root = _REPO_ROOT / "web"
     for suffix in (".js", ".jsx", ".ts", ".tsx"):
-        sources.extend(sorted(web_src.rglob(f"*{suffix}")))
-    # The scan must actually see the codebase; an empty or near-empty file set
-    # would mean the directories moved and the proof silently stopped proving.
-    assert len(sources) >= 20, sources
-    return sources
+        web_sources.extend(sorted((web_root / "src").rglob(f"*{suffix}")))
+        web_sources.extend(sorted(web_root.glob(f"*{suffix}")))
+    # The scan must actually see BOTH surfaces; losing either directory (a
+    # rename, a glob typo) must fail loudly, not silently stop proving.
+    assert len(workbench_sources) >= 15, workbench_sources
+    assert len(web_sources) >= 1, web_sources
+    return workbench_sources + web_sources
 
 
 def test_no_workbench_source_opens_copies_mounts_or_mutates_state_storage():
@@ -55,13 +64,23 @@ def test_no_workbench_source_opens_copies_mounts_or_mutates_state_storage():
     for source in _scanned_sources():
         relative = source.relative_to(_REPO_ROOT).as_posix()
         for number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
+            stripped = line.strip()
             if _STATE_STORAGE.search(line):
-                if _PROHIBITION_DOC.search(line):
+                # Allowlist: documentation-only lines — a comment line or a
+                # pure prose line inside a docstring. A line containing any
+                # executable code (assignment, call, etc.) is never exempt,
+                # even when a warning comment rides on it.
+                is_documentation = stripped.startswith("#") or (
+                    "=" not in line and "(" not in line
+                )
+                if is_documentation and _PROHIBITION_DOC.search(line):
                     prohibition_docs += 1
                 else:
-                    violations.append(f"{relative}:{number}: state storage reference: {line.strip()}")
+                    violations.append(f"{relative}:{number}: state storage reference: {stripped}")
             if _SQLITE.search(line):
-                violations.append(f"{relative}:{number}: sqlite reference: {line.strip()}")
+                violations.append(f"{relative}:{number}: sqlite reference: {stripped}")
+            if source.suffix == ".py" and _BULK_COPY.search(line):
+                violations.append(f"{relative}:{number}: bulk-copy primitive: {stripped}")
     assert violations == []
     # The allowlist must stay documentation-only, and the scanner must remain
     # sensitive enough to see the one docstring that states the prohibition.
