@@ -40,32 +40,15 @@ from typing import Any, Callable, Mapping, Sequence
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
-from .contracts import ContractValidationError, validate_catalog
-
-_CATALOG_CONTRACT_SCHEMA = (
-    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "operation-catalog.v1.schema.json"
-)
-_catalog_contract_validator_cache: Draft202012Validator | None = None
+from .contracts import ContractValidationError, catalog_contract_validator, validate_catalog
 
 
 def _catalog_contract_validator() -> Draft202012Validator:
-    """Load the operation-catalog contract schema once; fail closed if absent."""
-    global _catalog_contract_validator_cache
-    if _catalog_contract_validator_cache is None:
-        try:
-            schema = json.loads(_CATALOG_CONTRACT_SCHEMA.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise StateManifestError(
-                "operation-catalog contract schema is unavailable; refusing to pin descriptors"
-            ) from exc
-        bound = schema.get("properties", {}).get("generated_at", {})
-        if not isinstance(bound.get("maxLength"), int) or "pattern" not in bound:
-            raise StateManifestError(
-                "operation-catalog contract schema no longer bounds generated_at; "
-                "refusing to pin descriptors"
-            )
-        _catalog_contract_validator_cache = Draft202012Validator(schema)
-    return _catalog_contract_validator_cache
+    """Resolve the shared operation-catalog contract validator; fail closed."""
+    try:
+        return catalog_contract_validator()
+    except ContractValidationError as exc:
+        raise StateManifestError(f"{exc}; refusing to pin descriptors") from exc
 
 
 class StateManifestError(RuntimeError):

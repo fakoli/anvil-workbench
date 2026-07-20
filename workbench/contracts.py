@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Protocol
 
 from jsonschema import Draft202012Validator
@@ -18,6 +19,38 @@ from jsonschema.exceptions import ValidationError
 
 class ContractValidationError(ValueError):
     """A proposed contract resource or immutable execution snapshot is unsafe."""
+
+
+_CATALOG_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "operation-catalog.v1.schema.json"
+)
+_catalog_contract_validator_cache: Draft202012Validator | None = None
+
+
+def catalog_contract_validator() -> Draft202012Validator:
+    """Load the operation-catalog contract schema once; fail closed if absent.
+
+    Shared by every catalog consumer (State manifest discovery, the provider
+    catalog registry) so there is exactly one interpretation of the contract
+    schema.  The ``generated_at`` bound guard refuses a schema edit that would
+    let a provider smuggle unbounded content through the timestamp field.
+    """
+    global _catalog_contract_validator_cache
+    if _catalog_contract_validator_cache is None:
+        try:
+            schema = json.loads(_CATALOG_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "operation-catalog contract schema is unavailable; refusing to validate catalogs"
+            ) from exc
+        bound = schema.get("properties", {}).get("generated_at", {})
+        if not isinstance(bound.get("maxLength"), int) or "pattern" not in bound:
+            raise ContractValidationError(
+                "operation-catalog contract schema no longer bounds generated_at; "
+                "refusing to validate catalogs"
+            )
+        _catalog_contract_validator_cache = Draft202012Validator(schema)
+    return _catalog_contract_validator_cache
 
 
 class ApprovalConsumer(Protocol):
