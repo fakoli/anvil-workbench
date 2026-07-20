@@ -377,3 +377,28 @@ def test_audit_projections_never_carry_titles_or_message_content():
     dumped = repr(events)
     assert "secret" not in dumped.lower()
     assert "message body" not in dumped
+
+
+def test_retry_overflow_raises_the_typed_store_error():
+    store, conversation = store_with_conversation()
+    root = append_root(store, ALICE, conversation.id)
+    child = append_child(
+        store, ALICE, conversation.id, root.id, sibling=4096, kind="branch",
+    )
+    with pytest.raises(ConversationStoreError, match="sibling index"):
+        store.retry_turn(
+            ALICE, conversation.id, child.id, role="assistant",
+            status="complete", redaction=REDACTED, content=(ContentBlock("text", "again"),),
+        )
+
+
+def test_recover_on_open_interrupts_streaming_turns_at_construction():
+    store, conversation = store_with_conversation()
+    store.append_turn(
+        ALICE, conversation.id, role="assistant", status="streaming",
+        lineage=TurnLineage(None, 0, "initial"), redaction=REDACTED,
+        content=(ContentBlock("text", "partial"),),
+    )
+    reopened = MemoryConversationStore(store.rows, recover_on_open=True)
+    _, turns = reopened.get_conversation_with_turns(ALICE, conversation.id)
+    assert [turn.status for turn in turns] == ["interrupted"]

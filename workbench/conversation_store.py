@@ -121,6 +121,12 @@ class ConversationStore(Protocol):
     ) -> Turn: ...
     def advance_turn_status(self, actor: ConversationActor, conversation_id: str, turn_id: str, status: str) -> Turn: ...
     def get_conversation_with_turns(self, actor: ConversationActor, conversation_id: str) -> tuple[Conversation, tuple[Turn, ...]]: ...
+    # HUB-INTERNAL / SYSTEM-ONLY: the two operations below take no actor and
+    # span all actors' records. They must never be wired to an actor-facing
+    # endpoint without explicit operator/system authorization and scoping.
+    # Note also that TurnAudit.content_hash is a deterministic unsalted digest,
+    # so a shared audit stream is a cross-actor content-equality oracle — the
+    # API slice must treat audit access as privileged.
     def recover_streaming_turns(self) -> tuple[TurnAudit, ...]: ...
     def list_audit(self, limit: int = 20) -> list[ConversationAuditEvent]: ...
 
@@ -151,8 +157,20 @@ def _lineage_order(turns: list[Turn]) -> tuple[Turn, ...]:
 class MemoryConversationStore:
     """Hermetic row-backed conversation store; requests are serialized in tests."""
 
-    def __init__(self, rows: ConversationRows | None = None) -> None:
+    def __init__(self, rows: ConversationRows | None = None, *, recover_on_open: bool = False) -> None:
+        """Open the store over ``rows``.
+
+        After a restart over persisted rows, ``recover_streaming_turns()`` MUST
+        run before serving reads, or stale ``streaming`` turns can be advanced
+        to ``complete`` and fabricate a finished response; pass
+        ``recover_on_open=True`` to bind that recovery to construction.
+        Turn IDs are unique per ``(conversation_id, turn_id)`` — a durable
+        backend must key on the composite, never a global turn ID, or a
+        cross-actor insert refusal becomes an existence oracle.
+        """
         self.rows = rows if rows is not None else ConversationRows()
+        if recover_on_open:
+            self.recover_streaming_turns()
 
     # -- internal helpers -------------------------------------------------
 
@@ -318,7 +336,10 @@ class MemoryConversationStore:
         parent_id = target.lineage.parent_turn_id
         if parent_id is None:
             raise ConversationStoreError("the root turn cannot be retried")
-        lineage = TurnLineage(parent_id, self._next_sibling_index(conversation_id, parent_id), "retry")
+        try:
+            lineage = TurnLineage(parent_id, self._next_sibling_index(conversation_id, parent_id), "retry")
+        except ConversationError as exc:
+            raise ConversationStoreError(str(exc)) from exc
         return self.append_turn(
             actor, conversation_id, role=role, status=status, lineage=lineage,
             redaction=redaction, mode=mode, content=content, voice_events=voice_events,
@@ -333,7 +354,10 @@ class MemoryConversationStore:
         """Append a new child branch under an existing turn of this conversation."""
         self._owned(actor, conversation_id)
         self._find_turn(conversation_id, parent_turn_id)
-        lineage = TurnLineage(parent_turn_id, self._next_sibling_index(conversation_id, parent_turn_id), "branch")
+        try:
+            lineage = TurnLineage(parent_turn_id, self._next_sibling_index(conversation_id, parent_turn_id), "branch")
+        except ConversationError as exc:
+            raise ConversationStoreError(str(exc)) from exc
         return self.append_turn(
             actor, conversation_id, role=role, status=status, lineage=lineage,
             redaction=redaction, mode=mode, content=content, voice_events=voice_events,
