@@ -383,25 +383,29 @@ def _pin_selected_skills(
                 f"selected skill digest differs from the profile pin: {skill_id}"
             )
         selected[skill_id] = digest
-    workflow_skills: dict[str, str] = {}
+    # Collect every (id, digest) the workflow references — keyed by the FULL
+    # pair like operations, so a step that lists one skill id under two
+    # digests cannot silently drop the un-selected one (order-independent).
+    workflow_skill_keys: set[tuple[str, str]] = set()
     for step in workflow["steps"]:
         if step.get("kind") != "agent":
             continue
         for skill in step.get("skills", ()):
-            workflow_skills[str(skill["id"])] = str(skill["digest"])
-    for skill_id, digest in workflow_skills.items():
+            workflow_skill_keys.add((str(skill["id"]), str(skill["digest"])))
+    selected_keys = {(skill_id, digest) for skill_id, digest in selected.items()}
+    unpinned = workflow_skill_keys - selected_keys
+    if unpinned:
+        skill_id, _ = sorted(unpinned)[0]
         if skill_id not in selected:
-            raise WorkflowSnapshotError(
-                f"workflow references an unselected skill: {skill_id}"
-            )
-        if selected[skill_id] != digest:
-            raise WorkflowSnapshotError(
-                f"workflow skill digest differs from the selected pin: {skill_id}"
-            )
-    unused = set(selected) - set(workflow_skills)
-    if unused:
+            raise WorkflowSnapshotError(f"workflow references an unselected skill: {skill_id}")
         raise WorkflowSnapshotError(
-            f"selected skill is not referenced by the workflow: {sorted(unused)[0]}"
+            f"workflow skill digest differs from the selected pin: {skill_id}"
+        )
+    unused = selected_keys - workflow_skill_keys
+    if unused:
+        skill_id, _ = sorted(unused)[0]
+        raise WorkflowSnapshotError(
+            f"selected skill is not referenced by the workflow: {skill_id}"
         )
     return tuple(
         PinnedSkillSnapshot(

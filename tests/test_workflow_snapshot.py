@@ -700,3 +700,33 @@ def test_workflow_contract_schema_trust_root_fails_closed(monkeypatch, tmp_path)
     with pytest.raises(ContractValidationError, match="no longer closes its root object or bounds steps"):
         contracts_module.workflow_contract_validator()
     contracts_module._reset_workflow_contract_validator_cache()
+
+
+def test_skill_smuggle_via_duplicate_id_is_order_independent():
+    # A workflow agent step that lists one skill id under two digests must not
+    # let the un-selected digest ride through in either array order (the gate
+    # found this collapsed to id-keyed last-wins).
+    good = "sha256:" + "7" * 64
+    bogus = "sha256:" + "b" * 64
+    for ordering in ([bogus, good], [good, bogus]):
+        document = copy.deepcopy(workflow_example())
+        agent_step = next(step for step in document["steps"] if step.get("kind") == "agent")
+        agent_step["skills"] = [{"id": "anvil:execute", "digest": digest} for digest in ordering]
+        with pytest.raises(WorkflowSnapshotError, match="digest differs from the selected pin"):
+            compile_snapshot(workflow=document)
+
+
+def test_workflow_contract_schema_nested_reopen_fails_closed(monkeypatch, tmp_path):
+    from workbench import contracts as contracts_module
+
+    base = json.loads(
+        (ROOT / "docs" / "contracts" / "schemas" / "workflow.v2.schema.json").read_text(encoding="utf-8")
+    )
+    base["$defs"]["agent_step"].pop("additionalProperties", None)
+    drifted = tmp_path / "drifted.schema.json"
+    drifted.write_text(json.dumps(base), encoding="utf-8")
+    contracts_module._reset_workflow_contract_validator_cache()
+    monkeypatch.setattr(contracts_module, "_WORKFLOW_CONTRACT_SCHEMA_PATH", drifted)
+    with pytest.raises(ContractValidationError, match="no longer closes its agent_step"):
+        contracts_module.workflow_contract_validator()
+    contracts_module._reset_workflow_contract_validator_cache()

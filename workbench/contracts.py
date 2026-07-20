@@ -130,6 +130,14 @@ def workflow_contract_validator() -> Draft202012Validator:
                 "workflow contract schema no longer closes its root object or bounds steps; "
                 "refusing to validate workflows"
             )
+        defs = schema.get("$defs", {})
+        for name in ("operation_ref", "operation_step", "agent_step", "approval_step", "control_step"):
+            node = defs.get(name)
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"workflow contract schema no longer closes its {name} object; "
+                    "refusing to validate workflows"
+                )
         _workflow_contract_validator_cache = Draft202012Validator(schema)
     return _workflow_contract_validator_cache
 
