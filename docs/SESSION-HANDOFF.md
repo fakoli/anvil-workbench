@@ -64,6 +64,20 @@ rewrite it as part of Workbench work without a separate review of those changes.
 - No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 - No browser-supplied worktree paths, model/tool controls on the voice relay, raw audio storage, or transcript retention without the explicit environment switch.
 
+## 2026-07-20 autonomous anvil-driven run (actor `claude`) — continued
+
+Run #2 (same day): three more tasks delivered through the identical
+gate-reviewed lifecycle — `chat-first-voice` T002.2 (actor-scoped
+conversation store) and T002.3 (retention/deletion/irreversibility + the
+R008 keyed-HMAC content fingerprint), and `state-context-operations` T004.1
+(reviewed provider catalog registry with a shared catalog-contract
+validator and $ref fail-closed checks). Ten tasks total are merged; the
+full suite is at 213. A research pass (OpenClaw, Open WebUI) produced 16
+adversarially-filtered backlog items inserted across all six PRDs
+(project now 108 tasks / 98 ready); reports live in
+post-session-findings/2026-07-20-autonomous-prd-run/ (gitignored).
+Upstream anvil frictions are filed as fakoli/anvil#180.
+
 ## 2026-07-20 autonomous anvil-driven run (actor `claude`)
 
 Seven State-managed tasks were delivered through the full anvil lifecycle
