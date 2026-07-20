@@ -115,9 +115,9 @@ in [run-context and model proposal resources](../contracts/README.md).
     "provider": "anvil-state",
     "id": "state.evidence.submit",
     "contract_version": "1.0.0",
-    "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"
+    "operation_digest": "sha256:40dc36beb9ee974f311134a24416936a09881c8ac4087400987026e77ae9a033"
   },
-  "input": {"task_id": "T001", "verification_receipt_ids": ["rcpt_verification"]},
+  "input": {"task_ref": "release-beta:T001", "verification_receipt_ids": ["rcpt_verification"]},
   "reason": "The work packet requires evidence submission after its independent verification passed."
 }
 ```

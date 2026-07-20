@@ -22,7 +22,9 @@ These resources are the implementation-facing companion to
 | Improve a coding model’s next inference turn | [run context](schemas/run-context.v1.schema.json) | [run context](examples/run-context.v1.json) |
 | Validate a model’s bounded next action | [model proposal](schemas/model-proposal.v1.schema.json) | [operation request](examples/model-proposal.operation-request.v1.json) |
 | Deliver a command to a local bridge | [bridge command](schemas/bridge-command.v1.schema.json) | [bridge command](examples/bridge-command.invoke-operation.v1.json) |
-| Return evidence for an operation/effect | [operation receipt](schemas/operation-receipt.v1.schema.json) | [operation receipt](examples/operation-receipt.v1.json) |
+| Return evidence for an operation/effect | [operation receipt](schemas/operation-receipt.v1.schema.json) | [operation receipt](examples/operation-receipt.v1.json), [preflight refusal](examples/operation-receipt.refusal.v1.json) |
+| Display a project's PRD/plan/task hierarchy without touching State storage | [state snapshot](schemas/state-snapshot.v1.schema.json) | [project snapshot](examples/anvil-state.project-snapshot.v1.json) |
+| Read one PRD's bounded, redacted content for display | [PRD content](schemas/prd-content.v1.schema.json) | [PRD content read](examples/anvil-state.prd-content.v1.json) |
 
 ## Normative conventions
 
@@ -65,6 +67,13 @@ These resources are the implementation-facing companion to
    opaque references and short safe summaries. Never put raw transcript,
    local skill body/path, token, or unredacted provider payload in a contract
    artifact.
+10. A task reference is an object that names its owning PRD: `{prd_id,
+    task_id}` (plus `prd_revision` where a run pins a source revision). Task
+    IDs are only unique within one PRD, so two PRDs may each own a `T001` and
+    both remain unambiguous. A bare `task_id` string outside a reference
+    object (for example in receipt correlation) is display/correlation data
+    only and carries no authority; where present it should use the scoped
+    `<prd_id>:<task_id>` form.
 
 ## Contract-extension checklist
 

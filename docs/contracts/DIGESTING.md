@@ -26,6 +26,21 @@ render it as lowercase `sha256:<64 hex>`.
 | Workflow | `anvil-workbench/workflow/v2\0` | Omit an optional future `digest`; preserve step and edge order. |
 | Skill | `anvil-workbench/skill/v1\0` | Omit its declared digest; the bridge hashes configured reviewed skill metadata/content before it publishes a reference. |
 | Approved operation inputs | `anvil-workbench/approval-payload/v1\0` | Hash the exact typed `inputs` object attached to the approval-gated operation. |
+| State project snapshot | `anvil-workbench/state-snapshot/v1\0` | Omit `snapshot_digest` and volatile `generated_at`; sort `prds` by `prd_id` and `tasks` by `(ref.prd_id, ref.task_id)`. |
+| PRD content read | `anvil-workbench/prd-content/v1\0` | Omit `content_digest` and volatile `generated_at`. |
+
+All documented sort rules use plain code-point lexicographic string
+comparison — no numeric, locale, or case-insensitive collation (so `T002.10`
+sorts before `T002.2`). Snapshot task references must be unique per
+`(ref.prd_id, ref.task_id)`, which keeps the sort total and deterministic;
+`workbench.contracts.validate_state_snapshot` rejects duplicates.
+
+A State project snapshot digest is the hub's idempotency key for readable
+context publication: republishing an identical snapshot must not create a
+second PRD, plan, or task projection, and a snapshot or PRD-content read whose
+digest does not recompute is refused, never partially applied
+(`validate_state_snapshot` / `validate_prd_content` are the reference
+fail-closed checks).
 
 An operation digest is checked first, then its enclosing catalog digest. The
 catalog includes each checked operation digest. A provider must not use

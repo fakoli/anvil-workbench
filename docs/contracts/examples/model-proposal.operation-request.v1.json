@@ -2,6 +2,16 @@
   "schema_version": "workbench-model-proposal/v1",
   "kind": "operation_request",
   "reason": "The work packet requires captured verification before State evidence may be submitted.",
-  "operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0", "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"},
-  "input": {"task_id": "T001", "verification_receipt_ids": ["rcpt_verification"]}
+  "operation": {
+    "provider": "anvil-state",
+    "id": "state.evidence.submit",
+    "contract_version": "1.0.0",
+    "operation_digest": "sha256:40dc36beb9ee974f311134a24416936a09881c8ac4087400987026e77ae9a033"
+  },
+  "input": {
+    "task_ref": "release-beta:T001",
+    "verification_receipt_ids": [
+      "rcpt_verification"
+    ]
+  }
 }
