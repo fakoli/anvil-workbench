@@ -15,6 +15,8 @@ Each test group maps to an acceptance criterion of chat-first-voice:T002.2:
 """
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from workbench.conversation_models import (
@@ -37,6 +39,9 @@ from workbench.models import now_utc
 ALICE = ConversationActor("operator_alice")
 BOB = ConversationActor("operator_bob")
 REDACTED = TurnRedaction("redacted", "workbench.default")
+# Hermetic fixture keys for the server-keyed content fingerprint (PRD R008).
+KEY = b"store-test-content-hash-key-A-01"
+OTHER_KEY = b"store-test-content-hash-key-B-02"
 
 
 def retention(transcript: str = "retained_redacted", voice: str = "retained_redacted") -> RetentionPolicy:
@@ -44,7 +49,7 @@ def retention(transcript: str = "retained_redacted", voice: str = "retained_reda
 
 
 def store_with_conversation(actor: ConversationActor = ALICE, title: str = "Kickoff chat"):
-    store = MemoryConversationStore()
+    store = MemoryConversationStore(content_hash_key=KEY)
     conversation = store.create_conversation(actor, retention(), title=title)
     return store, conversation
 
@@ -119,7 +124,7 @@ def test_cross_actor_probes_are_indistinguishable_from_a_missing_conversation():
 
 
 def test_list_and_search_never_return_another_actors_conversations():
-    store = MemoryConversationStore()
+    store = MemoryConversationStore(content_hash_key=KEY)
     store.create_conversation(ALICE, retention(), title="Shared secret plan")
     store.create_conversation(BOB, retention(), title="Shared secret plan")
     assert {record.actor.actor_id for record in store.list_conversations(ALICE)} == {"operator_alice"}
@@ -206,7 +211,7 @@ def test_invariant_violating_appends_are_refused_by_the_store_itself():
 
 
 def test_same_actor_cross_conversation_parent_is_refused_but_cross_actor_parent_never_leaks():
-    store = MemoryConversationStore()
+    store = MemoryConversationStore(content_hash_key=KEY)
     alice_a = store.create_conversation(ALICE, retention(), title="A")
     alice_b = store.create_conversation(ALICE, retention(), title="B")
     bob_c = store.create_conversation(BOB, retention(), title="C")
@@ -223,7 +228,7 @@ def test_same_actor_cross_conversation_parent_is_refused_but_cross_actor_parent_
 
 
 def test_retention_gate_is_enforced_by_the_store_append_path():
-    store = MemoryConversationStore()
+    store = MemoryConversationStore(content_hash_key=KEY)
     conversation = store.create_conversation(ALICE, retention(transcript="metadata_only"), title="No transcripts")
     with pytest.raises(ConversationStoreError, match="metadata_only forbids persisting transcript"):
         store.append_turn(
@@ -284,7 +289,7 @@ def test_reload_restores_committed_turns_in_lineage_order_and_interrupts_streami
     )
 
     # Simulated hub restart: a fresh store instance over the same persisted rows.
-    reopened = MemoryConversationStore(store.rows)
+    reopened = MemoryConversationStore(store.rows, content_hash_key=KEY)
     recovered = reopened.recover_streaming_turns()
     assert [audit.turn_id for audit in recovered] == [unfinished.id]
     assert all(isinstance(audit, TurnAudit) and audit.status == "interrupted" for audit in recovered)
@@ -379,6 +384,71 @@ def test_audit_projections_never_carry_titles_or_message_content():
     assert "message body" not in dumped
 
 
+def test_audit_content_hash_is_no_equality_oracle_without_the_hub_key():
+    """The keyed fingerprint closes the content-equality/dictionary oracle.
+
+    A shared audit stream once exposed a deterministic unsalted digest, so a
+    reader could test guessed low-entropy prompts for equality.  With the
+    HMAC conversion, equal content under different hub keys yields different
+    values, and a party without the key cannot recompute either one.
+    """
+    guessable = "yes"
+    store_a = MemoryConversationStore(content_hash_key=KEY)
+    store_b = MemoryConversationStore(content_hash_key=OTHER_KEY)
+    conv_a = store_a.create_conversation(ALICE, retention(), title="A")
+    conv_b = store_b.create_conversation(BOB, retention(), title="B")
+    turn_a = append_root(store_a, ALICE, conv_a.id, guessable)
+    turn_b = append_root(store_b, BOB, conv_b.id, guessable)
+
+    hashes = {
+        event.record.content_hash
+        for event in store_a.list_audit() + store_b.list_audit()
+        if hasattr(event.record, "content_hash")
+    }
+    assert turn_a.content_hash in hashes and turn_b.content_hash in hashes
+    # Identical content under DIFFERENT keys: different fingerprints.
+    assert turn_a.content_hash != turn_b.content_hash
+    # A keyless dictionary attacker recomputing plain SHA-256 over every
+    # plausible canonicalization of the guessed content never matches.
+    guesses = {
+        "hmac-sha256:" + hashlib.sha256(prefix + body).hexdigest()
+        for prefix in (b"", b"anvil-workbench/chat-turn-content/v1\0")
+        for body in (
+            guessable.encode(),
+            b'[{"content_trust":"untrusted_task_data","kind":"text","text":"yes"}]',
+        )
+    } | {
+        "sha256:" + hashlib.sha256(body).hexdigest()
+        for body in (guessable.encode(),)
+    }
+    assert not (guesses & hashes)
+    # Within one hub the fingerprint is still deterministic (integrity holds).
+    conv_a2 = store_a.create_conversation(ALICE, retention(), title="A2")
+    assert append_root(store_a, ALICE, conv_a2.id, guessable).content_hash == turn_a.content_hash
+
+
+def test_content_hash_key_is_constructor_held_and_never_persisted_in_rows():
+    store, conversation = store_with_conversation()
+    append_root(store, ALICE, conversation.id, "hello")
+    # The key lives on the instance, never inside the persisted row containers.
+    dumped = repr(store.rows)
+    assert KEY.decode() not in dumped and repr(KEY) not in dumped
+    # A fresh instance over the same rows must be handed the key again, and a
+    # weak or missing key is refused fail-closed.
+    with pytest.raises(TypeError):
+        MemoryConversationStore(store.rows)  # type: ignore[call-arg]
+    with pytest.raises(ConversationStoreError, match="content hash key"):
+        MemoryConversationStore(store.rows, content_hash_key=b"short")
+    reopened = MemoryConversationStore(store.rows, content_hash_key=KEY)
+    _, turns = reopened.get_conversation_with_turns(ALICE, conversation.id)
+    assert [turn.content[0].text for turn in turns] == ["hello"]
+    # Reads re-verify the keyed fingerprint: the wrong key fails closed
+    # instead of serving content whose integrity cannot be established.
+    wrong = MemoryConversationStore(store.rows, content_hash_key=OTHER_KEY)
+    with pytest.raises(ConversationStoreError, match="does not match"):
+        wrong.get_conversation_with_turns(ALICE, conversation.id)
+
+
 def test_retry_overflow_raises_the_typed_store_error():
     store, conversation = store_with_conversation()
     root = append_root(store, ALICE, conversation.id)
@@ -399,6 +469,6 @@ def test_recover_on_open_interrupts_streaming_turns_at_construction():
         lineage=TurnLineage(None, 0, "initial"), redaction=REDACTED,
         content=(ContentBlock("text", "partial"),),
     )
-    reopened = MemoryConversationStore(store.rows, recover_on_open=True)
+    reopened = MemoryConversationStore(store.rows, content_hash_key=KEY, recover_on_open=True)
     _, turns = reopened.get_conversation_with_turns(ALICE, conversation.id)
     assert [turn.status for turn in turns] == ["interrupted"]

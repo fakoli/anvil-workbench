@@ -25,6 +25,17 @@ with the API slice; it is not implemented here.
 
 Audit entries carry only the content-free ``TurnAudit``/``ConversationAudit``
 shapes — never a title, content block, or transcript.
+
+Retention and deletion (chat-first-voice:T002.3): ``delete_conversation``
+honours the contract's two deletion modes and ``enforce_retention`` applies
+the ``retention.delete_after`` ceiling — the only age ceiling
+``chat-conversation.v1`` declares — plus reconciliation of a crashed
+``deletion_pending`` purge.  A purge removes content blocks and titles from
+the rows themselves (tombstones, not flags), so expired or deleted content is
+unrecoverable through every public store operation, including a fresh
+instance opened over the same rows.  Content fingerprints are keyed
+HMAC-SHA256 values; the hub key is constructor-injected, held on the
+instance only, and never written into the rows.
 """
 from __future__ import annotations
 
@@ -36,6 +47,7 @@ from .conversation_models import (
     Conversation,
     ConversationActor,
     ConversationAudit,
+    ConversationDeletion,
     ConversationError,
     ContentBlock,
     RetentionPolicy,
@@ -47,6 +59,8 @@ from .conversation_models import (
     VoiceEvent,
     conversation_audit,
     make_turn,
+    purge_turn_content,
+    require_content_hash_key,
     turn_audit,
     validate_turn_append,
 )
@@ -121,13 +135,17 @@ class ConversationStore(Protocol):
     ) -> Turn: ...
     def advance_turn_status(self, actor: ConversationActor, conversation_id: str, turn_id: str, status: str) -> Turn: ...
     def get_conversation_with_turns(self, actor: ConversationActor, conversation_id: str) -> tuple[Conversation, tuple[Turn, ...]]: ...
-    # HUB-INTERNAL / SYSTEM-ONLY: the two operations below take no actor and
-    # span all actors' records. They must never be wired to an actor-facing
+    def delete_conversation(self, actor: ConversationActor, conversation_id: str, mode: str) -> ConversationAudit: ...
+    # HUB-INTERNAL / SYSTEM-ONLY: the operations below take no actor and span
+    # all actors' records. They must never be wired to an actor-facing
     # endpoint without explicit operator/system authorization and scoping.
-    # Note also that TurnAudit.content_hash is a deterministic unsalted digest,
-    # so a shared audit stream is a cross-actor content-equality oracle — the
-    # API slice must treat audit access as privileged.
+    # TurnAudit.content_hash is a KEYED HMAC-SHA256 fingerprint (the hub key
+    # is constructor-injected and never persisted with the rows), so a shared
+    # audit stream is not a content-equality or dictionary oracle for a party
+    # without the key — the API slice must still treat audit access as
+    # privileged lifecycle metadata.
     def recover_streaming_turns(self) -> tuple[TurnAudit, ...]: ...
+    def enforce_retention(self, now: datetime | None = None) -> tuple[ConversationAudit, ...]: ...
     def list_audit(self, limit: int = 20) -> list[ConversationAuditEvent]: ...
 
 
@@ -157,8 +175,19 @@ def _lineage_order(turns: list[Turn]) -> tuple[Turn, ...]:
 class MemoryConversationStore:
     """Hermetic row-backed conversation store; requests are serialized in tests."""
 
-    def __init__(self, rows: ConversationRows | None = None, *, recover_on_open: bool = False) -> None:
-        """Open the store over ``rows``.
+    def __init__(
+        self,
+        rows: ConversationRows | None = None,
+        *,
+        content_hash_key: bytes,
+        recover_on_open: bool = False,
+    ) -> None:
+        """Open the store over ``rows`` with the hub-held content-hash key.
+
+        ``content_hash_key`` keys every turn-content fingerprint (HMAC-SHA256).
+        It is hub configuration — constructor/environment supplied — and is
+        held on the instance only, NEVER written into ``rows``; a fresh
+        instance over the same rows must be given the key again.
 
         After a restart over persisted rows, ``recover_streaming_turns()`` MUST
         run before serving reads, or stale ``streaming`` turns can be advanced
@@ -168,6 +197,10 @@ class MemoryConversationStore:
         backend must key on the composite, never a global turn ID, or a
         cross-actor insert refusal becomes an existence oracle.
         """
+        try:
+            self._content_hash_key = require_content_hash_key(content_hash_key)
+        except ConversationError as exc:
+            raise ConversationStoreError(str(exc)) from exc
         self.rows = rows if rows is not None else ConversationRows()
         if recover_on_open:
             self.recover_streaming_turns()
@@ -301,6 +334,7 @@ class MemoryConversationStore:
                 redaction=redaction,
                 voice_events=voice_events,
                 completed_at=None if status == "streaming" else now_utc(),
+                content_hash_key=self._content_hash_key,
             )
             validated = validate_turn_append(conversation, self._actor_turn_universe(actor), turn)
         except ConversationError as exc:
@@ -398,9 +432,123 @@ class MemoryConversationStore:
     def get_conversation_with_turns(
         self, actor: ConversationActor, conversation_id: str,
     ) -> tuple[Conversation, tuple[Turn, ...]]:
-        """Return the conversation and every persisted turn in lineage order."""
+        """Return the conversation and every persisted turn in lineage order.
+
+        Every live (non-purged) turn's keyed fingerprint is re-verified against
+        its stored content, so a content rewrite behind the store's back can
+        never hide behind a stale hash; a purged tombstone deliberately keeps
+        the fingerprint of the content that was removed.
+        """
         record = self._owned(actor, conversation_id)
-        return record, _lineage_order(list(self.rows.turns.get(conversation_id, [])))
+        ordered = _lineage_order(list(self.rows.turns.get(conversation_id, [])))
+        for item in ordered:
+            if item.content_purged:
+                continue
+            try:
+                item.verify_content_hash(self._content_hash_key)
+            except ConversationError as exc:
+                raise ConversationStoreError(str(exc)) from exc
+        return record, ordered
+
+    # -- retention enforcement and deletion --------------------------------
+
+    def delete_conversation(self, actor: ConversationActor, conversation_id: str, mode: str) -> ConversationAudit:
+        """Delete the owned conversation under one of the contract's two modes.
+
+        ``purge_content_keep_tombstone`` removes every turn's content blocks
+        and the title from the rows, leaving the identity row (status
+        ``deleted`` with its typed deletion record) plus tombstone turns that
+        keep only lifecycle, lineage, voice events, and the keyed content
+        fingerprint.  ``purge_all_records`` removes the conversation and its
+        turns entirely; only the content-free audit trail survives.  The purge
+        completes synchronously before return; the transient
+        ``deletion_pending`` state is persisted (and audited) first, so a
+        crash between the two is reconciled by :meth:`enforce_retention`,
+        never silently lost.  Returns the content-free final audit projection.
+        """
+        record = self._owned(actor, conversation_id)
+        if record.status not in _LISTABLE_STATUSES:
+            raise ConversationStoreError(f"a {record.status} conversation cannot be deleted again")
+        requested_at = now_utc()
+        try:
+            pending = replace(
+                record,
+                status="deletion_pending",
+                deletion=ConversationDeletion(requested_at, mode),
+                updated_at=requested_at,
+            )
+        except ConversationError as exc:
+            raise ConversationStoreError(str(exc)) from exc
+        self._store_conversation("conversation.deletion_requested", pending)
+        return self._complete_deletion(pending)
+
+    def _complete_deletion(self, pending: Conversation) -> ConversationAudit:
+        """Purge content for a ``deletion_pending`` conversation, fail-closed."""
+        deletion = pending.deletion
+        if deletion is None:  # pragma: no cover - the model invariant forbids this
+            raise ConversationStoreError("a pending deletion requires its deletion record")
+        completed_at = now_utc()
+        turns = self.rows.turns.get(pending.id, [])
+        for index, item in enumerate(turns):
+            if item.content_purged:
+                continue
+            tombstone = purge_turn_content(item)
+            turns[index] = tombstone
+            if deletion.mode == "purge_content_keep_tombstone":
+                self._append_audit("turn.content_purged", turn_audit(tombstone))
+        try:
+            deleted = replace(
+                pending,
+                status="deleted",
+                title=None,
+                deletion=ConversationDeletion(deletion.requested_at, deletion.mode, completed_at),
+                updated_at=completed_at,
+            )
+        except ConversationError as exc:
+            raise ConversationStoreError(str(exc)) from exc
+        if deletion.mode == "purge_all_records":
+            final = conversation_audit(deleted, turns)
+            self._append_audit("conversation.deleted", final)
+            self.rows.conversations.pop(pending.id, None)
+            self.rows.turns.pop(pending.id, None)
+            return final
+        self._store_conversation("conversation.deleted", deleted)
+        return conversation_audit(deleted, self.rows.turns.get(deleted.id, []))
+
+    def enforce_retention(self, now: datetime | None = None) -> tuple[ConversationAudit, ...]:
+        """HUB-INTERNAL sweep applying retention ceilings and finishing deletions.
+
+        Exactly what ``chat-conversation.v1`` declares, nothing more: the
+        per-conversation ``retention.delete_after`` instant (the contract's
+        only age ceiling) and the deletion lifecycle (a ``deletion_pending``
+        record left behind by a crash mid-purge is completed here).  An
+        expired conversation is purged as ``purge_content_keep_tombstone`` so
+        the content-free lifecycle/fingerprint audit facts survive; later
+        reads return only tombstoned shapes.  Idempotent: an already-deleted
+        tombstone is never re-enforced.  Returns the content-free audit
+        projections of the conversations enforced in this pass.
+        """
+        moment = now if now is not None else now_utc()
+        if not isinstance(moment, datetime) or moment.tzinfo is None:
+            raise ConversationStoreError("retention enforcement requires a timezone-aware datetime")
+        enforced: list[ConversationAudit] = []
+        for record in list(self.rows.conversations.values()):
+            if record.status == "deletion_pending":
+                enforced.append(self._complete_deletion(record))
+            elif (
+                record.status in _LISTABLE_STATUSES
+                and record.retention.delete_after is not None
+                and record.retention.delete_after <= moment
+            ):
+                expired = replace(
+                    record,
+                    status="deletion_pending",
+                    deletion=ConversationDeletion(moment, "purge_content_keep_tombstone"),
+                    updated_at=moment,
+                )
+                self._store_conversation("conversation.retention_expired", expired)
+                enforced.append(self._complete_deletion(expired))
+        return tuple(enforced)
 
     def recover_streaming_turns(self) -> tuple[TurnAudit, ...]:
         """Post-restart recovery: flip every persisted streaming turn to interrupted.

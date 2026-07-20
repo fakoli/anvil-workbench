@@ -35,6 +35,7 @@ from workbench.conversation_models import (
     VoiceEvent,
     conversation_audit,
     make_turn,
+    purge_turn_content,
     turn_audit,
     turn_content_hash,
     validate_turn_append,
@@ -42,6 +43,9 @@ from workbench.conversation_models import (
 
 NOW = datetime(2026, 7, 19, tzinfo=timezone.utc)
 REDACTED = TurnRedaction("redacted", "workbench.default")
+# Hermetic fixture keys for the server-keyed content fingerprint (PRD R008).
+KEY = b"unit-test-content-hash-key-A-0001"
+OTHER_KEY = b"unit-test-content-hash-key-B-0002"
 
 
 def retention(transcript: str = "retained_redacted", voice: str = "retained_redacted") -> RetentionPolicy:
@@ -84,6 +88,7 @@ def turn(
         voice_events=voice_events,
         created_at=NOW,
         completed_at=None if status == "streaming" else NOW,
+        content_hash_key=KEY,
     )
 
 
@@ -155,33 +160,61 @@ def test_turn_represents_committed_and_interrupted_states_with_partial_content()
         make_turn(
             id="turn_root_0003", conversation_id="conv_alpha_0001", role="user", mode="ordinary",
             status="streaming", lineage=TurnLineage(None, 0), redaction=REDACTED,
-            created_at=NOW, completed_at=NOW,
+            created_at=NOW, completed_at=NOW, content_hash_key=KEY,
         )
     with pytest.raises(ConversationError, match="completed_at"):
         make_turn(
             id="turn_root_0004", conversation_id="conv_alpha_0001", role="user", mode="ordinary",
             status="interrupted", lineage=TurnLineage(None, 0), redaction=REDACTED,
-            created_at=NOW, completed_at=None,
+            created_at=NOW, completed_at=None, content_hash_key=KEY,
         )
 
 
-def test_content_hash_is_deterministic_content_sensitive_and_verified():
+def test_content_hash_is_a_keyed_deterministic_content_sensitive_fingerprint():
     blocks = (ContentBlock("text", "hello"), ContentBlock("summary", "short"))
-    first = turn_content_hash(blocks)
-    assert re.fullmatch(r"sha256:[a-f0-9]{64}", first)
-    assert turn_content_hash(tuple(blocks)) == first
-    assert turn_content_hash((ContentBlock("text", "hello!"), ContentBlock("summary", "short"))) != first
-    assert turn_content_hash(()) != first
+    first = turn_content_hash(blocks, key=KEY)
+    assert re.fullmatch(r"hmac-sha256:[a-f0-9]{64}", first)
+    assert turn_content_hash(tuple(blocks), key=KEY) == first
+    assert turn_content_hash((ContentBlock("text", "hello!"), ContentBlock("summary", "short")), key=KEY) != first
+    assert turn_content_hash((), key=KEY) != first
 
-    # A stored hash that does not recompute from the stored content is refused,
-    # so a rewrite can never hide behind a stale hash.
+    # PRD R008: identical content under DIFFERENT server keys must yield
+    # different fingerprints — persisted metadata is no dictionary oracle.
+    assert turn_content_hash(blocks, key=OTHER_KEY) != first
+    # A weak, missing, or non-bytes key is refused fail-closed.
+    with pytest.raises(ConversationError, match="content hash key"):
+        turn_content_hash(blocks, key=b"short")
+    with pytest.raises(ConversationError, match="content hash key"):
+        turn_content_hash(blocks, key="a-string-not-bytes-but-long-enough")  # type: ignore[arg-type]
+
+    # A malformed stored fingerprint is refused at construction; the old
+    # unkeyed sha256: form is no longer accepted.
     with pytest.raises(ConversationError, match="content hash"):
         Turn(
             id="turn_root_0001", conversation_id="conv_alpha_0001", role="user", mode="ordinary",
             status="complete", lineage=TurnLineage(None, 0), content=blocks,
-            content_hash=turn_content_hash(()), redaction=REDACTED, created_at=NOW, completed_at=NOW,
+            content_hash="sha256:" + "0" * 64, redaction=REDACTED, created_at=NOW, completed_at=NOW,
         )
-    assert turn("turn_root_0001").content_hash == turn_content_hash((ContentBlock("text", "hello"),))
+    assert turn("turn_root_0001").content_hash == turn_content_hash((ContentBlock("text", "hello"),), key=KEY)
+
+
+def test_verify_content_hash_needs_the_hub_key_and_refuses_stale_hashes():
+    blocks = (ContentBlock("text", "hello"),)
+    live = turn("turn_root_0001", content=blocks)
+    live.verify_content_hash(KEY)
+    # The right shape under the wrong key never verifies.
+    with pytest.raises(ConversationError, match="does not match"):
+        live.verify_content_hash(OTHER_KEY)
+    # A stored hash that does not recompute from the stored content is
+    # detected by keyed verification, so a rewrite can never hide behind a
+    # stale hash.
+    stale = Turn(
+        id="turn_root_0002", conversation_id="conv_alpha_0001", role="user", mode="ordinary",
+        status="complete", lineage=TurnLineage(None, 0), content=blocks,
+        content_hash=turn_content_hash((), key=KEY), redaction=REDACTED, created_at=NOW, completed_at=NOW,
+    )
+    with pytest.raises(ConversationError, match="does not match"):
+        stale.verify_content_hash(KEY)
 
 
 def test_turn_lineage_and_metadata_only_redaction_are_typed():
@@ -204,7 +237,7 @@ def test_turn_lineage_and_metadata_only_redaction_are_typed():
             status="complete", lineage=TurnLineage(None, 0),
             content=(ContentBlock("text", "should not persist"),),
             redaction=TurnRedaction("metadata_only", "workbench.default"),
-            created_at=NOW, completed_at=NOW,
+            created_at=NOW, completed_at=NOW, content_hash_key=KEY,
         )
 
 
@@ -320,7 +353,7 @@ def test_append_enforces_the_retention_to_content_kind_mapping():
 
 
 def test_audit_models_structurally_carry_no_message_content_field():
-    scalar_annotations = {"str", "int", "str | None", "datetime", "datetime | None"}
+    scalar_annotations = {"str", "int", "bool", "str | None", "datetime", "datetime | None"}
     forbidden_names = {"text", "content", "title", "body", "message", "blocks", "transcript", "voice_events"}
     for model in (TurnAudit, ConversationAudit):
         for item in dataclasses.fields(model):
@@ -331,7 +364,8 @@ def test_audit_models_structurally_carry_no_message_content_field():
             assert item.type in scalar_annotations, f"{model.__name__}.{item.name}: {item.type}"
     assert {item.name for item in dataclasses.fields(TurnAudit)} == {
         "turn_id", "conversation_id", "role", "mode", "status", "lineage_kind", "parent_turn_id",
-        "sibling_index", "content_hash", "content_block_count", "voice_event_count", "created_at", "completed_at",
+        "sibling_index", "content_hash", "content_block_count", "voice_event_count", "content_purged",
+        "created_at", "completed_at",
     }
     assert {item.name for item in dataclasses.fields(ConversationAudit)} == {
         "conversation_id", "actor_id", "status", "retention_policy_id", "deletion_mode",
@@ -358,6 +392,52 @@ def test_audit_projections_keep_lifecycle_lineage_and_hash_metadata_only():
     assert row.parent_turn_id == "turn_root_0001" and row.sibling_index == 0 and row.lineage_kind == "initial"
     assert row.content_hash == partial.content_hash
     assert row.content_block_count == 1 and row.voice_event_count == 0
+
+
+def test_purge_turn_content_tombstone_keeps_lifecycle_and_fingerprint_only():
+    live = turn(
+        "turn_reply_0001", parent="turn_root_0001", role="assistant",
+        content=(ContentBlock("text", "the secret answer"),),
+        voice_events=(VoiceEvent("tts_start", NOW),),
+    )
+    tombstone = purge_turn_content(live)
+    # Content is removed from the record, not flagged over.
+    assert tombstone.content == () and tombstone.content_purged is True
+    # Lifecycle, lineage, typed voice events, and the keyed fingerprint survive.
+    assert (tombstone.id, tombstone.role, tombstone.mode, tombstone.status) == (live.id, live.role, live.mode, live.status)
+    assert tombstone.lineage == live.lineage and tombstone.voice_events == live.voice_events
+    assert (tombstone.created_at, tombstone.completed_at) == (live.created_at, live.completed_at)
+    assert tombstone.content_hash == live.content_hash
+    assert "secret answer" not in repr(tombstone)
+    # A purged fingerprint deliberately cannot recompute, even with the key.
+    with pytest.raises(ConversationError, match="cannot recompute"):
+        tombstone.verify_content_hash(KEY)
+    # Idempotent, and the purge is one-way: a purged record refuses content.
+    assert purge_turn_content(tombstone) is tombstone
+    with pytest.raises(ConversationError, match="content-purged"):
+        dataclasses.replace(tombstone, content=(ContentBlock("text", "resurrected"),))
+    with pytest.raises(ConversationError, match="purge requires a Turn"):
+        purge_turn_content("turn_reply_0001")  # type: ignore[arg-type]
+    # The audit projection records the purge without any content field.
+    row = turn_audit(tombstone)
+    assert row.content_purged is True and row.content_hash == live.content_hash
+
+
+def test_deleted_tombstone_conversation_must_not_retain_a_title_and_ceiling_is_typed():
+    with pytest.raises(ConversationError, match="must not retain a title"):
+        conversation(
+            status="deleted", title="still here",
+            deletion=ConversationDeletion(NOW, "purge_content_keep_tombstone", NOW),
+        )
+    # The contract's only age ceiling is delete_after; it must be tz-aware.
+    with pytest.raises(ConversationError, match="delete_after"):
+        RetentionPolicy("workbench.default-90d", "retained_redacted", "retained_redacted",
+                        delete_after=datetime(2026, 7, 19))
+    with pytest.raises(ConversationError, match="delete_after"):
+        RetentionPolicy("workbench.default-90d", "retained_redacted", "retained_redacted",
+                        delete_after="2026-07-19T00:00:00Z")  # type: ignore[arg-type]
+    bounded = RetentionPolicy("workbench.default-90d", "retained_redacted", "retained_redacted", delete_after=NOW)
+    assert bounded.delete_after == NOW
 
 
 def test_tts_only_voice_output_never_relaxes_the_text_retention_policy():
