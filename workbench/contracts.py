@@ -184,9 +184,22 @@ def validate_state_snapshot(snapshot: Mapping[str, Any]) -> None:
         seen_refs.add(key)
         if task.get("scoped_id") != f"{key[0]}:{key[1]}":
             raise ContractValidationError(f"scoped_id does not match its typed reference: {task.get('scoped_id')}")
+    # Second pass: the snapshot is the complete bounded projection, so every
+    # dependency edge must resolve to a task in this snapshot and no task may
+    # depend on itself; a dangling or reflexive edge is never legitimate.
+    for task in tasks:
+        ref = task["ref"]
+        key = (str(ref.get("prd_id")), str(ref.get("task_id")))
         for dependency in task.get("depends_on", ()):
-            if not isinstance(dependency, Mapping) or dependency.get("prd_id") not in prd_ids:
-                raise ContractValidationError("task dependency names an unknown PRD")
+            if not isinstance(dependency, Mapping):
+                raise ContractValidationError("task dependency is not a typed reference")
+            dep_key = (str(dependency.get("prd_id")), str(dependency.get("task_id")))
+            if dep_key not in seen_refs:
+                raise ContractValidationError(
+                    f"task dependency names a task absent from the snapshot: {dep_key[0]}:{dep_key[1]}"
+                )
+            if dep_key == key:
+                raise ContractValidationError(f"task cannot depend on itself: {key[0]}:{key[1]}")
 
 
 def validate_prd_content(document: Mapping[str, Any]) -> None:

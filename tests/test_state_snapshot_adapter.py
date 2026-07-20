@@ -136,7 +136,7 @@ def test_spoofed_parent_dependency_fails_closed() -> None:
     dependency["prd_id"] = "release-gamma"
     adapter, _calls = adapter_for(envelope(rehash(snapshot)))
 
-    with pytest.raises(StateSnapshotError, match="dependency names an unknown PRD"):
+    with pytest.raises(StateSnapshotError, match="absent from the snapshot"):
         adapter.fetch()
 
 
@@ -280,3 +280,77 @@ def test_publishable_snapshot_is_immutable() -> None:
     mutated = result.payload
     mutated["tasks"].clear()
     assert result.payload["tasks"], "payload accessor must return an untouched copy"
+
+
+def test_generated_at_cannot_smuggle_markdown_scale_content() -> None:
+    snapshot = example_snapshot()
+    snapshot["generated_at"] = "# Full PRD\n\n" + ("Thousands of words of requirements. " * 3000)
+    adapter, _calls = adapter_for(envelope(snapshot))
+
+    with pytest.raises(StateSnapshotError, match="contract"):
+        adapter.fetch()
+
+
+def test_dangling_task_dependency_fails_closed() -> None:
+    snapshot = example_snapshot()
+    task_named(snapshot, "release-beta:T002.2")["depends_on"] = [
+        {"prd_id": "release-beta", "task_id": "T999"}
+    ]
+    adapter, _calls = adapter_for(envelope(rehash(snapshot)))
+
+    with pytest.raises(StateSnapshotError, match="absent from the snapshot"):
+        adapter.fetch()
+
+
+def test_self_dependency_fails_closed() -> None:
+    snapshot = example_snapshot()
+    task_named(snapshot, "release-beta:T002.2")["depends_on"] = [
+        {"prd_id": "release-beta", "task_id": "T002.2"}
+    ]
+    adapter, _calls = adapter_for(envelope(rehash(snapshot)))
+
+    with pytest.raises(StateSnapshotError, match="depend on itself"):
+        adapter.fetch()
+
+
+def test_missing_contract_schema_file_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    adapter_module._reset_snapshot_contract_validator_cache()
+    monkeypatch.setattr(
+        adapter_module, "_SNAPSHOT_CONTRACT_SCHEMA", tmp_path / "absent.schema.json"
+    )
+    adapter, _calls = adapter_for(envelope(example_snapshot()))
+    with pytest.raises(StateSnapshotError, match="schema is unavailable"):
+        adapter.fetch()
+    adapter_module._reset_snapshot_contract_validator_cache()
+
+
+def test_drifted_open_or_unbounded_schema_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    base = json.loads(
+        (ROOT / "docs" / "contracts" / "schemas" / "state-snapshot.v1.schema.json").read_text(encoding="utf-8")
+    )
+    opened = copy.deepcopy(base)
+    del opened["$defs"]["taskRef"]["additionalProperties"]
+    drifted = tmp_path / "drifted.schema.json"
+    drifted.write_text(json.dumps(opened), encoding="utf-8")
+    adapter_module._reset_snapshot_contract_validator_cache()
+    monkeypatch.setattr(adapter_module, "_SNAPSHOT_CONTRACT_SCHEMA", drifted)
+    adapter, _calls = adapter_for(envelope(example_snapshot()))
+    with pytest.raises(StateSnapshotError, match="no longer closes its objects"):
+        adapter.fetch()
+
+    unbounded = copy.deepcopy(base)
+    del unbounded["properties"]["tasks"]["items"]["properties"]["title"]["maxLength"]
+    drifted.write_text(json.dumps(unbounded), encoding="utf-8")
+    adapter_module._reset_snapshot_contract_validator_cache()
+    with pytest.raises(StateSnapshotError, match="no longer bounds its prose"):
+        adapter.fetch()
+    adapter_module._reset_snapshot_contract_validator_cache()
+
+
+def test_oversize_validation_error_is_truncated() -> None:
+    snapshot = example_snapshot()
+    snapshot["tasks"][0]["title"] = "SECRETISH " * 2000
+    adapter, _calls = adapter_for(envelope(rehash(snapshot)))
+    with pytest.raises(StateSnapshotError) as excinfo:
+        adapter.fetch()
+    assert len(str(excinfo.value)) < 800

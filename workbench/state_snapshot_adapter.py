@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
 from .contracts import ContractValidationError, validate_state_snapshot
@@ -71,6 +71,15 @@ _CLOSED_OBJECT_PATHS: tuple[tuple[str, ...], ...] = (
     ("properties", "project"),
     ("properties", "prds", "items"),
     ("properties", "tasks", "items"),
+    ("$defs", "taskRef"),
+)
+
+#: Bounded prose fields whose maxLength must survive schema drift.
+_BOUNDED_PROSE_PATHS: tuple[tuple[str, ...], ...] = (
+    ("properties", "generated_at"),
+    ("properties", "project", "properties", "name"),
+    ("properties", "prds", "items", "properties", "title"),
+    ("properties", "tasks", "items", "properties", "title"),
 )
 
 
@@ -99,8 +108,21 @@ def _snapshot_contract_validator() -> Draft202012Validator:
                     f"(additionalProperties must be false at {'/'.join(path) or '<root>'}); "
                     "refusing to publish snapshots"
                 )
-        _snapshot_contract_validator_cache = Draft202012Validator(schema)
+        for path in _BOUNDED_PROSE_PATHS:
+            node = _schema_node(schema, path)
+            if not isinstance(node, Mapping) or not isinstance(node.get("maxLength"), int):
+                raise StateSnapshotError(
+                    "state-snapshot contract schema no longer bounds its prose "
+                    f"(maxLength required at {'/'.join(path)}); refusing to publish snapshots"
+                )
+        _snapshot_contract_validator_cache = Draft202012Validator(schema, format_checker=FormatChecker())
     return _snapshot_contract_validator_cache
+
+
+def _reset_snapshot_contract_validator_cache() -> None:
+    """Test hook: force the next validation to reload the on-disk schema."""
+    global _snapshot_contract_validator_cache
+    _snapshot_contract_validator_cache = None
 
 
 @dataclass(frozen=True)
@@ -177,13 +199,13 @@ def validate_snapshot_payload(
     except ValidationError as exc:
         raise StateSnapshotError(
             f"State snapshot payload does not conform to the {SNAPSHOT_SCHEMA_VERSION} "
-            f"contract: {exc.message}"
+            f"contract: {exc.message[:500]}"
         ) from exc
     try:
         Draft202012Validator(operation.output_schema).validate(materialized)
     except ValidationError as exc:
         raise StateSnapshotError(
-            f"State snapshot payload does not match the pinned output schema: {exc.message}"
+            f"State snapshot payload does not match the pinned output schema: {exc.message[:500]}"
         ) from exc
     source = materialized["source"]
     if source.get("read_operation_id") != operation.operation_id:
