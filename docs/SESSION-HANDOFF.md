@@ -73,3 +73,12 @@ rewrite it as part of Workbench work without a separate review of those changes.
 5. Qualify a live Dark voice endpoint and two bridge-configured worktrees. The implementation and hermetic contracts exist; neither is a substitute for live hardware/State qualification.
 6. Implement the provider-owned workflow operation catalog proposed in [WORKFLOW-OPERATION-LAYER.md](WORKFLOW-OPERATION-LAYER.md) before adding more bespoke browser-to-bridge command paths.
 7. Start that implementation from the versioned resources in [contracts/README.md](contracts/README.md): catalog/profile discovery, `operation` workflow steps, run-context snapshot, typed receipts, and bridge preflight. Do not turn the design into a generic tool runner. The State-side discovery half is implemented: `workbench/state_manifest.py` runs the bridge-configured `--state-describe-command`, fail-closed validates the advertised `anvil-operation-catalog/v1` catalog (digests, `read` effect class, contract major, draft 2020-12 object schemas), and pins the immutable `state.project.snapshot` / `state.prd.read_content` descriptor set that downstream adapters must take by constructor (`tests/test_state_manifest_discovery.py` is hermetic). Live qualification stays gated on the upstream State CLI actually advertising that catalog from `anvil describe` (fakoli/anvil#178); today's envelope only reports CLI/MCP surface names.
+8. The chat-first-voice contract foundation is proposed, not implemented:
+   `chat-conversation.v1` and `chat-turn.v1` under `docs/contracts/` define one
+   mode-agnostic conversation identity, append-only `(parent_turn_id,
+   sibling_index)` turn lineage, Serving-ID/digest-only route references,
+   display-only project/PRD-revision/task context, retention/deletion
+   semantics, typed voice events, and hard prohibitions on persisting raw
+   audio or hidden reasoning (tests: `tests/test_contract_resources.py`,
+   `tests/test_security_contract.py`). Build hub persistence and API
+   projection against these shapes; do not present them as live endpoints.

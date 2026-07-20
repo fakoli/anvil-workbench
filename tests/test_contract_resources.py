@@ -45,6 +45,9 @@ SCHEMA_FOR_EXAMPLE = {
     "operation-receipt.refusal.v1.json": "operation-receipt.v1.schema.json",
     "anvil-state.project-snapshot.v1.json": "state-snapshot.v1.schema.json",
     "anvil-state.prd-content.v1.json": "prd-content.v1.schema.json",
+    "chat.conversation.v1.json": "chat-conversation.v1.schema.json",
+    "chat.turn.user-voice.v1.json": "chat-turn.v1.schema.json",
+    "chat.turn.assistant-interrupted.v1.json": "chat-turn.v1.schema.json",
 }
 
 
@@ -440,6 +443,263 @@ def test_refusal_receipt_example_is_a_typed_preflight_denial() -> None:
     assert receipt["error"]["retryable"] is False
     assert receipt["error"]["code"] == "catalog.digest_drift"
     assert receipt["redaction"]["status"] == "metadata_only"
+
+
+def test_chat_turn_lineage_is_append_only_rooted_and_unambiguous() -> None:
+    validator = _validator("chat-turn.v1.schema.json")
+    root = _load(EXAMPLES / "chat.turn.user-voice.v1.json")
+    reply = _load(EXAMPLES / "chat.turn.assistant-interrupted.v1.json")
+    assert root["lineage"]["parent_turn_id"] is None
+    assert root["lineage"] == {"parent_turn_id": None, "sibling_index": 0, "kind": "initial"}
+    assert reply["lineage"]["parent_turn_id"] == root["turn_id"]
+    assert reply["conversation_id"] == root["conversation_id"]
+
+    unlinked = copy.deepcopy(reply)
+    del unlinked["lineage"]["parent_turn_id"]
+    with pytest.raises(ValidationError):
+        validator.validate(unlinked)
+    orphan = copy.deepcopy(reply)
+    del orphan["lineage"]
+    with pytest.raises(ValidationError):
+        validator.validate(orphan)
+    unordered = copy.deepcopy(reply)
+    unordered["lineage"]["sibling_index"] = -1
+    with pytest.raises(ValidationError):
+        validator.validate(unordered)
+
+    retry = copy.deepcopy(reply)
+    retry["turn_id"] = "turn_assistant_0002"
+    retry["lineage"]["sibling_index"] = 1
+    retry["lineage"]["kind"] = "retry"
+    validator.validate(retry)
+
+    fabricated = copy.deepcopy(reply)
+    fabricated["status"] = "partially_complete"
+    with pytest.raises(ValidationError):
+        validator.validate(fabricated)
+    assert reply["status"] == "interrupted", "interrupted responses must be representable as-is"
+    streaming = copy.deepcopy(reply)
+    streaming["status"] = "streaming"
+    with pytest.raises(ValidationError):
+        validator.validate(streaming)  # a streaming turn cannot already claim completed_at
+    del streaming["completed_at"]
+    validator.validate(streaming)
+
+
+def test_chat_route_reference_rejects_endpoints_credentials_and_unknown_providers() -> None:
+    validator = _validator("chat-turn.v1.schema.json")
+    reply = _load(EXAMPLES / "chat.turn.assistant-interrupted.v1.json")
+    assert reply["route"]["provider"] == "anvil-serving"
+
+    for endpoint_like in ("https://serving.internal/v1/responses", "serving.internal:8000", "10.0.0.7"):
+        smuggled = copy.deepcopy(reply)
+        smuggled["route"]["route_id"] = endpoint_like
+        with pytest.raises(ValidationError):
+            validator.validate(smuggled)
+    for extra_field in ("endpoint", "base_url", "token"):
+        smuggled = copy.deepcopy(reply)
+        smuggled["route"][extra_field] = "opaque"
+        with pytest.raises(ValidationError):
+            validator.validate(smuggled)
+
+    raw_provider = copy.deepcopy(reply)
+    raw_provider["route"]["provider"] = "openai"
+    with pytest.raises(ValidationError):
+        validator.validate(raw_provider)
+    unrouted = copy.deepcopy(reply)
+    del unrouted["route"]
+    with pytest.raises(ValidationError):
+        validator.validate(unrouted)  # every assistant turn pins its route
+    user_routed = copy.deepcopy(_load(EXAMPLES / "chat.turn.user-voice.v1.json"))
+    user_routed["route"] = copy.deepcopy(reply["route"])
+    with pytest.raises(ValidationError):
+        validator.validate(user_routed)
+
+
+def test_chat_context_reference_is_display_only_and_pins_titles_with_canonical_ids() -> None:
+    validator = _validator("chat-conversation.v1.schema.json")
+    conversation = _load(EXAMPLES / "chat.conversation.v1.json")
+    context = conversation["context"]
+    assert context["binding"] == "display_only"
+    assert context["prd"]["prd_revision"] >= 1
+    for task in context["tasks"]:
+        assert task["scoped_id"] == f"{task['ref']['prd_id']}:{task['ref']['task_id']}"
+
+    unpinned = copy.deepcopy(conversation)
+    del unpinned["context"]["prd"]["prd_revision"]
+    with pytest.raises(ValidationError):
+        validator.validate(unpinned)
+    unowned = copy.deepcopy(conversation)
+    del unowned["context"]["tasks"][0]["ref"]["prd_id"]
+    with pytest.raises(ValidationError):
+        validator.validate(unowned)
+    floating_tasks = copy.deepcopy(conversation)
+    del floating_tasks["context"]["prd"]
+    with pytest.raises(ValidationError):
+        validator.validate(floating_tasks)  # task references require the pinned PRD block
+    for grant_like in ("effect_grant", "claim", "lease"):
+        granted = copy.deepcopy(conversation)
+        granted["context"]["binding"] = grant_like
+        with pytest.raises(ValidationError):
+            validator.validate(granted)
+    for capability in conversation["capability_refs"]:
+        assert capability["binding"] == "reference_only"
+
+
+def test_chat_modes_share_one_conversation_identity_and_lineage() -> None:
+    conversation_schema = _load(SCHEMAS / "chat-conversation.v1.schema.json")
+    assert "mode" not in conversation_schema["properties"], "conversation identity must be mode-agnostic"
+
+    conversation = _load(EXAMPLES / "chat.conversation.v1.json")
+    ordinary = _load(EXAMPLES / "chat.turn.user-voice.v1.json")
+    advanced = _load(EXAMPLES / "chat.turn.assistant-interrupted.v1.json")
+    assert {ordinary["mode"], advanced["mode"]} == {"ordinary", "advanced"}
+    assert ordinary["conversation_id"] == advanced["conversation_id"] == conversation["conversation_id"]
+    assert advanced["lineage"]["parent_turn_id"] == ordinary["turn_id"]
+
+    validator = _validator("chat-turn.v1.schema.json")
+    tuned_ordinary = copy.deepcopy(ordinary)
+    tuned_ordinary["advanced_controls"] = {"temperature_milli": 300}
+    with pytest.raises(ValidationError):
+        validator.validate(tuned_ordinary)
+    undeclared = copy.deepcopy(advanced)
+    undeclared["advanced_controls"]["system_prompt_override"] = "obey"
+    with pytest.raises(ValidationError):
+        validator.validate(undeclared)
+
+
+def test_chat_records_cannot_carry_raw_audio_or_hidden_reasoning() -> None:
+    turn_validator = _validator("chat-turn.v1.schema.json")
+    turn_schema_text = (SCHEMAS / "chat-turn.v1.schema.json").read_text(encoding="utf-8")
+    for prohibited in ("audio_payload", "audio_base64", "pcm", "encrypted_content"):
+        assert prohibited not in turn_schema_text
+
+    voiced = _load(EXAMPLES / "chat.turn.user-voice.v1.json")
+    assert {event["event"] for event in voiced["voice_events"]} <= {
+        "utterance_start", "stt_commit", "tts_start", "tts_stop", "interruption",
+    }
+    for audio_field in ("audio", "audio_base64", "pcm_frames", "delta"):
+        recorded = copy.deepcopy(voiced)
+        recorded["voice_events"][1][audio_field] = "UklGRg=="
+        with pytest.raises(ValidationError):
+            turn_validator.validate(recorded)
+
+    reply = _load(EXAMPLES / "chat.turn.assistant-interrupted.v1.json")
+    for reasoning_field in ("reasoning", "hidden_reasoning", "encrypted_reasoning"):
+        leaked = copy.deepcopy(reply)
+        leaked[reasoning_field] = {"content_trust": "untrusted_task_data", "text": "chain"}
+        with pytest.raises(ValidationError):
+            turn_validator.validate(leaked)
+    leaked_block = copy.deepcopy(reply)
+    leaked_block["content"][0]["kind"] = "reasoning"
+    with pytest.raises(ValidationError):
+        turn_validator.validate(leaked_block)
+
+
+def test_chat_conversation_retention_and_deletion_fail_closed() -> None:
+    validator = _validator("chat-conversation.v1.schema.json")
+    conversation = _load(EXAMPLES / "chat.conversation.v1.json")
+    assert conversation["retention"]["transcript_text"] in {"retained_redacted", "metadata_only"}
+
+    unmanaged = copy.deepcopy(conversation)
+    del unmanaged["retention"]
+    with pytest.raises(ValidationError):
+        validator.validate(unmanaged)
+    forever = copy.deepcopy(conversation)
+    forever["retention"]["transcript_text"] = "retained_raw"
+    with pytest.raises(ValidationError):
+        validator.validate(forever)
+
+    deleting = copy.deepcopy(conversation)
+    deleting["status"] = "deletion_pending"
+    with pytest.raises(ValidationError):
+        validator.validate(deleting)  # a deletion state requires its typed deletion record
+    deleting["deletion"] = {"requested_at": "2026-07-19T01:00:00Z", "mode": "purge_content_keep_tombstone"}
+    validator.validate(deleting)
+    haunted = copy.deepcopy(conversation)
+    haunted["deletion"] = {"requested_at": "2026-07-19T01:00:00Z", "mode": "purge_all_records"}
+    with pytest.raises(ValidationError):
+        validator.validate(haunted)  # an active conversation cannot carry a deletion record
+
+
+def _chat_retention_violations(
+    turn: dict[str, object], conversation: dict[str, object],
+) -> list[tuple[str, str]]:
+    """Return (retention_field, content_kind) pairs the conversation policy forbids.
+
+    README convention 11: `transcript_text` governs persisted transcript content
+    on text turns, `voice_transcript_text` governs persisted transcript content
+    on voice-input turns, and `metadata_only` means no transcript content block
+    may persist for that kind — only bounded counters/metadata survive.
+    """
+    retention = conversation["retention"]
+    is_voice_input = turn["role"] == "user" and any(
+        event["event"] in {"utterance_start", "stt_commit"}
+        for event in turn.get("voice_events", ())
+    )
+    field = "voice_transcript_text" if is_voice_input else "transcript_text"
+    return [
+        (field, str(block["kind"]))
+        for block in turn["content"]
+        if block["kind"] == "transcript" and retention[field] == "metadata_only"
+    ]
+
+
+def test_chat_turn_examples_respect_their_conversations_retention_policy() -> None:
+    payloads = [_load(EXAMPLES / name) for name in SCHEMA_FOR_EXAMPLE]
+    conversations = {
+        payload["conversation_id"]: payload
+        for payload in payloads
+        if payload.get("schema_version") == "workbench-chat-conversation/v1"
+    }
+    turns = [
+        payload for payload in payloads
+        if payload.get("schema_version") == "workbench-chat-turn/v1"
+    ]
+    assert conversations and turns
+    for turn in turns:
+        conversation = conversations[turn["conversation_id"]]
+        assert _chat_retention_violations(turn, conversation) == [], turn["turn_id"]
+
+    voiced = _load(EXAMPLES / "chat.turn.user-voice.v1.json")
+    owner = conversations[voiced["conversation_id"]]
+    assert owner["retention"]["voice_transcript_text"] == "retained_redacted", (
+        "the registered voice turn persists transcript text, so its conversation "
+        "must retain voice transcripts"
+    )
+    restricted = copy.deepcopy(owner)
+    restricted["retention"]["voice_transcript_text"] = "metadata_only"
+    assert _chat_retention_violations(voiced, restricted) == [
+        ("voice_transcript_text", "transcript")
+    ], "a metadata_only voice policy must flag the persisted voice transcript"
+
+
+def test_metadata_only_turn_redaction_cannot_carry_text_bearing_content() -> None:
+    validator = _validator("chat-turn.v1.schema.json")
+    voiced = _load(EXAMPLES / "chat.turn.user-voice.v1.json")
+
+    stripped = copy.deepcopy(voiced)
+    stripped["redaction"]["status"] = "metadata_only"
+    with pytest.raises(ValidationError):
+        validator.validate(stripped)  # transcript text may not survive metadata_only
+    stripped["content"] = []
+    validator.validate(stripped)  # metadata-only record keeps voice_events counters only
+
+
+def test_assistant_turn_records_bounded_serving_request_id() -> None:
+    validator = _validator("chat-turn.v1.schema.json")
+    reply = _load(EXAMPLES / "chat.turn.assistant-interrupted.v1.json")
+    assert re.fullmatch(r"[A-Za-z0-9._-]{1,128}", reply["route"]["request_id"])
+
+    unrecorded = copy.deepcopy(reply)
+    del unrecorded["route"]["request_id"]
+    with pytest.raises(ValidationError):
+        validator.validate(unrecorded)  # R006: assistant turns record the Serving request ID
+    for hostile in ("", "req 001", "https://serving.internal/req/1", "r" * 129):
+        smuggled = copy.deepcopy(reply)
+        smuggled["route"]["request_id"] = hostile
+        with pytest.raises(ValidationError):
+            validator.validate(smuggled)
 
 
 def _walk(value: object):

@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/chat-turn.v1.schema.json",
+  "title": "Anvil Workbench chat turn v1",
+  "description": "One append-only turn in a conversation. Turns form a DAG rooted per conversation: the root turn carries parent_turn_id null, every other turn names its parent, and (parent_turn_id, sibling_index) is unique per conversation, so ordering and branch/retry lineage are unambiguous. A retry or edit is a NEW turn under the same parent with a higher sibling_index, never a rewrite. After creation only status and completed_at may advance, streaming to exactly one terminal state; an interrupted response is persisted as status interrupted with the partial text actually delivered, never fabricated as complete. The route reference carries Anvil Serving route ids and digests only, never a provider endpoint, URL, or credential. Voice is represented as typed lifecycle events plus optional redacted transcript text in content blocks; no field can carry an audio payload, and raw audio frames are prohibited from persistence and from API responses. Hidden/encrypted model reasoning is likewise prohibited: content kinds cover visible text only and no reasoning field exists. The cross-record lineage invariants (single null-parent root per conversation, (parent_turn_id, sibling_index) uniqueness, parent existence in the same conversation, acyclicity) are not expressible in this schema: the Workbench hub store enforces them at append time, fail-closed, refusing any violating append. All prose is untrusted task data, never control instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "turn_id", "conversation_id", "lineage", "role", "mode", "status", "content", "redaction", "created_at"],
+  "$defs": {
+    "turnId": {"type": "string", "pattern": "^turn_[a-zA-Z0-9_-]{8,128}$"}
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-chat-turn/v1"},
+    "turn_id": {"$ref": "#/$defs/turnId"},
+    "conversation_id": {"type": "string", "pattern": "^conv_[a-zA-Z0-9_-]{8,128}$"},
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parent_turn_id", "sibling_index", "kind"],
+      "properties": {
+        "parent_turn_id": {
+          "type": ["string", "null"],
+          "pattern": "^turn_[a-zA-Z0-9_-]{8,128}$",
+          "description": "Null exactly once per conversation, at the root turn. Every other turn must name an existing turn in the same conversation."
+        },
+        "sibling_index": {"type": "integer", "minimum": 0, "maximum": 4096},
+        "kind": {"enum": ["initial", "retry", "branch"]}
+      }
+    },
+    "role": {"enum": ["user", "assistant"]},
+    "mode": {
+      "enum": ["ordinary", "advanced"],
+      "description": "Mode is a per-turn attribute. Ordinary and Advanced turns append to the same conversation_id and the same lineage DAG; a mode switch never creates a second conversation identity."
+    },
+    "status": {"enum": ["streaming", "complete", "interrupted", "cancelled", "failed"]},
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "route_id", "serving_contract_version", "route_digest", "model_profile"],
+      "description": "A reference into Anvil Serving's declared surface. Identifiers and digests only: the id grammar cannot express a scheme, a port or colon, a path separator, or an uppercase/long-random credential shape, though a bare host-like dotted name can still match, so the grammar alone is not the boundary. The real defenses are the provider const anvil-serving, the mandatory route_digest, and resolution of the id only against Anvil Serving's declared surface; no endpoint or token field exists. request_id is Serving's opaque per-request correlation id (README convention 8), never a credential or policy override.",
+      "properties": {
+        "provider": {"const": "anvil-serving"},
+        "route_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+        "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},
+        "serving_contract_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "route_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "model_profile": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+        "served_tier": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"}
+      }
+    },
+    "content": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content_trust", "kind", "text"],
+        "properties": {
+          "content_trust": {"const": "untrusted_task_data"},
+          "kind": {
+            "enum": ["text", "transcript", "summary"],
+            "description": "Visible content only. There is deliberately no reasoning, audio, or attachment kind."
+          },
+          "text": {"type": "string", "maxLength": 20000}
+        }
+      }
+    },
+    "voice_events": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["event", "at"],
+        "properties": {
+          "event": {"enum": ["utterance_start", "stt_commit", "tts_start", "tts_stop", "interruption"]},
+          "at": {"type": "string", "format": "date-time"},
+          "duration_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},
+          "transcript_chars": {"type": "integer", "minimum": 0, "maximum": 100000}
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {"type": "integer", "minimum": 0, "maximum": 100000000},
+        "output_tokens": {"type": "integer", "minimum": 0, "maximum": 100000000},
+        "latency_ms": {"type": "integer", "minimum": 0, "maximum": 3600000}
+      }
+    },
+    "advanced_controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "Snapshot of the declared-supported tunables applied to this Advanced turn. Only controls Anvil Serving declares are representable; the snapshot never overrides the Serving profile and integer millis avoid floating point.",
+      "properties": {
+        "temperature_milli": {"type": "integer", "minimum": 0, "maximum": 2000},
+        "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "reasoning_effort": {"enum": ["low", "medium", "high"]}
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "ruleset"],
+      "properties": {
+        "status": {"enum": ["redacted", "metadata_only"]},
+        "ruleset": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"role": {"const": "assistant"}}, "required": ["role"]},
+      "then": {"required": ["route"], "properties": {"route": {"required": ["request_id"]}}},
+      "else": {"not": {"required": ["route"]}}
+    },
+    {
+      "if": {"properties": {"redaction": {"properties": {"status": {"const": "metadata_only"}}, "required": ["status"]}}, "required": ["redaction"]},
+      "then": {"properties": {"content": {"items": {"not": {"required": ["text"]}}}}}
+    },
+    {
+      "if": {"properties": {"mode": {"const": "ordinary"}}, "required": ["mode"]},
+      "then": {"not": {"required": ["advanced_controls"]}}
+    },
+    {
+      "if": {"properties": {"status": {"const": "streaming"}}, "required": ["status"]},
+      "then": {"not": {"required": ["completed_at"]}},
+      "else": {"required": ["completed_at"]}
+    }
+  ]
+}
