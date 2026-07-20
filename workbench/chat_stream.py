@@ -17,10 +17,12 @@ Design contract (the four acceptance criteria this slice binds):
   ends without a terminal event is ``serving_unavailable``.
 * **Cancellation terminates the upstream request and emits no later
   completion.**  A :class:`CancellationToken` is checked before every upstream
-  read, and the relay ``close()``s the transport stream on any non-completed
-  exit, so the injected transport observes the cancel and stops.  Once cancel
-  is seen the relay breaks *before* reading another event, so a ``completed``
-  event that the transport had queued can never be yielded.
+  read *and* again immediately after each read, and the relay ``close()``s the
+  transport stream on every exit, so the injected transport observes the cancel
+  and stops.  Once cancel is seen the relay settles ``cancelled`` *before*
+  honoring the frame it just read, so a ``completed`` event the transport had
+  queued -- even one delivered in the same read that tripped the cancel -- can
+  never be yielded.
 * **Timeout or partial output is never rendered as completed.**  The partial
   text delivered so far is preserved on :attr:`ChatStreamRelay.partial_text`,
   but :meth:`ChatStreamRelay.terminal_turn_status` maps a non-``completed``
@@ -47,7 +49,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterator, Mapping, Protocol, runtime_checkable
 
-from .chat_routes import ChatRouteSelection
+from .chat_routes import (
+    DECLARED_CHAT_CONTROLS,
+    ChatRouteError,
+    ChatRouteSelection,
+    _validated_control_value,
+)
 
 #: Prompt input ceiling; mirrors the durable content-text bound so an assembled
 #: request can never carry more prompt than a turn could ever persist.
@@ -111,9 +118,9 @@ _FAILURE_EVENTS = frozenset({"response.failed", "response.incomplete", "response
 class CancellationToken:
     """A one-way cancel flag the caller trips to stop an in-flight relay.
 
-    The relay checks :attr:`cancelled` before every upstream read and closes the
-    transport stream when it exits non-completed, so tripping this token both
-    terminates the upstream request and guarantees no later ``completed`` event.
+    The relay checks :attr:`cancelled` before and after every upstream read and
+    closes the transport stream on exit, so tripping this token both terminates
+    the upstream request and guarantees no later ``completed`` event.
     """
 
     __slots__ = ("_cancelled",)
@@ -193,6 +200,23 @@ def build_bounded_request(selection: ChatRouteSelection, prompt: str) -> dict[st
             f"bounded request prompt exceeds the {MAX_PROMPT_CHARS}-char limit"
         )
     controls = selection.controls_dict()
+    # A ChatRouteSelection is normally produced by T003.1's fail-closed
+    # validation, but ``isinstance`` alone does not prove its controls are in
+    # range: a hand-constructed selection could carry unbounded values.
+    # Re-validate every control against the *same* chat-turn.v1 bounds
+    # (reused from chat_routes, never duplicated here) so nothing out-of-range
+    # or undeclared reaches Serving at request-build time.
+    for name, value in controls.items():
+        if name not in DECLARED_CHAT_CONTROLS:
+            raise ChatStreamError(
+                f"bounded request refuses an undeclared control: {name!r}"
+            )
+        try:
+            _validated_control_value(name, value)
+        except ChatRouteError as exc:
+            raise ChatStreamError(
+                f"bounded request refuses an out-of-range control: {exc}"
+            ) from exc
     request: dict[str, Any] = {
         "model": selection.route.model_profile,
         "route_id": selection.route.route_id,
@@ -286,6 +310,11 @@ class ChatStreamRelay:
                     break
                 try:
                     event = next(iterator)
+                    # Interpret inside the guard: a malformed non-mapping frame
+                    # makes ``_interpret`` raise ServingStreamUnavailable, and it
+                    # must settle a terminal outcome here rather than escape the
+                    # generator and leave the stream un-settled with no terminal.
+                    relayed = self._interpret(event)
                 except StopIteration:
                     # The transport stopped.  If the caller cancelled, this is a
                     # torn-down upstream (cancelled); otherwise the Serving
@@ -297,7 +326,11 @@ class ChatStreamRelay:
                         else StreamOutcome.serving_unavailable
                     )
                     break
-                except ServingStreamTimeout:
+                except (ServingStreamTimeout, TimeoutError):
+                    # ``TimeoutError`` also covers the stdlib timeout aliases
+                    # (``asyncio.TimeoutError`` and the sockets-module timeout are
+                    # both ``TimeoutError`` on 3.10+), so a real deadline maps to
+                    # ``timed_out``, not unavailable.
                     self._outcome = StreamOutcome.timed_out
                     break
                 except ServingStreamUnavailable:
@@ -307,12 +340,18 @@ class ChatStreamRelay:
                     self._outcome = StreamOutcome.serving_unavailable
                     break
 
+                # A cancel tripped during the read (e.g. by the transport itself
+                # as a browser cancel would) strictly wins over the frame just
+                # read -- including a completion the transport had queued.
+                if self._cancel.cancelled:
+                    self._outcome = StreamOutcome.cancelled
+                    break
+
                 events_seen += 1
                 if events_seen > MAX_STREAM_EVENTS:
                     self._outcome = StreamOutcome.serving_unavailable
                     break
 
-                relayed = self._interpret(event)
                 if relayed is None:
                     continue
                 if relayed.kind == "terminal":
@@ -325,12 +364,13 @@ class ChatStreamRelay:
                     break
                 yield relayed
         finally:
-            # Terminate the upstream request on any non-completed exit (cancel,
-            # timeout, failure): the injected transport observes the close.
-            if self._outcome is not StreamOutcome.completed:
-                iterator_close = getattr(iterator, "close", None)
-                if callable(iterator_close):
-                    iterator_close()
+            # Terminate the upstream request on every exit, including a normal
+            # completion: a retained/suspended transport generator is left open
+            # otherwise, so always close it -- the injected transport observes
+            # the close and tears down the upstream request.
+            iterator_close = getattr(iterator, "close", None)
+            if callable(iterator_close):
+                iterator_close()
 
         assert self._outcome is not None  # every path above sets an outcome
         yield RelayEvent(kind="terminal", outcome=self._outcome)

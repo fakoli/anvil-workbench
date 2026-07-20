@@ -31,7 +31,12 @@ from pathlib import Path
 
 import pytest
 
-from workbench.chat_routes import discover_chat_routes, validate_chat_route_selection
+from workbench.chat_routes import (
+    ChatRouteDescriptor,
+    ChatRouteSelection,
+    discover_chat_routes,
+    validate_chat_route_selection,
+)
 from workbench.chat_stream import (
     CancellationToken,
     ChatStreamError,
@@ -351,6 +356,111 @@ def test_terminal_status_before_settle_fails_closed():
     relay = ChatStreamRelay(_selection(), "hi", ScriptedTransport([]))
     with pytest.raises(ChatStreamError, match="terminal outcome"):
         relay.terminal_turn_status()
+
+
+def test_malformed_non_mapping_frame_settles_unavailable_not_escaping():
+    # A malformed non-mapping frame makes ``_interpret`` raise
+    # ServingStreamUnavailable; it must settle a terminal outcome and emit the
+    # terminal event, never propagate out of the generator un-settled.
+    transport = ScriptedTransport([_delta("x"), "not-a-mapping"])
+    relay = ChatStreamRelay(_selection(), "hi", transport)
+    events = _drain(relay)  # must not raise
+    assert relay.outcome is StreamOutcome.serving_unavailable
+    assert events[-1].kind == "terminal"
+    assert events[-1].outcome is StreamOutcome.serving_unavailable
+    assert transport.upstream_open is False
+
+
+class _CancelRacingCompletionTransport:
+    """Trips the cancel token in the same read that delivers ``completed``.
+
+    Models a browser cancel that lands after the completion frame is already
+    queued: the relay must let cancel strictly win over the just-read completion.
+    """
+
+    def __init__(self):
+        self.closed = False
+        self.upstream_open = False
+
+    def open(self, request, cancel):
+        self.upstream_open = True
+
+        def _gen():
+            try:
+                yield _delta("partial")
+                cancel.cancel()  # cancel trips right before yielding completed
+                yield _COMPLETED
+            finally:
+                self.upstream_open = False
+                self.closed = True
+
+        return _gen()
+
+
+def test_cancel_racing_in_flight_completion_settles_cancelled():
+    transport = _CancelRacingCompletionTransport()
+    relay = ChatStreamRelay(_selection(), "hi", transport)
+    events = _drain(relay)
+
+    assert relay.outcome is StreamOutcome.cancelled
+    assert relay.terminal_turn_status() == "cancelled"
+    # The queued completion frame must never surface as a terminal.
+    assert all(e.outcome is not StreamOutcome.completed for e in events)
+    assert events[-1].outcome is StreamOutcome.cancelled
+    assert transport.upstream_open is False
+
+
+def test_completed_stream_closes_upstream_transport():
+    # A normal completion must still tear down the (retained) transport
+    # generator, not leave it suspended with the upstream open.
+    transport = ScriptedTransport([_delta("Hel"), _delta("lo"), _COMPLETED])
+    relay = ChatStreamRelay(_selection(), "hi", transport)
+    _drain(relay)
+
+    assert relay.outcome is StreamOutcome.completed
+    assert transport.closed is True
+    assert transport.upstream_open is False
+
+
+def test_stdlib_timeout_error_settles_timed_out():
+    # A stdlib TimeoutError (also the alias of socket.timeout /
+    # asyncio.TimeoutError on 3.10+) maps to timed_out -> interrupted, not
+    # serving_unavailable -> failed.
+    transport = ScriptedTransport(
+        [_delta("half")], raise_at=1, error=TimeoutError("deadline")
+    )
+    relay = ChatStreamRelay(_selection(), "hi", transport)
+    events = _drain(relay)
+
+    assert relay.outcome is StreamOutcome.timed_out
+    assert relay.terminal_turn_status() == "interrupted"
+    assert events[-1].outcome is StreamOutcome.timed_out
+
+
+def _hand_built_selection(controls):
+    route = ChatRouteDescriptor(
+        route_id="chat.heavy",
+        display_name="Heavy chat",
+        serving_contract_version="1.2.0",
+        route_digest="sha256:" + "b" * 64,
+        model_profile="chat-heavy",
+        controls=("max_output_tokens", "temperature_milli", "reasoning_effort"),
+    )
+    return ChatRouteSelection(route=route, controls=tuple(controls.items()))
+
+
+def test_bounded_request_revalidates_hand_built_selection_controls():
+    # ``isinstance(selection, ChatRouteSelection)`` alone does not prove the
+    # controls are bounded: a directly-constructed selection must be re-checked
+    # against the chat-turn.v1 bounds at request-build time.
+    for controls in (
+        {"max_output_tokens": 999_999_999},
+        {"temperature_milli": 50_000},
+        {"reasoning_effort": "ULTRA"},
+    ):
+        selection = _hand_built_selection(controls)
+        with pytest.raises(ChatStreamError, match="control"):
+            build_bounded_request(selection, "hi")
 
 
 def test_output_char_bound_is_enforced():
