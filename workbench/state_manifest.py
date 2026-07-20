@@ -38,9 +38,28 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError
+from jsonschema.exceptions import SchemaError, ValidationError
 
 from .contracts import ContractValidationError, validate_catalog
+
+_CATALOG_CONTRACT_SCHEMA = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "operation-catalog.v1.schema.json"
+)
+_catalog_contract_validator_cache: Draft202012Validator | None = None
+
+
+def _catalog_contract_validator() -> Draft202012Validator:
+    """Load the operation-catalog contract schema once; fail closed if absent."""
+    global _catalog_contract_validator_cache
+    if _catalog_contract_validator_cache is None:
+        try:
+            schema = json.loads(_CATALOG_CONTRACT_SCHEMA.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise StateManifestError(
+                "operation-catalog contract schema is unavailable; refusing to pin descriptors"
+            ) from exc
+        _catalog_contract_validator_cache = Draft202012Validator(schema)
+    return _catalog_contract_validator_cache
 
 
 class StateManifestError(RuntimeError):
@@ -222,6 +241,16 @@ def _pin_operation(provider: str, catalog: Mapping[str, Any], operation_id: str)
         raise StateManifestError(
             f"State operation {operation_id} does not name its bridge adapter"
         )
+    gates = operation.get("gates")
+    gate_states = (
+        (gates.get("preview"), gates.get("confirmation"), gates.get("human_approval"))
+        if isinstance(gates, Mapping) else ()
+    )
+    if any(state not in (None, "not_supported", "not_required") for state in gate_states):
+        raise StateManifestError(
+            f"State operation {operation_id} declares an active gate; "
+            "refusing to pin a gated descriptor as an ungated read"
+        )
     return PinnedStateOperation(
         provider=provider,
         operation_id=operation_id,
@@ -254,6 +283,12 @@ def pin_state_read_operations(
         validate_catalog(catalog)
     except ContractValidationError as exc:
         raise StateManifestError(f"State manifest failed digest validation: {exc}") from exc
+    try:
+        _catalog_contract_validator().validate(dict(catalog))
+    except ValidationError as exc:
+        raise StateManifestError(
+            f"State manifest catalog does not conform to the operation-catalog contract: {exc.message}"
+        ) from exc
     return PinnedStateReadOperations(
         provider=provider,
         catalog_version=str(catalog.get("catalog_version", "")),

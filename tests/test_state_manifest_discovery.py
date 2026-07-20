@@ -139,7 +139,7 @@ def test_incompatible_contract_major_fails_closed() -> None:
 
     malformed = example_catalog()
     operation_named(malformed, PRD_READ_CONTENT_OPERATION_ID)["contract_version"] = "latest"
-    with pytest.raises(StateManifestError, match="not semantic"):
+    with pytest.raises(StateManifestError, match="operation-catalog contract"):
         pin_state_read_operations({"ok": True, "command": "describe", "data": rehash(malformed)})
 
 
@@ -165,7 +165,7 @@ def test_invalid_or_non_object_schema_fails_closed() -> None:
 
     missing = example_catalog()
     del operation_named(missing, PROJECT_SNAPSHOT_OPERATION_ID)["input_schema"]
-    with pytest.raises(StateManifestError, match="no input_schema object"):
+    with pytest.raises(StateManifestError, match="operation-catalog contract"):
         pin_state_read_operations({"ok": True, "command": "describe", "data": rehash(missing)})
 
 
@@ -263,3 +263,30 @@ def test_pinned_descriptor_set_is_immutable() -> None:
     schema = pinned.prd_read_content.input_schema
     schema["properties"]["injected"] = {"type": "string"}
     assert "injected" not in pinned.prd_read_content.input_schema["properties"]
+
+
+def test_gated_read_operation_fails_closed_instead_of_pinning_ungated() -> None:
+    catalog = example_catalog()
+    operation_named(catalog, "state.prd.read_content")["gates"]["human_approval"] = "required"
+    operation_named(catalog, "state.prd.read_content")["gates"]["approval_action"] = "commit_pr"
+    discovery, _ = discovery_for(envelope(rehash(catalog)))
+    with pytest.raises(StateManifestError, match="active gate"):
+        discovery.pinned()
+
+
+def test_catalog_violating_the_operation_catalog_contract_fails_closed() -> None:
+    catalog = example_catalog()
+    operation_named(catalog, "state.project.snapshot")["execution"]["command"] = "state-cli"
+    discovery, _ = discovery_for(envelope(rehash(catalog)))
+    with pytest.raises(StateManifestError, match="operation-catalog contract"):
+        discovery.pinned()
+
+
+def test_incompatible_schema_dialect_fails_closed() -> None:
+    catalog = example_catalog()
+    operation_named(catalog, "state.project.snapshot")["input_schema"]["$schema"] = (
+        "http://json-schema.org/draft-07/schema#"
+    )
+    discovery, _ = discovery_for(envelope(rehash(catalog)))
+    with pytest.raises(StateManifestError, match="dialect"):
+        discovery.pinned()
