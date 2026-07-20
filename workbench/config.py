@@ -28,6 +28,9 @@ class Settings:
     rerank_model: str = ""
     identity_header: str = "Tailscale-User-Login"
     allow_insecure_dev_actor: bool = False
+    #: Hub-held key for the keyed chat content fingerprint (PRD R008).  Unset
+    #: means chat persistence is not configured and chat endpoints refuse.
+    chat_content_hash_key: str = ""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -52,4 +55,5 @@ class Settings:
             rerank_model=values.get("WORKBENCH_RERANK_MODEL", ""),
             identity_header=values.get("WORKBENCH_IDENTITY_HEADER", "Tailscale-User-Login").strip() or "Tailscale-User-Login",
             allow_insecure_dev_actor=values.get("WORKBENCH_ALLOW_INSECURE_DEV_ACTOR", "").lower() in {"1", "true", "yes"},
+            chat_content_hash_key=values.get("WORKBENCH_CHAT_HASH_KEY", ""),
         )
