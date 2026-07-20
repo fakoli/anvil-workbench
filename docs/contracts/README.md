@@ -25,6 +25,8 @@ These resources are the implementation-facing companion to
 | Return evidence for an operation/effect | [operation receipt](schemas/operation-receipt.v1.schema.json) | [operation receipt](examples/operation-receipt.v1.json), [preflight refusal](examples/operation-receipt.refusal.v1.json) |
 | Display a project's PRD/plan/task hierarchy without touching State storage | [state snapshot](schemas/state-snapshot.v1.schema.json) | [project snapshot](examples/anvil-state.project-snapshot.v1.json) |
 | Read one PRD's bounded, redacted content for display | [PRD content](schemas/prd-content.v1.schema.json) | [PRD content read](examples/anvil-state.prd-content.v1.json) |
+| Persist one chat/voice conversation identity with display-only project/PRD/task context | [chat conversation](schemas/chat-conversation.v1.schema.json) | [conversation](examples/chat.conversation.v1.json) |
+| Append one immutable chat/voice turn with lineage, route reference, and voice events | [chat turn](schemas/chat-turn.v1.schema.json) | [user voice turn](examples/chat.turn.user-voice.v1.json), [interrupted assistant turn](examples/chat.turn.assistant-interrupted.v1.json) |
 
 ## Normative conventions
 
@@ -74,6 +76,19 @@ These resources are the implementation-facing companion to
     object (for example in receipt correlation) is display/correlation data
     only and carries no authority; where present it should use the scoped
     `<prd_id>:<task_id>` form.
+11. A chat conversation is one identity shared by ordinary and Advanced modes
+    and by voice; mode is a per-turn attribute and turns are append-only with
+    typed `(parent_turn_id, sibling_index)` lineage — a retry or branch is a
+    new turn, never a rewrite. Raw audio frames and hidden/encrypted model
+    reasoning are prohibited from durable chat/turn records and from every API
+    response: voice persists typed lifecycle events plus, only where the
+    conversation's retention policy permits, redacted transcript text. A turn's
+    route reference carries Anvil Serving route IDs and digests only — never a
+    provider endpoint, URL, or credential — and a conversation's context block
+    is display-only: it pins readable titles plus canonical project,
+    PRD-revision, and task IDs without implying a claim, lease, or effect
+    grant. Chat records are hub-durable records, not bridge-verified
+    snapshots, so they are not contract-digest-bearing.
 
 ## Contract-extension checklist
 

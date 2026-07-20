@@ -1,0 +1,52 @@
+{
+  "schema_version": "workbench-chat-conversation/v1",
+  "conversation_id": "conv_release_alpha_0001",
+  "actor": {
+    "actor_id": "operator_example",
+    "kind": "operator"
+  },
+  "title": {
+    "content_trust": "untrusted_task_data",
+    "text": "Routed chat kickoff for release-alpha"
+  },
+  "context": {
+    "binding": "display_only",
+    "content_trust": "untrusted_task_data",
+    "project": {
+      "project_id": "project_example",
+      "name": "Anvil Workbench"
+    },
+    "prd": {
+      "prd_id": "release-alpha",
+      "prd_revision": 4,
+      "title": "Chat-first Workbench"
+    },
+    "tasks": [
+      {
+        "ref": {
+          "prd_id": "release-alpha",
+          "task_id": "T001"
+        },
+        "scoped_id": "release-alpha:T001",
+        "title": "Add routed chat"
+      }
+    ]
+  },
+  "capability_refs": [
+    {
+      "binding": "reference_only",
+      "kind": "operation",
+      "id": "serving.responses.create",
+      "digest": "sha256:9c1f4b0f0f6f2b8f3d4a5c6e7b8d9a0c1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b"
+    }
+  ],
+  "retention": {
+    "policy_id": "workbench.default-90d",
+    "transcript_text": "retained_redacted",
+    "voice_transcript_text": "metadata_only",
+    "delete_after": "2026-10-17T00:00:00Z"
+  },
+  "status": "active",
+  "created_at": "2026-07-19T00:00:00Z",
+  "updated_at": "2026-07-19T00:00:09Z"
+}

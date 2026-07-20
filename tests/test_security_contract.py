@@ -8,6 +8,7 @@ import pytest
 from workbench.bridge import BridgeSettings, StateReader
 from workbench.graph import GraphError, NullGraph
 from workbench.store import MemoryStore, StoreError
+from workbench.voice import summarize_server_event
 
 
 def test_unimplemented_privileged_actions_cannot_create_a_dangling_bridge_command():
@@ -28,6 +29,18 @@ def test_graph_only_accepts_redacted_evidence_metadata():
         graph.project("transcript", "run_1", "project_1", {"text": "do not index"})
     with pytest.raises(GraphError, match="transcripts"):
         graph.project("evidence", "run_1", "project_1", {"messages": ["raw"]})
+
+
+def test_voice_summaries_never_persist_audio_even_when_transcripts_are_retained():
+    # The chat-turn contract prohibits raw audio in durable records; the relay's
+    # summarizer is the only path into storage, so even the most permissive
+    # retention setting must reduce an audio delta to byte-count metadata.
+    audio_frame = '{"type":"response.output_audio.delta","delta":"UklGRiQAAABXQVZF"}'
+    for retain in (False, True):
+        kind, data = summarize_server_event(audio_frame, retain_transcripts=retain)
+        assert kind == "voice.tts.chunk"
+        assert data == {"bytes": 16}
+        assert "UklGRiQAAABXQVZF" not in json.dumps(data)
 
 
 def test_state_reader_tails_canonical_events_without_database_access(tmp_path: Path):

@@ -1,0 +1,59 @@
+{
+  "schema_version": "workbench-chat-turn/v1",
+  "turn_id": "turn_assistant_0001",
+  "conversation_id": "conv_release_alpha_0001",
+  "lineage": {
+    "parent_turn_id": "turn_user_root_0001",
+    "sibling_index": 0,
+    "kind": "initial"
+  },
+  "role": "assistant",
+  "mode": "advanced",
+  "status": "interrupted",
+  "route": {
+    "provider": "anvil-serving",
+    "route_id": "serving.route.heavy",
+    "serving_contract_version": "1.0.0",
+    "route_digest": "sha256:4b7d1c9e2f8a0b3c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c",
+    "model_profile": "heavy",
+    "served_tier": "heavy-local"
+  },
+  "content": [
+    {
+      "content_trust": "untrusted_task_data",
+      "kind": "text",
+      "text": "The release-alpha PRD is pinned at revision 4. Task release-alpha:T001 adds routed chat and is ready. Before claiming it you should"
+    }
+  ],
+  "voice_events": [
+    {
+      "event": "tts_start",
+      "at": "2026-07-19T00:00:05Z"
+    },
+    {
+      "event": "interruption",
+      "at": "2026-07-19T00:00:09Z"
+    },
+    {
+      "event": "tts_stop",
+      "at": "2026-07-19T00:00:09Z",
+      "duration_ms": 4000
+    }
+  ],
+  "usage": {
+    "input_tokens": 1840,
+    "output_tokens": 96,
+    "latency_ms": 950
+  },
+  "advanced_controls": {
+    "temperature_milli": 300,
+    "max_output_tokens": 1024,
+    "reasoning_effort": "low"
+  },
+  "redaction": {
+    "status": "redacted",
+    "ruleset": "workbench.default"
+  },
+  "created_at": "2026-07-19T00:00:05Z",
+  "completed_at": "2026-07-19T00:00:09Z"
+}
