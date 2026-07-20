@@ -204,6 +204,9 @@ class MemoryConversationStore:
         self.rows = rows if rows is not None else ConversationRows()
         if recover_on_open:
             self.recover_streaming_turns()
+            for record in list(self.rows.conversations.values()):
+                if record.status == "deletion_pending":
+                    self._complete_deletion(record)
 
     # -- internal helpers -------------------------------------------------
 
@@ -263,7 +266,17 @@ class MemoryConversationStore:
         return self._store_conversation("conversation.created", record)
 
     def get_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation:
-        return self._owned(actor, conversation_id)
+        return self._reconciled(self._owned(actor, conversation_id))
+
+    def _reconciled(self, record: Conversation) -> Conversation:
+        """Complete a crashed pending deletion before serving any read."""
+        if record.status != "deletion_pending":
+            return record
+        self._complete_deletion(record)
+        refreshed = self.rows.conversations.get(record.id)
+        if refreshed is None:
+            raise UnknownConversationError("unknown conversation")
+        return refreshed
 
     def list_conversations(self, actor: ConversationActor, include_archived: bool = False) -> list[Conversation]:
         self._require_actor(actor)
@@ -407,8 +420,14 @@ class MemoryConversationStore:
         Per the turn contract only ``status``/``completed_at`` may advance;
         a terminal turn is committed history and can never change again.
         """
-        self._owned(actor, conversation_id)
+        record = self._owned(actor, conversation_id)
+        if record.status not in _LISTABLE_STATUSES:
+            raise ConversationStoreError(
+                f"a {record.status} conversation's history is final and cannot advance"
+            )
         target = self._find_turn(conversation_id, turn_id)
+        if target.content_purged:
+            raise ConversationStoreError("a purged tombstone turn cannot advance status")
         if status not in TERMINAL_TURN_STATUSES:
             raise ConversationStoreError(f"turn status can only advance to a terminal state, not {status!r}")
         if target.status != "streaming":
@@ -439,7 +458,7 @@ class MemoryConversationStore:
         never hide behind a stale hash; a purged tombstone deliberately keeps
         the fingerprint of the content that was removed.
         """
-        record = self._owned(actor, conversation_id)
+        record = self._reconciled(self._owned(actor, conversation_id))
         ordered = _lineage_order(list(self.rows.turns.get(conversation_id, [])))
         for item in ordered:
             if item.content_purged:
@@ -467,6 +486,11 @@ class MemoryConversationStore:
         never silently lost.  Returns the content-free final audit projection.
         """
         record = self._owned(actor, conversation_id)
+        if record.status == "deletion_pending":
+            # A crash between the persisted pending state and the purge is
+            # completed here (using the already-persisted mode), never refused
+            # into a fail-open dead end.
+            return self._complete_deletion(record)
         if record.status not in _LISTABLE_STATUSES:
             raise ConversationStoreError(f"a {record.status} conversation cannot be deleted again")
         requested_at = now_utc()
@@ -492,6 +516,10 @@ class MemoryConversationStore:
         for index, item in enumerate(turns):
             if item.content_purged:
                 continue
+            if item.status == "streaming":
+                # A cut-off response is finalized as interrupted, never left
+                # advanceable to a fabricated completion on deleted history.
+                item = replace(item, status="interrupted", completed_at=completed_at)
             tombstone = purge_turn_content(item)
             turns[index] = tombstone
             if deletion.mode == "purge_content_keep_tombstone":

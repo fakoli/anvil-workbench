@@ -305,3 +305,67 @@ def test_purge_all_records_leaves_no_recoverable_trace_of_content_anywhere():
     assert reopened.list_conversations(ALICE, include_archived=True) == []
     # The lifecycle/hash audit facts are the only remnant, and they are clean.
     assert_no_secrets(repr(reopened.list_audit(limit=100)))
+
+
+def test_crashed_pending_deletion_is_reconciled_on_read_reopen_and_owner_retry():
+    # Simulate the crash window: pending state persisted, purge never ran.
+    store = fresh()
+    conversation, root, reply = seeded_conversation(store)
+    pending = replace(
+        store.rows.conversations[conversation.id],
+        status="deletion_pending",
+        deletion=ConversationDeletion(now_utc(), "purge_content_keep_tombstone"),
+        updated_at=now_utc(),
+    )
+    store.rows.conversations[conversation.id] = pending
+
+    # (a) A read never serves pending content: it completes the deletion first.
+    record, turns = store.get_conversation_with_turns(ALICE, conversation.id)
+    assert record.status == "deleted" and record.title is None
+    assert all(turn.content_purged and not turn.content for turn in turns)
+
+    # (b) recover_on_open reconciles a pending deletion at construction.
+    store2 = fresh()
+    conversation2, _, _ = seeded_conversation(store2)
+    store2.rows.conversations[conversation2.id] = replace(
+        store2.rows.conversations[conversation2.id],
+        status="deletion_pending",
+        deletion=ConversationDeletion(now_utc(), "purge_all_records"),
+        updated_at=now_utc(),
+    )
+    reopened = MemoryConversationStore(store2.rows, content_hash_key=KEY, recover_on_open=True)
+    with pytest.raises(UnknownConversationError):
+        reopened.get_conversation(ALICE, conversation2.id)
+
+    # (c) The owner's delete completes a pending deletion instead of refusing.
+    store3 = fresh()
+    conversation3, _, _ = seeded_conversation(store3)
+    store3.rows.conversations[conversation3.id] = replace(
+        store3.rows.conversations[conversation3.id],
+        status="deletion_pending",
+        deletion=ConversationDeletion(now_utc(), "purge_content_keep_tombstone"),
+        updated_at=now_utc(),
+    )
+    final = store3.delete_conversation(ALICE, conversation3.id, "purge_content_keep_tombstone")
+    assert final.deletion_mode == "purge_content_keep_tombstone"
+    assert store3.get_conversation(ALICE, conversation3.id).status == "deleted"
+
+
+def test_deleted_history_is_final_no_status_advance_on_tombstones():
+    store = fresh()
+    conversation, root, reply = seeded_conversation(store)
+    streaming = store.append_turn(
+        ALICE, conversation.id, role="assistant", status="streaming",
+        lineage=TurnLineage(reply.id, 1, "branch"), redaction=REDACTED,
+        content=(ContentBlock("text", "partial secret"),),
+    )
+    store.delete_conversation(ALICE, conversation.id, "purge_content_keep_tombstone")
+
+    # The purged streaming turn was finalized as interrupted at deletion...
+    _, turns = store.get_conversation_with_turns(ALICE, conversation.id)
+    statuses = {turn.id: turn.status for turn in turns}
+    assert statuses[streaming.id] == "interrupted"
+
+    # ...and no tombstone turn can advance status afterwards.
+    with pytest.raises(ConversationStoreError, match="final"):
+        store.advance_turn_status(ALICE, conversation.id, streaming.id, "complete")
