@@ -168,3 +168,13 @@ Decisions. Signed proof records live in the anvil workspace `proofs/` dir.
    still pending — `create_app` currently builds the in-memory
    `MemoryConversationStore` (with recover-on-open), so durable chat
    persistence across hub restarts does not exist yet.
+   The chat-route discovery slice (T003.1) now exists too:
+   `workbench/chat_routes.py` fail-closed validates the operator-reviewed
+   `WORKBENCH_CHAT_ROUTES` JSON allowlist into a frozen browser-safe
+   snapshot (chat-turn.v1 route identifiers/digests plus declared
+   Advanced-control names only — no endpoint, URL, token, credential, or
+   policy field is representable) and refuses an unknown route or
+   undeclared control before any Serving request, with no raw-provider
+   fallback path (`tests/test_chat_routes.py` is hermetic, including a
+   workbench-wide raw-provider-host scan) — implemented, not yet wired to
+   a browser endpoint or the turn-append path.
