@@ -38,34 +38,22 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.exceptions import ValidationError
 
-from .contracts import ContractValidationError, validate_catalog
-
-_CATALOG_CONTRACT_SCHEMA = (
-    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "operation-catalog.v1.schema.json"
+from .contracts import (
+    ContractValidationError,
+    catalog_contract_validator,
+    check_operation_schema,
+    validate_catalog,
 )
-_catalog_contract_validator_cache: Draft202012Validator | None = None
 
 
 def _catalog_contract_validator() -> Draft202012Validator:
-    """Load the operation-catalog contract schema once; fail closed if absent."""
-    global _catalog_contract_validator_cache
-    if _catalog_contract_validator_cache is None:
-        try:
-            schema = json.loads(_CATALOG_CONTRACT_SCHEMA.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise StateManifestError(
-                "operation-catalog contract schema is unavailable; refusing to pin descriptors"
-            ) from exc
-        bound = schema.get("properties", {}).get("generated_at", {})
-        if not isinstance(bound.get("maxLength"), int) or "pattern" not in bound:
-            raise StateManifestError(
-                "operation-catalog contract schema no longer bounds generated_at; "
-                "refusing to pin descriptors"
-            )
-        _catalog_contract_validator_cache = Draft202012Validator(schema)
-    return _catalog_contract_validator_cache
+    """Resolve the shared operation-catalog contract validator; fail closed."""
+    try:
+        return catalog_contract_validator()
+    except ContractValidationError as exc:
+        raise StateManifestError(f"{exc}; refusing to pin descriptors") from exc
 
 
 class StateManifestError(RuntimeError):
@@ -77,7 +65,6 @@ PRD_READ_CONTENT_OPERATION_ID = "state.prd.read_content"
 
 STATE_PROVIDER = "anvil-state"
 _CATALOG_SCHEMA_VERSION = "anvil-operation-catalog/v1"
-_DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _COMPATIBLE_CONTRACT_MAJOR = 1
 _CONTRACT_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
@@ -192,22 +179,10 @@ def _compatible_contract_version(operation_id: str, version: Any) -> str:
 def _schema_json(operation_id: str, name: str, schema: Any) -> str:
     if not isinstance(schema, Mapping):
         raise StateManifestError(f"State operation {operation_id} has no {name} object")
-    declared = schema.get("$schema")
-    if declared is not None and declared != _DRAFT_2020_12:
-        raise StateManifestError(
-            f"State operation {operation_id} {name} declares an unsupported dialect: {declared!r}"
-        )
-    if schema.get("type") != "object":
-        raise StateManifestError(
-            f"State operation {operation_id} {name} must be a typed object schema"
-        )
     try:
-        Draft202012Validator.check_schema(dict(schema))
-    except SchemaError as exc:
-        raise StateManifestError(
-            f"State operation {operation_id} {name} is not a valid draft 2020-12 schema: "
-            f"{exc.message}"
-        ) from exc
+        check_operation_schema(schema)
+    except ContractValidationError as exc:
+        raise StateManifestError(f"State operation {operation_id} {name} {exc}") from exc
     return json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 

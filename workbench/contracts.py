@@ -9,15 +9,123 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import unquote
 
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError
+from jsonschema.exceptions import SchemaError, ValidationError
 
 
 class ContractValidationError(ValueError):
     """A proposed contract resource or immutable execution snapshot is unsafe."""
+
+
+_CATALOG_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "operation-catalog.v1.schema.json"
+)
+_catalog_contract_validator_cache: Draft202012Validator | None = None
+
+
+def catalog_contract_validator() -> Draft202012Validator:
+    """Load the operation-catalog contract schema once; fail closed if absent.
+
+    Shared by every catalog consumer (State manifest discovery, the provider
+    catalog registry) so there is exactly one interpretation of the contract
+    schema.  The ``generated_at`` bound guard refuses a schema edit that would
+    let a provider smuggle unbounded content through the timestamp field.
+    """
+    global _catalog_contract_validator_cache
+    if _catalog_contract_validator_cache is None:
+        try:
+            schema = json.loads(_CATALOG_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "operation-catalog contract schema is unavailable; refusing to validate catalogs"
+            ) from exc
+        bound = schema.get("properties", {}).get("generated_at", {})
+        if not isinstance(bound.get("maxLength"), int) or "pattern" not in bound:
+            raise ContractValidationError(
+                "operation-catalog contract schema no longer bounds generated_at; "
+                "refusing to validate catalogs"
+            )
+        _catalog_contract_validator_cache = Draft202012Validator(schema)
+    return _catalog_contract_validator_cache
+
+
+_DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+
+
+def _iter_schema_refs(value: Any) -> Iterator[tuple[str, str]]:
+    """Yield every ``(keyword, target)`` reference pair anywhere in the tree.
+
+    The walk is deliberately over-broad: any ``$ref``/``$dynamicRef`` key with
+    a string value is treated as a reference, even inside annotation values
+    such as ``examples``.  A reviewed operation schema has no legitimate need
+    for such a key elsewhere, and an ambiguous document must be rejected
+    rather than partially trusted.
+    """
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if key in ("$ref", "$dynamicRef") and isinstance(nested, str):
+                yield (str(key), nested)
+            yield from _iter_schema_refs(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            yield from _iter_schema_refs(nested)
+
+
+def _resolve_local_pointer(root: Mapping[str, Any], keyword: str, target: str) -> None:
+    """Prove one intra-document ``#``-pointer fragment resolves; fail closed."""
+    fragment = target[1:]
+    if not fragment:
+        return
+    if not fragment.startswith("/"):
+        raise ContractValidationError(
+            f"declares a non-pointer {keyword} fragment (anchors are not supported): {target!r}"
+        )
+    node: Any = root
+    for raw_token in fragment[1:].split("/"):
+        token = unquote(raw_token).replace("~1", "/").replace("~0", "~")
+        if isinstance(node, Mapping) and token in node:
+            node = node[token]
+        elif isinstance(node, list) and token.isdigit() and int(token) < len(node):
+            node = node[int(token)]
+        else:
+            raise ContractValidationError(f"declares an unresolvable {keyword}: {target!r}")
+
+
+def check_operation_schema(schema: Any) -> None:
+    """Fail closed unless ``schema`` is a self-contained draft 2020-12 object schema.
+
+    ``Draft202012Validator.check_schema`` never resolves references, so a
+    dangling local pointer or a remote/``file:`` ``$ref`` would pass a bare
+    well-formedness check and only surface at evaluation time -- as a
+    referencing error that is not a :class:`jsonschema.ValidationError`, or as
+    an implicit fetch.  Beyond the well-formedness, dialect, and object-type
+    checks, this helper therefore (a) rejects every ``$ref``/``$dynamicRef``
+    that is not an intra-document ``#``-pointer fragment and (b) proves each
+    local pointer resolves.  Error messages are predicate fragments so callers
+    can prefix their own provider/operation context.
+    """
+    if not isinstance(schema, Mapping):
+        raise ContractValidationError("is not a schema object")
+    declared = schema.get("$schema")
+    if declared is not None and declared != _DRAFT_2020_12:
+        raise ContractValidationError(f"declares an unsupported dialect: {declared!r}")
+    if schema.get("type") != "object":
+        raise ContractValidationError("must be a typed object schema")
+    try:
+        Draft202012Validator.check_schema(dict(schema))
+    except SchemaError as exc:
+        raise ContractValidationError(
+            f"is not a valid draft 2020-12 schema: {exc.message}"
+        ) from exc
+    for keyword, target in _iter_schema_refs(schema):
+        if not target.startswith("#"):
+            raise ContractValidationError(f"declares a non-local {keyword}: {target!r}")
+        _resolve_local_pointer(schema, keyword, target)
 
 
 class ApprovalConsumer(Protocol):
@@ -285,9 +393,18 @@ def validate_bridge_command_snapshot(
     if not isinstance(input_schema, Mapping):
         raise ContractValidationError("selected operation has no object input schema")
     try:
+        check_operation_schema(input_schema)
+    except ContractValidationError as exc:
+        raise ContractValidationError(f"selected operation input schema {exc}") from exc
+    try:
         Draft202012Validator(input_schema).validate(dict(inputs))
     except ValidationError as exc:
         raise ContractValidationError(f"operation inputs do not match the selected schema: {exc.message}") from exc
+    except Exception as exc:
+        # A referencing/registry failure raised while evaluating the pinned
+        # schema is not a ValidationError; it must still fail closed instead
+        # of escaping as an unhandled crash.
+        raise ContractValidationError(f"operation input schema cannot be evaluated: {exc}") from exc
     profile_operation = {
         (item.get("provider"), item.get("id"), item.get("contract_version"), item.get("operation_digest"))
         for item in profile.get("operations", []) if isinstance(item, Mapping)
