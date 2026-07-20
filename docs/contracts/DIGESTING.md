@@ -29,6 +29,7 @@ render it as lowercase `sha256:<64 hex>`.
 | Approved operation inputs | `anvil-workbench/approval-payload/v1\0` | Hash the exact typed `inputs` object attached to the approval-gated operation. |
 | State project snapshot | `anvil-workbench/state-snapshot/v1\0` | Omit `snapshot_digest` and volatile `generated_at`; sort `prds` by `prd_id` and `tasks` by `(ref.prd_id, ref.task_id)`. |
 | PRD content read | `anvil-workbench/prd-content/v1\0` | Omit `content_digest` and volatile `generated_at`. |
+| Settings descriptor catalog | `anvil-workbench/settings-descriptor/v1\0` | Omit `catalog_digest`; sort `settings` by `id`. Preserve `scope_precedence` order (it encodes the total precedence, not a set). |
 
 All documented sort rules use plain code-point lexicographic string
 comparison — no numeric, locale, or case-insensitive collation (so `T002.10`

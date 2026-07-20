@@ -64,6 +64,42 @@ rewrite it as part of Workbench work without a separate review of those changes.
 - No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 - No browser-supplied worktree paths, model/tool controls on the voice relay, raw audio storage, or transcript retention without the explicit environment switch.
 
+## 2026-07-20 preferences-configuration T001 — settings descriptor contract
+
+Delivered the first `preferences-configuration` (milestone-4, F001) task: a
+versioned, digest-bearing settings-descriptor contract resource.
+
+- **Implemented (as a proposed contract resource, not a live endpoint):**
+  `docs/contracts/schemas/settings-descriptor.v1.schema.json` (draft 2020-12,
+  `additionalProperties:false` throughout) and
+  `docs/contracts/examples/settings-descriptor.v1.json` (16 descriptors across
+  personal/project/deployment/policy). `workbench/contracts.py` gained the
+  `settings-descriptor` digest kind (prefix + canonical normalization: omit
+  `catalog_digest`, sort `settings` by `id`, preserve `scope_precedence`
+  order), a `settings_descriptor_contract_validator()` with a closed-root/
+  closed-descriptor guard and a `_reset_...cache` hook (mirroring the
+  profile/workflow siblings), the `validate_settings_descriptor()` fail-closed
+  semantic validator, and the `settings_actor_view()` actor/project projection.
+- **Criteria proof:** each descriptor owns exactly one `scope` and
+  `scope_precedence` is a total order (`policy>deployment>project>personal`),
+  with a `policy_ceiling` forced to outrank its setting so a personal value can
+  never exceed a policy/retention/route bound (criterion 1). Secret and
+  path-like descriptors are authority-owned, carry no serializable default, and
+  are dropped by `settings_actor_view()` — proven by a forbidden-marker scan and
+  a defence-in-depth rogue-secret test (criterion 2). Route/worktree/workflow/
+  skill/plugin/capability defaults are `id_ref`/`digest_ref` pattern-validated
+  references, and a free-text capability default is refused (criterion 3).
+- **Evidence:** `python -m pytest -q tests/test_contract_resources.py
+  tests/test_security_contract.py tests/test_settings_descriptor.py` = 44
+  passed; full suite `python -m pytest -q` = 332 passed (318 baseline + 14 new
+  in `tests/test_settings_descriptor.py`). Docs updated: contracts README table,
+  DIGESTING.md row, and a "Settings and preferences descriptor (proposed)"
+  section in CONTRACTS.md.
+- **Remaining gate / next step:** the catalog is proposed only. T002.x must
+  wire it into a durable actor/project preference store, an effective-value
+  resolver, and the preference/export APIs (the actor view is the only
+  serialization those APIs may emit).
+
 ## 2026-07-20 autonomous anvil-driven run (actor `claude`) — continued
 
 Run #2 (same day): three more tasks delivered through the identical

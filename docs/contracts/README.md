@@ -33,6 +33,7 @@ These resources are the implementation-facing companion to
 | Read one PRD's bounded, redacted content for display | [PRD content](schemas/prd-content.v1.schema.json) | [PRD content read](examples/anvil-state.prd-content.v1.json) |
 | Persist one chat/voice conversation identity with display-only project/PRD/task context | [chat conversation](schemas/chat-conversation.v1.schema.json) | [conversation](examples/chat.conversation.v1.json) |
 | Append one immutable chat/voice turn with lineage, route reference, and voice events | [chat turn](schemas/chat-turn.v1.schema.json) | [user voice turn](examples/chat.turn.user-voice.v1.json), [interrupted assistant turn](examples/chat.turn.assistant-interrupted.v1.json) |
+| Declare every initial setting's type, scope, sensitivity, mutability, precedence, and typed reference defaults | [settings descriptor](schemas/settings-descriptor.v1.schema.json) | [settings descriptor catalog](examples/settings-descriptor.v1.json) |
 
 ## Normative conventions
 

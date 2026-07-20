@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/settings-descriptor.v1.schema.json",
+  "title": "Anvil Workbench settings descriptor catalog v1",
+  "description": "A reviewed, version-pinned catalog of every initial Workbench setting. Each descriptor declares exactly one owning scope, a sensitivity tier, mutability, dependencies, optional migration, an optional authority-owned policy ceiling, and application timing. It is a shape-and-authority contract, not a store of live values: a secret or path-like field carries no browser-serializable default, and a route/worktree/workflow/skill/plugin/capability default is a typed id/digest reference, never free text. Scope precedence is a total order so effective-value resolution is deterministic.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "catalog_id", "revision", "catalog_digest", "scope_precedence", "settings"],
+  "$defs": {
+    "scope": {"enum": ["personal", "project", "deployment", "policy"]},
+    "settingId": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)+$", "maxLength": 128},
+    "refKind": {"enum": ["route", "worktree", "workflow", "skill", "plugin", "capability"]},
+    "idRefValue": {"type": "string", "pattern": "^[a-z][a-z0-9._:-]{1,127}$"},
+    "digestRefValue": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "type", "scope", "sensitivity", "mutability", "application_timing"],
+      "properties": {
+        "id": {"$ref": "#/$defs/settingId"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 120},
+        "description": {"type": "string", "maxLength": 400},
+        "type": {"enum": ["bool", "int", "enum", "string", "id_ref", "digest_ref"]},
+        "scope": {"$ref": "#/$defs/scope"},
+        "sensitivity": {"enum": ["public", "redacted", "secret"]},
+        "path_like": {"type": "boolean"},
+        "mutability": {"enum": ["mutable", "env_only", "approval_gated"]},
+        "application_timing": {"enum": ["immediate", "next_turn", "next_session", "next_run"]},
+        "ref_kind": {"$ref": "#/$defs/refKind"},
+        "allowed_values": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
+        "bounds": {"type": "object", "additionalProperties": false, "required": ["min", "max"], "properties": {"min": {"type": "integer"}, "max": {"type": "integer"}}},
+        "default": {"type": ["boolean", "integer", "string"]},
+        "depends_on": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"$ref": "#/$defs/settingId"}},
+        "migration": {"type": "object", "additionalProperties": false, "required": ["from_revision"], "properties": {"from_revision": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"}, "note": {"type": "string", "maxLength": 200}}},
+        "policy_ceiling": {"type": "object", "additionalProperties": false, "required": ["ceiling_setting"], "properties": {"ceiling_setting": {"$ref": "#/$defs/settingId"}, "note": {"type": "string", "maxLength": 200}}}
+      },
+      "allOf": [
+        {
+          "$comment": "A reference default (route/worktree/workflow/skill/plugin/capability) must be a typed id/digest reference, never a free-text string.",
+          "if": {"required": ["ref_kind"]},
+          "then": {"properties": {"type": {"enum": ["id_ref", "digest_ref"]}}}
+        },
+        {
+          "$comment": "id_ref and digest_ref settings must name their reference kind and constrain the default to a pattern-validated id/digest.",
+          "if": {"properties": {"type": {"const": "id_ref"}}, "required": ["type"]},
+          "then": {"required": ["ref_kind"], "properties": {"default": {"$ref": "#/$defs/idRefValue"}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "digest_ref"}}, "required": ["type"]},
+          "then": {"required": ["ref_kind"], "properties": {"default": {"$ref": "#/$defs/digestRefValue"}}}
+        },
+        {
+          "$comment": "A free-text string setting is never a capability reference.",
+          "if": {"properties": {"type": {"const": "string"}}, "required": ["type"]},
+          "then": {"not": {"required": ["ref_kind"]}, "properties": {"default": {"type": "string", "maxLength": 200}}}
+        },
+        {
+          "$comment": "An enum setting enumerates its allowed values and its default is one of them (membership is enforced by the reference validator).",
+          "if": {"properties": {"type": {"const": "enum"}}, "required": ["type"]},
+          "then": {"required": ["allowed_values"], "properties": {"default": {"type": "string"}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "int"}}, "required": ["type"]},
+          "then": {"properties": {"default": {"type": "integer"}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "bool"}}, "required": ["type"]},
+          "then": {"properties": {"default": {"type": "boolean"}}}
+        },
+        {
+          "$comment": "Criterion 2: a secret or path-like field is authority-owned, carries no browser-serializable default, and can never own a personal or project scope.",
+          "if": {"anyOf": [
+            {"properties": {"sensitivity": {"const": "secret"}}, "required": ["sensitivity"]},
+            {"properties": {"path_like": {"const": true}}, "required": ["path_like"]}
+          ]},
+          "then": {"properties": {"scope": {"enum": ["deployment", "policy"]}}, "not": {"required": ["default"]}}
+        }
+      ]
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-settings-descriptor/v1"},
+    "catalog_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"},
+    "revision": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "catalog_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "scope_precedence": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/scope"},
+      "description": "A total ordering of every scope, highest authority first. A run resolves a value at the highest-precedence scope that owns it, so the order must be a permutation of every scope with no omission or duplicate."
+    },
+    "settings": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"$ref": "#/$defs/descriptor"}}
+  }
+}

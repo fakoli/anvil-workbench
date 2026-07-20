@@ -48,6 +48,7 @@ SCHEMA_FOR_EXAMPLE = {
     "chat.conversation.v1.json": "chat-conversation.v1.schema.json",
     "chat.turn.user-voice.v1.json": "chat-turn.v1.schema.json",
     "chat.turn.assistant-interrupted.v1.json": "chat-turn.v1.schema.json",
+    "settings-descriptor.v1.json": "settings-descriptor.v1.schema.json",
 }
 
 

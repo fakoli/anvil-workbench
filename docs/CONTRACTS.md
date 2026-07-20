@@ -130,3 +130,15 @@ An approval is one-time, expires, is scoped to a bridge, and binds the canonical
 Neo4j is a deterministic, idempotent projection keyed by source kind, source identifier, and source hash. It may contain State event metadata, work-packet metadata, Serving route/evaluation metadata, PR references, approvals, and redacted evidence artifacts.
 
 It must not contain raw transcripts or message arrays, accept generic Cypher from agents, execute writes on behalf of agents, or return an approval decision. Graph output is evidence and recommendation context only.
+
+## Settings and preferences descriptor (proposed)
+
+This describes a **proposed** contract resource, not an implemented endpoint. No live API reads or writes it yet; it is the shape-and-authority companion to the [settings descriptor schema](contracts/schemas/settings-descriptor.v1.schema.json) and [example catalog](contracts/examples/settings-descriptor.v1.json) that a later Settings implementation (milestone-4 `preferences-configuration` F001) must adopt.
+
+A settings descriptor catalog is a reviewed, version-pinned, digest-bearing list of every initial setting. Each descriptor declares its type, allowed values or bounds, default, exactly one owning scope, sensitivity, mutability, dependencies, optional migration, an optional authority-owned policy ceiling, and application timing. The catalog also pins `scope_precedence`, a total order over every scope. Three boundaries are load-bearing:
+
+- **One owning scope, deterministic precedence.** Each setting owns exactly one scope (`personal`, `project`, `deployment`, or `policy`). `scope_precedence` is a permutation of all four scopes, so effective-value resolution is deterministic. A `policy_ceiling` must be owned by a strictly higher-authority scope, so a personal value can never exceed a project/deployment/policy bound — a personal preference cannot override a route policy, capability profile, approval gate, or retention ceiling.
+- **Secret and path-like fields never serialize.** A `secret`-sensitivity or path-like descriptor is authority-owned (`deployment`/`policy`), carries no browser-serializable default, and is dropped entirely by the actor/project projection (`workbench.contracts.settings_actor_view`) — defence-in-depth behind the schema guard. No secret, token, credential, endpoint, or local path can reach a preference API or a redacted export.
+- **Capability defaults are typed references.** A route, worktree, workflow, skill, plugin, or capability default is an `id_ref` or `digest_ref` bound to a pattern-validated allowed id or SHA-256 digest, never free text.
+
+`workbench.contracts.validate_settings_descriptor` is the reference fail-closed check (digest recompute, precedence total order, ceiling authority, secret/path exclusion, reference-kind completeness and typing). The catalog is a proposed contract resource until code and tests wire it into a Settings store and API.
