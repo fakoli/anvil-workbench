@@ -255,7 +255,7 @@ class StateReader:
     ) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             args, cwd=worktree_root or self.settings.project_root,
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()[:500]
@@ -282,7 +282,7 @@ class StateReader:
     def _current_branch(worktree_root: Path) -> str:
         completed = subprocess.run(
             ["git", "branch", "--show-current"], cwd=worktree_root,
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
         branch = completed.stdout.strip() if completed.returncode == 0 else ""
         if not branch:
@@ -653,7 +653,7 @@ class ApprovedActionRunner:
 
     def _run(self, *args: str, environment: Mapping[str, str] | None = None) -> str:
         completed = subprocess.run(
-            args, cwd=self.worktree_root, capture_output=True, text=True,
+            args, cwd=self.worktree_root, capture_output=True, text=True, encoding="utf-8", errors="replace",
             check=False, env=environment,
         )
         if completed.returncode != 0:

@@ -274,7 +274,7 @@ class StateSnapshotAdapter:
 
     def _run_snapshot(self, operation: PinnedStateOperation, args: Sequence[str]) -> str:
         completed = subprocess.run(
-            list(args), cwd=self._cwd, capture_output=True, text=True, check=False,
+            list(args), cwd=self._cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()[:500]
