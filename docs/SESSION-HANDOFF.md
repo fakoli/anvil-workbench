@@ -108,5 +108,27 @@ Decisions. Signed proof records live in the anvil workspace `proofs/` dir.
    (create/list/search/rename/archive, appends and branch/retry routed through
    `validate_turn_append`, cross-actor probes indistinguishable from a missing
    conversation, streaming turns recovered as `interrupted` after reload,
-   content-free audit; `tests/test_conversation_store.py` is hermetic) — the
-   API projection and the production Postgres backend are still pending.
+   content-free audit; `tests/test_conversation_store.py` is hermetic). The
+   retention/deletion slice (T002.3) now exists too: the turn content hash
+   was converted from an unkeyed domain-separated SHA-256 to a server-keyed
+   HMAC-SHA256 fingerprint (`hmac-sha256:<hex>`, PRD R008 — the hub key is
+   constructor-injected into `MemoryConversationStore`, held on the instance
+   only, never persisted next to the hashes, and reads re-verify live turns'
+   fingerprints fail-closed; identical content under different keys yields
+   different values, closing the audit content-equality/dictionary oracle for
+   parties without the key), `delete_conversation` implements the contract's
+   two deletion modes (`purge_content_keep_tombstone` leaves the identity row
+   plus content-purged tombstone turns keeping only lifecycle, lineage, voice
+   events, and the keyed fingerprint; `purge_all_records` removes the
+   conversation and turns entirely) through a persisted, audited
+   `deletion_pending` -> `deleted` lifecycle, and `enforce_retention(now)`
+   applies exactly the ceilings `chat-conversation.v1` declares — the
+   per-conversation `retention.delete_after` instant plus reconciliation of a
+   crashed pending deletion; no invented policy fields. Purges remove content
+   blocks and titles from the rows themselves (a purged record refuses
+   content at construction, so the purge is one-way), and
+   `tests/test_conversation_retention.py` proves each criterion hermetically,
+   including that a fresh store instance over the same rows recovers nothing.
+   The API projection and the production Postgres backend are still pending;
+   the API slice must source the content-hash key from hub configuration
+   (constructor/env), never from the row store.

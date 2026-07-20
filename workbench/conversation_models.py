@@ -28,6 +28,15 @@ hidden/encrypted model reasoning, on the turn records or on the safe audit
 shapes.  The audit models expose lifecycle, lineage, hash, and bounded count
 metadata only — never message content.
 
+The content fingerprint is a keyed HMAC-SHA256 (chat-first-voice PRD R008):
+the hub holds the key and injects it at store construction; it is never
+persisted next to the hashes, so persisted metadata is not a content-equality
+or dictionary oracle for parties without the key.  Retention/deletion
+tombstoning (:func:`purge_turn_content`) removes content blocks from the row
+outright, keeping only lifecycle, lineage, typed voice events, and that
+fingerprint; a purged record refuses content at construction, so the purge is
+one-way.
+
 Deliberate scope omissions versus ``chat-turn.v1``: the ``route`` (with its
 assistant-requires-route/request_id conditional), ``usage``,
 ``advanced_controls``, and context blocks are Serving-integration concerns
@@ -38,8 +47,9 @@ that slice lands.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from .contracts import canonical_json_bytes
@@ -81,9 +91,16 @@ _ACTOR_ID = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
 _POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 _REDACTION_RULESET = re.compile(r"^[a-z][a-z0-9._-]{1,127}$")
 
-# Domain separation so a chat content hash can never collide with a contract
-# digest computed over the same bytes (see docs/contracts/DIGESTING.md idiom).
+# Domain separation so a chat content fingerprint can never collide with a
+# contract digest computed over the same bytes (see docs/contracts/DIGESTING.md
+# idiom).  The fingerprint is a KEYED HMAC-SHA256 (chat-first-voice PRD R008):
+# chat prompts are low-entropy and guessable, so an unkeyed digest persisted in
+# metadata/audit rows would be a content-equality/dictionary oracle.  The hub
+# holds the key, injects it at store construction, and never persists it next
+# to the hashes.
 _CHAT_CONTENT_PREFIX = b"anvil-workbench/chat-turn-content/v1\0"
+MIN_CONTENT_HASH_KEY_BYTES = 16
+_CONTENT_HASH = re.compile(r"^hmac-sha256:[a-f0-9]{64}$")
 
 
 def _require(condition: bool, message: str) -> None:
@@ -123,6 +140,14 @@ class RetentionPolicy:
             self.voice_transcript_text in RETENTION_VALUES,
             f"retention voice_transcript_text is not allowlisted: {self.voice_transcript_text!r}",
         )
+        # ``delete_after`` is the contract's only age ceiling (chat-conversation.v1
+        # retention block); it must be a timezone-aware instant so an enforcement
+        # sweep can compare it fail-closed against an aware "now".
+        if self.delete_after is not None:
+            _require(
+                isinstance(self.delete_after, datetime) and self.delete_after.tzinfo is not None,
+                "retention delete_after must be a timezone-aware datetime",
+            )
 
 
 @dataclass(frozen=True)
@@ -135,6 +160,9 @@ class ConversationDeletion:
 
     def __post_init__(self) -> None:
         _require(self.mode in DELETION_MODES, f"deletion mode is not allowlisted: {self.mode!r}")
+        _require(isinstance(self.requested_at, datetime), "deletion requested_at must be a datetime")
+        if self.completed_at is not None:
+            _require(isinstance(self.completed_at, datetime), "deletion completed_at must be a datetime")
 
 
 @dataclass(frozen=True)
@@ -161,6 +189,11 @@ class Conversation:
             _require(isinstance(self.deletion, ConversationDeletion), f"conversation status {self.status!r} requires a deletion record")
         else:
             _require(self.deletion is None, f"conversation status {self.status!r} must not carry a deletion record")
+        # A ``deleted`` row is the post-purge tombstone: identity, lifecycle,
+        # and counts only.  The title is untrusted prose content and must not
+        # survive the purge.
+        if self.status == "deleted":
+            _require(self.title is None, "a deleted conversation tombstone must not retain a title")
 
 
 @dataclass(frozen=True)
@@ -236,15 +269,35 @@ class TurnRedaction:
         _require(isinstance(self.ruleset, str) and bool(_REDACTION_RULESET.match(self.ruleset)), "redaction ruleset is invalid")
 
 
-def turn_content_hash(content: tuple[ContentBlock, ...] | list[ContentBlock]) -> str:
-    """Deterministic ``sha256:<hex>`` hash over the canonical content blocks."""
+def require_content_hash_key(key: bytes) -> bytes:
+    """Fail closed unless ``key`` is a usable server-held fingerprint key.
+
+    The key is hub configuration (constructor/environment supplied); it must
+    never be persisted next to the fingerprints it keys.
+    """
+    _require(
+        isinstance(key, bytes) and len(key) >= MIN_CONTENT_HASH_KEY_BYTES,
+        f"content hash key must be bytes of at least {MIN_CONTENT_HASH_KEY_BYTES} octets",
+    )
+    return key
+
+
+def turn_content_hash(content: tuple[ContentBlock, ...] | list[ContentBlock], *, key: bytes) -> str:
+    """Keyed ``hmac-sha256:<hex>`` fingerprint over the canonical content blocks.
+
+    Identical content under different keys yields different fingerprints, so a
+    party holding persisted metadata but not the hub key cannot test content
+    equality or run a dictionary of guessed prompts against the stored values.
+    """
+    require_content_hash_key(key)
     for block in content:
         _require(isinstance(block, ContentBlock), "content hash input must be ContentBlock values")
     payload = [
         {"content_trust": block.content_trust, "kind": block.kind, "text": block.text}
         for block in content
     ]
-    return "sha256:" + hashlib.sha256(_CHAT_CONTENT_PREFIX + canonical_json_bytes(payload)).hexdigest()
+    digest = hmac.new(key, _CHAT_CONTENT_PREFIX + canonical_json_bytes(payload), hashlib.sha256)
+    return "hmac-sha256:" + digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -270,6 +323,10 @@ class Turn:
     voice_events: tuple[VoiceEvent, ...] = ()
     created_at: datetime = field(default_factory=now_utc)
     completed_at: datetime | None = None
+    #: True only on a retention/deletion tombstone: the content blocks were
+    #: removed from the row and only lifecycle, lineage, typed voice events,
+    #: and the keyed content fingerprint survive.
+    content_purged: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "content", tuple(self.content))
@@ -291,15 +348,35 @@ class Turn:
         for event in self.voice_events:
             _require(isinstance(event, VoiceEvent), "turn voice events must contain VoiceEvent values")
         _require(self.lineage.parent_turn_id != self.id, "a turn cannot be its own lineage parent")
-        # The stored hash must always recompute from the stored content, so a
-        # content rewrite can never hide behind a stale hash.
-        _require(self.content_hash == turn_content_hash(self.content), "turn content hash does not match its content")
+        # The fingerprint is keyed, so the record can only check its shape here;
+        # the store recomputes it with the hub key (:meth:`verify_content_hash`)
+        # so a content rewrite can never hide behind a stale hash.
+        _require(
+            isinstance(self.content_hash, str) and bool(_CONTENT_HASH.match(self.content_hash)),
+            "turn content hash is invalid",
+        )
+        _require(isinstance(self.content_purged, bool), "turn content_purged must be a bool")
+        if self.content_purged:
+            _require(self.content == (), "a content-purged turn must not carry content blocks")
         if self.redaction.status == "metadata_only":
             _require(self.content == (), "a metadata_only turn must not persist content text")
         if self.status == "streaming":
             _require(self.completed_at is None, "a streaming turn cannot carry completed_at")
         else:
             _require(self.completed_at is not None, f"a {self.status} turn requires completed_at")
+
+    def verify_content_hash(self, key: bytes) -> None:
+        """Fail closed unless the stored fingerprint recomputes from the stored content.
+
+        A content-purged tombstone deliberately keeps the fingerprint of the
+        purged content, so recomputation is meaningless there; callers must
+        skip purged tombstones (calling anyway fails closed).
+        """
+        _require(not self.content_purged, "a content-purged turn's fingerprint cannot recompute")
+        _require(
+            self.content_hash == turn_content_hash(self.content, key=key),
+            "turn content hash does not match its content",
+        )
 
     @property
     def committed(self) -> bool:
@@ -327,8 +404,9 @@ def make_turn(
     voice_events: tuple[VoiceEvent, ...] | list[VoiceEvent] = (),
     created_at: datetime | None = None,
     completed_at: datetime | None = None,
+    content_hash_key: bytes,
 ) -> Turn:
-    """Build a turn with its content hash computed from the canonical content."""
+    """Build a live turn with its keyed fingerprint computed from the content."""
     return Turn(
         id=id,
         conversation_id=conversation_id,
@@ -337,12 +415,26 @@ def make_turn(
         status=status,
         lineage=lineage,
         content=tuple(content),
-        content_hash=turn_content_hash(tuple(content)),
+        content_hash=turn_content_hash(tuple(content), key=content_hash_key),
         redaction=redaction,
         voice_events=tuple(voice_events),
         created_at=created_at if created_at is not None else now_utc(),
         completed_at=completed_at,
     )
+
+
+def purge_turn_content(turn: Turn) -> Turn:
+    """Project one turn into its content-purged tombstone.
+
+    The content blocks are REMOVED from the record, not flagged over: only
+    lifecycle (ids, role, mode, status, timestamps), lineage, typed voice
+    events, and the keyed content fingerprint survive.  Idempotent; the purged
+    marker is one-way because a purged record refuses content at construction.
+    """
+    _require(isinstance(turn, Turn), "purge requires a Turn value")
+    if turn.content_purged:
+        return turn
+    return replace(turn, content=(), content_purged=True)
 
 
 def validate_turn_append(
@@ -457,6 +549,7 @@ class TurnAudit:
     content_hash: str
     content_block_count: int
     voice_event_count: int
+    content_purged: bool
     created_at: datetime
     completed_at: datetime | None
 
@@ -495,6 +588,7 @@ def turn_audit(turn: Turn) -> TurnAudit:
         content_hash=turn.content_hash,
         content_block_count=len(turn.content),
         voice_event_count=len(turn.voice_events),
+        content_purged=turn.content_purged,
         created_at=turn.created_at,
         completed_at=turn.completed_at,
     )
