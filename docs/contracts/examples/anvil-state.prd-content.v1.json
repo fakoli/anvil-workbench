@@ -1,6 +1,6 @@
 {
   "schema_version": "workbench-prd-content/v1",
-  "content_digest": "sha256:96f92d30112e023ccf7c7d4791cbc161bf61f7527b6d91c1a49f929a8f9cb5d7",
+  "content_digest": "sha256:52b31cae309d64e335d05382f1102c31199092283c78e5ffc5dfcbdd355c1706",
   "provider": "anvil-state",
   "generated_at": "2026-07-19T00:00:00Z",
   "prd": {
@@ -18,6 +18,6 @@
   },
   "redaction": {
     "status": "redacted",
-    "ruleset": "workbench.default.v1"
+    "ruleset": "workbench-default-v1"
   }
 }

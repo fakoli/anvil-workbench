@@ -245,7 +245,7 @@ def test_delivery_fixture_has_a_terminal_success_path_and_reconciliation_for_eff
 COMMAND_LIKE = re.compile(
     r"(?i)(?:^|\s)(?:python|pytest|git|npm|npx|pip|uv|bash|sh|pwsh|powershell|curl|wget|docker|rm|del)\s+[-.\w]"
 )
-HOST_PATH_LIKE = re.compile(r"(?i)(?:^[A-Za-z]:[\\/]|^/(?:home|users|tmp|var|etc)/|\\\\)")
+HOST_PATH_LIKE = re.compile(r"(?i)(?:[A-Za-z]:[\\/]|/(?:home|users|tmp|var|etc)/|\\\\)")
 
 
 def test_contract_examples_are_redacted_and_digest_shaped() -> None:

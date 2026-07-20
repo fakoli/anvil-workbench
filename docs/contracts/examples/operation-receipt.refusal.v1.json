@@ -17,7 +17,7 @@
   },
   "redaction": {
     "status": "metadata_only",
-    "ruleset": "workbench.default.v1"
+    "ruleset": "workbench-default-v1"
   },
   "error": {
     "code": "catalog.digest_drift",

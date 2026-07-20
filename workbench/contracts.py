@@ -41,11 +41,13 @@ _PREFIXES = {
 
 
 def _reject_floats(value: Any) -> None:
-    """Enforce the DIGESTING.md domain: no floating-point value may be digested."""
+    """Enforce the DIGESTING.md domain: string keys only, no floats anywhere."""
     if isinstance(value, float):
         raise ContractValidationError("floating-point values are not permitted in digest-bearing resource fields")
     if isinstance(value, Mapping):
-        for nested in value.values():
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise ContractValidationError("non-string object keys are not permitted in digest-bearing resources")
             _reject_floats(nested)
     elif isinstance(value, (list, tuple)):
         for nested in value:

@@ -16,7 +16,7 @@
     "idempotency_key": {"type": "string", "maxLength": 256},
     "external_ref": {"type": "object", "maxProperties": 16, "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"}, "additionalProperties": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,160}$"}},
     "evidence_refs": {"type": "array", "maxItems": 64, "items": {"type": "string", "pattern": "^(?:evidence|artifact|state_event|route|verification)_[A-Za-z0-9._-]{1,128}$"}},
-    "correlation": {"type": "object", "additionalProperties": false, "properties": {"task_id": {"type": "string"}, "request_id": {"type": "string"}, "traceparent": {"type": "string", "maxLength": 256}}},
+    "correlation": {"type": "object", "additionalProperties": false, "properties": {"task_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?$", "description": "Scoped <prd_id>:<task_id> display/correlation reference; carries no authority."}, "request_id": {"type": "string"}, "traceparent": {"type": "string", "maxLength": 256}}},
     "redaction": {"type": "object", "additionalProperties": false, "required": ["status", "ruleset"], "properties": {"status": {"enum": ["redacted", "metadata_only"]}, "ruleset": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}}},
     "error": {"type": "object", "additionalProperties": false, "required": ["code", "safe_summary", "retryable"], "properties": {"code": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}, "safe_summary": {"type": "string", "maxLength": 500, "not": {"pattern": "(?i:authorization|bearer|api[_ -]?key|github[_ -]?token|password|secret)"}}, "retryable": {"type": "boolean"}}},
     "started_at": {"type": "string", "format": "date-time"},
