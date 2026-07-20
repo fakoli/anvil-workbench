@@ -22,7 +22,9 @@ from workbench.contracts import (
     contract_digest,
     validate_bridge_command_snapshot,
     validate_catalog,
+    validate_prd_content,
     validate_profile,
+    validate_state_snapshot,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,7 +104,7 @@ def test_catalog_profile_workflow_and_context_examples_reference_declared_operat
     assert profile_keys <= operation_keys
 
     workflow = _load(EXAMPLES / "delivery.workflow.v2.json")
-    assert contract_digest("workflow", workflow) == "sha256:debbde33e9826df965d26112fc3ea785ccaf3b456e115dd18d8afa8459a58994"
+    assert contract_digest("workflow", workflow) == "sha256:08eb89de05b27a1d22db4b26ca743f4e5cf60b47efca0f5ff0d5fc65d868e73a"
     workflow_keys = {_operation_key(step["operation"]) for step in workflow["steps"] if step["kind"] == "operation"}
     assert workflow_keys <= profile_keys
 
@@ -240,6 +242,12 @@ def test_delivery_fixture_has_a_terminal_success_path_and_reconciliation_for_eff
     )
 
 
+COMMAND_LIKE = re.compile(
+    r"(?i)(?:^|\s)(?:python|pytest|git|npm|npx|pip|uv|bash|sh|pwsh|powershell|curl|wget|docker|rm|del)\s+[-.\w]"
+)
+HOST_PATH_LIKE = re.compile(r"(?i)(?:^[A-Za-z]:[\\/]|^/(?:home|users|tmp|var|etc)/|\\\\)")
+
+
 def test_contract_examples_are_redacted_and_digest_shaped() -> None:
     example_text = "\n".join(path.read_text(encoding="utf-8").lower() for path in EXAMPLES.glob("*.json"))
     for forbidden in ("api_key", "authorization", "password", "secret", "github_token", "state.db"):
@@ -247,8 +255,12 @@ def test_contract_examples_are_redacted_and_digest_shaped() -> None:
 
     for path in EXAMPLES.glob("*.json"):
         for value in _walk(_load(path)):
-            if isinstance(value, str) and value.startswith("sha256:"):
+            if not isinstance(value, str):
+                continue
+            if value.startswith("sha256:"):
                 assert DIGEST.fullmatch(value), (path, value)
+            assert not COMMAND_LIKE.search(value), (path, value)
+            assert not HOST_PATH_LIKE.search(value), (path, value)
 
 
 def test_contract_schemas_reject_privilege_and_binding_shortcuts() -> None:
@@ -339,6 +351,87 @@ def test_prd_content_read_is_bounded_digest_stable_and_rejects_path_smuggling() 
     unbounded["content"]["body"] = "x" * 65537
     with pytest.raises(ValidationError):
         validator.validate(unbounded)
+
+
+def test_digest_domain_rejects_empty_key_stripping_and_floats() -> None:
+    assert approval_payload_digest({"": "smuggled", "a": 1}) != approval_payload_digest({"a": 1})
+
+    with pytest.raises(ContractValidationError, match="floating-point"):
+        contract_digest("approval-payload", {"amount": 1.5})
+    with pytest.raises(ContractValidationError, match="floating-point"):
+        contract_digest("state-snapshot", {"prds": [{"weight": 0.25}]})
+
+
+def test_state_snapshot_reference_validator_fails_closed() -> None:
+    snapshot = _load(EXAMPLES / "anvil-state.project-snapshot.v1.json")
+    validate_state_snapshot(snapshot)
+
+    drifted = copy.deepcopy(snapshot)
+    drifted["tasks"][0]["title"] += "!"
+    with pytest.raises(ContractValidationError, match="digest mismatch"):
+        validate_state_snapshot(drifted)
+
+    def rehash(payload):
+        payload["snapshot_digest"] = contract_digest("state-snapshot", payload)
+        return payload
+
+    mismatched = rehash(copy.deepcopy(snapshot))
+    mismatched["tasks"][0]["scoped_id"] = "release-alpha:T999"
+    with pytest.raises(ContractValidationError, match="scoped_id"):
+        validate_state_snapshot(rehash(mismatched))
+
+    orphaned = copy.deepcopy(snapshot)
+    orphaned["tasks"][0]["ref"]["prd_id"] = "release-gamma"
+    orphaned["tasks"][0]["scoped_id"] = "release-gamma:T001"
+    with pytest.raises(ContractValidationError, match="unknown PRD"):
+        validate_state_snapshot(rehash(orphaned))
+
+    duplicated = copy.deepcopy(snapshot)
+    duplicated["tasks"].append(copy.deepcopy(duplicated["tasks"][0]))
+    with pytest.raises(ContractValidationError, match="duplicate task reference"):
+        validate_state_snapshot(rehash(duplicated))
+
+
+def test_prd_content_reference_validator_enforces_byte_bounds() -> None:
+    document = _load(EXAMPLES / "anvil-state.prd-content.v1.json")
+    validate_prd_content(document)
+
+    def rehash(payload):
+        payload["content_digest"] = contract_digest("prd-content", payload)
+        return payload
+
+    lying = copy.deepcopy(document)
+    lying["content"]["truncated"] = False
+    with pytest.raises(ContractValidationError, match="total_bytes"):
+        validate_prd_content(rehash(lying))
+
+    shrunk = copy.deepcopy(document)
+    shrunk["content"]["total_bytes"] = 1
+    with pytest.raises(ContractValidationError, match="total_bytes"):
+        validate_prd_content(rehash(shrunk))
+
+
+def test_state_catalog_declares_both_required_read_surfaces_with_scoped_mutation_refs() -> None:
+    catalog = _load(EXAMPLES / "anvil-state.catalog.v1.json")
+    operations = {operation["id"]: operation for operation in catalog["operations"]}
+    assert {"state.project.snapshot", "state.prd.read_content"} <= set(operations)
+    for read_id in ("state.project.snapshot", "state.prd.read_content"):
+        assert operations[read_id]["effect"] == "read"
+
+    snapshot = _load(EXAMPLES / "anvil-state.project-snapshot.v1.json")
+    assert snapshot["source"]["read_operation_id"] in operations
+
+    scoped = re.compile(r"^\^\[a-z0-9\]")
+    for mutation_id in ("state.task.claim", "state.evidence.submit"):
+        properties = operations[mutation_id]["input_schema"]["properties"]
+        assert "task_id" not in properties, "bare task_id must not appear at a state-mutation boundary"
+        assert scoped.match(properties["task_ref"]["pattern"])
+
+    merge = next(
+        operation for operation in _load(EXAMPLES / "project-bridge.catalog.v1.json")["operations"]
+        if operation["id"] == "bridge.github.merge_and_accept"
+    )
+    assert "task_ref" in merge["input_schema"]["required"]
 
 
 def test_refusal_receipt_example_is_a_typed_preflight_denial() -> None:

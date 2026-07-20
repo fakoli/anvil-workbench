@@ -5,11 +5,39 @@
   "run_id": "run_example",
   "bridge_id": "bridge_example",
   "project_id": "project_example",
-  "workflow_snapshot": {"workflow_digest": "sha256:debbde33e9826df965d26112fc3ea785ccaf3b456e115dd18d8afa8459a58994", "catalogs": [{"provider": "anvil-state", "digest": "sha256:b00800723b8f89fa300d30d854500d9c6fdc7aa2d8b2c62b03ad7baab7b26120"}], "capability_profile_digest": "sha256:375632a096ee8bc75fa6b42975f374a028029572cab7d724243fbba2ff77a163"},
-  "lease": {"worktree_name": "checkout-a", "epoch": 3},
-  "correlation": {"task_id": "T001", "request_id": "req_example"},
+  "workflow_snapshot": {
+    "workflow_digest": "sha256:08eb89de05b27a1d22db4b26ca743f4e5cf60b47efca0f5ff0d5fc65d868e73a",
+    "catalogs": [
+      {
+        "provider": "anvil-state",
+        "digest": "sha256:2760ef31410e21712f2473a84d9a7e83ecf9dede66e0bb5e3086b7e7aadd9a1a"
+      }
+    ],
+    "capability_profile_digest": "sha256:441250e1309aadd1eb1ffb543e0de05816f7a40e7e671a3f35aae56824f7252e"
+  },
+  "lease": {
+    "worktree_name": "checkout-a",
+    "epoch": 3
+  },
+  "correlation": {
+    "task_id": "release-beta:T001",
+    "request_id": "req_example"
+  },
   "idempotency_key": "run:run_example:step:evidence:attempt:1",
   "issued_at": "2026-07-19T00:00:00Z",
   "expires_at": "2026-07-19T00:05:00Z",
-  "payload": {"operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0", "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"}, "inputs": {"task_id": "T001", "verification_receipt_ids": ["rcpt_verification"]}}
+  "payload": {
+    "operation": {
+      "provider": "anvil-state",
+      "id": "state.evidence.submit",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:40dc36beb9ee974f311134a24416936a09881c8ac4087400987026e77ae9a033"
+    },
+    "inputs": {
+      "task_ref": "release-beta:T001",
+      "verification_receipt_ids": [
+        "rcpt_verification"
+      ]
+    }
+  }
 }

@@ -29,7 +29,7 @@
       "required": ["format", "body", "truncated", "total_bytes"],
       "properties": {
         "format": {"enum": ["markdown", "plain_text"]},
-        "body": {"type": "string", "maxLength": 65536},
+        "body": {"type": "string", "maxLength": 65536, "description": "JSON Schema maxLength bounds code points; the normative bound is 65536 UTF-8 BYTES, enforced fail-closed by the bridge and workbench.contracts.validate_prd_content before publication."},
         "truncated": {"type": "boolean"},
         "total_bytes": {"type": "integer", "minimum": 0}
       }

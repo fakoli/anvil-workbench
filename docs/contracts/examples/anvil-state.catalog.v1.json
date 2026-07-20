@@ -2,23 +2,196 @@
   "schema_version": "anvil-operation-catalog/v1",
   "provider": "anvil-state",
   "catalog_version": "1.0.0",
-  "catalog_digest": "sha256:b00800723b8f89fa300d30d854500d9c6fdc7aa2d8b2c62b03ad7baab7b26120",
+  "catalog_digest": "sha256:2760ef31410e21712f2473a84d9a7e83ecf9dede66e0bb5e3086b7e7aadd9a1a",
   "generated_at": "2026-07-19T00:00:00Z",
   "operations": [
+    {
+      "id": "state.project.snapshot",
+      "title": "Read the State project snapshot",
+      "summary": "Publish the bounded, digest-keyed projection of the project's PRD, plan, and task hierarchy through the supported State surface. Read-only; the snapshot digest is the hub's idempotent publication key.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:855294e966e10198f73dbe10292ff471d4f60ccd63ab81239d96bff940d4d30d",
+      "effect": "read",
+      "execution": {
+        "kind": "bridge_adapter",
+        "bridge_adapter": "state.cli.project_snapshot",
+        "transport": "state_cli",
+        "deadline_seconds": 60
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "snapshot_digest"
+        ],
+        "properties": {
+          "snapshot_digest": {
+            "type": "string"
+          }
+        }
+      },
+      "preconditions": [
+        "bridge.connected"
+      ],
+      "gates": {
+        "preview": "not_supported",
+        "confirmation": "not_required",
+        "human_approval": "not_required",
+        "approval_action": null
+      },
+      "idempotency": {
+        "key_scope": "run_step",
+        "replay": "return_prior_receipt",
+        "max_attempts": 3
+      },
+      "receipts": [
+        "state_snapshot"
+      ],
+      "failure": "fail",
+      "docs": "docs/CONTRACTS.md#anvil-state-contract"
+    },
+    {
+      "id": "state.prd.read_content",
+      "title": "Read bounded PRD content",
+      "summary": "Read one PRD's human-readable content as a bounded, redacted, digest-attributed document for display. Read-only untrusted task data; it grants no capability.",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:9aae462fd1fb92fc3b9fb057e36cb4dfd3349a678e245b864fbb9aa486642790",
+      "effect": "read",
+      "execution": {
+        "kind": "bridge_adapter",
+        "bridge_adapter": "state.cli.prd_read_content",
+        "transport": "state_cli",
+        "deadline_seconds": 60
+      },
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "prd_id"
+        ],
+        "properties": {
+          "prd_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "content_digest",
+          "truncated"
+        ],
+        "properties": {
+          "content_digest": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
+      },
+      "preconditions": [
+        "bridge.connected"
+      ],
+      "gates": {
+        "preview": "not_supported",
+        "confirmation": "not_required",
+        "human_approval": "not_required",
+        "approval_action": null
+      },
+      "idempotency": {
+        "key_scope": "run_step",
+        "replay": "return_prior_receipt",
+        "max_attempts": 3
+      },
+      "receipts": [
+        "state_prd_content"
+      ],
+      "failure": "fail",
+      "docs": "docs/CONTRACTS.md#anvil-state-contract"
+    },
     {
       "id": "state.task.claim",
       "title": "Claim a State task",
       "summary": "Acquire a task lease through the supported State CLI/MCP surface in the bridge-resolved leased worktree, then attest the selected branch before Codex starts.",
       "contract_version": "1.0.0",
-      "operation_digest": "sha256:ec20c724a2da09f742621ad779ea3a61a106b4939e8cfb62e9426706299c9c28",
+      "operation_digest": "sha256:29b7a2bcfd96cd4de1f27c6a226ebf03e83b6543d46ce54f822c341c84ecf597",
       "effect": "state_mutation",
-      "execution": {"kind": "bridge_adapter", "bridge_adapter": "state.cli.claim", "transport": "state_cli", "deadline_seconds": 60},
-      "input_schema": {"type": "object", "required": ["task_id", "actor", "worktree_name"], "properties": {"task_id": {"type": "string"}, "actor": {"type": "string"}, "worktree_name": {"type": "string", "description": "A bridge-configured leased worktree name, never a path."}}, "additionalProperties": false},
-      "output_schema": {"type": "object", "required": ["claim_id", "event_id", "branch"], "properties": {"claim_id": {"type": "string"}, "event_id": {"type": "string"}, "branch": {"type": "string"}}},
-      "preconditions": ["bridge.connected", "bridge.lease_valid", "worktree.configured", "task.ready", "task.unclaimed_or_owned"],
-      "gates": {"preview": "not_supported", "confirmation": "not_required", "human_approval": "not_required", "approval_action": null},
-      "idempotency": {"key_scope": "run_step", "replay": "return_prior_receipt", "max_attempts": 1},
-      "receipts": ["state_claim", "state_event"],
+      "execution": {
+        "kind": "bridge_adapter",
+        "bridge_adapter": "state.cli.claim",
+        "transport": "state_cli",
+        "deadline_seconds": 60
+      },
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "task_ref",
+          "actor",
+          "worktree_name"
+        ],
+        "properties": {
+          "task_ref": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?$",
+            "description": "A scoped <prd_id>:<task_id> reference; the owning PRD is mandatory because task IDs are only unique within one PRD."
+          },
+          "actor": {
+            "type": "string"
+          },
+          "worktree_name": {
+            "type": "string",
+            "description": "A bridge-configured leased worktree name, never a path."
+          }
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "claim_id",
+          "event_id",
+          "branch"
+        ],
+        "properties": {
+          "claim_id": {
+            "type": "string"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          }
+        }
+      },
+      "preconditions": [
+        "bridge.connected",
+        "bridge.lease_valid",
+        "worktree.configured",
+        "task.ready",
+        "task.unclaimed_or_owned"
+      ],
+      "gates": {
+        "preview": "not_supported",
+        "confirmation": "not_required",
+        "human_approval": "not_required",
+        "approval_action": null
+      },
+      "idempotency": {
+        "key_scope": "run_step",
+        "replay": "return_prior_receipt",
+        "max_attempts": 1
+      },
+      "receipts": [
+        "state_claim",
+        "state_event"
+      ],
       "failure": "reconcile",
       "docs": "docs/CONTRACTS.md#anvil-state-contract"
     },
@@ -27,15 +200,68 @@
       "title": "Submit State evidence",
       "summary": "Submit independently captured verification and declared changed-file evidence through the supported State surface.",
       "contract_version": "1.0.0",
-      "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228",
+      "operation_digest": "sha256:40dc36beb9ee974f311134a24416936a09881c8ac4087400987026e77ae9a033",
       "effect": "state_mutation",
-      "execution": {"kind": "bridge_adapter", "bridge_adapter": "state.cli.submit_evidence", "transport": "state_cli", "deadline_seconds": 120},
-      "input_schema": {"type": "object", "required": ["task_id", "verification_receipt_ids"], "properties": {"task_id": {"type": "string"}, "verification_receipt_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}}}, "additionalProperties": false},
-      "output_schema": {"type": "object", "required": ["event_id"], "properties": {"event_id": {"type": "string"}}},
-      "preconditions": ["bridge.lease_valid", "work_packet.digest_matches", "verification.passed", "packet.declared_change_exists"],
-      "gates": {"preview": "not_supported", "confirmation": "not_required", "human_approval": "not_required", "approval_action": null},
-      "idempotency": {"key_scope": "run_step", "replay": "return_prior_receipt", "max_attempts": 1},
-      "receipts": ["state_evidence", "state_event"],
+      "execution": {
+        "kind": "bridge_adapter",
+        "bridge_adapter": "state.cli.submit_evidence",
+        "transport": "state_cli",
+        "deadline_seconds": 120
+      },
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "task_ref",
+          "verification_receipt_ids"
+        ],
+        "properties": {
+          "task_ref": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?$",
+            "description": "A scoped <prd_id>:<task_id> reference; the owning PRD is mandatory."
+          },
+          "verification_receipt_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "event_id"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string"
+          }
+        }
+      },
+      "preconditions": [
+        "bridge.lease_valid",
+        "work_packet.digest_matches",
+        "verification.passed",
+        "packet.declared_change_exists"
+      ],
+      "gates": {
+        "preview": "not_supported",
+        "confirmation": "not_required",
+        "human_approval": "not_required",
+        "approval_action": null
+      },
+      "idempotency": {
+        "key_scope": "run_step",
+        "replay": "return_prior_receipt",
+        "max_attempts": 1
+      },
+      "receipts": [
+        "state_evidence",
+        "state_event"
+      ],
       "failure": "reconcile",
       "docs": "docs/CONTRACTS.md#state-writes"
     }

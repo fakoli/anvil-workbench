@@ -40,8 +40,21 @@ _PREFIXES = {
 }
 
 
+def _reject_floats(value: Any) -> None:
+    """Enforce the DIGESTING.md domain: no floating-point value may be digested."""
+    if isinstance(value, float):
+        raise ContractValidationError("floating-point values are not permitted in digest-bearing resource fields")
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            _reject_floats(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _reject_floats(nested)
+
+
 def _canonical_json(value: Any) -> bytes:
     """Encode the restricted JSON contract domain in the documented canonical form."""
+    _reject_floats(value)
     return json.dumps(
         value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
@@ -66,7 +79,7 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
     """Return a copy normalized according to ``docs/contracts/DIGESTING.md``."""
     if kind not in _PREFIXES:
         raise ContractValidationError(f"unsupported contract digest kind: {kind}")
-    payload = _without(value, "operation_digest" if kind == "operation" else "")
+    payload = _without(value, "operation_digest") if kind == "operation" else _without(value)
     if kind == "catalog":
         payload = _without(value, "catalog_digest", "generated_at")
         operations = payload.get("operations")
@@ -137,6 +150,59 @@ def validate_profile(profile: Mapping[str, Any]) -> None:
     """Fail closed when a project capability profile has drifted."""
     if profile.get("digest") != contract_digest("profile", profile):
         raise ContractValidationError("capability profile digest mismatch")
+
+
+def validate_state_snapshot(snapshot: Mapping[str, Any]) -> None:
+    """Fail closed when a State project snapshot is internally inconsistent.
+
+    Schema validation cannot express these rules: the advertised digest must
+    recompute, every task must reference a PRD present in the snapshot, the
+    display ``scoped_id`` must equal its typed reference, and references must
+    be unique so the digest sort order is total and publication is idempotent.
+    """
+    if snapshot.get("snapshot_digest") != contract_digest("state-snapshot", snapshot):
+        raise ContractValidationError("state snapshot digest mismatch")
+    prds = snapshot.get("prds")
+    tasks = snapshot.get("tasks")
+    if not isinstance(prds, list) or not isinstance(tasks, list):
+        raise ContractValidationError("state snapshot prds/tasks are invalid")
+    prd_ids = {prd.get("prd_id") for prd in prds if isinstance(prd, Mapping)}
+    if len(prd_ids) != len(prds):
+        raise ContractValidationError("state snapshot PRD ids must be unique")
+    seen_refs: set[tuple[str, str]] = set()
+    for task in tasks:
+        ref = task.get("ref") if isinstance(task, Mapping) else None
+        if not isinstance(ref, Mapping):
+            raise ContractValidationError("state snapshot task has no typed reference")
+        key = (str(ref.get("prd_id")), str(ref.get("task_id")))
+        if key[0] not in prd_ids:
+            raise ContractValidationError(f"task reference names an unknown PRD: {key[0]}")
+        if key in seen_refs:
+            raise ContractValidationError(f"duplicate task reference: {key[0]}:{key[1]}")
+        seen_refs.add(key)
+        if task.get("scoped_id") != f"{key[0]}:{key[1]}":
+            raise ContractValidationError(f"scoped_id does not match its typed reference: {task.get('scoped_id')}")
+        for dependency in task.get("depends_on", ()):
+            if not isinstance(dependency, Mapping) or dependency.get("prd_id") not in prd_ids:
+                raise ContractValidationError("task dependency names an unknown PRD")
+
+
+def validate_prd_content(document: Mapping[str, Any]) -> None:
+    """Fail closed when a bounded PRD-content read breaks its own bounds."""
+    if document.get("content_digest") != contract_digest("prd-content", document):
+        raise ContractValidationError("prd content digest mismatch")
+    content = document.get("content")
+    if not isinstance(content, Mapping) or not isinstance(content.get("body"), str):
+        raise ContractValidationError("prd content body is invalid")
+    body_bytes = len(content["body"].encode("utf-8"))
+    if body_bytes > 65536:
+        raise ContractValidationError("prd content body exceeds the 64 KiB byte bound")
+    total = content.get("total_bytes")
+    truncated = content.get("truncated")
+    if truncated is False and total != body_bytes:
+        raise ContractValidationError("untruncated prd content must declare total_bytes equal to the body byte length")
+    if truncated is True and (not isinstance(total, int) or total <= body_bytes):
+        raise ContractValidationError("truncated prd content must declare total_bytes greater than the body byte length")
 
 
 def validate_bridge_command_snapshot(

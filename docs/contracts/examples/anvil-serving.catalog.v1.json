@@ -12,13 +12,95 @@
       "contract_version": "1.0.0",
       "operation_digest": "sha256:a5563505e4b241032f326707fb1840ac366b3905c8f23b91fe3742d2f822e98d",
       "effect": "bounded_execution",
-      "execution": {"kind": "bridge_adapter", "bridge_adapter": "serving.mcp.preflight_probe", "transport": "serving_mcp", "deadline_seconds": 7200},
-      "input_schema": {"type": "object", "required": ["target_id", "model", "checks", "timeout_seconds"], "properties": {"target_id": {"type": "string", "description": "Bridge-configured serving target name, never a browser URL."}, "model": {"type": "string"}, "checks": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"enum": ["smoke", "json", "needle", "tools"]}}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1798, "description": "Conservative cap: four checks remain under Serving's 7200-second workload limit."}}, "additionalProperties": false},
-      "output_schema": {"type": "object", "required": ["artifact_id", "applied", "returncode"], "properties": {"artifact_id": {"type": "string", "description": "Workbench-created redacted artifact reference; not a raw Serving return field."}, "applied": {"type": "boolean"}, "returncode": {"type": "integer"}, "route_correlation": {"type": "string", "description": "Present only when a correlation-capable Serving interface supplies it."}}},
-      "preconditions": ["target.declared", "model.declared_route", "target.bounded"],
-      "gates": {"preview": "not_supported", "confirmation": "required", "human_approval": "not_required", "approval_action": null},
-      "idempotency": {"key_scope": "run_step", "replay": "return_prior_receipt", "max_attempts": 1},
-      "receipts": ["preflight_artifact", "route_correlation"],
+      "execution": {
+        "kind": "bridge_adapter",
+        "bridge_adapter": "serving.mcp.preflight_probe",
+        "transport": "serving_mcp",
+        "deadline_seconds": 7200
+      },
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "target_id",
+          "model",
+          "checks",
+          "timeout_seconds"
+        ],
+        "properties": {
+          "target_id": {
+            "type": "string",
+            "description": "Bridge-configured serving target name, never a browser URL."
+          },
+          "model": {
+            "type": "string"
+          },
+          "checks": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "smoke",
+                "json",
+                "needle",
+                "tools"
+              ]
+            }
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1798,
+            "description": "Conservative cap: four checks remain under Serving's 7200-second workload limit."
+          }
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "artifact_id",
+          "applied",
+          "returncode"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "description": "Workbench-created redacted artifact reference; not a raw Serving return field."
+          },
+          "applied": {
+            "type": "boolean"
+          },
+          "returncode": {
+            "type": "integer"
+          },
+          "route_correlation": {
+            "type": "string",
+            "description": "Present only when a correlation-capable Serving interface supplies it."
+          }
+        }
+      },
+      "preconditions": [
+        "target.declared",
+        "model.declared_route",
+        "target.bounded"
+      ],
+      "gates": {
+        "preview": "not_supported",
+        "confirmation": "required",
+        "human_approval": "not_required",
+        "approval_action": null
+      },
+      "idempotency": {
+        "key_scope": "run_step",
+        "replay": "return_prior_receipt",
+        "max_attempts": 1
+      },
+      "receipts": [
+        "preflight_artifact",
+        "route_correlation"
+      ],
       "failure": "fail",
       "docs": "docs/OPERATOR-SKILLS-AND-SUBAGENTS.md#evaluation"
     }
