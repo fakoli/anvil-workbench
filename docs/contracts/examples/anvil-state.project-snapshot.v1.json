@@ -1,0 +1,77 @@
+{
+  "schema_version": "workbench-state-snapshot/v1",
+  "snapshot_digest": "sha256:5ddaacfaf8405e6e3f0d0a920e0f1f2b20afadded4f8d98748fb42868da0ad2e",
+  "provider": "anvil-state",
+  "generated_at": "2026-07-19T00:00:00Z",
+  "source": {
+    "provider_contract_version": "1.0.0",
+    "read_operation_id": "state.project.snapshot",
+    "state_schema_label": "16"
+  },
+  "project": {
+    "project_id": "project_example",
+    "name": "Anvil Workbench"
+  },
+  "prds": [
+    {
+      "content_trust": "untrusted_task_data",
+      "prd_id": "release-alpha",
+      "title": "Chat-first Workbench",
+      "status": "approved",
+      "revision": 4,
+      "target_version": "milestone-2"
+    },
+    {
+      "content_trust": "untrusted_task_data",
+      "prd_id": "release-beta",
+      "title": "State context and operations",
+      "status": "approved",
+      "revision": 5,
+      "target_version": "milestone-1"
+    }
+  ],
+  "tasks": [
+    {
+      "content_trust": "untrusted_task_data",
+      "ref": {
+        "prd_id": "release-alpha",
+        "task_id": "T001"
+      },
+      "scoped_id": "release-alpha:T001",
+      "title": "Add routed chat",
+      "status": "ready",
+      "priority": "critical",
+      "feature_id": "release-alpha:F001"
+    },
+    {
+      "content_trust": "untrusted_task_data",
+      "ref": {
+        "prd_id": "release-beta",
+        "task_id": "T001"
+      },
+      "scoped_id": "release-beta:T001",
+      "title": "Finalize the context, catalog, profile, and receipt contracts",
+      "status": "ready",
+      "priority": "critical",
+      "feature_id": "release-beta:F001"
+    },
+    {
+      "content_trust": "untrusted_task_data",
+      "ref": {
+        "prd_id": "release-beta",
+        "task_id": "T002.2"
+      },
+      "scoped_id": "release-beta:T002.2",
+      "title": "Implement the schema-versioned project-snapshot adapter",
+      "status": "ready",
+      "priority": "critical",
+      "feature_id": "release-beta:F002",
+      "depends_on": [
+        {
+          "prd_id": "release-beta",
+          "task_id": "T001"
+        }
+      ]
+    }
+  ]
+}

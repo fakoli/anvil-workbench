@@ -1,0 +1,23 @@
+{
+  "schema_version": "workbench-prd-content/v1",
+  "content_digest": "sha256:96f92d30112e023ccf7c7d4791cbc161bf61f7527b6d91c1a49f929a8f9cb5d7",
+  "provider": "anvil-state",
+  "generated_at": "2026-07-19T00:00:00Z",
+  "prd": {
+    "prd_id": "release-beta",
+    "title": "State context and operations",
+    "status": "approved",
+    "revision": 5
+  },
+  "content_trust": "untrusted_task_data",
+  "content": {
+    "format": "markdown",
+    "body": "# State context and operations\n\n## Summary\n\nEstablish the typed, version-pinned foundation that lets Workbench display human-readable State context without becoming the authority for State.\n\n## Goals\n\n- Make PRD, plan, and task context readable through the supported State surface.\n- Keep every projection attributable to an exact source revision.\n",
+    "truncated": true,
+    "total_bytes": 18211
+  },
+  "redaction": {
+    "status": "redacted",
+    "ruleset": "workbench.default.v1"
+  }
+}

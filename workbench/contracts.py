@@ -35,6 +35,8 @@ _PREFIXES = {
     "workflow": b"anvil-workbench/workflow/v2\0",
     "skill": b"anvil-workbench/skill/v1\0",
     "approval-payload": b"anvil-workbench/approval-payload/v1\0",
+    "state-snapshot": b"anvil-workbench/state-snapshot/v1\0",
+    "prd-content": b"anvil-workbench/prd-content/v1\0",
 }
 
 
@@ -85,6 +87,22 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
         payload = _without(value, "digest")
     elif kind == "skill":
         payload = _without(value, "digest")
+    elif kind == "state-snapshot":
+        payload = _without(value, "snapshot_digest", "generated_at")
+        prds = payload.get("prds")
+        if isinstance(prds, list):
+            payload["prds"] = sorted(copy.deepcopy(prds), key=lambda item: str(item.get("prd_id", "")))
+        tasks = payload.get("tasks")
+        if isinstance(tasks, list):
+            payload["tasks"] = sorted(
+                copy.deepcopy(tasks),
+                key=lambda item: (
+                    str(item.get("ref", {}).get("prd_id", "")) if isinstance(item.get("ref"), Mapping) else "",
+                    str(item.get("ref", {}).get("task_id", "")) if isinstance(item.get("ref"), Mapping) else "",
+                ),
+            )
+    elif kind == "prd-content":
+        payload = _without(value, "content_digest", "generated_at")
     return payload
 
 

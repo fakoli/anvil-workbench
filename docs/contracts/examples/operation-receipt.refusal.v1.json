@@ -1,0 +1,14 @@
+{
+  "schema_version": "workbench-operation-receipt/v1",
+  "receipt_id": "rcpt_refusal_example_0001",
+  "command_id": "cmd_example_0002",
+  "run_id": "run_example",
+  "operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0", "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"},
+  "status": "denied",
+  "idempotency_key": "run_example/submit_evidence/1",
+  "correlation": {"task_id": "release-beta:T001", "request_id": "req_example"},
+  "redaction": {"status": "metadata_only", "ruleset": "workbench.default.v1"},
+  "error": {"code": "catalog.digest_drift", "safe_summary": "Preflight recomputed the local anvil-state catalog digest and it no longer matches the pinned run snapshot. Execution stopped before any effect; refresh the snapshot and reconcile.", "retryable": false},
+  "started_at": "2026-07-19T00:00:05Z",
+  "finished_at": "2026-07-19T00:00:05Z"
+}

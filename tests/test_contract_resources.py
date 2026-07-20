@@ -40,6 +40,9 @@ SCHEMA_FOR_EXAMPLE = {
     "model-proposal.operation-request.v1.json": "model-proposal.v1.schema.json",
     "bridge-command.invoke-operation.v1.json": "bridge-command.v1.schema.json",
     "operation-receipt.v1.json": "operation-receipt.v1.schema.json",
+    "operation-receipt.refusal.v1.json": "operation-receipt.v1.schema.json",
+    "anvil-state.project-snapshot.v1.json": "state-snapshot.v1.schema.json",
+    "anvil-state.prd-content.v1.json": "prd-content.v1.schema.json",
 }
 
 
@@ -273,6 +276,77 @@ def test_contract_schemas_reject_privilege_and_binding_shortcuts() -> None:
     receipt["error"] = {"code": "failure", "safe_summary": "Bearer token", "retryable": False}
     with pytest.raises(ValidationError):
         _validator("operation-receipt.v1.schema.json").validate(receipt)
+
+
+def test_state_snapshot_digest_is_deterministic_order_independent_and_content_sensitive() -> None:
+    snapshot = _load(EXAMPLES / "anvil-state.project-snapshot.v1.json")
+    advertised = snapshot["snapshot_digest"]
+    assert contract_digest("state-snapshot", snapshot) == advertised
+
+    reordered = copy.deepcopy(snapshot)
+    reordered["prds"] = list(reversed(reordered["prds"]))
+    reordered["tasks"] = list(reversed(reordered["tasks"]))
+    reordered["generated_at"] = "2027-01-01T00:00:00Z"
+    assert contract_digest("state-snapshot", reordered) == advertised
+
+    changed = copy.deepcopy(snapshot)
+    changed["tasks"][0]["title"] += "!"
+    assert contract_digest("state-snapshot", changed) != advertised
+
+
+def test_state_snapshot_task_references_require_an_owning_prd_and_scope_duplicate_ids() -> None:
+    snapshot = _load(EXAMPLES / "anvil-state.project-snapshot.v1.json")
+    prd_ids = {prd["prd_id"] for prd in snapshot["prds"]}
+    task_ids = [task["ref"]["task_id"] for task in snapshot["tasks"]]
+    assert len(set(task_ids)) < len(task_ids), "example must exercise duplicate task IDs across PRDs"
+    scoped = set()
+    for task in snapshot["tasks"]:
+        ref = task["ref"]
+        assert ref["prd_id"] in prd_ids
+        assert task["scoped_id"] == f"{ref['prd_id']}:{ref['task_id']}"
+        scoped.add(task["scoped_id"])
+        for dependency in task.get("depends_on", ()):
+            assert dependency["prd_id"] in prd_ids
+    assert len(scoped) == len(snapshot["tasks"])
+
+    validator = _validator("state-snapshot.v1.schema.json")
+    orphan = copy.deepcopy(snapshot)
+    del orphan["tasks"][0]["ref"]["prd_id"]
+    with pytest.raises(ValidationError):
+        validator.validate(orphan)
+
+    run_context_validator = _validator("run-context.v1.schema.json")
+    context = copy.deepcopy(_load(EXAMPLES / "run-context.v1.json"))
+    del context["task"]["ref"]
+    with pytest.raises(ValidationError):
+        run_context_validator.validate(context)
+
+
+def test_prd_content_read_is_bounded_digest_stable_and_rejects_path_smuggling() -> None:
+    document = _load(EXAMPLES / "anvil-state.prd-content.v1.json")
+    assert contract_digest("prd-content", document) == document["content_digest"]
+    assert len(document["content"]["body"].encode("utf-8")) <= 65536
+    assert document["content"]["truncated"] is True
+    assert document["content"]["total_bytes"] > len(document["content"]["body"].encode("utf-8"))
+
+    validator = _validator("prd-content.v1.schema.json")
+    smuggled = copy.deepcopy(document)
+    smuggled["content"]["file_path"] = "C:/projects/prd.md"
+    with pytest.raises(ValidationError):
+        validator.validate(smuggled)
+
+    unbounded = copy.deepcopy(document)
+    unbounded["content"]["body"] = "x" * 65537
+    with pytest.raises(ValidationError):
+        validator.validate(unbounded)
+
+
+def test_refusal_receipt_example_is_a_typed_preflight_denial() -> None:
+    receipt = _load(EXAMPLES / "operation-receipt.refusal.v1.json")
+    assert receipt["status"] == "denied"
+    assert receipt["error"]["retryable"] is False
+    assert receipt["error"]["code"] == "catalog.digest_drift"
+    assert receipt["redaction"]["status"] == "metadata_only"
 
 
 def _walk(value: object):
