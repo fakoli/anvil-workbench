@@ -178,3 +178,17 @@ Decisions. Signed proof records live in the anvil workspace `proofs/` dir.
    fallback path (`tests/test_chat_routes.py` is hermetic, including a
    workbench-wide raw-provider-host scan) — implemented, not yet wired to
    a browser endpoint or the turn-append path.
+   The bounded Responses stream relay (T003.2) now exists too:
+   `workbench/chat_stream.py` assembles a bounded Responses request from a
+   T003.1-validated `ChatRouteSelection` (Serving `model_profile`/`route_id`
+   and validated controls only, bounded prompt) and relays an injected Anvil
+   Serving SSE sequence as typed relay events, settling into exactly one
+   distinct `StreamOutcome` (`completed`/`cancelled`/`timed_out`/
+   `serving_unavailable`) whose turn-status mapping never renders a cancelled,
+   timed-out, or partial stream as `complete`; a `CancellationToken` checked
+   before every upstream read terminates the injected transport and guarantees
+   no later completion, and every failure settles through the Serving runtime
+   (the module imports no HTTP client and embeds no URL/provider literal) —
+   `tests/test_chat_stream.py` is hermetic (scripted SSE transport, no
+   network), and the relay is stateless: persistence stays in the store, not
+   yet wired to a browser endpoint or the turn-append path.
