@@ -529,7 +529,9 @@ def validate_settings_descriptor(catalog: Mapping[str, Any]) -> None:
     * ``scope_precedence`` is a total order over every scope, so effective-value
       resolution is deterministic (criterion 1);
     * every descriptor owns exactly one scope, a ``policy_ceiling`` must be owned
-      by a strictly higher-authority scope, so a personal value can never exceed
+      by a strictly higher-authority scope (this pins the scope RANKING; the
+      numeric value clamp of a lower-scope bound against its ceiling is the
+      T002 resolver's job, not the descriptor's), so a personal value can never exceed
       a project/deployment/policy bound (criterion 1 + PRD non-goal);
     * a ``secret`` or path-like descriptor stays authority-owned with no default
       (criterion 2, defence-in-depth behind the schema guard);
@@ -548,6 +550,18 @@ def validate_settings_descriptor(catalog: Mapping[str, Any]) -> None:
     if not isinstance(precedence, list) or set(precedence) != set(_SETTINGS_SCOPES) or len(precedence) != len(_SETTINGS_SCOPES):
         raise ContractValidationError("scope_precedence must be a total order over every scope")
     rank = {scope: index for index, scope in enumerate(precedence)}
+    # Authority direction is pinned, not merely declared: every authority scope
+    # must outrank (precede) every actor scope, so an inverted permutation
+    # (personal above policy) cannot pass validation and a personal value can
+    # never be declared to outrank a policy bound. A lower rank index = higher
+    # authority.
+    for _authority in _SETTINGS_AUTHORITY_SCOPES:
+        for _actor in _SETTINGS_ACTOR_SCOPES:
+            if rank[_authority] >= rank[_actor]:
+                raise ContractValidationError(
+                    "scope_precedence must rank authority scopes above actor scopes "
+                    f"(got {_authority!r} not above {_actor!r})"
+                )
 
     settings = catalog.get("settings")
     if not isinstance(settings, list):
@@ -637,10 +651,26 @@ def settings_actor_view(catalog: Mapping[str, Any]) -> dict[str, Any]:
             continue
         if setting.get("sensitivity") == "secret" or setting.get("path_like") is True:
             continue
-        view["settings"].append(
-            {key: copy.deepcopy(item) for key, item in setting.items() if key in _SETTINGS_ACTOR_VIEW_FIELDS}
-        )
+        projected = {}
+        for key, item in setting.items():
+            if key not in _SETTINGS_ACTOR_VIEW_FIELDS:
+                continue
+            # Defense-in-depth: even a field declared non-secret is scrubbed for
+            # secret/path shapes before it can reach a browser/export, so a
+            # mis-declared sensitivity cannot leak a token or path.
+            projected[key] = _redact_settings_value(copy.deepcopy(item)) if key in _SETTINGS_SCRUBBED_FIELDS else copy.deepcopy(item)
+        view["settings"].append(projected)
     return view
+
+
+_SETTINGS_SCRUBBED_FIELDS = frozenset({"default", "title", "description", "allowed_values"})
+
+
+def _redact_settings_value(value):
+    """Recursively scrub secret/path shapes from an actor-facing settings value."""
+    from workbench.redaction import redact_value
+
+    return redact_value(value)
 
 
 def validate_bridge_command_snapshot(

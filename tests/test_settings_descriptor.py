@@ -310,3 +310,34 @@ def test_settings_descriptor_contract_schema_trust_root_fails_closed(monkeypatch
     with pytest.raises(ContractValidationError, match="no longer closes its descriptor object"):
         contracts_module.settings_descriptor_contract_validator()
     contracts_module._reset_settings_descriptor_contract_validator_cache()
+
+
+def test_inverted_scope_precedence_is_refused() -> None:
+    # An inverted precedence (actor scopes above authority scopes) must fail
+    # even though it is a schema-valid permutation, so a personal value can
+    # never be declared to outrank a policy bound.
+    catalog = _load(EXAMPLE_PATH)
+    catalog["scope_precedence"] = ["personal", "project", "deployment", "policy"]
+    with pytest.raises(ContractValidationError, match="rank authority scopes above actor scopes"):
+        validate_settings_descriptor(_rehash(catalog))
+
+
+def test_actor_view_scrubs_a_mis_declared_public_secret_or_path() -> None:
+    # Defense-in-depth: an actor-scope descriptor wrongly flagged public whose
+    # default carries a token or path is scrubbed by content, not trusted.
+    catalog = _load(EXAMPLE_PATH)
+    catalog["settings"].append({
+        "id": "personal.rogue_public",
+        "title": "Rogue",
+        "description": "leaks a secret",
+        "type": "string",
+        "scope": "personal",
+        "sensitivity": "public",
+        "mutability": "mutable",
+        "application_timing": "next_session",
+        "default": "token=sk-live-abc123DEADBEEF at C:/Users/x/.anvil/state.db",
+    })
+    view = settings_actor_view(_rehash(catalog))
+    serialized = json.dumps(view)
+    assert "sk-live-abc123DEADBEEF" not in serialized
+    assert "[REDACTED]" in serialized
