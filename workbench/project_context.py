@@ -371,6 +371,20 @@ class ProjectContextProjection:
     def summary_keys(self) -> tuple[tuple[str, str, str, str], ...]:
         return tuple(summary.key for summary in (*self.prds, *self.features, *self.tasks))
 
+    @property
+    def source_revision(self) -> int:
+        """The highest source revision this display projection reflects.
+
+        Each summary is attributed to its owning PRD's revision (features and
+        tasks inherit their owning PRD's).  The projection's revision is the
+        maximum — i.e. how fresh the underlying snapshot is.  The projection
+        store orders supersession by this scalar: a newer revision for the same
+        project supersedes the latest display projection, a lower one never
+        clobbers it.  A projection that reflects no summaries returns ``0``.
+        """
+        revisions = [summary.source_revision for summary in (*self.prds, *self.features, *self.tasks)]
+        return max(revisions) if revisions else 0
+
     def as_dict(self) -> dict[str, Any]:
         """Deterministic display serialization; round-trips via :meth:`from_dict`."""
         return {
