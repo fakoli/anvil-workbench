@@ -42,7 +42,7 @@ from workbench.capability_profiles import (
     PinnedCapabilityProfile,
     validate_project_profile,
 )
-from workbench.contracts import contract_digest
+from workbench.contracts import ContractValidationError, contract_digest
 from workbench.provider_catalogs import (
     DEFAULT_PROVIDER_ALLOWLIST,
     PublishedCatalogSet,
@@ -372,3 +372,27 @@ def test_pinned_profile_is_frozen_and_deep_copy_isolated() -> None:
 
     # A fresh validation from pristine inputs still produces the same pin.
     assert pin().as_dict() == expected
+
+
+def test_profile_contract_schema_trust_root_fails_closed(monkeypatch, tmp_path):
+    from workbench import contracts as contracts_module
+
+    contracts_module._reset_profile_contract_validator_cache()
+    monkeypatch.setattr(
+        contracts_module, "_PROFILE_CONTRACT_SCHEMA_PATH", tmp_path / "absent.schema.json"
+    )
+    with pytest.raises(ContractValidationError, match="schema is unavailable"):
+        contracts_module.profile_contract_validator()
+
+    import json as json_module
+    base = json_module.loads(
+        (ROOT / "docs" / "contracts" / "schemas" / "capability-profile.v1.schema.json").read_text(encoding="utf-8")
+    )
+    del base["properties"]["operations"]["items"]["additionalProperties"]
+    drifted = tmp_path / "drifted.schema.json"
+    drifted.write_text(json_module.dumps(base), encoding="utf-8")
+    contracts_module._reset_profile_contract_validator_cache()
+    monkeypatch.setattr(contracts_module, "_PROFILE_CONTRACT_SCHEMA_PATH", drifted)
+    with pytest.raises(ContractValidationError, match="no longer closes its objects"):
+        contracts_module.profile_contract_validator()
+    contracts_module._reset_profile_contract_validator_cache()

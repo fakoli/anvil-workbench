@@ -30,6 +30,13 @@ mutating any projection cannot alter a later validation.
 
 Like the T004.1 registry, this validator is implemented and hermetically
 tested but not wired into live workflow queueing yet.
+
+Scope of profile v1: plugin descriptors and per-route digests are NOT part of
+this contract revision — plugins are hard-disabled at the bridge
+(features.plugins=false) and any plugin-shaped extension field is refused by
+the closed schema; model profiles are pinned by reviewed name (their digests
+live with Anvil Serving's declared surface). A future profile revision that
+adds either must extend the contract schema first.
 """
 from __future__ import annotations
 

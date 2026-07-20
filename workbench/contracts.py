@@ -76,13 +76,30 @@ def profile_contract_validator() -> Draft202012Validator:
             raise ContractValidationError(
                 "capability-profile contract schema is unavailable; refusing to validate profiles"
             ) from exc
-        if schema.get("additionalProperties") is not False:
-            raise ContractValidationError(
-                "capability-profile contract schema no longer closes the profile object; "
-                "refusing to validate profiles"
-            )
+        closed_paths = (
+            (),
+            ("properties", "operations", "items"),
+            ("properties", "skills", "items"),
+            ("properties", "limits"),
+        )
+        for path in closed_paths:
+            node = schema
+            for name in path:
+                node = node.get(name) if isinstance(node, dict) else None
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    "capability-profile contract schema no longer closes its objects "
+                    f"(additionalProperties must be false at {'/'.join(path) or '<root>'}); "
+                    "refusing to validate profiles"
+                )
         _profile_contract_validator_cache = Draft202012Validator(schema)
     return _profile_contract_validator_cache
+
+
+def _reset_profile_contract_validator_cache() -> None:
+    """Test hook: force the next profile validation to reload the on-disk schema."""
+    global _profile_contract_validator_cache
+    _profile_contract_validator_cache = None
 
 
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
