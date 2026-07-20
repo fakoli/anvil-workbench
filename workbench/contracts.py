@@ -62,6 +62,16 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def canonical_json_bytes(value: Any) -> bytes:
+    """Public canonical encoding for other digest consumers (e.g. chat content).
+
+    Same restricted domain as contract digests: string keys, no floats, sorted
+    keys, compact separators, UTF-8.  Callers add their own domain-separation
+    prefix so a chat-content hash can never collide with a contract digest.
+    """
+    return _canonical_json(value)
+
+
 def _without(value: Mapping[str, Any], *names: str) -> dict[str, Any]:
     return {key: copy.deepcopy(item) for key, item in value.items() if key not in names}
 

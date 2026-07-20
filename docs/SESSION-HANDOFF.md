@@ -82,3 +82,11 @@ rewrite it as part of Workbench work without a separate review of those changes.
    audio or hidden reasoning (tests: `tests/test_contract_resources.py`,
    `tests/test_security_contract.py`). Build hub persistence and API
    projection against these shapes; do not present them as live endpoints.
+   The first implementation slice exists: `workbench/conversation_models.py`
+   defines frozen conversation/turn/retention/deletion domain values
+   mirroring those schemas, a deterministic domain-separated `sha256:`
+   content hash, a fail-closed `validate_turn_append` gate enforcing the
+   four append-time lineage invariants plus the conversation-ownership
+   boundary and the retention-to-content-kind mapping, and content-free
+   `TurnAudit`/`ConversationAudit` shapes (`tests/test_conversation_models.py`
+   is hermetic). Store persistence and API projection remain unwired.
