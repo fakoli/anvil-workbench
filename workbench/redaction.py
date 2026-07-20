@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)\b(?:sk|rk|ghp|github_pat|hf)_[A-Za-z0-9_\-]{8,}\b"),
+    re.compile(r"(?i)\b(?:sk|rk|ghp|gho|github_pat|hf|akia)[_-][A-Za-z0-9_\-]{8,}\b"),
     re.compile(r"(?i)\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}\b"),
 )
