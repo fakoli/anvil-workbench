@@ -58,6 +58,12 @@ def _catalog_contract_validator() -> Draft202012Validator:
             raise StateManifestError(
                 "operation-catalog contract schema is unavailable; refusing to pin descriptors"
             ) from exc
+        bound = schema.get("properties", {}).get("generated_at", {})
+        if not isinstance(bound.get("maxLength"), int) or "pattern" not in bound:
+            raise StateManifestError(
+                "operation-catalog contract schema no longer bounds generated_at; "
+                "refusing to pin descriptors"
+            )
         _catalog_contract_validator_cache = Draft202012Validator(schema)
     return _catalog_contract_validator_cache
 

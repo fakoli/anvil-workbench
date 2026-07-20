@@ -290,3 +290,11 @@ def test_incompatible_schema_dialect_fails_closed() -> None:
     discovery, _ = discovery_for(envelope(rehash(catalog)))
     with pytest.raises(StateManifestError, match="dialect"):
         discovery.pinned()
+
+
+def test_catalog_generated_at_cannot_smuggle_markdown_scale_content() -> None:
+    catalog = example_catalog()
+    catalog["generated_at"] = "# Full PRD\n\n" + ("Thousands of words of requirements. " * 3000)
+    discovery, _ = discovery_for(envelope(catalog))
+    with pytest.raises(StateManifestError, match="operation-catalog contract"):
+        discovery.pinned()
