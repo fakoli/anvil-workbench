@@ -8,6 +8,12 @@ These resources are the implementation-facing companion to
 - This directory contains **proposed**, versioned shapes for the next operation
   layer. They do not create an endpoint, grant a capability, or supersede an
   owner’s own contract until code and tests adopt them.
+- The State-side read half is adopted by code: manifest discovery plus the
+  snapshot and bounded PRD-content adapters are implemented and hermetically
+  tested, but not wired into the live bridge poll loop. Their authoritative
+  description is the "State read-adapter contract" section of
+  [CONTRACTS.md](../CONTRACTS.md); live qualification stays gated on
+  fakoli/anvil#178.
 - Schemas validate payload shape. Bridge code must additionally enforce every
   semantic rule: catalog/profile authorization, worktree lease, digest match,
   approval binding, idempotency, and reconciliation.
