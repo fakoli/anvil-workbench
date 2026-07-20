@@ -87,8 +87,19 @@ These resources are the implementation-facing companion to
     provider endpoint, URL, or credential — and a conversation's context block
     is display-only: it pins readable titles plus canonical project,
     PRD-revision, and task IDs without implying a claim, lease, or effect
-    grant. Chat records are hub-durable records, not bridge-verified
-    snapshots, so they are not contract-digest-bearing.
+    grant. The conversation's retention fields map normatively onto persisted
+    turn content kinds: `transcript_text` governs persisted `kind:
+    "transcript"` content blocks on text turns, and `voice_transcript_text`
+    governs persisted `kind: "transcript"` content blocks on voice-input
+    turns; a value of `metadata_only` means NO transcript content block may
+    persist for that kind — only bounded counters and metadata (for example
+    `transcript_chars` on voice events) survive. The cross-record lineage
+    invariants — exactly one null-parent root per conversation,
+    `(parent_turn_id, sibling_index)` uniqueness, parent existence in the
+    same conversation, and acyclicity — are schema-inexpressible and are
+    enforced by the Workbench hub store at append time, fail-closed: a
+    violating append is refused. Chat records are hub-durable records, not
+    bridge-verified snapshots, so they are not contract-digest-bearing.
 
 ## Contract-extension checklist
 

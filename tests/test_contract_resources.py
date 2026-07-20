@@ -622,6 +622,86 @@ def test_chat_conversation_retention_and_deletion_fail_closed() -> None:
         validator.validate(haunted)  # an active conversation cannot carry a deletion record
 
 
+def _chat_retention_violations(
+    turn: dict[str, object], conversation: dict[str, object],
+) -> list[tuple[str, str]]:
+    """Return (retention_field, content_kind) pairs the conversation policy forbids.
+
+    README convention 11: `transcript_text` governs persisted transcript content
+    on text turns, `voice_transcript_text` governs persisted transcript content
+    on voice-input turns, and `metadata_only` means no transcript content block
+    may persist for that kind — only bounded counters/metadata survive.
+    """
+    retention = conversation["retention"]
+    is_voice_input = turn["role"] == "user" and any(
+        event["event"] in {"utterance_start", "stt_commit"}
+        for event in turn.get("voice_events", ())
+    )
+    field = "voice_transcript_text" if is_voice_input else "transcript_text"
+    return [
+        (field, str(block["kind"]))
+        for block in turn["content"]
+        if block["kind"] == "transcript" and retention[field] == "metadata_only"
+    ]
+
+
+def test_chat_turn_examples_respect_their_conversations_retention_policy() -> None:
+    payloads = [_load(EXAMPLES / name) for name in SCHEMA_FOR_EXAMPLE]
+    conversations = {
+        payload["conversation_id"]: payload
+        for payload in payloads
+        if payload.get("schema_version") == "workbench-chat-conversation/v1"
+    }
+    turns = [
+        payload for payload in payloads
+        if payload.get("schema_version") == "workbench-chat-turn/v1"
+    ]
+    assert conversations and turns
+    for turn in turns:
+        conversation = conversations[turn["conversation_id"]]
+        assert _chat_retention_violations(turn, conversation) == [], turn["turn_id"]
+
+    voiced = _load(EXAMPLES / "chat.turn.user-voice.v1.json")
+    owner = conversations[voiced["conversation_id"]]
+    assert owner["retention"]["voice_transcript_text"] == "retained_redacted", (
+        "the registered voice turn persists transcript text, so its conversation "
+        "must retain voice transcripts"
+    )
+    restricted = copy.deepcopy(owner)
+    restricted["retention"]["voice_transcript_text"] = "metadata_only"
+    assert _chat_retention_violations(voiced, restricted) == [
+        ("voice_transcript_text", "transcript")
+    ], "a metadata_only voice policy must flag the persisted voice transcript"
+
+
+def test_metadata_only_turn_redaction_cannot_carry_text_bearing_content() -> None:
+    validator = _validator("chat-turn.v1.schema.json")
+    voiced = _load(EXAMPLES / "chat.turn.user-voice.v1.json")
+
+    stripped = copy.deepcopy(voiced)
+    stripped["redaction"]["status"] = "metadata_only"
+    with pytest.raises(ValidationError):
+        validator.validate(stripped)  # transcript text may not survive metadata_only
+    stripped["content"] = []
+    validator.validate(stripped)  # metadata-only record keeps voice_events counters only
+
+
+def test_assistant_turn_records_bounded_serving_request_id() -> None:
+    validator = _validator("chat-turn.v1.schema.json")
+    reply = _load(EXAMPLES / "chat.turn.assistant-interrupted.v1.json")
+    assert re.fullmatch(r"[A-Za-z0-9._-]{1,128}", reply["route"]["request_id"])
+
+    unrecorded = copy.deepcopy(reply)
+    del unrecorded["route"]["request_id"]
+    with pytest.raises(ValidationError):
+        validator.validate(unrecorded)  # R006: assistant turns record the Serving request ID
+    for hostile in ("", "req 001", "https://serving.internal/req/1", "r" * 129):
+        smuggled = copy.deepcopy(reply)
+        smuggled["route"]["request_id"] = hostile
+        with pytest.raises(ValidationError):
+            validator.validate(smuggled)
+
+
 def _walk(value: object):
     if isinstance(value, dict):
         for nested in value.values():

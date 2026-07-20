@@ -43,7 +43,7 @@
   "retention": {
     "policy_id": "workbench.default-90d",
     "transcript_text": "retained_redacted",
-    "voice_transcript_text": "metadata_only",
+    "voice_transcript_text": "retained_redacted",
     "delete_after": "2026-10-17T00:00:00Z"
   },
   "status": "active",

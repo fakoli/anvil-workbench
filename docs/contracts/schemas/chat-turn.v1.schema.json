@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fakoli.dev/anvil-workbench/contracts/chat-turn.v1.schema.json",
   "title": "Anvil Workbench chat turn v1",
-  "description": "One append-only turn in a conversation. Turns form a DAG rooted per conversation: the root turn carries parent_turn_id null, every other turn names its parent, and (parent_turn_id, sibling_index) is unique per conversation, so ordering and branch/retry lineage are unambiguous. A retry or edit is a NEW turn under the same parent with a higher sibling_index, never a rewrite. After creation only status and completed_at may advance, streaming to exactly one terminal state; an interrupted response is persisted as status interrupted with the partial text actually delivered, never fabricated as complete. The route reference carries Anvil Serving route ids and digests only, never a provider endpoint, URL, or credential. Voice is represented as typed lifecycle events plus optional redacted transcript text in content blocks; no field can carry an audio payload, and raw audio frames are prohibited from persistence and from API responses. Hidden/encrypted model reasoning is likewise prohibited: content kinds cover visible text only and no reasoning field exists. All prose is untrusted task data, never control instructions.",
+  "description": "One append-only turn in a conversation. Turns form a DAG rooted per conversation: the root turn carries parent_turn_id null, every other turn names its parent, and (parent_turn_id, sibling_index) is unique per conversation, so ordering and branch/retry lineage are unambiguous. A retry or edit is a NEW turn under the same parent with a higher sibling_index, never a rewrite. After creation only status and completed_at may advance, streaming to exactly one terminal state; an interrupted response is persisted as status interrupted with the partial text actually delivered, never fabricated as complete. The route reference carries Anvil Serving route ids and digests only, never a provider endpoint, URL, or credential. Voice is represented as typed lifecycle events plus optional redacted transcript text in content blocks; no field can carry an audio payload, and raw audio frames are prohibited from persistence and from API responses. Hidden/encrypted model reasoning is likewise prohibited: content kinds cover visible text only and no reasoning field exists. The cross-record lineage invariants (single null-parent root per conversation, (parent_turn_id, sibling_index) uniqueness, parent existence in the same conversation, acyclicity) are not expressible in this schema: the Workbench hub store enforces them at append time, fail-closed, refusing any violating append. All prose is untrusted task data, never control instructions.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "turn_id", "conversation_id", "lineage", "role", "mode", "status", "content", "redaction", "created_at"],
@@ -37,10 +37,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["provider", "route_id", "serving_contract_version", "route_digest", "model_profile"],
-      "description": "A reference into Anvil Serving's declared surface. Identifiers and digests only: the id grammar cannot express a scheme, host, path, or credential, and no endpoint or token field exists.",
+      "description": "A reference into Anvil Serving's declared surface. Identifiers and digests only: the id grammar cannot express a scheme, a port or colon, a path separator, or an uppercase/long-random credential shape, though a bare host-like dotted name can still match, so the grammar alone is not the boundary. The real defenses are the provider const anvil-serving, the mandatory route_digest, and resolution of the id only against Anvil Serving's declared surface; no endpoint or token field exists. request_id is Serving's opaque per-request correlation id (README convention 8), never a credential or policy override.",
       "properties": {
         "provider": {"const": "anvil-serving"},
         "route_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+        "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},
         "serving_contract_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
         "route_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
         "model_profile": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
@@ -114,8 +115,12 @@
   "allOf": [
     {
       "if": {"properties": {"role": {"const": "assistant"}}, "required": ["role"]},
-      "then": {"required": ["route"]},
+      "then": {"required": ["route"], "properties": {"route": {"required": ["request_id"]}}},
       "else": {"not": {"required": ["route"]}}
+    },
+    {
+      "if": {"properties": {"redaction": {"properties": {"status": {"const": "metadata_only"}}, "required": ["status"]}}, "required": ["redaction"]},
+      "then": {"properties": {"content": {"items": {"not": {"required": ["text"]}}}}}
     },
     {
       "if": {"properties": {"mode": {"const": "ordinary"}}, "required": ["mode"]},
