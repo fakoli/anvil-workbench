@@ -103,4 +103,10 @@ Decisions. Signed proof records live in the anvil workspace `proofs/` dir.
    four append-time lineage invariants plus the conversation-ownership
    boundary and the retention-to-content-kind mapping, and content-free
    `TurnAudit`/`ConversationAudit` shapes (`tests/test_conversation_models.py`
-   is hermetic). Store persistence and API projection remain unwired.
+   is hermetic). The store slice now exists too:
+   `workbench/conversation_store.py` is the actor-scoped hub persistence layer
+   (create/list/search/rename/archive, appends and branch/retry routed through
+   `validate_turn_append`, cross-actor probes indistinguishable from a missing
+   conversation, streaming turns recovered as `interrupted` after reload,
+   content-free audit; `tests/test_conversation_store.py` is hermetic) — the
+   API projection and the production Postgres backend are still pending.
