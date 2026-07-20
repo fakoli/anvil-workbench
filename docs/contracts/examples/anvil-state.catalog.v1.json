@@ -2,7 +2,7 @@
   "schema_version": "anvil-operation-catalog/v1",
   "provider": "anvil-state",
   "catalog_version": "1.0.0",
-  "catalog_digest": "sha256:2760ef31410e21712f2473a84d9a7e83ecf9dede66e0bb5e3086b7e7aadd9a1a",
+  "catalog_digest": "sha256:f6b297907a06a7c5dc058764382bbd2262a0cb217fb14e3e11a172ad6a18c207",
   "generated_at": "2026-07-19T00:00:00Z",
   "operations": [
     {
@@ -59,7 +59,7 @@
       "title": "Read bounded PRD content",
       "summary": "Read one PRD's human-readable content as a bounded, redacted, digest-attributed document for display. Read-only untrusted task data; it grants no capability.",
       "contract_version": "1.0.0",
-      "operation_digest": "sha256:9aae462fd1fb92fc3b9fb057e36cb4dfd3349a678e245b864fbb9aa486642790",
+      "operation_digest": "sha256:18eef8484f83906964d6db8ad7310183094b4e0b9613e3f9967c2cd8c05be744",
       "effect": "read",
       "execution": {
         "kind": "bridge_adapter",
@@ -84,14 +84,22 @@
         "type": "object",
         "required": [
           "content_digest",
-          "truncated"
+          "content"
         ],
         "properties": {
           "content_digest": {
             "type": "string"
           },
-          "truncated": {
-            "type": "boolean"
+          "content": {
+            "type": "object",
+            "required": [
+              "truncated"
+            ],
+            "properties": {
+              "truncated": {
+                "type": "boolean"
+              }
+            }
           }
         }
       },

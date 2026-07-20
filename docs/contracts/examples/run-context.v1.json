@@ -37,7 +37,7 @@
     "catalogs": [
       {
         "provider": "anvil-state",
-        "digest": "sha256:2760ef31410e21712f2473a84d9a7e83ecf9dede66e0bb5e3086b7e7aadd9a1a"
+        "digest": "sha256:f6b297907a06a7c5dc058764382bbd2262a0cb217fb14e3e11a172ad6a18c207"
       },
       {
         "provider": "anvil-serving",
