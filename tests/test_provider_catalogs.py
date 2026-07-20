@@ -489,3 +489,22 @@ def test_relative_local_source_resolves_against_the_configured_root(tmp_path: Pa
         [CatalogSource("anvil-serving", "local_json", "serving.catalog.json")], cwd=tmp_path
     )
     assert registry.published().catalog("anvil-serving").provider == "anvil-serving"
+
+
+def test_duplicate_worktree_flags_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Mirror of the provider-catalog rule: a repeated --worktree id must refuse
+    # instead of silently letting the last flag win.
+    from workbench.bridge import main
+
+    monkeypatch.setenv("WORKBENCH_BRIDGE_TOKEN", "test-token")
+    with pytest.raises(SystemExit, match="duplicate --worktree id: wt-a"):
+        main(
+            [
+                "--hub", "http://hub", "--bridge-id", "b1", "--project-root", str(tmp_path),
+                "--project-id", "p1", "--router-base-url", "http://router",
+                "--worktree", "wt-a=/checkouts/a",
+                "--worktree", "wt-a=/checkouts/b",
+            ]
+        )
