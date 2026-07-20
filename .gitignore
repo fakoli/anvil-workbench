@@ -7,3 +7,4 @@ web/node_modules/
 web/dist/
 web/*.png
 .env
+post-session-findings/
