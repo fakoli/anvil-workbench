@@ -126,6 +126,7 @@ class BridgeSettings:
     router_base_url: str
     router_token_env: str
     codex_config: tuple[str, ...]
+    state_describe_command: str = "anvil describe"
     worktrees: Mapping[str, Path] = field(default_factory=dict)
     skill_roots: tuple[Path, ...] = ()
     verification_commands: tuple[str, ...] = ()
@@ -963,6 +964,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-events", type=Path, help="canonical State events.jsonl; resolves through State CLI when omitted")
     parser.add_argument("--cursor-file", type=Path)
     parser.add_argument("--state-status-command", default="anvil status")
+    parser.add_argument(
+        "--state-describe-command", default="anvil describe",
+        help="State CLI manifest command used to discover and pin read-operation descriptors",
+    )
     parser.add_argument("--state-claim-command", default="anvil claim {task_id} --actor {actor} --json")
     parser.add_argument("--state-work-packet-command", default="anvil packet {task_id} --format json")
     parser.add_argument("--state-hook-command", default="anvil hook capture-evidence")
@@ -999,6 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
         state_events=args.state_events,
         cursor_file=args.cursor_file or root / ".workbench" / "state-events.cursor",
         state_status_command=args.state_status_command,
+        state_describe_command=args.state_describe_command,
         state_claim_command=args.state_claim_command,
         state_work_packet_command=args.state_work_packet_command,
         state_hook_command=args.state_hook_command,
