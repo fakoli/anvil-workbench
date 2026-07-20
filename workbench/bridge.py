@@ -1009,7 +1009,10 @@ def main(argv: list[str] | None = None) -> int:
         provider, separator, raw_path = item.partition("=")
         if not separator or not provider.strip() or not raw_path.strip():
             raise SystemExit("--provider-catalog must use PROVIDER=PATH")
-        provider_catalog_files[provider.strip()] = Path(raw_path.strip()).resolve()
+        provider = provider.strip()
+        if provider in provider_catalog_files:
+            raise SystemExit(f"duplicate --provider-catalog provider: {provider}")
+        provider_catalog_files[provider] = Path(raw_path.strip()).resolve()
     settings = BridgeSettings(
         hub=args.hub, bridge_id=args.bridge_id, token=token, project_root=root, project_id=args.project_id,
         state_events=args.state_events,

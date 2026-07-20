@@ -169,6 +169,32 @@ def test_invalid_or_non_object_schema_fails_closed() -> None:
         pin_state_read_operations({"ok": True, "command": "describe", "data": rehash(missing)})
 
 
+def test_unresolvable_schema_reference_fails_closed() -> None:
+    # check_schema alone never resolves $ref; a dangling pointer previously
+    # passed pinning and crashed only at input-evaluation time.
+    dangling = example_catalog()
+    operation_named(dangling, PRD_READ_CONTENT_OPERATION_ID)["input_schema"]["properties"]["prd_id"] = {
+        "$ref": "#/$defs/does_not_exist"
+    }
+    with pytest.raises(StateManifestError, match="unresolvable"):
+        pin_state_read_operations({"ok": True, "command": "describe", "data": rehash(dangling)})
+
+    remote = example_catalog()
+    operation_named(remote, PRD_READ_CONTENT_OPERATION_ID)["input_schema"]["properties"]["prd_id"] = {
+        "$ref": "https://evil.example.com/schemas/anything.json"
+    }
+    with pytest.raises(StateManifestError, match="non-local"):
+        pin_state_read_operations({"ok": True, "command": "describe", "data": rehash(remote)})
+
+    # Positive control: a resolvable intra-document pointer still pins.
+    local = example_catalog()
+    operation = operation_named(local, PRD_READ_CONTENT_OPERATION_ID)
+    operation["input_schema"]["$defs"] = {"prd_ref": {"type": "string", "minLength": 1}}
+    operation["input_schema"]["properties"]["prd_id"] = {"$ref": "#/$defs/prd_ref"}
+    pinned = pin_state_read_operations({"ok": True, "command": "describe", "data": rehash(local)})
+    assert pinned.prd_read_content.input_schema["properties"]["prd_id"] == {"$ref": "#/$defs/prd_ref"}
+
+
 def test_malformed_manifest_fails_closed_and_caches_nothing() -> None:
     discovery, calls = discovery_for("this is not a manifest")
 

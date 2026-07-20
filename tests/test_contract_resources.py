@@ -153,6 +153,41 @@ def test_contract_digests_and_cross_resource_snapshot_rules_fail_closed() -> Non
             validate_bridge_command_snapshot(invalid, catalogs, profile)
 
 
+def test_snapshot_validation_refuses_an_unresolvable_pinned_input_schema() -> None:
+    # A pinned schema whose $ref cannot resolve used to escape as a raw
+    # jsonschema referencing error (not a ValidationError) at evaluation time;
+    # it must fail closed as a ContractValidationError instead.
+    catalogs = {
+        catalog["provider"]: catalog
+        for catalog in (
+            _load(EXAMPLES / "anvil-state.catalog.v1.json"),
+            _load(EXAMPLES / "anvil-serving.catalog.v1.json"),
+            _load(EXAMPLES / "project-bridge.catalog.v1.json"),
+        )
+    }
+    profile = _load(EXAMPLES / "project-capability-profile.v1.json")
+    command = copy.deepcopy(_load(EXAMPLES / "bridge-command.invoke-operation.v1.json"))
+    reference = command["payload"]["operation"]
+    catalog = copy.deepcopy(catalogs[reference["provider"]])
+    operation = next(
+        item for item in catalog["operations"]
+        if item["id"] == reference["id"] and item["contract_version"] == reference["contract_version"]
+    )
+    operation["input_schema"].setdefault("properties", {})["poisoned"] = {
+        "$ref": "#/$defs/does_not_exist"
+    }
+    operation["operation_digest"] = contract_digest("operation", operation)
+    catalog["catalog_digest"] = contract_digest("catalog", catalog)
+    catalogs[reference["provider"]] = catalog
+    reference["operation_digest"] = operation["operation_digest"]
+    for entry in command["workflow_snapshot"]["catalogs"]:
+        if entry["provider"] == reference["provider"]:
+            entry["digest"] = catalog["catalog_digest"]
+
+    with pytest.raises(ContractValidationError, match="unresolvable"):
+        validate_bridge_command_snapshot(command, catalogs, profile)
+
+
 def test_approval_gated_operation_requires_matching_grant_action_and_exact_inputs() -> None:
     class AtomicApprovalConsumer:
         def __init__(self) -> None:

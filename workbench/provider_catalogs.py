@@ -15,8 +15,9 @@ Fail-closed rules:
   outside the configured allowlist, a catalog advertising a provider other
   than the one its source was reviewed for, a digest that does not recompute,
   a duplicate ``(id, contract_version)`` operation, two catalogs claiming the
-  same provider with different digests, an invalid or non-object draft
-  2020-12 schema reference, or an unsupported schema/contract version aborts
+  same provider with different digests, an invalid, non-object, remote, or
+  unresolvable draft 2020-12 schema reference, or an unsupported
+  schema/contract version aborts
   the whole load with :class:`ProviderCatalogError`; nothing is published and
   nothing is cached.
 * The implemented transports are ``local_json`` (an operator-reviewed catalog
@@ -24,9 +25,11 @@ Fail-closed rules:
   command).  ``http`` and ``mcp`` are declared source transports but are not
   implemented; selecting one fails closed instead of stubbing network code.
 * The published projection contains identifiers, titles, versions, effect
-  classes, summaries, and digests only -- never execution blocks, adapters,
-  transports, commands, paths, preconditions, credentials, or raw provider
-  payloads.  Full descriptors (schemas included) stay private to the bridge.
+  classes, summaries, digests, and the validated input/output schemas -- never
+  execution blocks, adapters, transports, commands, paths, preconditions,
+  credentials, or raw provider payloads.  Execution, adapter, and transport
+  blocks stay private to the bridge; the schemas are published because
+  preflight and typed model proposals need the exact pinned input contract.
 
 Like the T002.1 discovery, this registry is implemented and hermetically
 tested but not wired into the live bridge poll loop; live qualification stays
@@ -34,6 +37,7 @@ gated on providers actually serving these catalogs (fakoli/anvil#178).
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -43,10 +47,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.exceptions import ValidationError
 
-from .contracts import ContractValidationError, catalog_contract_validator, validate_catalog
+from .contracts import (
+    ContractValidationError,
+    catalog_contract_validator,
+    check_operation_schema,
+    validate_catalog,
+)
 from .state_manifest import StateManifestError, _catalog_from_manifest, _json_document
 
 
@@ -62,7 +70,6 @@ DEFAULT_PROVIDER_ALLOWLIST = ("anvil-state", "anvil-serving", "project-bridge")
 SOURCE_TRANSPORTS = ("local_json", "state_describe", "http", "mcp")
 _IMPLEMENTED_TRANSPORTS = frozenset({"local_json", "state_describe"})
 
-_DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _COMPATIBLE_CONTRACT_MAJOR = 1
 _CONTRACT_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
@@ -96,7 +103,13 @@ class CatalogSource:
 
 @dataclass(frozen=True)
 class PublishedOperation:
-    """The safe public metadata for one validated catalog operation."""
+    """The safe public metadata for one validated catalog operation.
+
+    ``input_schema``/``output_schema`` are deep copies of the validated,
+    self-contained draft 2020-12 schemas: preflight and typed model proposals
+    need the exact pinned input contract (acceptance criterion 2).  Execution,
+    adapter, transport, gate, and receipt blocks remain bridge-private.
+    """
 
     id: str
     title: str
@@ -104,8 +117,10 @@ class PublishedOperation:
     operation_digest: str
     effect: str
     summary: str
+    input_schema: Mapping[str, Any]
+    output_schema: Mapping[str, Any]
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "title": self.title,
@@ -113,6 +128,8 @@ class PublishedOperation:
             "operation_digest": self.operation_digest,
             "effect": self.effect,
             "summary": self.summary,
+            "input_schema": copy.deepcopy(dict(self.input_schema)),
+            "output_schema": copy.deepcopy(dict(self.output_schema)),
         }
 
 
@@ -171,21 +188,11 @@ def _validated_contract_version(provider: str, operation_id: str, version: Any) 
 def _check_operation_schema(provider: str, operation_id: str, name: str, schema: Any) -> None:
     if not isinstance(schema, Mapping):
         raise ProviderCatalogError(f"{provider} operation {operation_id} has no {name} object")
-    declared = schema.get("$schema")
-    if declared is not None and declared != _DRAFT_2020_12:
-        raise ProviderCatalogError(
-            f"{provider} operation {operation_id} {name} declares an unsupported dialect: {declared!r}"
-        )
-    if schema.get("type") != "object":
-        raise ProviderCatalogError(
-            f"{provider} operation {operation_id} {name} must be a typed object schema"
-        )
     try:
-        Draft202012Validator.check_schema(dict(schema))
-    except SchemaError as exc:
+        check_operation_schema(schema)
+    except ContractValidationError as exc:
         raise ProviderCatalogError(
-            f"{provider} operation {operation_id} {name} is not a valid draft 2020-12 schema: "
-            f"{exc.message}"
+            f"{provider} operation {operation_id} {name} {exc}"
         ) from exc
 
 
@@ -247,6 +254,8 @@ def validate_provider_catalog(
                 operation_digest=str(operation["operation_digest"]),
                 effect=str(operation["effect"]),
                 summary=str(operation["summary"]),
+                input_schema=copy.deepcopy(dict(operation["input_schema"])),
+                output_schema=copy.deepcopy(dict(operation["output_schema"])),
             )
         )
     return PublishedCatalog(

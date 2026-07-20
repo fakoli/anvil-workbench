@@ -11,9 +11,11 @@ Acceptance mapping (state-context-operations:T004.1):
   digests, invalid schema references, unsupported versions fail closed):
   ``test_unknown_provider_*``, ``test_duplicate_operation_*``,
   ``test_conflicting_provider_digests_*``, ``test_invalid_schema_reference_*``,
+  ``test_unresolvable_or_nonlocal_schema_references_*``,
   ``test_unsupported_versions_*``, plus the digest-drift/contract/transport
   fail-closed tests.
-* Criterion 2 (published descriptors expose only safe metadata):
+* Criterion 2 (published descriptors expose identifiers, versions, effect
+  classes, schemas, and digests -- and nothing execution-shaped):
   ``test_published_view_exposes_only_safe_metadata``.
 * Criterion 3 (canonicalization determinism):
   ``test_canonicalization_is_order_insensitive``.
@@ -113,6 +115,8 @@ def test_happy_path_publishes_every_configured_provider(tmp_path: Path) -> None:
             assert operation.operation_digest == source["operation_digest"]
             assert operation.effect == source["effect"]
             assert operation.summary == source["summary"]
+            assert operation.input_schema == source["input_schema"]
+            assert operation.output_schema == source["output_schema"]
 
 
 def test_published_snapshot_is_cached_and_frozen(tmp_path: Path) -> None:
@@ -201,6 +205,55 @@ def test_invalid_schema_reference_fails_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ProviderCatalogError, match="unsupported dialect"):
         validate_provider_catalog("anvil-serving", rehash(foreign_dialect))
+
+
+def test_unresolvable_or_nonlocal_schema_references_fail_closed() -> None:
+    # check_schema alone never resolves $ref; each of these previously passed
+    # validation and only failed (or fetched) at evaluation time.
+    dangling = example("anvil-serving")
+    operation_named(dangling, "serving.eval.preflight")["input_schema"]["properties"]["model"] = {
+        "$ref": "#/$defs/does_not_exist"
+    }
+    with pytest.raises(ProviderCatalogError, match="unresolvable"):
+        validate_provider_catalog("anvil-serving", rehash(dangling))
+
+    remote = example("anvil-serving")
+    operation_named(remote, "serving.eval.preflight")["input_schema"]["properties"]["model"] = {
+        "$ref": "https://evil.example.com/schemas/anything.json"
+    }
+    with pytest.raises(ProviderCatalogError, match="non-local"):
+        validate_provider_catalog("anvil-serving", rehash(remote))
+
+    file_ref = example("anvil-serving")
+    operation_named(file_ref, "serving.eval.preflight")["output_schema"]["properties"]["artifact_id"] = {
+        "$ref": "file:///C:/secrets/schema.json"
+    }
+    with pytest.raises(ProviderCatalogError, match="non-local"):
+        validate_provider_catalog("anvil-serving", rehash(file_ref))
+
+    anchor = example("anvil-serving")
+    operation_named(anchor, "serving.eval.preflight")["input_schema"]["properties"]["model"] = {
+        "$dynamicRef": "#meta"
+    }
+    with pytest.raises(ProviderCatalogError, match="anchors are not supported"):
+        validate_provider_catalog("anvil-serving", rehash(anchor))
+
+
+def test_resolvable_local_defs_reference_still_passes() -> None:
+    # Positive control: an intra-document #/$defs pointer is a legitimate,
+    # self-contained schema shape and must keep validating.
+    catalog = example("anvil-serving")
+    operation = operation_named(catalog, "serving.eval.preflight")
+    operation["input_schema"]["$defs"] = {"model_id": {"type": "string", "minLength": 1}}
+    operation["input_schema"]["properties"]["model"] = {"$ref": "#/$defs/model_id"}
+
+    published = validate_provider_catalog("anvil-serving", rehash(catalog))
+
+    published_operation = next(
+        item for item in published.operations if item.id == "serving.eval.preflight"
+    )
+    assert published_operation.input_schema["properties"]["model"] == {"$ref": "#/$defs/model_id"}
+    assert published_operation.input_schema["$defs"] == {"model_id": {"type": "string", "minLength": 1}}
 
 
 def test_unsupported_versions_fail_closed(tmp_path: Path) -> None:
@@ -305,6 +358,18 @@ def test_one_bad_source_prevents_any_publication(tmp_path: Path) -> None:
     assert registry._published is None, "no partial publication after a failure"
 
 
+def _schema_refs(value):
+    """Yield every $ref/$dynamicRef target anywhere in a schema tree."""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key in ("$ref", "$dynamicRef") and isinstance(nested, str):
+                yield nested
+            yield from _schema_refs(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _schema_refs(nested)
+
+
 def test_published_view_exposes_only_safe_metadata(tmp_path: Path) -> None:
     registry, _calls = full_registry(tmp_path)
 
@@ -314,15 +379,28 @@ def test_published_view_exposes_only_safe_metadata(tmp_path: Path) -> None:
     for provider, catalog in view.items():
         assert set(catalog) == {"provider", "catalog_version", "catalog_digest", "operations"}
         assert catalog["provider"] == provider
-        for operation in catalog["operations"]:
+        fixture = example(provider)
+        for operation, source in zip(catalog["operations"], fixture["operations"], strict=True):
             assert set(operation) == {
                 "id", "title", "contract_version", "operation_digest", "effect", "summary",
+                "input_schema", "output_schema",
             }
+            # Acceptance criterion 2: the published schemas are exactly the
+            # validated ones, and they are self-contained (no non-local $ref;
+            # remote/file/dangling targets already fail validation upstream).
+            input_schema = operation.pop("input_schema")
+            output_schema = operation.pop("output_schema")
+            assert input_schema == source["input_schema"]
+            assert output_schema == source["output_schema"]
+            for target in (*_schema_refs(input_schema), *_schema_refs(output_schema)):
+                assert target.startswith("#"), f"published schema leaked a non-local ref {target!r}"
+    # With the schemas popped, the remaining serialized surface must carry no
+    # execution/adapter/transport/path/credential material.
     serialized = json.dumps(view)
     for forbidden in (
         '"execution"', "bridge_adapter", "transport", '"command"', "path",
         "precondition", "idempotency", "receipts", "gates", '"failure"',
-        "input_schema", "output_schema", "deadline", "docs",
+        "deadline", "docs",
         "state_cli", "serving_mcp", "bridge_local", "token", "secret",
     ):
         assert forbidden not in serialized, f"published view leaked {forbidden!r}"
@@ -384,6 +462,25 @@ def test_bridge_parser_accepts_reviewed_provider_catalog_files() -> None:
         ]
     )
     assert args.provider_catalog == ["anvil-serving=/reviewed/serving.catalog.json"]
+
+
+def test_duplicate_provider_catalog_flags_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A repeated --provider-catalog for the same provider must refuse instead
+    # of silently letting the last flag win.
+    from workbench.bridge import main
+
+    monkeypatch.setenv("WORKBENCH_BRIDGE_TOKEN", "test-token")
+    with pytest.raises(SystemExit, match="duplicate --provider-catalog provider: anvil-serving"):
+        main(
+            [
+                "--hub", "http://hub", "--bridge-id", "b1", "--project-root", str(tmp_path),
+                "--project-id", "p1", "--router-base-url", "http://router",
+                "--provider-catalog", "anvil-serving=/reviewed/a.catalog.json",
+                "--provider-catalog", "anvil-serving=/reviewed/b.catalog.json",
+            ]
+        )
 
 
 def test_relative_local_source_resolves_against_the_configured_root(tmp_path: Path) -> None:
