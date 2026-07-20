@@ -64,6 +64,20 @@ rewrite it as part of Workbench work without a separate review of those changes.
 - No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 - No browser-supplied worktree paths, model/tool controls on the voice relay, raw audio storage, or transcript retention without the explicit environment switch.
 
+## 2026-07-20 autonomous anvil-driven run (actor `claude`)
+
+Seven State-managed tasks were delivered through the full anvil lifecycle
+(claim -> implement -> adversarial multi-agent review gate -> fix rounds ->
+independent re-verification -> evidence submit -> apply -> merge), each merge
+with the full suite green (61 -> 154 tests): `state-context-operations`
+T001/T002.1/T002.2/T002.3/T002.4 (feature F002, the State project-context
+projection, is complete but deliberately not wired into the live bridge loop
+pending fakoli/anvil#178) and `chat-first-voice` T001/T002.1 (contract
+schemas + conversation/turn domain models). All six PRDs are now approved;
+`plan-task-delivery` and `reviewed-tools-plugins` were adversarially
+reviewed, revised (r2), and approved with their open questions resolved into
+Decisions. Signed proof records live in the anvil workspace `proofs/` dir.
+
 ## Best next engineering tasks
 
 1. Resolve the Codex/local-model tool-call compatibility blocker recorded in [QUALIFICATION.md](QUALIFICATION.md); preserve the current Heavy as a qualified general Responses route but do not claim Codex harness parity.
