@@ -1,0 +1,222 @@
+{
+  "schema_version": "workbench-settings-descriptor/v1",
+  "catalog_id": "workbench.settings.initial",
+  "revision": "1.0.0",
+  "catalog_digest": "sha256:25845af37c947f14fdc74cdd7a49af6ef5f3885522ef30960c0ee5fb715dafc9",
+  "scope_precedence": [
+    "policy",
+    "deployment",
+    "project",
+    "personal"
+  ],
+  "settings": [
+    {
+      "id": "personal.landing_surface",
+      "title": "Default landing surface",
+      "description": "The surface an actor opens on. Chat is the product default.",
+      "type": "enum",
+      "scope": "personal",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "immediate",
+      "allowed_values": [
+        "chat",
+        "delivery",
+        "dashboard"
+      ],
+      "default": "chat"
+    },
+    {
+      "id": "personal.appearance_density",
+      "title": "Appearance density",
+      "type": "enum",
+      "scope": "personal",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "immediate",
+      "allowed_values": [
+        "comfortable",
+        "compact"
+      ],
+      "default": "comfortable"
+    },
+    {
+      "id": "personal.time_format",
+      "title": "Time format",
+      "type": "enum",
+      "scope": "personal",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "immediate",
+      "allowed_values": [
+        "format_24h",
+        "format_12h"
+      ],
+      "default": "format_24h"
+    },
+    {
+      "id": "personal.voice_autoplay",
+      "title": "Voice auto-play",
+      "description": "Play synthesized replies aloud automatically. Off until the actor enables it.",
+      "type": "bool",
+      "scope": "personal",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_session",
+      "default": false
+    },
+    {
+      "id": "personal.default_chat_route",
+      "title": "Default chat route",
+      "description": "An allowed Anvil Serving route id, bounded by the project route profile.",
+      "type": "id_ref",
+      "scope": "personal",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_turn",
+      "ref_kind": "route",
+      "default": "route.chat-fast",
+      "policy_ceiling": {
+        "ceiling_setting": "policy.route_allowlist_profile",
+        "note": "Route choice stays within the approved profile."
+      }
+    },
+    {
+      "id": "personal.chat_transcript_retention_days",
+      "title": "Chat transcript retention (days)",
+      "description": "Actor-chosen retention for redacted chat transcripts, capped by the operator ceiling.",
+      "type": "int",
+      "scope": "personal",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_run",
+      "bounds": {
+        "min": 1,
+        "max": 90
+      },
+      "default": 30,
+      "policy_ceiling": {
+        "ceiling_setting": "policy.transcript_retention_max_days"
+      }
+    },
+    {
+      "id": "project.preferred_worktree",
+      "title": "Preferred named worktree",
+      "description": "A named bridge worktree id. No filesystem path is stored or returned.",
+      "type": "id_ref",
+      "scope": "project",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_run",
+      "ref_kind": "worktree",
+      "default": "worktree.delivery-main"
+    },
+    {
+      "id": "project.workflow_template",
+      "title": "Default workflow template",
+      "type": "id_ref",
+      "scope": "project",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_run",
+      "ref_kind": "workflow",
+      "default": "workflow.delivery-standard"
+    },
+    {
+      "id": "project.default_capability_profile",
+      "title": "Default capability profile",
+      "description": "The reviewed capability profile digest a run pins.",
+      "type": "digest_ref",
+      "scope": "project",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_run",
+      "ref_kind": "capability",
+      "default": "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+    },
+    {
+      "id": "project.reviewed_skill_default",
+      "title": "Default reviewed skill",
+      "type": "id_ref",
+      "scope": "project",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_run",
+      "ref_kind": "skill",
+      "default": "skill.code-review"
+    },
+    {
+      "id": "project.enabled_plugin_default",
+      "title": "Default enabled plugin",
+      "type": "id_ref",
+      "scope": "project",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_run",
+      "ref_kind": "plugin",
+      "default": "plugin.commit-commands"
+    },
+    {
+      "id": "project.delivery_route",
+      "title": "Default delivery route",
+      "type": "id_ref",
+      "scope": "project",
+      "sensitivity": "public",
+      "mutability": "mutable",
+      "application_timing": "next_run",
+      "ref_kind": "route",
+      "default": "route.delivery-heavy",
+      "policy_ceiling": {
+        "ceiling_setting": "policy.route_allowlist_profile"
+      }
+    },
+    {
+      "id": "deployment.identity_header_name",
+      "title": "Identity header name",
+      "description": "Owner-managed identity header, configured in the environment only.",
+      "type": "string",
+      "scope": "deployment",
+      "sensitivity": "redacted",
+      "mutability": "env_only",
+      "application_timing": "next_session"
+    },
+    {
+      "id": "deployment.state_read_location",
+      "title": "State read location",
+      "description": "Owner-managed, path-like, and never serialized to the browser.",
+      "type": "string",
+      "scope": "deployment",
+      "sensitivity": "redacted",
+      "path_like": true,
+      "mutability": "env_only",
+      "application_timing": "next_session"
+    },
+    {
+      "id": "policy.transcript_retention_max_days",
+      "title": "Transcript retention ceiling (days)",
+      "description": "Operator-enforced maximum retention. An actor may choose shorter, never longer.",
+      "type": "int",
+      "scope": "policy",
+      "sensitivity": "public",
+      "mutability": "approval_gated",
+      "application_timing": "next_run",
+      "bounds": {
+        "min": 1,
+        "max": 365
+      },
+      "default": 90
+    },
+    {
+      "id": "policy.route_allowlist_profile",
+      "title": "Route allowlist profile",
+      "description": "The approved capability profile digest that bounds route selection.",
+      "type": "digest_ref",
+      "scope": "policy",
+      "sensitivity": "public",
+      "mutability": "approval_gated",
+      "application_timing": "next_run",
+      "ref_kind": "capability",
+      "default": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+    }
+  ]
+}

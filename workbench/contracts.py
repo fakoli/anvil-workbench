@@ -148,6 +148,57 @@ def _reset_workflow_contract_validator_cache() -> None:
     _workflow_contract_validator_cache = None
 
 
+_SETTINGS_DESCRIPTOR_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "settings-descriptor.v1.schema.json"
+)
+_settings_descriptor_contract_validator_cache: Draft202012Validator | None = None
+
+
+def settings_descriptor_contract_validator() -> Draft202012Validator:
+    """Load the settings-descriptor contract schema once; fail closed if absent.
+
+    Shared by every settings-descriptor consumer (the resolver, the actor/export
+    projection, future Settings APIs) so there is exactly one interpretation of
+    the contract schema.  The closed-root and closed-descriptor guards refuse a
+    schema edit that would reopen the catalog or a descriptor to unreviewed
+    extension fields: a descriptor must stay a closed, typed record, never an
+    extensible envelope through which a secret or a raw path could ride in.
+    """
+    global _settings_descriptor_contract_validator_cache
+    if _settings_descriptor_contract_validator_cache is None:
+        try:
+            schema = json.loads(_SETTINGS_DESCRIPTOR_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "settings-descriptor contract schema is unavailable; refusing to validate descriptors"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "settings-descriptor contract schema no longer closes its root object; "
+                "refusing to validate descriptors"
+            )
+        descriptor = schema.get("$defs", {}).get("descriptor")
+        if not isinstance(descriptor, dict) or descriptor.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "settings-descriptor contract schema no longer closes its descriptor object; "
+                "refusing to validate descriptors"
+            )
+        settings = schema.get("properties", {}).get("settings", {})
+        if not isinstance(settings.get("maxItems"), int):
+            raise ContractValidationError(
+                "settings-descriptor contract schema no longer bounds its settings list; "
+                "refusing to validate descriptors"
+            )
+        _settings_descriptor_contract_validator_cache = Draft202012Validator(schema)
+    return _settings_descriptor_contract_validator_cache
+
+
+def _reset_settings_descriptor_contract_validator_cache() -> None:
+    """Test hook: force the next descriptor validation to reload the on-disk schema."""
+    global _settings_descriptor_contract_validator_cache
+    _settings_descriptor_contract_validator_cache = None
+
+
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -240,6 +291,7 @@ _PREFIXES = {
     "approval-payload": b"anvil-workbench/approval-payload/v1\0",
     "state-snapshot": b"anvil-workbench/state-snapshot/v1\0",
     "prd-content": b"anvil-workbench/prd-content/v1\0",
+    "settings-descriptor": b"anvil-workbench/settings-descriptor/v1\0",
 }
 
 
@@ -349,6 +401,11 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
             )
     elif kind == "prd-content":
         payload = _without(value, "content_digest", "generated_at")
+    elif kind == "settings-descriptor":
+        payload = _without(value, "catalog_digest")
+        settings = payload.get("settings")
+        if isinstance(settings, list):
+            payload["settings"] = sorted(copy.deepcopy(settings), key=lambda item: str(item.get("id", "")))
     return payload
 
 
@@ -449,6 +506,171 @@ def validate_prd_content(document: Mapping[str, Any]) -> None:
         raise ContractValidationError("untruncated prd content must declare total_bytes equal to the body byte length")
     if truncated is True and (not isinstance(total, int) or total <= body_bytes):
         raise ContractValidationError("truncated prd content must declare total_bytes greater than the body byte length")
+
+
+_SETTINGS_SCOPES = ("personal", "project", "deployment", "policy")
+_SETTINGS_ACTOR_SCOPES = ("personal", "project")
+_SETTINGS_AUTHORITY_SCOPES = ("deployment", "policy")
+_SETTINGS_REFERENCE_KINDS = ("route", "worktree", "workflow", "skill", "plugin", "capability")
+_SETTINGS_ACTOR_VIEW_FIELDS = frozenset({
+    "id", "title", "description", "type", "scope", "sensitivity", "mutability",
+    "application_timing", "ref_kind", "allowed_values", "bounds", "default",
+    "depends_on", "migration", "policy_ceiling",
+})
+
+
+def validate_settings_descriptor(catalog: Mapping[str, Any]) -> None:
+    """Fail closed when a settings-descriptor catalog is internally inconsistent.
+
+    JSON Schema pins each descriptor's shape; these are the cross-field rules it
+    cannot express and that the three acceptance criteria depend on:
+
+    * the advertised ``catalog_digest`` must recompute (tamper-evident catalog);
+    * ``scope_precedence`` is a total order over every scope, so effective-value
+      resolution is deterministic (criterion 1);
+    * every descriptor owns exactly one scope, a ``policy_ceiling`` must be owned
+      by a strictly higher-authority scope (this pins the scope RANKING; the
+      numeric value clamp of a lower-scope bound against its ceiling is the
+      T002 resolver's job, not the descriptor's), so a personal value can never exceed
+      a project/deployment/policy bound (criterion 1 + PRD non-goal);
+    * a ``secret`` or path-like descriptor stays authority-owned with no default
+      (criterion 2, defence-in-depth behind the schema guard);
+    * every reference kind is present and typed as an id/digest reference rather
+      than free text (criterion 3).
+    """
+    try:
+        settings_descriptor_contract_validator().validate(dict(catalog))
+    except ValidationError as exc:
+        raise ContractValidationError(f"settings descriptor catalog is not schema valid: {exc.message}") from exc
+
+    if catalog.get("catalog_digest") != contract_digest("settings-descriptor", catalog):
+        raise ContractValidationError("settings descriptor catalog digest mismatch")
+
+    precedence = catalog.get("scope_precedence")
+    if not isinstance(precedence, list) or set(precedence) != set(_SETTINGS_SCOPES) or len(precedence) != len(_SETTINGS_SCOPES):
+        raise ContractValidationError("scope_precedence must be a total order over every scope")
+    rank = {scope: index for index, scope in enumerate(precedence)}
+    # Authority direction is pinned, not merely declared: every authority scope
+    # must outrank (precede) every actor scope, so an inverted permutation
+    # (personal above policy) cannot pass validation and a personal value can
+    # never be declared to outrank a policy bound. A lower rank index = higher
+    # authority.
+    for _authority in _SETTINGS_AUTHORITY_SCOPES:
+        for _actor in _SETTINGS_ACTOR_SCOPES:
+            if rank[_authority] >= rank[_actor]:
+                raise ContractValidationError(
+                    "scope_precedence must rank authority scopes above actor scopes "
+                    f"(got {_authority!r} not above {_actor!r})"
+                )
+
+    settings = catalog.get("settings")
+    if not isinstance(settings, list):
+        raise ContractValidationError("settings descriptor catalog has no settings list")
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for setting in settings:
+        if not isinstance(setting, Mapping):
+            raise ContractValidationError("settings descriptor is not an object")
+        setting_id = str(setting.get("id"))
+        if setting_id in by_id:
+            raise ContractValidationError(f"duplicate setting id: {setting_id}")
+        by_id[setting_id] = setting
+
+    present_reference_kinds: set[str] = set()
+    for setting_id, setting in by_id.items():
+        scope = setting.get("scope")
+        if scope not in _SETTINGS_SCOPES:
+            raise ContractValidationError(f"setting names an unknown scope: {setting_id}")
+
+        is_secret = setting.get("sensitivity") == "secret" or setting.get("path_like") is True
+        if is_secret:
+            if scope not in _SETTINGS_AUTHORITY_SCOPES:
+                raise ContractValidationError(f"secret or path-like setting must be authority-owned: {setting_id}")
+            if "default" in setting:
+                raise ContractValidationError(f"secret or path-like setting must not carry a default: {setting_id}")
+
+        ref_kind = setting.get("ref_kind")
+        if ref_kind is not None:
+            if setting.get("type") not in ("id_ref", "digest_ref"):
+                raise ContractValidationError(f"reference-kind setting must be an id/digest reference: {setting_id}")
+            present_reference_kinds.add(str(ref_kind))
+
+        if setting.get("type") == "enum":
+            allowed = setting.get("allowed_values")
+            default = setting.get("default")
+            if default is not None and default not in (allowed or ()):
+                raise ContractValidationError(f"enum default is not one of allowed_values: {setting_id}")
+
+        bounds = setting.get("bounds")
+        default = setting.get("default")
+        if isinstance(bounds, Mapping) and isinstance(default, int) and not isinstance(default, bool):
+            if not (bounds.get("min", default) <= default <= bounds.get("max", default)):
+                raise ContractValidationError(f"int default is outside its bounds: {setting_id}")
+
+        for dependency in setting.get("depends_on", ()):
+            dep = str(dependency)
+            if dep == setting_id:
+                raise ContractValidationError(f"setting cannot depend on itself: {setting_id}")
+            if dep not in by_id:
+                raise ContractValidationError(f"setting dependency names an unknown setting: {dep}")
+
+        ceiling = setting.get("policy_ceiling")
+        if isinstance(ceiling, Mapping):
+            ceiling_id = str(ceiling.get("ceiling_setting"))
+            ceiling_setting = by_id.get(ceiling_id)
+            if ceiling_setting is None:
+                raise ContractValidationError(f"policy_ceiling names an unknown setting: {ceiling_id}")
+            if rank[ceiling_setting.get("scope")] >= rank[scope]:
+                raise ContractValidationError(
+                    f"policy_ceiling must be owned by a strictly higher-authority scope: {setting_id}"
+                )
+
+    missing = set(_SETTINGS_REFERENCE_KINDS) - present_reference_kinds
+    if missing:
+        raise ContractValidationError(f"settings catalog omits reference-kind defaults: {sorted(missing)}")
+
+
+def settings_actor_view(catalog: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the actor/project-facing serialization of a descriptor catalog.
+
+    This is the only shape a preference API or a redacted export may serialize.
+    It keeps personal- and project-owned descriptors and drops every
+    authority-owned, ``secret``, or path-like descriptor -- defence-in-depth
+    behind the schema guard so a secret value or its default can never reach a
+    browser payload or an export even if a malformed catalog slips through.
+    """
+    view: dict[str, Any] = {
+        "schema_version": catalog.get("schema_version"),
+        "catalog_id": catalog.get("catalog_id"),
+        "revision": catalog.get("revision"),
+        "settings": [],
+    }
+    for setting in catalog.get("settings", []):
+        if not isinstance(setting, Mapping):
+            continue
+        if setting.get("scope") not in _SETTINGS_ACTOR_SCOPES:
+            continue
+        if setting.get("sensitivity") == "secret" or setting.get("path_like") is True:
+            continue
+        projected = {}
+        for key, item in setting.items():
+            if key not in _SETTINGS_ACTOR_VIEW_FIELDS:
+                continue
+            # Defense-in-depth: even a field declared non-secret is scrubbed for
+            # secret/path shapes before it can reach a browser/export, so a
+            # mis-declared sensitivity cannot leak a token or path.
+            projected[key] = _redact_settings_value(copy.deepcopy(item)) if key in _SETTINGS_SCRUBBED_FIELDS else copy.deepcopy(item)
+        view["settings"].append(projected)
+    return view
+
+
+_SETTINGS_SCRUBBED_FIELDS = frozenset({"default", "title", "description", "allowed_values"})
+
+
+def _redact_settings_value(value):
+    """Recursively scrub secret/path shapes from an actor-facing settings value."""
+    from workbench.redaction import redact_value
+
+    return redact_value(value)
 
 
 def validate_bridge_command_snapshot(
