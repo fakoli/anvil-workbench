@@ -1003,6 +1003,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--worktree must use ID=PATH")
         if worktree_id.strip() == "default":
             raise SystemExit("default is reserved for --project-root")
+        if worktree_id.strip() in worktrees:
+            raise SystemExit(f"duplicate --worktree id: {worktree_id.strip()}")
         worktrees[worktree_id.strip()] = Path(raw_path.strip()).resolve()
     provider_catalog_files: dict[str, Path] = {}
     for item in args.provider_catalog:
