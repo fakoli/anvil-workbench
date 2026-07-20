@@ -39,6 +39,9 @@ instance only, and never written into the rows.
 """
 from __future__ import annotations
 
+import threading
+from functools import wraps
+
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Protocol
@@ -201,6 +204,11 @@ class MemoryConversationStore:
             self._content_hash_key = require_content_hash_key(content_hash_key)
         except ConversationError as exc:
             raise ConversationStoreError(str(exc)) from exc
+        # Single-writer serialization for the in-memory backend: every public
+        # method runs under this reentrant lock so concurrent threadpool
+        # requests cannot interleave a mutation (the Postgres backend will use
+        # row-level transactions instead).
+        self._lock = threading.RLock()
         self.rows = rows if rows is not None else ConversationRows()
         if recover_on_open:
             self.recover_streaming_turns()
@@ -600,3 +608,37 @@ class MemoryConversationStore:
 
     def list_audit(self, limit: int = 20) -> list[ConversationAuditEvent]:
         return list(reversed(self.rows.audit[-max(1, min(limit, 100)):]))
+
+
+def _synchronize_memory_store() -> None:
+    """Wrap every public MemoryConversationStore method under its instance lock."""
+
+    def _guard(method):
+        @wraps(method)
+        def _locked(self, *args, **kwargs):
+            with self._lock:
+                return method(self, *args, **kwargs)
+        return _locked
+
+    for _name in (
+        "create_conversation",
+        "get_conversation",
+        "list_conversations",
+        "search_conversations",
+        "rename_conversation",
+        "archive_conversation",
+        "unarchive_conversation",
+        "append_turn",
+        "retry_turn",
+        "branch_turn",
+        "advance_turn_status",
+        "get_conversation_with_turns",
+        "delete_conversation",
+        "enforce_retention",
+        "recover_streaming_turns",
+        "list_audit",
+    ):
+        setattr(MemoryConversationStore, _name, _guard(getattr(MemoryConversationStore, _name)))
+
+
+_synchronize_memory_store()

@@ -64,10 +64,16 @@ def conversation_actor(trusted_name: str) -> ConversationActor:
     ``actor`` dependency before it reaches here.  A login that fits the
     conversation actor-id charset is used directly; one that does not (for
     example an email login containing ``@``) is mapped deterministically to a
-    hashed id so the same identity always owns the same conversations.  The
-    mapping never consults request data — only the trusted identity string.
+    hashed ``id-<sha256>`` id so the same identity always owns the same
+    conversations.  The ``id-`` prefix is RESERVED for that hashed namespace:
+    a direct login that itself begins with ``id-`` is hashed too, so the
+    hashed and direct id-spaces are provably disjoint and two distinct logins
+    can never collapse to the same owner.  The mapping never consults request
+    data — only the trusted identity string.
     """
     try:
+        if trusted_name.startswith("id-"):
+            raise ConversationError("id- is a reserved hashed-actor namespace")
         return ConversationActor(trusted_name)
     except ConversationError:
         digest = hashlib.sha256(trusted_name.encode("utf-8")).hexdigest()

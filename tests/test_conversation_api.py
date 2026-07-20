@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from workbench.api import create_app
 from workbench.config import Settings
+from workbench.conversation_api import conversation_actor
 from workbench.conversation_store import MemoryConversationStore
 from workbench.graph import NullGraph
 from workbench.store import MemoryStore
@@ -413,3 +414,47 @@ def test_chat_endpoints_refuse_when_the_content_hash_key_is_unset():
         for response in refusals:
             assert response.status_code == 503
             assert "WORKBENCH_CHAT_HASH_KEY" in response.json()["detail"]
+
+
+def test_actor_id_namespace_is_disjoint_between_direct_and_hashed_logins():
+    # A charset-valid login that itself begins with the reserved id- prefix is
+    # hashed, so it can never collide with the hashed mapping of another login.
+    import hashlib
+
+    email = "alice@corp.example"
+    hashed = conversation_actor(email)
+    literal = conversation_actor(f"id-{hashlib.sha256(email.encode()).hexdigest()}")
+    assert hashed.actor_id != literal.actor_id
+    # Two distinct emails also stay distinct.
+    assert conversation_actor("a@x").actor_id != conversation_actor("b@x").actor_id
+
+
+def test_email_identity_fallback_owns_a_stable_actor_scope_over_http():
+    # The production identity header carries emails (charset-invalid), which
+    # exercise the sha256 fallback branch — untested by the name-based cases.
+    email = "sdoumbouya81@gmail.com"
+    other = "someone-else@corp.example"
+    approvers = frozenset({email, other})
+    api = client(identity_header="Tailscale-User-Login", owner=email, approvers=approvers)
+    api2 = client(
+        conversation_store=api.app.state.conversation_store,
+        identity_header="Tailscale-User-Login", owner=email, approvers=approvers,
+    )
+    created = api.post(
+        "/api/conversations", headers={"Tailscale-User-Login": email},
+        json={"title": "Kickoff"},
+    )
+    assert created.status_code == 201
+    conversation_id = created.json()["id"]
+    # Same email → same owner on a second app instance over shared rows.
+    listed = api2.get("/api/conversations", headers={"Tailscale-User-Login": email})
+    assert [c["id"] for c in listed.json()["conversations"]] == [conversation_id]
+    # A different email cannot see it (byte-equal missing-id refusal).
+    foreign = api.get(
+        f"/api/conversations/{conversation_id}", headers={"Tailscale-User-Login": other},
+    )
+    missing = api.get(
+        "/api/conversations/conv_does_not_exist_00", headers={"Tailscale-User-Login": other},
+    )
+    assert foreign.status_code == missing.status_code
+    assert foreign.content == missing.content
