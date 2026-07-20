@@ -302,3 +302,18 @@ def test_feature_spanning_multiple_prds_fails_closed() -> None:
     snapshot = validate_snapshot_payload(snapshot_payload, pinned_snapshot_operation())
     with pytest.raises(ProjectContextError, match="spans more than one owning PRD"):
         ProjectContextProjection.from_snapshot(snapshot)
+
+
+def test_secrets_in_untrusted_display_text_are_scrubbed_on_the_last_hop() -> None:
+    from workbench.contracts import contract_digest
+
+    payload = json.loads(EXAMPLE_SNAPSHOT.read_text(encoding="utf-8"))
+    payload["project"]["name"] = "Bearer sk-live-abc123DEADBEEF secret project"
+    payload["tasks"][0]["title"] = "Fix token=supersecretvalue in the api_key=leak path"
+    payload["snapshot_digest"] = contract_digest("state-snapshot", payload)
+    snapshot = validate_snapshot_payload(payload, pinned_snapshot_operation())
+
+    serialized = json.dumps(ProjectContextProjection.from_snapshot(snapshot).as_dict())
+    for leaked in ("sk-live-abc123DEADBEEF", "supersecretvalue", "Bearer sk-live"):
+        assert leaked not in serialized
+    assert "[REDACTED]" in serialized

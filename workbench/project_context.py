@@ -44,6 +44,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .redaction import redact_text
 from .state_snapshot_adapter import PublishableSnapshot
 
 PROJECT_CONTEXT_SCHEMA_VERSION = "workbench-project-context/v1"
@@ -77,7 +78,10 @@ def _require(condition: bool, message: str) -> None:
 
 def _bounded_prose(value: Any, limit: int, label: str) -> str:
     _require(isinstance(value, str) and 0 < len(value) <= limit, f"{label} must be bounded readable text")
-    return value
+    # Defense-in-depth for the last display hop before the browser/model
+    # context: even though the snapshot is already redacted upstream, scrub any
+    # secret this display read-model might otherwise pass through verbatim.
+    return redact_text(value)
 
 
 def _revision(value: Any, label: str) -> int:
@@ -103,12 +107,12 @@ class PrdSummary:
     def __post_init__(self) -> None:
         _require(bool(_PROJECT_ID.match(str(self.project_id))), "prd summary project_id is invalid")
         _require(bool(_PRD_ID.match(str(self.scoped_id))), "prd summary scoped_id is invalid")
-        _bounded_prose(self.title, MAX_TITLE_CHARS, "prd summary title")
+        object.__setattr__(self, "title", _bounded_prose(self.title, MAX_TITLE_CHARS, "prd summary title"))
         _require(bool(_STATUS_TOKEN.match(str(self.status))), "prd summary status is invalid")
         _revision(self.source_revision, "prd summary source_revision")
         _require(bool(_DIGEST.match(str(self.source_digest))), "prd summary source_digest is invalid")
         if self.target_version is not None:
-            _bounded_prose(self.target_version, MAX_TARGET_VERSION_CHARS, "prd summary target_version")
+            object.__setattr__(self, "target_version", _bounded_prose(self.target_version, MAX_TARGET_VERSION_CHARS, "prd summary target_version"))
         _require(self.content_trust == CONTENT_TRUST, "prd summary prose is always untrusted task data")
         _require(self.source_kind == "prd", "prd summary source_kind must be 'prd'")
         _require(self.non_canonical is True, "a display summary is always non-canonical")
@@ -241,7 +245,7 @@ class TaskSummary:
     def __post_init__(self) -> None:
         _require(bool(_PROJECT_ID.match(str(self.project_id))), "task summary project_id is invalid")
         _require(bool(_TASK_SCOPED_ID.match(str(self.scoped_id))), "task summary scoped_id is invalid")
-        _bounded_prose(self.title, MAX_TITLE_CHARS, "task summary title")
+        object.__setattr__(self, "title", _bounded_prose(self.title, MAX_TITLE_CHARS, "task summary title"))
         _require(bool(_STATUS_TOKEN.match(str(self.status))), "task summary status is invalid")
         _require(bool(_PRD_ID.match(str(self.owning_prd_id))), "task summary owning_prd_id is invalid")
         _require(
@@ -345,7 +349,7 @@ class ProjectContextProjection:
         )
         _require(bool(_DIGEST.match(str(self.source_digest))), "projection source_digest is invalid")
         _require(bool(_PROJECT_ID.match(str(self.project_id))), "projection project_id is invalid")
-        _bounded_prose(self.project_name, MAX_PROJECT_NAME_CHARS, "projection project_name")
+        object.__setattr__(self, "project_name", _bounded_prose(self.project_name, MAX_PROJECT_NAME_CHARS, "projection project_name"))
         # The load-bearing authority invariant: this read model is NEVER canonical.
         _require(self.canonical is False, "a project-context projection is never canonical")
         _require(self.non_canonical is True, "a project-context projection must mark itself non-canonical")
