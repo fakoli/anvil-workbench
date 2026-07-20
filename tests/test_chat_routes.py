@@ -176,6 +176,10 @@ def test_unknown_route_selection_fails_closed_before_any_serving_request(monkeyp
     monkeypatch.setattr(
         router, "_request", lambda *_a, **_k: pytest.fail("refusal must precede any Serving request")
     )
+    import urllib.request
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda *_a, **_k: pytest.fail("refusal must precede any network I/O")
+    )
 
     with pytest.raises(ChatRouteError, match="not in the reviewed allowlist"):
         validate_chat_route_selection("chat.unlisted", {"max_output_tokens": 100}, discovered)
@@ -185,6 +189,10 @@ def test_undeclared_control_selection_fails_closed_before_any_serving_request(mo
     discovered = discover_chat_routes(configured())
     monkeypatch.setattr(
         router, "_request", lambda *_a, **_k: pytest.fail("refusal must precede any Serving request")
+    )
+    import urllib.request
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda *_a, **_k: pytest.fail("refusal must precede any network I/O")
     )
 
     # chat.fast declares only max_output_tokens; temperature is declared by the
@@ -300,3 +308,25 @@ def test_router_refuses_when_serving_is_unconfigured_instead_of_falling_back():
     # And the module-level declared surface is data plus validators only.
     assert not hasattr(chat_routes, "urlopen")
     assert isinstance(discover_chat_routes(configured()), DiscoveredChatRoutes)
+
+
+def test_display_name_refuses_scheme_less_urls_and_credential_prefixes():
+    for display in (
+        "api.openai.com model",              # scheme-less provider host
+        "sk-live-9f8a7b6c5d4e3f2a1b0c9d8e7f",  # secret-prefixed token
+        "ghp_ABCdef0123456789ABCdef0123",      # GitHub PAT shape
+        "AKIA0123456789ABCDEF chat",           # AWS access-key shape
+        "config a1b2c3d4e5f6g7h8i9j0k1l2",     # high-entropy alnum run
+    ):
+        unsafe = configured()
+        unsafe[0]["display_name"] = display
+        with pytest.raises(ChatRouteError, match="display_name"):
+            discover_chat_routes(unsafe)
+
+
+def test_display_name_accepts_ordinary_human_labels():
+    for display in ("Fast local chat", "Heavy (gemma3-27b)", "Chat, v2 & tools"):
+        ok = configured()
+        ok[0]["display_name"] = display
+        routes = discover_chat_routes(ok)
+        assert routes.as_dict()["routes"][0]["display_name"] == display

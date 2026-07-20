@@ -51,11 +51,16 @@ _ROUTE_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 MAX_DISPLAY_NAME_CHARS = 120
 
-#: Substrings that must never appear in operator display metadata; a match
-#: refuses discovery rather than shipping the value to a browser.
-_FORBIDDEN_DISPLAY_MARKERS = (
-    "://", "token", "secret", "bearer", "credential", "password", "api_key", "apikey",
-)
+#: A display name is human-readable text only, guarded three ways: an
+#: allowlist charset that structurally forbids URL and path punctuation
+#: (colon, slash, at-sign) so no endpoint can be expressed; a semantic word
+#: denylist for secret vocabulary; and a per-token check refusing
+#: secret-prefixed tokens, dotted host-like names, and high-entropy runs the
+#: charset alone would admit.
+_DISPLAY_NAME_CHARSET = re.compile(r"^[\w .,()&+'\-]{1,120}$")
+_FORBIDDEN_DISPLAY_WORDS = ("token", "secret", "bearer", "credential", "password", "api_key", "apikey")
+_SECRET_PREFIXES = ("sk-", "sk_", "pk-", "pk_", "ghp_", "gho_", "xox", "aws_", "akia")
+_CREDENTIAL_SHAPED_TOKEN = re.compile(r"^(?=.*[0-9])(?=.*[A-Za-z])[A-Za-z0-9_-]{20,}$")
 
 #: The complete declared-supported Advanced control surface, mirroring the
 #: ``chat-turn.v1`` ``advanced_controls`` block.  A control name outside this
@@ -151,15 +156,31 @@ def _identifier(entry: Mapping[str, Any], key: str, pattern: re.Pattern[str]) ->
 
 def _display_name(entry: Mapping[str, Any], route_id: str) -> str:
     value = entry.get("display_name", route_id)
-    if not isinstance(value, str) or not value.strip() or len(value) > MAX_DISPLAY_NAME_CHARS:
+    if not isinstance(value, str) or not value.strip() or not _DISPLAY_NAME_CHARSET.match(value):
         raise ChatRouteError(f"chat route {route_id} declares an invalid display_name")
     lowered = value.lower()
-    for marker in _FORBIDDEN_DISPLAY_MARKERS:
-        if marker in lowered:
+    for word in _FORBIDDEN_DISPLAY_WORDS:
+        if word in lowered:
             raise ChatRouteError(
-                f"chat route {route_id} display_name carries forbidden material ({marker!r})"
+                f"chat route {route_id} display_name carries forbidden material ({word!r})"
+            )
+    for token in value.split():
+        if _token_is_credential_shaped(token):
+            raise ChatRouteError(
+                f"chat route {route_id} display_name carries credential- or host-shaped material"
             )
     return value.strip()
+
+
+def _token_is_credential_shaped(token: str) -> bool:
+    """Refuse a display-name token that looks like a secret or a provider host."""
+    lowered = token.lower()
+    if any(lowered.startswith(prefix) for prefix in _SECRET_PREFIXES):
+        return True
+    segments = [part for part in token.split(".") if part]
+    if len(segments) >= 3 and all(seg.isalnum() for seg in segments):
+        return True  # a dotted host-like token (three or more alnum segments)
+    return bool(_CREDENTIAL_SHAPED_TOKEN.match(token))
 
 
 def _controls(entry: Mapping[str, Any], route_id: str) -> tuple[str, ...]:
