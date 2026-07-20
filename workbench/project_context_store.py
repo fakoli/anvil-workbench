@@ -160,11 +160,15 @@ class MemoryProjectContextStore:
         latest_digest = self.rows.latest.get(scope)
         if latest_digest is not None:
             latest = namespace[latest_digest]
-            # A new digest supersedes only with a strictly newer revision; a
-            # lower-or-equal revision must not clobber the current latest.
-            if revision <= latest.source_revision:
+            # A new distinct digest supersedes when it is at least as recent as
+            # the latest by source revision: a strictly-newer revision, or an
+            # equal revision carrying different content (e.g. a task-status
+            # flip that bumps no PRD revision) legitimately refreshes the
+            # display.  A strictly-LOWER revision is stale and must not clobber
+            # the current latest.
+            if revision < latest.source_revision:
                 raise StaleProjectionError(
-                    "a new projection must carry a newer source revision to supersede the latest"
+                    "a new projection must be at least as recent as the latest source revision to supersede it"
                 )
 
         namespace[digest] = projection

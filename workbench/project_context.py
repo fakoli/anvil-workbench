@@ -382,6 +382,11 @@ class ProjectContextProjection:
         project supersedes the latest display projection, a lower one never
         clobbers it.  A projection that reflects no summaries returns ``0``.
         """
+        # Note: this scalar is the max PRD revision, which can DECREASE if the
+        # highest-revision PRD is removed between snapshots; the store keys
+        # supersession on "at least as recent" and allows an equal-revision
+        # content refresh, but a decreasing-max snapshot is a known ordering
+        # limitation tracked for the persistence layer.
         revisions = [summary.source_revision for summary in (*self.prds, *self.features, *self.tasks)]
         return max(revisions) if revisions else 0
 

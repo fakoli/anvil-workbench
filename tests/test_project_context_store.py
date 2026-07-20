@@ -156,23 +156,25 @@ def test_supersede_preserves_historical_attribution() -> None:
     assert store.get_latest("project_a") == v2
 
 
-def test_stale_or_equal_revision_never_clobbers_latest() -> None:
+def test_lower_revision_is_stale_but_equal_revision_refreshes_latest() -> None:
     store = MemoryProjectContextStore()
     v2 = make_projection("project_a", revision=2)
     store.publish("project_a", v2)
 
-    # A lower revision under a new digest is refused, latest unchanged.
+    # A strictly-lower revision under a new digest is refused, latest unchanged.
     stale = make_projection("project_a", revision=1, seed="late-arrival")
     with pytest.raises(StaleProjectionError):
         store.publish("project_a", stale)
     assert store.get_latest("project_a") == v2
 
-    # An equal revision under a different digest also does not supersede.
-    equal = make_projection("project_a", revision=2, seed="different-digest-same-rev")
-    with pytest.raises(StaleProjectionError):
-        store.publish("project_a", equal)
-    assert store.get_latest("project_a") == v2
-    assert list(store.rows.projections["project_a"]) == [v2.source_digest]
+    # An equal revision under a DIFFERENT digest legitimately refreshes the
+    # display (e.g. a task-status flip that bumps no PRD revision); the prior
+    # projection stays addressable for historical attribution.
+    refreshed = make_projection("project_a", revision=2, seed="different-digest-same-rev")
+    result = store.publish("project_a", refreshed)
+    assert result == refreshed
+    assert store.get_latest("project_a") == refreshed
+    assert set(store.rows.projections["project_a"]) == {v2.source_digest, refreshed.source_digest}
 
 
 def test_cross_project_publish_is_refused_non_leaking() -> None:
@@ -258,3 +260,39 @@ def test_public_methods_are_synchronized() -> None:
 
     assert len(store.rows.projections["project_a"]) == 1
     assert all(result == projection for result in results)
+
+
+def test_concurrent_distinct_digest_publishes_serialize_without_corruption() -> None:
+    # The lock's load-bearing path: many concurrent publishes with DISTINCT
+    # digests at the same revision must serialize into one coherent state — a
+    # single deterministic `latest` pointer and exactly one row per digest,
+    # never an interleaved lost update.
+    store = MemoryProjectContextStore()
+    count = 16
+    projections = [
+        make_projection("project_a", revision=1, seed=f"racer-{index}") for index in range(count)
+    ]
+    barrier = threading.Barrier(count)
+    errors: list[Exception] = []
+
+    def _worker(projection: ProjectContextProjection) -> None:
+        barrier.wait()
+        try:
+            store.publish("project_a", projection)
+        except Exception as exc:  # noqa: BLE001 - surface any race failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(proj,)) for proj in projections]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    # Every distinct digest is stored exactly once; the latest pointer is one
+    # of them and resolves to a real stored row (no torn state).
+    stored = store.rows.projections["project_a"]
+    assert len(stored) == count
+    assert set(stored) == {proj.source_digest for proj in projections}
+    latest = store.get_latest("project_a")
+    assert latest.source_digest in stored
