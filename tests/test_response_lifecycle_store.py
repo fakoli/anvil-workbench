@@ -226,7 +226,12 @@ _AUTH_MARKERS = (
 )
 
 # The exact, closed set of fields a persisted lifecycle/usage row may carry.
-_SAFE_LIFECYCLE_FIELDS = {"request_id", "conversation_id", "actor", "state", "usage", "created_at", "updated_at"}
+# ``state_version``/``last_committed_seq`` (T008) are bounded non-negative ints:
+# sequence metadata only, structurally unable to hold a credential.
+_SAFE_LIFECYCLE_FIELDS = {
+    "request_id", "conversation_id", "actor", "state", "usage",
+    "state_version", "last_committed_seq", "created_at", "updated_at",
+}
 _SAFE_USAGE_FIELDS = {"input_tokens", "output_tokens", "duration_ms"}
 
 

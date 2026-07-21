@@ -86,6 +86,11 @@ LIFECYCLE_STATE_FOR_OUTCOME: dict[str, str] = {
 MAX_USAGE_TOKENS = 100_000_000
 MAX_USAGE_DURATION_MS = 86_400_000  # 24h; a bound, not a policy
 
+#: Hard bound on a per-conversation sequence number and a state-version, so a
+#: misbehaving caller cannot allocate or commit an unbounded counter.  Ample for
+#: any real conversation while remaining a fail-closed ceiling.
+MAX_SEQUENCE = 1_000_000_000
+
 _UNKNOWN_RESPONSE = "unknown response"
 
 
@@ -147,6 +152,14 @@ class ResponseLifecycle:
     actor: ConversationActor
     state: str
     usage: SafeUsage = field(default_factory=SafeUsage)
+    #: Monotonic version that bumps on every committed *state change* (T008).  A
+    #: reconnecting client compares versions to detect an out-of-order lower
+    #: state-version and refuse to regress a terminal.
+    state_version: int = 1
+    #: The highest per-conversation sequence number committed for this response
+    #: (T008).  A reconnecting client resyncs to this seq and refuses any stale
+    #: frame at or below it, so a dropped frame never duplicates the response.
+    last_committed_seq: int = 0
     created_at: datetime = field(default_factory=now_utc)
     updated_at: datetime = field(default_factory=now_utc)
 
@@ -161,6 +174,12 @@ class ResponseLifecycle:
             raise ResponseLifecycleError(f"response lifecycle state is not allowlisted: {self.state!r}")
         if not isinstance(self.usage, SafeUsage):
             raise ResponseLifecycleError("response usage must be a SafeUsage")
+        for name in ("state_version", "last_committed_seq"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ResponseLifecycleError(f"response {name} must be an int")
+            if value < 0 or value > MAX_SEQUENCE:
+                raise ResponseLifecycleError(f"response {name} is out of the bounded range")
 
     @property
     def is_terminal(self) -> bool:
@@ -178,7 +197,29 @@ class ResponseLifecycleAudit:
     actor_id: str
     state: str
     usage: SafeUsage
+    state_version: int = 1
+    last_committed_seq: int = 0
     created_at: datetime = field(default_factory=now_utc)
+
+
+@dataclass(frozen=True)
+class ResponseSnapshot:
+    """The last-committed lifecycle state a reconnecting client resyncs to (T008).
+
+    A snapshot is a pure read of the durable record: it carries only the settled
+    state, its monotonic ``state_version``, and the highest committed
+    per-conversation sequence number.  Returning it lets a client that detected a
+    dropped frame refresh to the last-committed state WITHOUT the response being
+    re-streamed or duplicated — there is no message content and no frame replay
+    here, only the position a client resyncs to.
+    """
+
+    request_id: str
+    conversation_id: str
+    state: str
+    state_version: int
+    last_committed_seq: int
+    is_terminal: bool
 
 
 @dataclass
@@ -195,6 +236,12 @@ class ResponseLifecycleRows:
 
     responses: dict[tuple[str, str], ResponseLifecycle] = field(default_factory=dict)
     audit: list[ResponseLifecycleAudit] = field(default_factory=list)
+    #: The per-conversation strictly-monotonic sequence high-water mark (T008),
+    #: keyed by ``conversation_id`` so every response in one conversation draws
+    #: from a single ascending sequence.  It lives in the shared row container,
+    #: so a fresh store over the same rows (a hub restart) continues allocating
+    #: strictly above the last committed seq and never resets.
+    conversation_seq: dict[str, int] = field(default_factory=dict)
 
 
 class ResponseLifecycleStore(Protocol):
@@ -204,8 +251,10 @@ class ResponseLifecycleStore(Protocol):
     ) -> ResponseLifecycle: ...
     def advance(
         self, actor: ConversationActor, request_id: str, state: str,
-        usage: SafeUsage | None = None,
+        usage: SafeUsage | None = None, *, seq: int | None = None,
     ) -> ResponseLifecycle: ...
+    def next_seq(self, actor: ConversationActor, request_id: str) -> int: ...
+    def snapshot(self, actor: ConversationActor, request_id: str) -> ResponseSnapshot: ...
     def reconnect(self, actor: ConversationActor, request_id: str) -> ResponseLifecycle: ...
     # HUB-INTERNAL / SYSTEM-ONLY: spans all actors' records; run after a restart
     # before serving reconnects, never wired to an actor-facing endpoint.
@@ -280,6 +329,8 @@ class MemoryResponseLifecycleStore:
                 actor_id=record.actor.actor_id,
                 state=record.state,
                 usage=record.usage,
+                state_version=record.state_version,
+                last_committed_seq=record.last_committed_seq,
             )
         )
         return record
@@ -317,16 +368,24 @@ class MemoryResponseLifecycleStore:
 
     def advance(
         self, actor: ConversationActor, request_id: str, state: str,
-        usage: SafeUsage | None = None,
+        usage: SafeUsage | None = None, *, seq: int | None = None,
     ) -> ResponseLifecycle:
         """Advance a response's lifecycle monotonically toward its terminal.
 
-        Allowed transitions: ``in_progress -> in_progress`` (a usage heartbeat
-        while still streaming) and ``in_progress -> terminal`` (exactly once).
-        A terminal record is committed and IMMUTABLE: any advance from a
-        terminal state — to an earlier state, a different terminal, or the same
-        terminal again — fails closed (criterion 3), so a late or racing update
-        can never replace a terminal with an earlier state.
+        Allowed transitions: ``in_progress -> in_progress`` (a usage/seq
+        heartbeat while still streaming) and ``in_progress -> terminal``
+        (exactly once).  A terminal record is committed and IMMUTABLE: any
+        advance from a terminal state — to an earlier state, a different
+        terminal, or the same terminal again — fails closed, so a late or racing
+        update can never replace a terminal with an earlier state.
+
+        ``seq`` optionally commits the highest per-conversation sequence number
+        the client should have observed at this point (T008).  A committed seq
+        must STRICTLY advance ``last_committed_seq``; a stale frame (``seq`` at or
+        below the last committed) is refused before any state change, so a
+        dropped/replayed/out-of-order frame can never regress the lifecycle nor
+        regress a terminal.  A committed state change bumps ``state_version`` so a
+        reconnecting client can order versions and reject a lower one.
         """
         record = self._owned(actor, request_id)
         if state not in LIFECYCLE_STATES:
@@ -335,22 +394,76 @@ class MemoryResponseLifecycleStore:
             # Exactly SafeUsage, not a subclass: a subclass could add a free-form
             # string field and defeat the 'no credential can be persisted' shape.
             raise ResponseLifecycleError("usage must be exactly a SafeUsage or None")
+        if seq is not None:
+            if not isinstance(seq, int) or isinstance(seq, bool):
+                raise ResponseLifecycleError("commit seq must be an int")
+            if seq < 0 or seq > MAX_SEQUENCE:
+                raise ResponseLifecycleError("commit seq is out of the bounded range")
         if record.is_terminal:
+            # A terminal is immutable: a stale-sequence frame arriving after the
+            # terminal is committed is refused here and can never regress it.
             raise ResponseLifecycleError(
                 "committed lifecycle is immutable; a terminal response cannot advance"
             )
         # record.state is in_progress here.
-        if state == IN_PROGRESS_STATE and usage is None:
-            # A no-op heartbeat with no new usage carries no information.
-            raise ResponseLifecycleError("an in_progress advance must carry updated usage")
+        if seq is not None and seq <= record.last_committed_seq:
+            # A frame at or below the last committed seq is stale/out-of-order;
+            # it carries no forward progress and must never drive a state change.
+            raise ResponseLifecycleError(
+                "stale sequence frame refused; it cannot regress the lifecycle"
+            )
+        if state == IN_PROGRESS_STATE and usage is None and seq is None:
+            # A no-op heartbeat with neither new usage nor a new seq carries no
+            # information.
+            raise ResponseLifecycleError("an in_progress advance must carry updated usage or seq")
         advanced = replace(
             record,
             state=state,
             usage=usage if usage is not None else record.usage,
+            # A committed *state change* bumps the version; a same-state heartbeat
+            # does not (it advances seq/usage only).
+            state_version=record.state_version + (1 if state != record.state else 0),
+            last_committed_seq=seq if seq is not None else record.last_committed_seq,
             updated_at=now_utc(),
         )
         kind = "response.terminated" if advanced.is_terminal else "response.progressed"
         return self._store(kind, advanced)
+
+    def next_seq(self, actor: ConversationActor, request_id: str) -> int:
+        """Allocate the next strictly-monotonic per-conversation sequence number.
+
+        Every emitted stream frame draws its ``seq`` here.  The counter is scoped
+        to the response's conversation and lives in the shared row container, so
+        it is strictly increasing across every response in the conversation and
+        continues strictly above the last value after a hub restart over the same
+        rows (criterion 1) — it never resets.  Allocation requires owning a
+        response in the conversation, so it is not a cross-actor oracle.
+        """
+        record = self._owned(actor, request_id)
+        current = self.rows.conversation_seq.get(record.conversation_id, 0)
+        nxt = current + 1
+        if nxt > MAX_SEQUENCE:
+            raise ResponseLifecycleError("conversation sequence is exhausted")
+        self.rows.conversation_seq[record.conversation_id] = nxt
+        return nxt
+
+    def snapshot(self, actor: ConversationActor, request_id: str) -> ResponseSnapshot:
+        """Return the last-committed lifecycle position for a resync (criterion 2).
+
+        A pure read: it returns the settled state, its ``state_version``, and the
+        highest committed seq so a client that detected a dropped frame can
+        refresh to last-committed state WITHOUT the response being re-streamed or
+        duplicated.  It never mutates, re-begins, or replays frames.
+        """
+        record = self._owned(actor, request_id)
+        return ResponseSnapshot(
+            request_id=record.request_id,
+            conversation_id=record.conversation_id,
+            state=record.state,
+            state_version=record.state_version,
+            last_committed_seq=record.last_committed_seq,
+            is_terminal=record.is_terminal,
+        )
 
     def reconnect(self, actor: ConversationActor, request_id: str) -> ResponseLifecycle:
         """Return the last persisted lifecycle for the response request.
@@ -411,6 +524,8 @@ def _synchronize_memory_store() -> None:
     for _name in (
         "begin",
         "advance",
+        "next_seq",
+        "snapshot",
         "reconnect",
         "recover_interrupted",
         "list_audit",

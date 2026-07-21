@@ -64,6 +64,58 @@ rewrite it as part of Workbench work without a separate review of those changes.
 - No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 - No browser-supplied worktree paths, model/tool controls on the voice relay, raw audio storage, or transcript retention without the explicit environment switch.
 
+## 2026-07-20 chat-first-voice T008 — gap-detectable sequence + state-version stream metadata
+
+Added strictly-monotonic per-conversation sequence numbers and a state-version
+to the streaming/lifecycle metadata so a reconnecting client can detect a
+dropped frame and refresh to last-committed state without duplicating the
+response. All backend, all hermetic; the client half is a pure helper.
+
+- **`workbench/response_lifecycle_store.py` (+~80):** `ResponseLifecycle` gained
+  two bounded non-negative int fields — `state_version` (bumps on each committed
+  *state change*; begun `in_progress` = 1, `in_progress -> terminal` = 2) and
+  `last_committed_seq` (the highest per-conversation seq committed for the
+  response). `ResponseLifecycleRows` gained `conversation_seq: dict[str,int]`,
+  the per-conversation high-water mark that lives in the shared row container so
+  it survives a restart. New `next_seq(actor, request_id)` allocates the next
+  strictly-monotonic per-conversation seq (ownership-scoped, so it is not a
+  cross-actor oracle; bounded by `MAX_SEQUENCE`). New `snapshot(...)` returns a
+  frozen `ResponseSnapshot` (state + state_version + last_committed_seq +
+  is_terminal) as a pure read — no mutation, no frame replay. `advance(...)`
+  gained an optional keyword `seq`: a committed seq must STRICTLY advance
+  `last_committed_seq`, so a stale frame (seq ≤ last committed) is refused before
+  any state change, and terminal-immutability still refuses ANY advance from a
+  terminal — a stale-sequence frame can never regress a terminal.
+- **`workbench/stream_sequence.py` (new, +~110):** pure gap-detection contract —
+  `detect_gap(last_seq, frame_seq)` (a skip = a drop), `is_stale_frame(...)`,
+  `needs_snapshot_refresh(...)` — plus `sequence_events(events, allocate)` which
+  stamps each relay frame with the next `seq`. `workbench/chat_stream.py`
+  `RelayEvent` gained an optional bounded `seq` field (default None).
+- **Criteria → proving tests (`tests/test_stream_sequence.py`, +15):**
+  (1) monotonic-per-conversation + survives-reconnect →
+  `test_seq_continues_strictly_above_last_committed_after_reconnect`,
+  `test_seq_is_monotonic_across_two_requests_in_one_conversation`;
+  (2) dropped-frame detectable client-side + snapshot returns last-committed
+  state with no duplication →
+  `test_dropped_frame_is_detectable_and_snapshot_returns_last_committed`;
+  (3) stale-seq cannot regress a terminal →
+  `test_stale_sequence_frame_cannot_regress_a_terminal`,
+  `test_racing_seq_commits_keep_a_stable_terminal` (tight `sys.setswitchinterval`
+  restored in `finally`).
+- **Client helper:** the frontend toolchain WORKS in this environment (`npm ci`
+  clean, vitest green). `web/src/chat-api.js` (new) mirrors the gap-detection
+  contract (`detectGap`/`isStaleFrame`/`needsSnapshotRefresh`) plus a pure
+  `reduceStreamState`/`applySnapshot` reducer; `web/src/chat-api.test.js` (new,
+  +5) proves a stale frame is ignored (no duplication) and a gap resyncs to the
+  snapshot. No new HTTP endpoint was added — `snapshot`/`next_seq` are the store
+  contract; wiring them onto `/api/conversations` (and a `GET .../snapshot`
+  route) is the next thin slice.
+- **No JSON schema change:** the response lifecycle store (T003.3) has no schema
+  mirror, so `state_version`/`last_committed_seq` stay internal store metadata,
+  consistent with the existing `state`/`usage` fields. `chat-turn.v1` unchanged.
+- **Verification:** FULL Python suite green at 429 (414 baseline + 15 new); web
+  vitest green at 13 (8 baseline + 5 new); all doc JSON parses.
+
 ## 2026-07-20 chat-first-voice T007 — idempotency keys on side-effecting chat APIs
 
 Delivered actor-scoped idempotency keys for the side-effecting chat endpoints.
