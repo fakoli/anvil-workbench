@@ -112,6 +112,20 @@ class DeleteInput(_ChatInput):
     mode: str = Field(pattern=r"^(purge_content_keep_tombstone|purge_all_records)$")
 
 
+#: A safe organization label: the same bounded token the ``Conversation`` model
+#: pins, mirrored here so an unsafe tag/folder is refused at the edge as 422
+#: (never reaching turn content or a Serving request).
+_ORG_TOKEN_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,63}$"
+
+
+class TagInput(_ChatInput):
+    tag: str = Field(pattern=_ORG_TOKEN_PATTERN)
+
+
+class FolderInput(_ChatInput):
+    folder: str = Field(pattern=_ORG_TOKEN_PATTERN)
+
+
 class LineageInput(_ChatInput):
     parent_turn_id: str | None = Field(default=None, min_length=13, max_length=133)
     sibling_index: int = Field(default=0, ge=0, le=MAX_SIBLING_INDEX)
@@ -191,6 +205,12 @@ def conversation_json(record: Conversation) -> dict[str, Any]:
         "id": record.id,
         "status": record.status,
         "title": record.title,
+        # Organization metadata (chat-first-voice T011): the actor's pin/tags/
+        # folder labels for the conversation list.  Safe tokens only, never turn
+        # content, and never part of a Serving request.
+        "pinned": record.pinned,
+        "tags": list(record.tags),
+        "folder": record.folder,
         # Truthful ephemeral badge: computed from the durable retention policy
         # (both content kinds metadata_only), never an asserted label, so the
         # badge a browser rail renders always reflects the real policy.
@@ -398,18 +418,29 @@ def build_conversation_router(
 
     @router.get("")
     def list_conversations(
-        include_archived: bool = False, actor: ConversationActor = Depends(chat_actor),
+        include_archived: bool = False,
+        pinned: bool | None = Query(default=None),
+        tag: str | None = Query(default=None, pattern=_ORG_TOKEN_PATTERN),
+        folder: str | None = Query(default=None, pattern=_ORG_TOKEN_PATTERN),
+        actor: ConversationActor = Depends(chat_actor),
     ) -> dict[str, Any]:
-        records = chat_store().list_conversations(actor, include_archived=include_archived)
+        records = chat_store().list_conversations(
+            actor, include_archived=include_archived, pinned=pinned, tag=tag, folder=folder,
+        )
         return {"conversations": [conversation_json(record) for record in records]}
 
     @router.get("/search")
     def search_conversations(
         query: str = Query(min_length=1, max_length=MAX_TITLE_CHARS),
         include_archived: bool = False,
+        pinned: bool | None = Query(default=None),
+        tag: str | None = Query(default=None, pattern=_ORG_TOKEN_PATTERN),
+        folder: str | None = Query(default=None, pattern=_ORG_TOKEN_PATTERN),
         actor: ConversationActor = Depends(chat_actor),
     ) -> dict[str, Any]:
-        records = chat_store().search_conversations(actor, query, include_archived=include_archived)
+        records = chat_store().search_conversations(
+            actor, query, include_archived=include_archived, pinned=pinned, tag=tag, folder=folder,
+        )
         return {"conversations": [conversation_json(record) for record in records]}
 
     @router.get("/{conversation_id}")
@@ -452,6 +483,86 @@ def build_conversation_router(
 
         return idempotent(
             actor, "conversations.unarchive", idempotency_key, {"conversation_id": conversation_id}, _run,
+        )
+
+    # -- organization metadata (pin / tags / folder) ----------------------
+    # Thin endpoints over the store's actor-scoped mutations; each returns the
+    # updated conversation projection (with pinned/tags/folder) and honours an
+    # optional idempotency key like every side-effecting endpoint.
+
+    @router.post("/{conversation_id}/pin")
+    def pin_conversation(
+        conversation_id: str, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().pin_conversation(actor, conversation_id))
+
+        return idempotent(
+            actor, "conversations.pin", idempotency_key, {"conversation_id": conversation_id}, _run,
+        )
+
+    @router.post("/{conversation_id}/unpin")
+    def unpin_conversation(
+        conversation_id: str, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().unpin_conversation(actor, conversation_id))
+
+        return idempotent(
+            actor, "conversations.unpin", idempotency_key, {"conversation_id": conversation_id}, _run,
+        )
+
+    @router.post("/{conversation_id}/tags")
+    def add_conversation_tag(
+        conversation_id: str, payload: TagInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().add_conversation_tag(actor, conversation_id, payload.tag))
+
+        return idempotent(
+            actor, "conversations.add_tag", idempotency_key,
+            {"conversation_id": conversation_id, "body": payload.model_dump(mode="json")}, _run,
+        )
+
+    @router.post("/{conversation_id}/tags/remove")
+    def remove_conversation_tag(
+        conversation_id: str, payload: TagInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().remove_conversation_tag(actor, conversation_id, payload.tag))
+
+        return idempotent(
+            actor, "conversations.remove_tag", idempotency_key,
+            {"conversation_id": conversation_id, "body": payload.model_dump(mode="json")}, _run,
+        )
+
+    @router.post("/{conversation_id}/folder")
+    def set_conversation_folder(
+        conversation_id: str, payload: FolderInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().set_conversation_folder(actor, conversation_id, payload.folder))
+
+        return idempotent(
+            actor, "conversations.set_folder", idempotency_key,
+            {"conversation_id": conversation_id, "body": payload.model_dump(mode="json")}, _run,
+        )
+
+    @router.post("/{conversation_id}/folder/clear")
+    def clear_conversation_folder(
+        conversation_id: str, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().clear_conversation_folder(actor, conversation_id))
+
+        return idempotent(
+            actor, "conversations.clear_folder", idempotency_key, {"conversation_id": conversation_id}, _run,
         )
 
     @router.post("/{conversation_id}/delete")
