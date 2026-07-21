@@ -14,6 +14,50 @@ Use this file to resume work in a new Anvil Workbench coding session.
 - Immediate roadmap: [ROADMAP.md](ROADMAP.md)
 - Agent rules: [../AGENTS.md](../AGENTS.md)
 
+## 2026-07-21 Advanced model playground runtime lane (advanced-model-playground T002/T003/T008)
+
+- **Implemented (three new hermetic modules, NOT wired into the live bridge loop):**
+  - `workbench/advanced_routes.py` (T002): discovers and validates Advanced-mode
+    route capabilities/controls against the frozen discovery snapshot before any
+    Serving request; refuses unknown/undeclared/out-of-bounds/policy-owned/stale
+    controls with a typed `AdvancedRouteError.reason`. `route_capability_repair`
+    now **fails closed**: a vanished live route, or a pinned `route_digest`/
+    `profile_digest` that is missing / non-string / non-`sha256:` → `repair_required`
+    (never a silent `ready`); a substituted route is never returned.
+  - `workbench/advanced_runtime.py` (T003): forks an advanced attempt as an
+    ordinary `mode="advanced"` sibling turn on the SAME `ConversationStore`, reuses
+    `ChatStreamRelay.for_prepared_request` + `ResponseLifecycleStore`, and refines
+    the relay outcome into the seven durable `AdvancedState`s. The durable
+    reconnect-safe lifecycle terminal is now derived from the REFINED advanced
+    state (`_LIFECYCLE_STATE_FOR_STATE`), not the raw relay outcome, so a
+    `schema_invalid` attempt persists `interrupted` — a reconnecting client can
+    never see `completed` for a settled-failed attempt. The served/persisted
+    advanced-trace.v1 `safe_summary` guard (and the schema's two `safe_summary`
+    patterns) now also scrub the dotless single-label `host:port` class
+    (`serving:8443`, `redis:6379`) that `redact_config_text` misses; a residual
+    falls back to the fixed safe marker (fail-safe). Trace `request.input_chars`
+    now reports the PROMPT length (the delta event keeps the output `text_chars`).
+  - `workbench/advanced_dispatch.py` (T008): fans one prompt across N reviewed
+    routes as isolated sibling turns; preflights the whole batch (undeclared route
+    / out-of-bounds control / over-concurrency / over-budget) before any transport
+    is opened or turn forked; per-attempt isolation with a lock-serialized shared
+    seq allocator.
+- **Additive surface:** `ChatStreamRelay.for_prepared_request` (a pre-validated
+  bounded-request relay constructor, pinned by a direct contract test; the WIRED
+  Advanced path re-validates via `AdvancedRouteSelection` before calling it) and
+  `contracts.validate_advanced_trace` (the served-record schema gate). An advanced
+  record — result, trace, per-attempt `SiblingAttempt`, or the aggregate
+  `ParallelDispatchResult` — is refused as authoritative evidence by
+  `refuse_advanced_evidence`, now via a generic `authoritative is False` gate so a
+  self-ID-stripped advanced record is still refused.
+- **Not wired live:** these are hermetic, injected-transport modules with no HTTP
+  client, endpoint, or credential representable. Wiring the browser projection /
+  bridge dispatch over them is a later step; the integrator is the control plane.
+- **Tests:** `tests/test_advanced_routes.py`, `tests/test_advanced_runtime.py`,
+  `tests/test_advanced_dispatch.py`, `tests/test_advanced_contracts.py`,
+  plus the direct `for_prepared_request` contract test in
+  `tests/test_chat_stream.py`. Full suite green.
+
 ## 2026-07-21 immutable run-context capture + read API (state-context-operations T004/T005.x)
 
 - **Implemented (read-model + capture point, NOT wired into the live queue):**

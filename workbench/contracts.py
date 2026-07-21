@@ -290,6 +290,71 @@ def _reset_advanced_preset_contract_validator_cache() -> None:
     _advanced_preset_contract_validator_cache = None
 
 
+_ADVANCED_TRACE_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "advanced-trace.v1.schema.json"
+)
+_advanced_trace_contract_validator_cache: Draft202012Validator | None = None
+
+
+def advanced_trace_contract_validator() -> Draft202012Validator:
+    """Load the advanced-trace contract schema once; fail closed if absent.
+
+    Shared by every Advanced-trace consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root and closed-event
+    guards refuse a schema edit that would reopen the trace or an event card to
+    unreviewed extension fields: a trace must stay a closed, redaction-only
+    record -- never an extensible envelope through which a credential, a raw
+    header, hidden model reasoning, a filesystem path, or an unredacted
+    provider/tool payload could ride in.  The validator carries no
+    ``FormatChecker``: the trace is hub-durable, not contract-digest-bearing, and
+    its timestamps are ``date-time`` strings the schema length- and
+    pattern-bounds at the edge, mirroring the branch/preset loaders.
+    """
+    global _advanced_trace_contract_validator_cache
+    if _advanced_trace_contract_validator_cache is None:
+        try:
+            schema = json.loads(_ADVANCED_TRACE_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "advanced-trace contract schema is unavailable; refusing to validate traces"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-trace contract schema no longer closes its root object; "
+                "refusing to validate traces"
+            )
+        events = schema.get("properties", {}).get("events", {}).get("items", {})
+        if not isinstance(events, dict) or events.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-trace contract schema no longer closes its event card; "
+                "refusing to validate traces"
+            )
+        _advanced_trace_contract_validator_cache = Draft202012Validator(schema)
+    return _advanced_trace_contract_validator_cache
+
+
+def _reset_advanced_trace_contract_validator_cache() -> None:
+    """Test hook: force the next trace validation to reload the on-disk schema."""
+    global _advanced_trace_contract_validator_cache
+    _advanced_trace_contract_validator_cache = None
+
+
+def validate_advanced_trace(trace: Mapping[str, Any]) -> None:
+    """Fail closed when a redacted Advanced-mode trace violates its contract.
+
+    The advanced-trace.v1 schema is closed and redaction-only: it cannot carry a
+    credential, a raw header, hidden model reasoning, a filesystem path, or an
+    unredacted provider/tool payload, and every free-text ``safe_summary`` is
+    pattern-guarded against those shapes.  This is the SERVED-record gate a trace
+    builder validates against, so a leak is refused at the boundary and not only
+    at construction.
+    """
+    try:
+        advanced_trace_contract_validator().validate(dict(trace))
+    except ValidationError as exc:
+        raise ContractValidationError(f"advanced trace is not schema valid: {exc.message}") from exc
+
+
 _TASK_REFERENCE_CONTRACT_SCHEMA_PATH = (
     Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "task-reference.v1.schema.json"
 )
