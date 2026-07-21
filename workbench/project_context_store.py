@@ -21,8 +21,11 @@ scope and touches only that project's namespace:
   project's latest display projection: the latest pointer moves, but the prior
   projection stays addressable by its own digest so historical source
   attribution is never rewritten.
-* A lower-or-equal revision under a new digest never clobbers the latest; it
-  fails closed.
+* A new distinct digest supersedes the latest when it is *at least as recent*
+  by source revision -- a strictly-newer revision, or an equal revision
+  carrying different content (e.g. a task-status flip that bumps no PRD
+  revision). Only a strictly-LOWER revision under a new digest fails closed and
+  never clobbers the latest.
 * A cross-project publish, read, or overwrite is refused with the same
   ``UnknownProjectionError`` a genuinely missing record raises, so one project
   can never learn whether another project's projection exists — the indistinct
@@ -67,9 +70,10 @@ class UnknownProjectionError(ProjectContextStoreError):
 class StaleProjectionError(ProjectContextStoreError):
     """A new-digest publish would not advance the acting project's latest.
 
-    A projection supersedes only when it carries a strictly newer source
-    revision than the current latest.  A lower-or-equal revision under a new
-    digest fails closed rather than clobbering the latest display projection.
+    A projection supersedes when it carries a source revision at least as recent
+    as the current latest (a strictly-newer revision, or an equal revision under
+    a different digest).  Only a strictly-LOWER revision under a new digest fails
+    closed rather than clobbering the latest display projection.
     """
 
 
@@ -125,8 +129,9 @@ class MemoryProjectContextStore:
 
         Idempotent by ``(project_id, source_digest)``: re-publishing an
         identical digest returns the already-stored record and creates no
-        duplicate (criterion 1).  A projection with a strictly newer
-        ``source_revision`` supersedes the acting project's latest display
+        duplicate (criterion 1).  A projection carrying a source revision at
+        least as recent as the current latest (strictly newer, or equal under a
+        different digest) supersedes the acting project's latest display
         projection while leaving every prior projection addressable by its own
         digest (criterion 2, and historical attribution is never rewritten).  A
         projection whose ``project_id`` differs from the acting scope is refused
