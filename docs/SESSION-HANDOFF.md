@@ -100,6 +100,21 @@ versioned, digest-bearing settings-descriptor contract resource.
   resolver, and the preference/export APIs (the actor view is the only
   serialization those APIs may emit).
 
+## 2026-07-20 autonomous anvil-driven run (actor `claude`) — run 3
+
+Twenty State-managed tasks are now merged through the gate-reviewed lifecycle;
+the full suite is at 399. All six PRDs carry merged work: milestone-1
+(state context, provider catalogs, capability profiles, workflow snapshots),
+milestone-2 (chat contracts, conversation store, retention, APIs, route
+discovery, streaming relay, reconnect-safe lifecycle), milestone-4
+(settings-descriptor contract), milestone-6 (advanced-mode contracts);
+milestones 3 and 5 are approved and fully planned. Every implemented slice is
+hermetic and deliberately not wired into the live loop pending its integration
+task; live qualification stays gated on fakoli/anvil#178. Research-derived
+backlog (16 items across all PRDs) is planned; upstream anvil frictions filed
+as fakoli/anvil#180. Run reports live in
+post-session-findings/2026-07-20-autonomous-prd-run/ (gitignored).
+
 ## 2026-07-20 autonomous anvil-driven run (actor `claude`) — continued
 
 Run #2 (same day): three more tasks delivered through the identical
