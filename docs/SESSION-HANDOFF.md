@@ -14,6 +14,35 @@ Use this file to resume work in a new Anvil Workbench coding session.
 - Immediate roadmap: [ROADMAP.md](ROADMAP.md)
 - Agent rules: [../AGENTS.md](../AGENTS.md)
 
+## 2026-07-20 autonomous PR-delivery run summary (actor `claude`)
+
+This run drove backend tasks all the way to **merged GitHub pull requests** on
+`fakoli/anvil-workbench`, each gated by an independent 3-lens adversarial review
+before push. Merged this run:
+
+| PR | Task(s) | What landed |
+| --- | --- | --- |
+| [#4](https://github.com/fakoli/anvil-workbench/pull/4) | 20 tasks | M1/M2/M4/M6 State-managed foundations (contracts, conversation/turn store, retention, response lifecycle, advanced-branch + settings resources) |
+| [#5](https://github.com/fakoli/anvil-workbench/pull/5) | chat-first-voice:T007 | Idempotency keys on side-effecting chat APIs |
+| [#6](https://github.com/fakoli/anvil-workbench/pull/6) | chat-first-voice:T008 | Gap-detectable sequence + `state_version` stream metadata |
+| [#7](https://github.com/fakoli/anvil-workbench/pull/7) | chat-first-voice:T009 | Off-read-path retention enforcement + one-action ephemeral chat |
+| [#8](https://github.com/fakoli/anvil-workbench/pull/8) | chat-first-voice:T011 | Conversation pinning, tags, folders, filterable search |
+
+**24 tasks are `done` in State and on `origin/main`.** The suite is 452 tests
+green (verified deterministic ×3). Every merge followed the same pipeline:
+worktree branch → adversarial gate PASS → State submit/apply (signed proof) →
+`git merge main` + full suite → push → `gh pr create` → `gh pr merge --merge` →
+`git merge --ff-only origin/main` → worktree/branch cleanup. **Every gate that
+ran found at least one real defect a green suite had missed; zero upheld false
+positives across the run** (scoreboard in the post-session findings).
+
+The hard ceiling is unchanged and honest: all merged work is **backend/contract
+persistence slices**. None is wired into `create_app`, a browser endpoint, the
+relay turn-append path, or the production Postgres backend, and the agentic
+delivery loop remains unqualified (see below). No `integrate-and-qualify`,
+browser-render, or voice task is completable without live infra — tracked at
+[fakoli/anvil#178](https://github.com/fakoli/anvil/issues/178).
+
 ## Current product state
 
 The repository contains the v1 hub, bridge, frontend shell, Compose stack, and contract tests. Workbench is explicitly a private, tailnet-first agent harness whose web UI is the primary operator entry point. The Workbench code is intentionally separate from Anvil Serving and Anvil State. The separate hub is designed to be started by Anvil Serving as an optional product stack, but Workbench business logic must not move into the Serving router.
