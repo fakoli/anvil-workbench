@@ -6,7 +6,7 @@ import {
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
 } from './api'
-import { describeConversation, selectChatRoute, terminalToStatus } from './chat-api'
+import { describeConversation, selectChatRoute, successorTurnBody, terminalToStatus } from './chat-api'
 
 const emptyData = {
   projects: [], runs: [], sessions: [], workflows: [], approvals: [], skills: [], directives: [], audit: [],
@@ -160,14 +160,20 @@ function turnText(turn) {
   return (turn.content || []).map((block) => block.text || '').join('')
 }
 
-function ConversationRow({ record, selected, onSelect, onRename, onArchive, onUnarchive, onDelete, renaming, onStartRename, onCancelRename }) {
+function ConversationRow({ record, selected, onSelect, onRename, onArchive, onUnarchive, onDelete, renaming, onStartRename, onCancelRename, confirmingDelete, onRequestDelete, onCancelDelete }) {
   const info = describeConversation(record)
   const [draft, setDraft] = useState(info.title)
+  const renameRef = useRef(null)
   useEffect(() => { setDraft(info.title) }, [renaming, info.title])
+  // Move focus into the rename field the moment editing opens, and support
+  // Escape-to-cancel so keyboard users are never trapped mid-edit (a11y #6).
+  useEffect(() => { if (renaming) renameRef.current?.focus() }, [renaming])
   if (renaming) {
     return <li className={`conv-row ${info.archived ? 'is-archived' : 'is-active'}`}>
       <form className="conv-rename" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) onRename(record.id, draft.trim()) }}>
-        <input aria-label={`Rename ${info.title}`} value={draft} onChange={(event) => setDraft(event.target.value)} />
+        <input ref={renameRef} aria-label={`Rename ${info.title}`} value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); onCancelRename() } }} />
         <button type="submit" disabled={!draft.trim()}>Save</button>
         <button type="button" onClick={onCancelRename}>Cancel</button>
       </form>
@@ -188,18 +194,28 @@ function ConversationRow({ record, selected, onSelect, onRename, onArchive, onUn
       {info.archived
         ? <button aria-label={`Unarchive ${info.title}`} onClick={() => onUnarchive(record.id)}>Unarchive</button>
         : <button aria-label={`Archive ${info.title}`} onClick={() => onArchive(record.id)}>Archive</button>}
-      <button aria-label={`Delete ${info.title}`} onClick={() => onDelete(record.id)}>Delete</button>
+      {/* Delete is a two-step confirm so a single stray keypress cannot destroy a
+          conversation (a11y #7): the first press arms an explicit Confirm/Keep. */}
+      {confirmingDelete
+        ? <>
+            <button className="conv-danger" aria-label={`Confirm delete ${info.title}`} onClick={() => onDelete(record.id)}>Confirm delete</button>
+            <button aria-label={`Keep ${info.title}`} onClick={onCancelDelete}>Keep</button>
+          </>
+        : <button aria-label={`Delete ${info.title}`} onClick={() => onRequestDelete(record.id)}>Delete</button>}
     </div>
   </li>
 }
 
-function ConversationRail({ conversations, selectedId, includeArchived, query, renamingId, onSelect, onNew, onQueryChange, onToggleArchived, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename }) {
+function ConversationRail({ conversations, selectedId, includeArchived, query, renamingId, confirmingDeleteId, railRef, onSelect, onNew, onQueryChange, onToggleArchived, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename, onRequestDelete, onCancelDelete }) {
   const active = conversations.filter((record) => record.status !== 'archived')
   const archived = conversations.filter((record) => record.status === 'archived')
-  const rowProps = { selected: false, onSelect, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename }
-  const row = (record) => <ConversationRow key={record.id} record={record} {...rowProps} selected={selectedId === record.id} renaming={renamingId === record.id} />
-  return <nav className="conv-rail" aria-label="Conversations">
-    <div className="conv-rail-head"><h2>Conversations</h2><button className="conv-new" aria-label="Start a new conversation" onClick={onNew}>+ New</button></div>
+  const rowProps = { selected: false, onSelect, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename, onRequestDelete, onCancelDelete }
+  const row = (record) => <ConversationRow key={record.id} record={record} {...rowProps} selected={selectedId === record.id} renaming={renamingId === record.id} confirmingDelete={confirmingDeleteId === record.id} />
+  // Heading order (a11y #11): the rail is first in document order, so its label
+  // is a non-heading element. The page <h1> in chat-main is the document's first
+  // heading, keeping the rank sequence h1 → … without a rail <h2> preceding it.
+  return <nav className="conv-rail" aria-label="Conversations" ref={railRef}>
+    <div className="conv-rail-head"><p className="conv-rail-title">Conversations</p><button className="conv-new" aria-label="Start a new conversation" onClick={onNew}>+ New</button></div>
     <form className="conv-search" role="search" onSubmit={(event) => event.preventDefault()}>
       <input type="search" aria-label="Search conversations" placeholder="Search titles and messages" value={query} onChange={(event) => onQueryChange(event.target.value)} />
     </form>
@@ -207,8 +223,8 @@ function ConversationRail({ conversations, selectedId, includeArchived, query, r
     {conversations.length === 0
       ? <p className="conv-empty">{query.trim() ? 'No conversations match that search.' : 'No conversations yet. Start one to begin.'}</p>
       : <>
-          <section aria-label="Active conversations"><h3>Active</h3><ul className="conv-list">{active.length ? active.map(row) : <li className="conv-none">No active conversations.</li>}</ul></section>
-          {includeArchived && <section aria-label="Archived conversations"><h3>Archived</h3><ul className="conv-list">{archived.length ? archived.map(row) : <li className="conv-none">No archived conversations.</li>}</ul></section>}
+          <section aria-label="Active conversations"><p className="conv-section-title">Active</p><ul className="conv-list">{active.length ? active.map(row) : <li className="conv-none">No active conversations.</li>}</ul></section>
+          {includeArchived && <section aria-label="Archived conversations"><p className="conv-section-title">Archived</p><ul className="conv-list">{archived.length ? archived.map(row) : <li className="conv-none">No archived conversations.</li>}</ul></section>}
         </>}
   </nav>
 }
@@ -238,7 +254,7 @@ function AdvancedPanel() {
   </section>
 }
 
-function TurnView({ turn, onRetry, onBranch }) {
+function TurnView({ turn, onRetry, onBranch, streamActive }) {
   const text = turnText(turn)
   const streaming = turn.status === 'streaming'
   const distinct = !streaming && turn.status !== 'complete'
@@ -251,32 +267,50 @@ function TurnView({ turn, onRetry, onBranch }) {
       {distinct && <span className={`turn-status turn-status-${turn.status}`}>{turn.status}</span>}
     </div>
     <p className="turn-text">{text || (streaming ? '…' : '')}</p>
+    {/* Successor actions are disabled while a stream is in flight (a11y #12): a
+        retry/branch cannot be issued against history that is still settling. */}
     {turn.role === 'assistant' && !streaming && <div className="turn-actions">
-      <button aria-label="Retry this response" onClick={() => onRetry(turn)}>Retry</button>
-      <button aria-label="Branch from this response" onClick={() => onBranch(turn)}>Branch</button>
+      <button aria-label="Retry this response" disabled={streamActive} onClick={() => onRetry(turn)}>Retry</button>
+      <button aria-label="Branch from this response" disabled={streamActive} onClick={() => onBranch(turn)}>Branch</button>
     </div>}
   </li>
 }
 
 function Transcript({ selected, turns, streamingTurn, onRetry, onBranch }) {
-  if (!selected) return <div className="chat-empty" aria-label="No conversation selected"><h2>Select or start a conversation</h2><p>Your conversations are private to you and stay on the tailnet.</p></div>
+  if (!selected) return <div className="chat-empty" role="region" aria-label="No conversation selected"><h2>Select or start a conversation</h2><p>Your conversations are private to you and stay on the tailnet.</p></div>
   const rendered = streamingTurn ? [...turns, streamingTurn] : turns
-  if (rendered.length === 0) return <div className="chat-empty" aria-label="Empty conversation"><h2>No messages yet</h2><p>Send the first message to start this conversation.</p></div>
-  return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} />)}</ol>
+  if (rendered.length === 0) return <div className="chat-empty" role="region" aria-label="Empty conversation"><h2>No messages yet</h2><p>Send the first message to start this conversation.</p></div>
+  const streamActive = Boolean(streamingTurn)
+  return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} streamActive={streamActive} />)}</ol>
 }
 
 function Composer({ draft, setDraft, onSend, onCancel, streaming, disabled, canSend }) {
+  const textareaRef = useRef(null)
+  const cancelRef = useRef(null)
+  const wasStreamingRef = useRef(false)
   const onKeyDown = (event) => {
+    // Do not submit on an IME commit Enter (a11y #8): while composing CJK/other
+    // input, the terminal Enter that accepts a candidate reports isComposing
+    // (keyCode 229 on older engines) and must insert/commit, never send.
+    if (event.isComposing || event.keyCode === 229) return
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (canSend) onSend() }
   }
+  // Focus follows the Send↔Cancel swap (a11y #6): when a stream starts, move
+  // focus to Cancel so it is never dropped to <body>; when the stream settles,
+  // return focus to the composer so the next message can be typed immediately.
+  useEffect(() => {
+    if (streaming) cancelRef.current?.focus()
+    else if (wasStreamingRef.current) textareaRef.current?.focus()
+    wasStreamingRef.current = streaming
+  }, [streaming])
   return <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); if (canSend) onSend() }}>
-    <textarea aria-label="Message composer" aria-describedby="composer-hint" rows="3" value={draft} disabled={disabled}
+    <textarea ref={textareaRef} aria-label="Message composer" aria-describedby="composer-hint" rows="3" value={draft} disabled={disabled}
       onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown}
       placeholder={disabled ? 'Select or start a conversation to send a message…' : 'Message…  (Enter to send, Shift+Enter for a new line)'} />
     <div className="composer-bar">
       <small id="composer-hint">Enter sends. Shift+Enter inserts a new line.</small>
       {streaming
-        ? <button type="button" className="composer-cancel" aria-label="Cancel streaming response" onClick={onCancel}>Cancel</button>
+        ? <button ref={cancelRef} type="button" className="composer-cancel" aria-label="Cancel streaming response" onClick={onCancel}>Cancel</button>
         : <button type="submit" aria-label="Send message" disabled={!canSend}>Send <span aria-hidden="true">↵</span></button>}
     </div>
   </form>
@@ -304,30 +338,71 @@ function ChatView({ append }) {
   const [streamingTurn, setStreamingTurn] = useState(null)
   const [lifecycle, setLifecycle] = useState('')
   const [renamingId, setRenamingId] = useState(null)
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null)
   const abortRef = useRef(null)
   const seqRef = useRef(0)
+  // Latest-wins guard for the conversation list/search (a11y #9): every fetch
+  // claims a monotonic ticket; a resolved fetch applies its result only if it is
+  // still the newest, so a slow earlier query can never overwrite a newer one.
+  const listSeqRef = useRef(0)
+  const listAbortRef = useRef(null)
+  const railRef = useRef(null)
+  // Mirror of the selected id readable from an async settle without a stale
+  // closure (a11y #2): an in-flight send captured its conversation id and
+  // compares it against this on settle to drop a result for a switched-away
+  // conversation instead of mutating the now-current one.
+  const selectedIdRef = useRef(null)
 
   const selected = conversations.find((record) => record.id === selectedId) || null
 
-  const refreshList = async (nextQuery, nextArchived) => {
+  const refreshList = async (nextQuery, nextArchived, signal) => {
+    const seq = (listSeqRef.current += 1)
     try {
       const value = nextQuery && nextQuery.trim()
-        ? await searchConversations(nextQuery.trim(), { includeArchived: nextArchived })
-        : await listConversations({ includeArchived: nextArchived })
+        ? await searchConversations(nextQuery.trim(), { includeArchived: nextArchived, signal })
+        : await listConversations({ includeArchived: nextArchived, signal })
+      if (seq !== listSeqRef.current) return // a newer list/search superseded this one
       setConversations(value.conversations || [])
-    } catch { append('Conversations are unavailable. No conversation content left the tailnet.') }
+    } catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError') return // superseded fetch aborted
+      if (seq === listSeqRef.current) append('Conversations are unavailable. No conversation content left the tailnet.')
+    }
   }
-  useEffect(() => { refreshList(query, includeArchived) }, [query, includeArchived])
+  // List/search fetch with debounce + abort (a11y #9): each run aborts the prior
+  // in-flight request, then a non-empty search waits ~150ms so a fast typist
+  // makes one request per pause; the plain list and the archived toggle refresh
+  // immediately. The latest-wins guard in refreshList is the final backstop.
+  useEffect(() => {
+    const controller = new AbortController()
+    listAbortRef.current?.abort()
+    listAbortRef.current = controller
+    if (!query.trim()) { refreshList(query, includeArchived, controller.signal); return undefined }
+    const handle = setTimeout(() => { refreshList(query, includeArchived, controller.signal) }, 150)
+    return () => { clearTimeout(handle) }
+  }, [query, includeArchived])
   useEffect(() => {
     fetchChatRoutes()
       .then((value) => { const list = value.routes || []; setRoutes(list); setRouteId((current) => current || list[0]?.route_id || '') })
       .catch(() => setRoutes([]))
   }, [])
 
+  // Focus a sensible target after a row leaves the rail (a11y #6): the first
+  // remaining conversation, else the "New" affordance — never <body>.
+  const focusRail = () => {
+    const rail = railRef.current
+    if (!rail) return
+    const target = rail.querySelector('.conv-open') || rail.querySelector('.conv-new')
+    target?.focus()
+  }
+
   const select = async (id) => {
-    setSelectedId(id); setStreamingTurn(null); setLifecycle(''); setRenamingId(null)
-    try { const value = await getConversation(id); setTurns(value.turns || []) }
-    catch { setTurns([]); append('That conversation could not be opened.') }
+    // Switching conversations aborts any in-flight stream so its settled answer
+    // cannot land in — or announce for — the newly selected conversation (#2).
+    abortRef.current?.abort()
+    selectedIdRef.current = id
+    setSelectedId(id); setStreamingTurn(null); setLifecycle(''); setRenamingId(null); setConfirmingDeleteId(null)
+    try { const value = await getConversation(id); if (selectedIdRef.current === id) setTurns(value.turns || []) }
+    catch { if (selectedIdRef.current === id) { setTurns([]); append('That conversation could not be opened.') } }
   }
   const newConversation = async () => {
     try { const record = await createConversation({}); setConversations((current) => [record, ...current]); await select(record.id) }
@@ -338,10 +413,15 @@ function ChatView({ append }) {
     try { const record = await renameConversation(id, title); setConversations((current) => current.map((item) => (item.id === id ? record : item))) }
     catch { append('The conversation could not be renamed.') }
   }
-  const archive = async (id) => { try { await archiveConversation(id); await refreshList(query, includeArchived) } catch { append('The conversation could not be archived.') } }
-  const unarchive = async (id) => { try { await unarchiveConversation(id); await refreshList(query, includeArchived) } catch { append('The conversation could not be unarchived.') } }
+  const archive = async (id) => { try { await archiveConversation(id); await refreshList(query, includeArchived); focusRail() } catch { append('The conversation could not be archived.') } }
+  const unarchive = async (id) => { try { await unarchiveConversation(id); await refreshList(query, includeArchived); focusRail() } catch { append('The conversation could not be unarchived.') } }
   const remove = async (id) => {
-    try { await deleteConversation(id); if (selectedId === id) { setSelectedId(null); setTurns([]) } await refreshList(query, includeArchived) }
+    setConfirmingDeleteId(null)
+    try {
+      await deleteConversation(id)
+      if (selectedId === id) { abortRef.current?.abort(); selectedIdRef.current = null; setSelectedId(null); setTurns([]); setStreamingTurn(null); setLifecycle('') }
+      await refreshList(query, includeArchived); focusRail()
+    }
     catch { append('The conversation could not be deleted.') }
   }
 
@@ -349,6 +429,10 @@ function ChatView({ append }) {
     const prompt = draft.trim()
     if (!prompt || !selectedId || !routeId || streamingTurn) return
     try { selectChatRoute(routes, routeId) } catch { append('That route is not in the reviewed allowlist.'); return }
+    // Bind this send to the conversation it started in; a settle for a
+    // switched-away conversation is dropped rather than mutating the current one.
+    const conversationId = selectedId
+    const isCurrent = () => selectedIdRef.current === conversationId
     const ordinal = (seqRef.current += 1)
     const userTurn = { id: `local-user-${ordinal}`, role: 'user', status: 'complete', content: [{ text: prompt }], lineage: { kind: 'initial' } }
     setTurns((current) => [...current, userTurn]); setDraft('')
@@ -357,47 +441,59 @@ function ChatView({ append }) {
     const controller = new AbortController(); abortRef.current = controller
     try {
       const state = await sendMessage({
-        conversationId: selectedId, routeId, prompt, signal: controller.signal,
-        onState: (streamState) => setStreamingTurn((current) => (current ? {
+        conversationId, routeId, prompt, signal: controller.signal,
+        onState: (streamState) => { if (!isCurrent()) return; setStreamingTurn((current) => (current ? {
           ...current, content: [{ text: streamState.text }],
           status: streamState.terminal ? terminalToStatus(streamState.terminal) : 'streaming',
-        } : current)),
+        } : current)) },
       })
+      if (!isCurrent()) return // switched away mid-stream: drop this settle entirely
       const status = terminalToStatus(state.terminal)
       setTurns((current) => [...current, { ...assistant, content: [{ text: state.text }], status }])
       setStreamingTurn(null)
       setLifecycle(LIFECYCLE[status] || LIFECYCLE.complete)
       if (state.needsRefresh) {
-        try { const value = await getConversation(selectedId); setTurns(value.turns || []) }
-        catch { append('The reconnected transcript could not be refreshed.') }
+        try { const value = await getConversation(conversationId); if (isCurrent()) setTurns(value.turns || []) }
+        catch { if (isCurrent()) append('The reconnected transcript could not be refreshed.') }
       }
     } catch {
+      if (!isCurrent()) return
       setStreamingTurn(null)
       setTurns((current) => [...current, { ...assistant, status: 'failed', content: [{ text: '' }] }])
       setLifecycle(LIFECYCLE.failed)
       append('The response failed. No partial answer was recorded as complete.')
-    } finally { abortRef.current = null }
+    } finally {
+      // Only clear the ref if this send still owns it — a newer stream may have
+      // taken it while this one was settling (#2), and must not be wiped.
+      if (abortRef.current === controller) abortRef.current = null
+    }
   }
   const cancel = () => { abortRef.current?.abort() }
 
-  const addSuccessor = async (call, turn, fallbackKind, failure) => {
+  // Retry/branch post ONLY the `{kind:'text', text}` slice the server accepts and
+  // pick the role the server's turn tree expects (#1): retry appends a sibling
+  // ASSISTANT regeneration; branch opens a follow-up USER turn. Reposting a
+  // server-loaded block verbatim carried `content_trust` and was rejected 422.
+  const addSuccessor = async (call, turn, role, fallbackKind, failure) => {
     try {
-      const created = await call(selectedId, turn.id, { role: 'assistant', status: 'complete', content: turn.content || [], mode: advanced ? 'advanced' : 'ordinary' })
+      const created = await call(selectedId, turn.id, successorTurnBody(turn, { role, mode: advanced ? 'advanced' : 'ordinary' }))
       setTurns((current) => [...current, { ...created, lineage: created.lineage || { kind: fallbackKind } }])
       setLifecycle(fallbackKind === 'retry' ? 'Added a retry response' : 'Added a branch response')
     } catch { append(failure) }
   }
-  const retry = (turn) => addSuccessor(retryTurn, turn, 'retry', 'Retry could not be recorded.')
-  const branch = (turn) => addSuccessor(branchTurn, turn, 'branch', 'Branch could not be recorded.')
+  const retry = (turn) => addSuccessor(retryTurn, turn, 'assistant', 'retry', 'Retry could not be recorded.')
+  const branch = (turn) => addSuccessor(branchTurn, turn, 'user', 'branch', 'Branch could not be recorded.')
 
   const streaming = Boolean(streamingTurn)
   const canSend = Boolean(!streaming && draft.trim() && selectedId && routeId)
   return <main className="chat">
     <ConversationRail
       conversations={conversations} selectedId={selectedId} includeArchived={includeArchived} query={query} renamingId={renamingId}
+      confirmingDeleteId={confirmingDeleteId} railRef={railRef}
       onSelect={select} onNew={newConversation} onQueryChange={setQuery} onToggleArchived={() => setIncludeArchived((value) => !value)}
       onRename={rename} onArchive={archive} onUnarchive={unarchive} onDelete={remove}
-      onStartRename={setRenamingId} onCancelRename={() => setRenamingId(null)} />
+      onStartRename={(id) => { setConfirmingDeleteId(null); setRenamingId(id) }} onCancelRename={() => setRenamingId(null)}
+      onRequestDelete={(id) => { setRenamingId(null); setConfirmingDeleteId(id) }} onCancelDelete={() => setConfirmingDeleteId(null)} />
     <section className="chat-main" aria-label="Conversation">
       <header className="chat-header">
         <div><span className="crumb">Chat / private</span><h1>{selected ? describeConversation(selected).title : 'Chat'}</h1></div>
@@ -425,7 +521,7 @@ function App() {
   const addDirection = async (sessionId, text) => { const event = await addDirective(sessionId, text); setData((current) => ({ ...current, directives: [...current.directives, event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.'); await load() }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
   const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
-  return <div className="app-shell">
+  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}`}>
     <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
     <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>

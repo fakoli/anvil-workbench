@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
@@ -44,6 +44,7 @@ const activeConversation = {
   context: { project: { title: 'Checkout revamp', id: 'project_1' }, prd: { title: 'PRD: chat-first', id: 'prd_1' }, task: { title: 'Route selection', id: 'TASK-1' } },
 }
 const archivedConversation = { id: 'conv_arch', title: 'Old triage', status: 'archived', ephemeral: false, pinned: false, tags: [], folder: null, updated_at: 't1' }
+const secondConversation = { id: 'conv_b', title: 'Second thread', status: 'active', ephemeral: false, pinned: false, tags: [], folder: null, updated_at: 't3' }
 const chatRoutes = [{ route_id: 'route.fast', display_name: 'Fast local' }, { route_id: 'route.deep', display_name: 'Deep local' }]
 
 function assistantTurn(id, text, status = 'complete', kind = 'initial') {
@@ -167,7 +168,11 @@ describe('Chat conversation rail (T004.2)', () => {
     expect(createConversation).toHaveBeenCalled()
     await user.click(screen.getByRole('button', { name: 'Archive Router planning' }))
     expect(archiveConversation).toHaveBeenCalledWith('conv_active')
+    // Delete is a two-step confirm (a11y #7): the first press only arms it, so a
+    // single stray keypress cannot destroy a conversation.
     await user.click(screen.getByRole('button', { name: 'Delete Router planning' }))
+    expect(deleteConversation).not.toHaveBeenCalled() // not yet — armed, not fired
+    await user.click(screen.getByRole('button', { name: 'Confirm delete Router planning' }))
     expect(deleteConversation).toHaveBeenCalledWith('conv_active')
     // Rename last: it changes the row's accessible name, so it cannot precede the
     // by-title archive/delete lookups above.
@@ -176,6 +181,35 @@ describe('Chat conversation rail (T004.2)', () => {
     await user.clear(renameField); await user.type(renameField, 'Router evidence')
     await user.click(screen.getByRole('button', { name: 'Save' }))
     expect(renameConversation).toHaveBeenCalledWith('conv_active', 'Router evidence')
+    // Render assertion (correctness #5): the setConversations map must actually
+    // update the rendered row title — deleting App.jsx's rename map fails here.
+    expect(await screen.findByText('Router evidence')).toBeTruthy()
+    expect(screen.queryByText('Router planning')).toBeNull()
+  })
+
+  it('reflects archive and delete outcomes in the rendered rail, not just the call', async () => {
+    // Correctness #5: assert the rail re-renders from the refreshed server list —
+    // after archive the row moves into the Archived section; after delete it is
+    // gone. Deleting App.jsx's setConversations refresh path fails these.
+    const user = await renderChat()
+    // Show archived so both sections render, then archive the active row; the
+    // post-archive refresh returns it with an archived status.
+    await user.click(screen.getByRole('checkbox', { name: 'Show archived conversations' }))
+    listConversations.mockResolvedValue({
+      conversations: [{ ...activeConversation, status: 'archived' }, archivedConversation],
+    })
+    await user.click(screen.getByRole('button', { name: 'Archive Router planning' }))
+    const archived = await screen.findByRole('region', { name: 'Archived conversations' })
+    expect(within(archived).getByText('Router planning')).toBeTruthy() // moved to Archived
+    const active = screen.getByRole('region', { name: 'Active conversations' })
+    expect(within(active).queryByText('Router planning')).toBeNull()
+    // Delete it from the Archived section: the post-delete refresh omits it.
+    listConversations.mockResolvedValue({ conversations: [archivedConversation] })
+    await user.click(within(archived).getByRole('button', { name: 'Delete Router planning' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm delete Router planning' }))
+    expect(deleteConversation).toHaveBeenCalledWith('conv_active')
+    await waitFor(() => expect(screen.queryByText('Router planning')).toBeNull()) // row disappeared
+    expect(screen.getByText('Old triage')).toBeTruthy() // the other row remains
   })
 
   it('keeps the title and state prominent while the id is secondary disclosure', async () => {
@@ -192,15 +226,17 @@ describe('Chat conversation rail (T004.2)', () => {
     // (which searches retained content) returns it, and the rail surfaces it.
     searchConversations.mockResolvedValue({ conversations: [{ id: 'conv_c', title: 'Weekly sync', status: 'active', tags: [] }] })
     await user.type(screen.getByRole('searchbox', { name: 'Search conversations' }), 'invoices')
-    expect(searchConversations).toHaveBeenCalledWith('invoices', expect.objectContaining({ includeArchived: false }))
+    // The search is debounced (a11y #9), so wait for the rendered result, then
+    // assert the one settled request carried the full query.
     expect(await screen.findByText('Weekly sync')).toBeTruthy()
+    expect(searchConversations).toHaveBeenCalledWith('invoices', expect.objectContaining({ includeArchived: false }))
   })
 
   it('keeps active and archived conversations visibly distinct', async () => {
     const user = await renderChat()
     expect(screen.queryByText('Old triage')).toBeNull() // archived hidden by default
     await user.click(screen.getByRole('checkbox', { name: 'Show archived conversations' }))
-    expect(listConversations).toHaveBeenLastCalledWith({ includeArchived: true })
+    expect(listConversations).toHaveBeenLastCalledWith(expect.objectContaining({ includeArchived: true }))
     const archivedSection = await screen.findByRole('region', { name: 'Archived conversations' })
     expect(within(archivedSection).getByText('Old triage')).toBeTruthy()
     const activeSection = screen.getByRole('region', { name: 'Active conversations' })
@@ -208,6 +244,12 @@ describe('Chat conversation rail (T004.2)', () => {
   })
 
   it('shows bound project, PRD, and task titles with ids as secondary disclosure', async () => {
+    // NOTE: `activeConversation.context` ({project,prd,task}:{title,id}) is a
+    // PROPOSED projection shape — the merged conversation projection does not yet
+    // emit it (see conversation_api.py:turn_json/conversation_json, which carry no
+    // delivery binding). This pins the intended DeliveryContext render for when
+    // the binding is emitted; the truthful "No linked delivery context" degrade
+    // (asserted where context is absent) is the current shipped behavior.
     const user = await renderChat()
     await openConversation(user, [])
     const context = await screen.findByRole('region', { name: 'Linked delivery context' })
@@ -265,9 +307,66 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     await openConversation(user, [assistantTurn('turn_1', 'first answer')])
     expect(await screen.findByText('first answer')).toBeTruthy()
     await user.click(screen.getByRole('button', { name: 'Retry this response' }))
-    expect(retryTurn).toHaveBeenCalledWith('conv_active', 'turn_1', expect.objectContaining({ role: 'assistant' }))
+    // Retry posts a normalized {kind:'text',text} slice as an assistant sibling —
+    // never the server-loaded block verbatim (which carries content_trust → 422).
+    expect(retryTurn).toHaveBeenCalledWith('conv_active', 'turn_1', expect.objectContaining({
+      role: 'assistant', status: 'complete', content: [{ kind: 'text', text: 'first answer' }],
+    }))
     expect(await screen.findByText('second answer')).toBeTruthy()
     expect(screen.getByText('first answer')).toBeTruthy() // the original turn is preserved, not rewritten
+  })
+
+  it('records a branch as a follow-up user turn with a normalized body', async () => {
+    const user = await renderChat()
+    await openConversation(user, [assistantTurn('turn_1', 'first answer')])
+    expect(await screen.findByText('first answer')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'Branch from this response' }))
+    // Branch opens a USER successor (server turn tree), body normalized to
+    // {kind:'text',text} — not an assistant repost of the prior answer (#1).
+    expect(branchTurn).toHaveBeenCalledWith('conv_active', 'turn_1', expect.objectContaining({
+      role: 'user', status: 'complete', content: [{ kind: 'text', text: 'first answer' }],
+    }))
+    expect(await screen.findByText('branched answer')).toBeTruthy()
+  })
+
+  it('does not let a settled stream from one conversation land in another (state-drift #2)', async () => {
+    listConversations.mockResolvedValue({ conversations: [activeConversation, secondConversation] })
+    const user = await renderChat()
+    await openConversation(user, [])
+
+    // A's stream emits 'A-answer', then stays pending until the test settles it.
+    let settleA
+    sendMessage.mockImplementation(({ conversationId, onState }) => {
+      if (conversationId === 'conv_active') {
+        onState({ text: 'A-answer', terminal: null })
+        return new Promise((resolve) => { settleA = () => resolve({ text: 'A-answer', terminal: 'completed' }) })
+      }
+      // Conversation B: pending until its Cancel aborts the signal.
+      return new Promise((resolve) => { /* B settles via signal below */ })
+    })
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'hi A')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('A-answer')).toBeTruthy() // A streaming in A's view
+
+    // Switch to B mid-stream: A's in-flight stream is aborted and B opens empty.
+    getConversation.mockResolvedValueOnce({ conversation: secondConversation, turns: [] })
+    await user.click(screen.getByRole('button', { name: 'Open Second thread' }))
+    expect(await screen.findByLabelText('Empty conversation')).toBeTruthy()
+
+    // Start a stream in B that settles cancelled when its signal aborts.
+    sendMessage.mockImplementation(({ signal }) =>
+      new Promise((resolve) => { signal.addEventListener('abort', () => resolve({ text: 'B', terminal: 'cancelled' })) }))
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'hi B')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(screen.getByText('Streaming response…')).toBeTruthy()
+
+    // Now settle A. Its answer must NOT append to B, and must not clear B's stream.
+    await act(async () => { settleA(); await Promise.resolve() })
+    expect(screen.queryByText('A-answer')).toBeNull() // A's answer never lands in B
+
+    // B's Cancel still works — A's finally must not have wiped B's controller.
+    await user.click(screen.getByRole('button', { name: 'Cancel streaming response' }))
+    expect(await screen.findByText('Response cancelled')).toBeTruthy()
   })
 
   it('preserves the transcript when Advanced mode opens and shows a truthful unavailable state', async () => {
@@ -326,6 +425,23 @@ describe('Chat routing, navigation, and accessibility (T004.4)', () => {
     expect(chatNav.compareDocumentPosition(deliveryNav) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     await user.click(deliveryNav)
     expect(await screen.findByRole('heading', { name: 'Task TASK-1' })).toBeTruthy()
+  })
+
+  it('scopes the narrow-layout relax to the chat route and keeps actions reachable (responsive #4)', async () => {
+    const user = await renderChat()
+    // The chat route stamps `chat-active` on the shell: the ≤900px media query
+    // relaxes the 980px min-width and unfixes the nav rail ONLY under this class,
+    // so the composer and row actions are reachable (not occluded) when narrow.
+    const shell = document.querySelector('.app-shell')
+    expect(shell.classList.contains('chat-active')).toBe(true)
+    expect(screen.getByRole('textbox', { name: 'Message composer' })).toBeTruthy()
+    const del = screen.getByRole('button', { name: 'Delete Router planning' })
+    expect(del).toBeTruthy()
+    expect(del.style.display).not.toBe('none') // not removed from the layout
+    // Delivery keeps its own 980px assumption: the class is dropped off-route.
+    await user.click(screen.getByRole('button', { name: 'Delivery' }))
+    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    expect(document.querySelector('.app-shell').classList.contains('chat-active')).toBe(false)
   })
 
   it('exposes keyboard focus and an announced live region for lifecycle states', async () => {
