@@ -151,7 +151,11 @@ export function controlKind(descriptor) {
 export function changeAffordance(descriptor) {
   const mutability = descriptor?.mutability
   if (mutability === 'approval_gated') return 'approval'
-  if (mutability === 'read_only' || mutability === 'env_only') return 'read_only'
+  // The backend actor-view enum is `mutable | env_only | approval_gated`, where
+  // `env_only` IS the read-only (owner/env-managed) case. `read_only` is accepted
+  // defensively — it is not currently emitted, but a future/foreign descriptor
+  // carrying it must fail closed to the read-only affordance, never `save`.
+  if (mutability === 'env_only' || mutability === 'read_only') return 'read_only'
   return 'save'
 }
 

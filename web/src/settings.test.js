@@ -166,5 +166,9 @@ describe('stale-draft + approval-preview formatting (T005.3/T005.4)', () => {
   it('flags a preview that would leak a host:port or url as NOT redacted', () => {
     expect(approvalPreviewIsRedacted({ fingerprint: 'sha256:' + 'd'.repeat(64), materialChange: { summary: 'connect https://provider.example:8443/key' } })).toBe(false)
     expect(approvalPreviewIsRedacted({ fingerprint: 'not-a-hash', materialChange: { summary: 'ok' } })).toBe(false)
+    // A DOTLESS host:port (e.g. an internal `serving:8443`) has no URL scheme and
+    // no dotted domain, but the `:PORT` still leaks a network endpoint and must be
+    // caught by the denylist.
+    expect(approvalPreviewIsRedacted({ fingerprint: 'sha256:' + 'd'.repeat(64), materialChange: { summary: 'target serving:8443' } })).toBe(false)
   })
 })

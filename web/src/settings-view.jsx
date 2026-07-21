@@ -5,6 +5,7 @@ import {
 import {
   buildSettingsModel, filterSettings, describeSetting, indexEffective, explainEffective,
   changeAffordance, validateSettingValue, staleDraftState, formatApprovalPreview,
+  approvalPreviewIsRedacted,
 } from './settings'
 
 // --- Searchable Settings surface (preferences-configuration T005) -------------
@@ -51,6 +52,7 @@ function SettingEditor({ setting, projectId, effective, onClose, onSaved, announ
   const [stale, setStale] = useState(null)
   const [notice, setNotice] = useState(null)
   const [preview, setPreview] = useState(null)
+  const [resetPreview, setResetPreview] = useState(null)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -126,7 +128,10 @@ function SettingEditor({ setting, projectId, effective, onClose, onSaved, announ
     } else if (result.status === 'invalid') {
       setRepair(result.message)
       announce(`${setting.title}: ${result.message}`)
-    } else if (result.status === 'unknown') {
+    } else if (result.status === 'approval_required') {
+      // An authority refusal, NOT a stale write: reloading would change nothing,
+      // so never show the "changed elsewhere — reload to compare" loop here.
+      setStale(null)
       setNotice({ tone: 'error', text: result.message })
       announce(`${setting.title}: ${result.message}`)
     } else {
@@ -155,42 +160,69 @@ function SettingEditor({ setting, projectId, effective, onClose, onSaved, announ
     }
   }
 
+  // Reset PREVIEWS before it applies (T005.3 c4): show the actor the single scope
+  // affected and the inherited/default value the reset will land on, then require
+  // an explicit confirm. `store.reset_preference` removes the stored override, so
+  // the setting falls back to its descriptor default — that is the shown target.
+  const openResetPreview = () => {
+    setNotice(null)
+    setResetPreview({ scope: setting.scope, target: setting.default })
+  }
+  const cancelResetPreview = () => setResetPreview(null)
+
   const runReset = async () => {
     setBusy(true)
     const result = await resetPreference(setting.id, { scope: setting.scope, expectedVersion, projectId })
     if (!mountedRef.current) return
     setBusy(false)
     if (result.status === 'reset') {
-      setStale(null); setRepair(null)
+      setStale(null); setRepair(null); setResetPreview(null)
+      // The stored override is removed, so the next write starts from version 0;
+      // refresh expectedVersion so an immediate draft-based re-save is not a
+      // guaranteed stale 409 (S2).
+      setExpectedVersion(0)
       setNotice({ tone: 'ok', text: `Reset to inherited default at the ${setting.scope} scope.` })
       announce(`${setting.title} reset to its inherited default at the ${setting.scope} scope.`)
       onSaved(setting.id, null, result.effective)
     } else if (result.status === 'stale') {
+      setResetPreview(null)
       setStale(staleDraftState(draft, result))
       announce(`${setting.title}: ${result.message}`)
     } else {
+      // approval_required / unknown / unavailable: a distinct, truthful error —
+      // never the fabricated stale/reload loop.
+      setResetPreview(null)
       setNotice({ tone: 'error', text: result.message })
       announce(`${setting.title}: ${result.message}`)
     }
   }
 
-  const runPreview = async () => {
+  // Preview an approval-gated change through the typed policy-operation spine,
+  // mutating nothing. `preference.set` validates the draft; `preference.reset` is
+  // valueless. An approval-gated reset routes HERE — it never fires a plain
+  // mutating POST that would return an authority refusal and dead-end as "stale".
+  const runPreview = async (operation) => {
     setBusy(true); setNotice(null)
-    const check = validateSettingValue(setting, draft)
-    if (!check.valid) {
-      setBusy(false); setRepair(check.message); announce(`${setting.title}: ${check.message}`)
-      return
+    let value
+    if (operation === 'preference.set') {
+      const check = validateSettingValue(setting, draft)
+      if (!check.valid) {
+        setBusy(false); setRepair(check.message); announce(`${setting.title}: ${check.message}`)
+        return
+      }
+      setRepair(null)
+      value = check.value
     }
-    setRepair(null)
     const result = await previewPolicyOperation({
-      settingId: setting.id, scope: setting.scope, operation: 'preference.set',
-      opVersion: expectedVersion + 1, value: check.value, projectId,
+      settingId: setting.id, scope: setting.scope, operation,
+      opVersion: expectedVersion + 1, value, projectId,
     })
     if (!mountedRef.current) return
     setBusy(false)
     if (result.status === 'previewed') {
       setPreview(formatApprovalPreview(result.preview))
-      announce(`${setting.title}: approval preview ready. This change needs an operator approval before it applies.`)
+      const what = operation === 'preference.reset' ? 'reset' : 'change'
+      announce(`${setting.title}: approval preview ready. This ${what} needs an operator approval before it applies.`)
     } else {
       setNotice({ tone: 'error', text: result.message })
       announce(`${setting.title}: ${result.message}`)
@@ -204,7 +236,7 @@ function SettingEditor({ setting, projectId, effective, onClose, onSaved, announ
     <div className="setting-editor" role="group" aria-labelledby={`${idBase}-editor-title`} onKeyDown={onKeyDown}>
       <div className="setting-editor-head">
         <h4 id={`${idBase}-editor-title`} tabIndex={-1} ref={headingRef}>Change {setting.title}</h4>
-        <button className="setting-editor-close" aria-label={`Close ${setting.title} editor`} onClick={onClose}>Done</button>
+        <button className="setting-editor-close" aria-label={`Done — close ${setting.title} editor`} onClick={onClose}>Done</button>
       </div>
 
       {affordance === 'read_only' ? (
@@ -241,19 +273,54 @@ function SettingEditor({ setting, projectId, effective, onClose, onSaved, announ
 
           {preview && <ApprovalPreview preview={preview} />}
 
+          {resetPreview && (
+            <div className="setting-reset-preview" role="group" aria-label="Confirm reset">
+              <p>
+                Reset only the <b>{resetPreview.scope}</b> scope. It will inherit the reviewed
+                default: <b>{resetPreview.target === undefined ? 'unset' : String(resetPreview.target)}</b>.
+                No other scope is affected.
+              </p>
+              <div className="setting-reset-preview-actions">
+                <button className="setting-reset-confirm" onClick={runReset} disabled={busy}>Confirm reset</button>
+                <button className="setting-reset-cancel" onClick={cancelResetPreview} disabled={busy}>Cancel</button>
+              </div>
+            </div>
+          )}
+
           <div className="setting-editor-actions">
             {affordance === 'approval' ? (
-              <button className="setting-preview-btn" onClick={runPreview} disabled={busy || !versionKnown}>
-                {busy ? 'Preparing…' : 'Preview approval-gated change'}
-              </button>
+              <>
+                <button className="setting-preview-btn" onClick={() => runPreview('preference.set')} disabled={busy || !versionKnown}>
+                  {busy ? 'Preparing…' : 'Preview approval-gated change'}
+                </button>
+                {/* An approval-gated setting must NOT offer a plain Reset that fires an
+                    unapproved mutation (it would return an authority refusal and
+                    dead-end as a fabricated stale/reload loop). Route the reset through
+                    the same preview spine as the set. */}
+                <button
+                  className="setting-reset-btn"
+                  onClick={() => runPreview('preference.reset')}
+                  disabled={busy || !versionKnown}
+                  aria-label={`Preview reset of ${setting.title} at the ${setting.scope} scope (requires approval)`}
+                >
+                  Preview reset ({setting.scope})
+                </button>
+              </>
             ) : (
-              <button className="setting-save-btn" onClick={runSave} disabled={busy || !versionKnown}>
-                {busy ? 'Saving…' : 'Save change'}
-              </button>
+              <>
+                <button className="setting-save-btn" onClick={runSave} disabled={busy || !versionKnown}>
+                  {busy ? 'Saving…' : 'Save change'}
+                </button>
+                <button
+                  className="setting-reset-btn"
+                  onClick={openResetPreview}
+                  disabled={busy || !versionKnown || Boolean(resetPreview)}
+                  aria-label={`Reset ${setting.scope} scope to its inherited default`}
+                >
+                  Reset {setting.scope} scope
+                </button>
+              </>
             )}
-            <button className="setting-reset-btn" onClick={runReset} disabled={busy || !versionKnown} aria-label={`Reset ${setting.title} to inherited default at the ${setting.scope} scope`}>
-              Reset {setting.scope} scope
-            </button>
           </div>
         </>
       )}
@@ -314,17 +381,23 @@ function SettingControl({ setting, value, controlId, describedBy, invalid, onCha
 }
 
 // The approval preview: operation type, material change, target scope, expiry,
-// and the payload-hash fingerprint — no secret, no endpoint, no path.
+// and the payload-hash fingerprint. The no-secret/no-endpoint/no-path guarantee
+// is ENFORCED at render, not merely asserted: `approvalPreviewIsRedacted` gates
+// the free-form fields (fingerprint + material-change summary), so a
+// non-conforming digest or a summary carrying a host:port/url/credential is
+// suppressed rather than shown under a trusted label.
 function ApprovalPreview({ preview }) {
+  const redacted = approvalPreviewIsRedacted(preview)
+  const summary = preview.materialChange.summary || (preview.materialChange.hasValue ? String(preview.materialChange.value) : '—')
   return (
     <section className="setting-approval-preview" aria-label="Approval preview">
       <p className="setting-approval-title">This change needs an operator approval before it applies.</p>
       <dl>
         <div><dt>Operation</dt><dd>{preview.operationType}</dd></div>
         <div><dt>Target scope</dt><dd>{preview.targetScope}</dd></div>
-        <div><dt>Material change</dt><dd>{preview.materialChange.summary || (preview.materialChange.hasValue ? String(preview.materialChange.value) : '—')}</dd></div>
+        <div><dt>Material change</dt><dd>{redacted ? summary : 'summary unavailable'}</dd></div>
         <div><dt>Expiry</dt><dd>{preview.expiry || 'set when the operator grants approval'}</dd></div>
-        <div><dt>Payload fingerprint</dt><dd className="setting-fingerprint">{preview.fingerprint}</dd></div>
+        <div><dt>Payload fingerprint</dt><dd className="setting-fingerprint">{redacted ? preview.fingerprint : 'fingerprint unavailable'}</dd></div>
       </dl>
     </section>
   )
