@@ -647,3 +647,126 @@ def test_posture_check_rejects_a_smuggled_execution_shaped_id():
     # The real dotted ids the audit emits stay valid.
     for good in ("posture.integration.anvil_serving", "posture.security.insecure_dev_actor"):
         assert _SHCheck(check_id=good, title="x", status="ok", severity="info", remediation="x").check_id == good
+
+
+# ---------------------------------------------------------------------------
+# Typed operation spine: no secret, path, command, or capability leak
+# (state-context-operations:T006.1 / T006.2 / T006.3)
+# ---------------------------------------------------------------------------
+
+#: The exact closed top-level field set an operation receipt may serialize, so a
+#: leak-by-addition (an extra field) fails the assertion rather than passing it.
+_RECEIPT_ALLOWED_FIELDS = frozenset({
+    "schema_version", "receipt_id", "command_id", "run_id", "operation", "status",
+    "idempotency_key", "external_ref", "evidence_refs", "correlation", "redaction",
+    "error", "started_at", "finished_at",
+})
+
+
+def test_operation_refusal_summary_scrubs_seeded_credentials_urls_and_paths():
+    from workbench.models import OperationRefusal
+
+    # A path/URL summary (no bare credential-class word) is scrubbed to markers.
+    refusal = OperationRefusal(
+        "operation.digest_drift",
+        "drift observed for config at C:\creds\prod.env reached via https://serving.tail1234.ts.net:8443/x",
+    )
+    assert "[REDACTED-PATH]" in refusal.safe_summary
+    assert "[REDACTED-URL]" in refusal.safe_summary
+    assert "prod.env" not in refusal.safe_summary
+    assert "serving.tail1234.ts.net" not in refusal.safe_summary
+
+    # A summary literally naming a credential class is refused by the receipt
+    # schema, so the forbidden-token guard replaces it wholesale rather than
+    # letting "Bearer sk-..." or "secret" ride into a receipt.
+    leaky = OperationRefusal("approval.invalid", "Bearer sk-abcdefgh12345678 leaked the api_key secret value")
+    assert leaky.safe_summary == "operation refused; consult the typed refusal code"
+    for token in ("sk-abcdefgh", "Bearer", "secret", "api_key"):
+        assert token not in leaky.safe_summary
+
+
+def test_operation_receipt_external_ref_rejects_credential_and_free_text_shapes():
+    from workbench.models import OperationRef, OperationReceipt, RunContextError, new_receipt_id
+    from datetime import datetime, timezone
+
+    operation = OperationRef("anvil-state", "state.evidence.submit", "1.0.0", "sha256:" + "4" * 64)
+    now = datetime.now(timezone.utc)
+    # external_ref is a bounded OPAQUE-TOKEN map (schema pattern): a value with a
+    # space, a credential assignment, a query string, or a bearer token cannot
+    # ride through it -- there is no free-text field for a secret to arrive in.
+    for bad_value in ("api_key=abc def", "Bearer sk-abcdefgh 12", "https://evil.internal/x?tok=1", "secret value here"):
+        with pytest.raises(RunContextError):
+            OperationReceipt(
+                new_receipt_id(), "cmd_x", "run_1", operation, "succeeded",
+                "run:run_1:evidence:1", now, now, external_ref={"state_event_id": bad_value},
+            )
+
+
+def test_persisted_operation_receipt_exposes_only_its_closed_field_set():
+    from workbench.contracts import validate_operation_receipt
+    from workbench.models import OperationRef, OperationRefusal
+    from workbench.store import MemoryOperationReceiptStore, OperationOutcome
+
+    store = MemoryOperationReceiptStore()
+    operation = OperationRef("anvil-state", "state.evidence.submit", "1.0.0", "sha256:" + "4" * 64)
+    denied, _ = store.record_attempt(
+        run_id="run_1", command_id="cmd_1", operation=operation, idempotency_key="k1",
+        task_ref="release-beta:T001",
+        executor=lambda: OperationOutcome(
+            "denied",
+            error=OperationRefusal(
+                "approval.invalid", "grant reached via https://evil.internal/tok secret", retryable=False,
+            ),
+        ),
+    )
+    # Closed-set: no field outside the declared receipt shape (leak-by-addition).
+    assert set(denied) - _RECEIPT_ALLOWED_FIELDS == set()
+    assert denied["redaction"]["status"] == "metadata_only"
+    # The persisted receipt is schema valid and carries no seeded leak.
+    validate_operation_receipt(denied)
+    blob = json.dumps(denied)
+    assert "evil.internal" not in blob
+    assert "secret" not in blob
+
+
+def test_reconciliation_record_scrubs_a_seeded_secret_and_path_summary():
+    from workbench.store import MemoryOperationReceiptStore, UnknownOutcomeError
+    from workbench.models import OperationRef
+
+    store = MemoryOperationReceiptStore()
+    operation = OperationRef("project-bridge", "bridge.github.merge_and_accept", "1.0.0", "sha256:" + "0" * 64)
+
+    def interrupted():
+        raise UnknownOutcomeError(
+            "merge unknown; token at C:\creds\gh.pem via https://api.github.example/x",
+            external_ref={"pr": "gh:1"}, reason="interrupted",
+        )
+
+    store.record_attempt(
+        run_id="run_1", command_id="cmd_1", operation=operation, idempotency_key="k1", executor=interrupted,
+    )
+    item = store.list_reconciliations()[0]
+    assert "[REDACTED-PATH]" in item["safe_summary"]
+    assert "[REDACTED-URL]" in item["safe_summary"]
+    assert "gh.pem" not in json.dumps(item)
+    assert "api.github.example" not in json.dumps(item)
+
+
+def test_a_model_operation_request_cannot_select_an_unprofiled_capability():
+    # Defence-in-depth security assertion: a model naming an operation that is in
+    # the discovered catalog but absent from the run's pinned capability profile
+    # is refused for that exact reason, never resolved into a dispatch.
+    from _support import compile_delivery_snapshot, operation_ref_for, published_catalog_set
+    from workbench.models import TypedOperationError
+    from workbench.workflows import resolve_operation_request
+
+    proposal = {
+        "schema_version": "workbench-model-proposal/v1",
+        "kind": "operation_request",
+        "reason": "Attempt to read the project snapshot outside the profile.",
+        "operation": operation_ref_for("state.project.snapshot"),
+        "input": {},
+    }
+    with pytest.raises(TypedOperationError) as excinfo:
+        resolve_operation_request(proposal, compile_delivery_snapshot(), published_catalog_set())
+    assert excinfo.value.code == "operation.unprofiled"
