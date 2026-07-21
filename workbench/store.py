@@ -2980,6 +2980,85 @@ class MemoryPreferenceStore:
                 scope, scope_key, setting_id, live_valid_refs=live_valid_refs
             )
 
+    def apply_batch(
+        self, operations: "list[Mapping[str, Any]]", actor: str,
+    ) -> list[dict[str, Any]]:
+        """Atomically apply a set of scoped set/reset operations, all-or-nothing.
+
+        Each operation is ``{scope, scope_key, setting_id, op, value?, expected_version}``
+        where ``op`` is ``"set"`` or ``"reset"``.  This is the batch counterpart of
+        :meth:`set_preference` / :meth:`reset_preference` and reuses the SAME typed
+        validation and optimistic-concurrency rules: under one lock it first
+        validates every writable descriptor + set value AND checks every
+        ``expected_version``, and only then commits every operation.  If ANY check
+        fails — a malformed value (:class:`~workbench.models.PreferenceValidationError`),
+        a cross-scope/unknown id (:class:`UnknownPreferenceError`), or a stale version
+        (:class:`StalePreferenceWriteError`) — nothing is committed, so a batch import
+        or a scoped reset lands entirely or not at all (T006.2 / T006.3 atomicity).
+
+        Every operation is bound to exactly its own ``(scope, scope_key)`` namespace,
+        so a batch touches ONLY the named scopes and can never mutate another actor's
+        namespace, a project it did not name, or a deployment/policy authority value
+        (scope isolation).  Returns one result per applied op with its committed
+        record (a ``set``) or ``None`` (a ``reset``) for the caller's audit trail.
+        """
+        prepared: list[tuple[str, str, str, str, Any, int]] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        with self._lock:
+            # Phase 1 -- validate everything and check every version. NO mutation.
+            for op in operations:
+                scope, scope_key = self._require_scope(op["scope"], op["scope_key"])
+                setting_id = op["setting_id"]
+                # A duplicate (scope, scope_key, setting_id) in one batch would pass
+                # the SAME phase-1 version check twice and then double-commit; reject
+                # it up front so the batch stays a single, unambiguous atomic apply.
+                batch_key = (scope, scope_key, setting_id)
+                if batch_key in seen_keys:
+                    raise PreferenceStoreError(
+                        f"duplicate operation for {setting_id!r} in scope {scope!r} within one batch"
+                    )
+                seen_keys.add(batch_key)
+                # Ownership/writability gate (cross-scope -> indistinct not-found,
+                # authority/env_only -> fail closed) exactly like a single write.
+                descriptor = self._writable_descriptor(scope, setting_id)
+                kind = op["op"]
+                if kind == "set":
+                    validate_setting_value(descriptor, op.get("value"))
+                elif kind != "reset":
+                    raise PreferenceStoreError(f"unknown batch operation: {kind!r}")
+                expected = op["expected_version"]
+                if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+                    raise PreferenceStoreError("expected_version must be a non-negative integer")
+                namespace = self.rows.records.get((scope, scope_key))
+                existing = namespace.get(setting_id) if namespace is not None else None
+                current = existing.write_version if existing is not None else 0
+                if expected != current:
+                    # Reload-required: NOTHING in the batch is committed.
+                    raise StalePreferenceWriteError(current)
+                prepared.append((scope, scope_key, setting_id, kind, op.get("value"), current))
+            # Phase 2 -- commit every op; all validation + version checks passed.
+            results: list[dict[str, Any]] = []
+            for scope, scope_key, setting_id, kind, value, current in prepared:
+                if kind == "set":
+                    record = PreferenceRecord(
+                        setting_id=setting_id, scope=scope, scope_key=scope_key,
+                        value=value, write_version=current + 1, updated_by=actor,
+                    )
+                    self.rows.records.setdefault((scope, scope_key), {})[setting_id] = record
+                    results.append({
+                        "setting_id": setting_id, "scope": scope, "scope_key": scope_key,
+                        "op": "set", "record": record,
+                    })
+                else:  # reset
+                    namespace = self.rows.records.get((scope, scope_key))
+                    if namespace is not None and setting_id in namespace:
+                        del namespace[setting_id]
+                    results.append({
+                        "setting_id": setting_id, "scope": scope, "scope_key": scope_key,
+                        "op": "reset", "record": None,
+                    })
+            return results
+
 
 # ---------------------------------------------------------------------------
 # Non-secret plugin preference field resolution (reviewed-tools-plugins T011)

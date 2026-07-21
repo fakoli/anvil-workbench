@@ -2317,3 +2317,71 @@ def test_t011_actor_view_projection_itself_neutralizes_hostport_and_akia():
     blob = _t011s_json.dumps(view)
     for marker in ("serving:8443", "AKIA", "AKIAIOSFODNN7EXAMPLE"):
         assert marker not in blob
+
+
+# ---------------------------------------------------------------------------
+# preferences-configuration:T006.1 / T006 — configuration export no-leak.
+#
+# A versioned redacted export must NEVER carry a secret, credential, token,
+# local path, raw URL, chat history, or raw prompt, and must reference the actor
+# only by a SAFE OPAQUE token. This exercises the REAL export serializer over a
+# store seeded with the full dangerous corpus in the authority namespaces the
+# export never ranges over, so a regression that widened the export past the
+# actor-view portability filter (or dropped the opaque actor ref) fails here.
+# ---------------------------------------------------------------------------
+
+import json as _cfg_json
+from pathlib import Path as _CfgPath
+
+from workbench.configuration_transfer import ConfigurationTransferService as _CfgSvc
+from workbench.store import MemoryPreferenceStore as _CfgStore
+
+
+def _cfg_catalog() -> dict:
+    path = _REPO_ROOT / "docs" / "contracts" / "examples" / "settings-descriptor.v1.json"
+    return _cfg_json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_configuration_export_never_carries_a_secret_path_url_or_raw_actor_identity():
+    catalog = _cfg_catalog()
+    store = _CfgStore(catalog)
+    # The full dangerous corpus, seeded into authority namespaces (deployment /
+    # policy) the actor-view portability filter excludes. A path-like deployment
+    # value and an identity header value stand in for secrets/paths/hosts; a
+    # policy value stands in for an owner-managed ceiling.
+    store.seed_authority_value(
+        "deployment", "deployment.state_read_location", r"C:\deploy\secrets\prod.pem",
+    )
+    store.seed_authority_value(
+        "deployment", "deployment.identity_header_name", "serving:8443/AKIAIOSFODNN7EXAMPLE",
+    )
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 45)
+    # Portable overrides the export SHOULD carry.
+    store.set_preference("personal", "alice@example.com", "personal.landing_surface", "dashboard", 0, "alice@example.com")
+    store.set_preference("project", "proj_1", "project.delivery_route", "route.delivery-heavy", 0, "alice@example.com")
+
+    service = _CfgSvc(catalog, store, audit_key=b"export-audit-key-0123456789")
+    export = service.export(actor="alice@example.com", project_id="proj_1")
+    blob = _cfg_json.dumps(export)
+
+    # Only portable actor/project ids appear — no authority/secret/path id.
+    exported_ids = {entry["setting_id"] for entry in export["settings"]}
+    assert exported_ids == {"personal.landing_surface", "project.delivery_route"}
+    for authority_id in (
+        "deployment.state_read_location", "deployment.identity_header_name",
+        "policy.transcript_retention_max_days",
+    ):
+        assert authority_id not in blob
+
+    # No secret / path / host / key / raw-actor-identity marker survives.
+    for marker in (
+        "prod.pem", "deploy", "secrets", ":8443", "AKIA", "AKIAIOSFODNN7EXAMPLE",
+        "alice@example.com", r"C:\\", "/etc",
+    ):
+        assert marker not in blob, marker
+
+    # The source references the actor ONLY by a safe opaque token.
+    actor_ref = export["source"]["actor_ref"]
+    assert actor_ref.startswith("actorref:")
+    assert "alice" not in actor_ref and "@" not in actor_ref
+    assert export["schema_version"] == "workbench-configuration-export/v1"

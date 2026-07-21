@@ -19,6 +19,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Settings
+from .configuration_transfer import (
+    ConfigurationTransferError,
+    ConfigurationTransferService,
+)
 from .contracts import settings_actor_view
 from .conversation_api import (
     build_conversation_router,
@@ -1379,6 +1383,153 @@ def build_policy_operations_router(
     return router
 
 
+class ConfigurationImportBody(BaseModel):
+    # Closed body: an import names the envelope, the optional target project, and
+    # the optional base-version snapshot from a preview -- never a raw command,
+    # path, credential, or extra field.
+    model_config = ConfigDict(extra="forbid")
+
+    envelope: dict[str, Any]
+    project_id: str | None = Field(default=None, max_length=128)
+    base_versions: dict[str, int] | None = None
+
+
+class ConfigurationResetBody(BaseModel):
+    # Closed body: a scoped reset names only its actor/project scope and the
+    # optional base-version snapshot; it can never name another actor or a
+    # deployment/policy scope.
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str = Field(pattern=r"^(personal|project)$")
+    project_id: str | None = Field(default=None, max_length=128)
+    base_versions: dict[str, int] | None = None
+
+
+def build_configuration_transfer_router(
+    actor_dependency: Callable[..., str],
+    configuration_transfer_service: ConfigurationTransferService | None,
+) -> APIRouter:
+    """Build the configuration export/import/reset browser surface (T006).
+
+    Every endpoint is authenticated by the trusted ``actor`` dependency and is
+    scope-bound to that actor: the personal namespace is ALWAYS keyed by the
+    authenticated actor (a client can never name another actor) and a project
+    namespace by the body/query ``project_id``.  The export is a CLOSED, redacted
+    serialization of only the actor's portable settings + a safe opaque actor
+    reference; an import is validate/preview/apply where an invalid import applies
+    nothing and a valid apply is atomic, version-checked, and audited; a scoped
+    reset previews then applies atomically without crossing a scope boundary.
+    Every response is scrubbed on the last hop with
+    :func:`~workbench.redaction.scrub_config_payload`.  When
+    ``configuration_transfer_service`` is ``None`` the surface is not configured
+    and fails closed with 503, mirroring the other injectable supervision models.
+    """
+    router = APIRouter(prefix="/api/configuration")
+
+    def service() -> ConfigurationTransferService:
+        if configuration_transfer_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="configuration transfer is not configured",
+            )
+        return configuration_transfer_service
+
+    def _stale_409(exc: StalePreferenceWriteError) -> HTTPException:
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": "reload required before writing",
+                "reload_required": True,
+                "current_version": exc.current_version,
+            },
+        )
+
+    @router.get("/export")
+    def export_configuration(
+        project_id: str | None = None,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The actor's CLOSED, versioned, redacted portable-settings export."""
+        return scrub_config_payload(service().export(actor=actor, project_id=project_id))
+
+    @router.post("/import/preview")
+    def preview_import(
+        body: ConfigurationImportBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Preview an import as typed categories; mutate nothing."""
+        try:
+            result = service().import_preview(
+                actor=actor, envelope=body.envelope, project_id=body.project_id,
+            )
+        except ConfigurationTransferError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        return scrub_config_payload(result)
+
+    @router.post("/import/apply")
+    def apply_import(
+        body: ConfigurationImportBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Apply a valid import atomically, version-checked, and audited."""
+        try:
+            result = service().import_apply(
+                actor=actor, envelope=body.envelope, project_id=body.project_id,
+                base_versions=body.base_versions,
+            )
+        except ConfigurationTransferError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        except StalePreferenceWriteError as exc:
+            raise _stale_409(exc) from exc
+        except UnknownPreferenceError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PREFERENCE_DETAIL) from exc
+        except PreferenceStoreError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return scrub_config_payload(result)
+
+    @router.post("/reset/preview")
+    def preview_reset(
+        body: ConfigurationResetBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Preview the exact values + scope a scoped reset will change."""
+        try:
+            result = service().reset_preview(actor=actor, scope=body.scope, project_id=body.project_id)
+        except ConfigurationTransferError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        return scrub_config_payload(result)
+
+    @router.post("/reset/apply")
+    def apply_reset(
+        body: ConfigurationResetBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Apply a scoped reset atomically, version-checked, and audited."""
+        try:
+            result = service().reset_apply(
+                actor=actor, scope=body.scope, project_id=body.project_id,
+                base_versions=body.base_versions,
+            )
+        except ConfigurationTransferError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        except StalePreferenceWriteError as exc:
+            raise _stale_409(exc) from exc
+        except UnknownPreferenceError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PREFERENCE_DETAIL) from exc
+        except PreferenceStoreError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return scrub_config_payload(result)
+
+    @router.get("/audit")
+    def list_audit(
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The non-identifying audit trail of applied imports/resets (browser-safe)."""
+        return scrub_config_payload({"audit": service().audit_records()})
+
+    return router
+
+
 def create_app(
     settings: Settings | None = None,
     store: WorkbenchStore | None = None,
@@ -1398,6 +1549,7 @@ def create_app(
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
     voice_relay_service: VoiceRelayService | None = None,
+    configuration_transfer_service: ConfigurationTransferService | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
@@ -1469,6 +1621,12 @@ def create_app(
     # wired into the live bridge poll loop; it stays ``None`` unless injected, so
     # the browser surface fails closed (503).
     app.state.policy_gate_service = policy_gate_service
+    # The configuration export/import/scoped-reset service is a hub-side
+    # supervision read/write model over the reviewed preference spine. Like the
+    # preference store and policy gate it is deliberately NOT wired into the live
+    # bridge poll loop; it stays ``None`` unless injected, so the browser surface
+    # fails closed (503).
+    app.state.configuration_transfer_service = configuration_transfer_service
     # The chat push-to-talk / read-aloud voice relay is a hub-side supervision
     # surface that is deliberately NOT wired into the live poll loop; it stays
     # ``None`` unless a service is injected, so the browser surface fails closed
@@ -1643,6 +1801,11 @@ def create_app(
     # T004.3): preview, approval-binding, apply, and browser-safe receipt /
     # reconciliation status. Fails closed (503) until a gate service is injected.
     app.include_router(build_policy_operations_router(actor, policy_gate_service))
+    # Configuration export / import / scoped-reset surface
+    # (preferences-configuration:T006): a versioned redacted export, an import
+    # validate/preview/apply, and a scoped reset preview/apply over the reviewed
+    # preference spine. Fails closed (503) until a service is injected.
+    app.include_router(build_configuration_transfer_router(actor, configuration_transfer_service))
     # Chat push-to-talk (STT) + read-aloud (TTS) relay (chat-first-voice T005):
     # authenticated by the same trusted ``actor`` dependency, relaying in-memory
     # audio through Anvil Serving ONLY, and fail-closed (503) until a relay

@@ -4086,3 +4086,152 @@ def test_t010_search_records_an_idempotent_receipt_replayed_on_repeat() -> None:
     again = svc.search(_T010_ALICE, "idempotent")
     # The same (actor, query) replays the same typed receipt (idempotent read).
     assert first["receipt"]["receipt_id"] == again["receipt"]["receipt_id"]
+
+
+# ---------------------------------------------------------------------------
+# Configuration export / import / scoped reset slice
+# (preferences-configuration:T006 / T006.2 / T006.3)
+# ---------------------------------------------------------------------------
+
+from workbench.configuration_transfer import (
+    CONFIGURATION_EXPORT_SCHEMA_VERSION,
+    ConfigurationTransferError,
+    ConfigurationTransferService,
+    validate_configuration_envelope,
+)
+
+
+def _cfg_seeded_store():
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    store.set_preference("personal", "alice", "personal.landing_surface", "dashboard", 0, "alice")
+    store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 20, 0, "alice")
+    return catalog, store
+
+
+def _cfg_service(store):
+    return ConfigurationTransferService(store.catalog, store, audit_key=_PREF_AUDIT_KEY)
+
+
+def test_t006_apply_batch_is_atomic_no_partial_write_on_a_single_stale_op():
+    # The store primitive the import/reset reuse: if ANY op in the batch is stale,
+    # NOTHING in the batch commits (atomicity), reusing optimistic concurrency.
+    _, store = _cfg_seeded_store()
+    ops = [
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.landing_surface",
+         "op": "set", "value": "delivery", "expected_version": 1},
+        # This one is stale: current is 1, expected 0 -> the whole batch fails.
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.chat_transcript_retention_days",
+         "op": "set", "value": 45, "expected_version": 0},
+    ]
+    with pytest.raises(StalePreferenceWriteError):
+        store.apply_batch(ops, "alice")
+    # The first (non-stale) op did NOT land — the batch is all-or-nothing.
+    assert store.stored_values("personal", "alice")["personal.landing_surface"] == "dashboard"
+
+
+def test_t006_apply_batch_rejects_a_malformed_value_before_any_commit():
+    # Value validation runs BEFORE any mutation, so a bad value in the batch
+    # rolls the whole thing back (nothing applied).
+    _, store = _cfg_seeded_store()
+    ops = [
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.landing_surface",
+         "op": "set", "value": "delivery", "expected_version": 1},
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.chat_transcript_retention_days",
+         "op": "set", "value": 100000, "expected_version": 1},  # out of bounds
+    ]
+    with pytest.raises(PreferenceValidationError):
+        store.apply_batch(ops, "alice")
+    assert store.stored_values("personal", "alice")["personal.landing_surface"] == "dashboard"
+
+
+def test_t006_apply_batch_rejects_a_duplicate_key_within_one_batch():
+    # A duplicate (scope, scope_key, setting_id) in one batch would pass the SAME
+    # phase-1 version check twice and then double-commit; the store rejects it up
+    # front with a typed error and commits nothing (it is a public method even
+    # though the transfer service's classifier dedups before reaching it).
+    _, store = _cfg_seeded_store()
+    ops = [
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.landing_surface",
+         "op": "set", "value": "delivery", "expected_version": 1},
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.landing_surface",
+         "op": "set", "value": "chat", "expected_version": 1},  # duplicate key
+    ]
+    with pytest.raises(PreferenceStoreError):
+        store.apply_batch(ops, "alice")
+    # Nothing committed — the original stored value is untouched.
+    assert store.stored_values("personal", "alice")["personal.landing_surface"] == "dashboard"
+
+
+def test_t006_closed_envelope_rejects_unknown_extension_and_bad_schema():
+    validate_configuration_envelope({"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": []})
+    for bad in (
+        {"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": [], "plugins": {}},  # extension key
+        {"schema_version": "workbench-configuration-export/v99", "settings": []},               # unknown version
+        {"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": {}},                 # settings not a list
+        {"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION,
+         "settings": [{"setting_id": "x", "value": 1, "surprise": True}]},                       # unknown entry key
+        {"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": [{"setting_id": "x"}]},  # no value
+    ):
+        with pytest.raises(ConfigurationTransferError):
+            validate_configuration_envelope(bad)
+
+
+def test_t006_import_preview_typed_categories_and_invalid_lists_repairable():
+    catalog, store = _cfg_seeded_store()
+    service = _cfg_service(store)
+    envelope = {"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": [
+        {"setting_id": "personal.landing_surface", "value": "delivery"},           # change
+        {"setting_id": "personal.time_format", "value": "format_12h"},             # create
+        {"setting_id": "personal.chat_transcript_retention_days", "value": 30},    # reset to default
+        {"setting_id": "personal.default_chat_route", "value": "route.ghost"},     # unavailable ref
+    ]}
+    preview = service.import_preview(actor="alice", envelope=envelope)
+    assert preview["valid"] is True
+    assert [c["setting_id"] for c in preview["changes"]] == ["personal.landing_surface"]
+    assert [c["setting_id"] for c in preview["creates"]] == ["personal.time_format"]
+    assert [c["setting_id"] for c in preview["resets"]] == ["personal.chat_transcript_retention_days"]
+    assert preview["unavailable_references"][0]["setting_id"] == "personal.default_chat_route"
+
+    invalid = {"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": [
+        {"setting_id": "personal.time_format", "value": "bogus"},
+        {"setting_id": "does.not_exist", "value": 1},
+    ]}
+    bad_preview = service.import_preview(actor="alice", envelope=invalid)
+    assert bad_preview["valid"] is False
+    assert {r["setting_id"] for r in bad_preview["repairable"]} == {"personal.time_format", "does.not_exist"}
+    with pytest.raises(ConfigurationTransferError):
+        service.import_apply(actor="alice", envelope=invalid)
+    # The valid landing_surface entry in the invalid batch never landed.
+    assert store.stored_values("personal", "alice")["personal.landing_surface"] == "dashboard"
+
+
+def test_t006_import_apply_is_audited_and_reset_isolates_scopes():
+    catalog, store = _cfg_seeded_store()
+    # A second actor + a project + an authority value that must all be untouched.
+    # bob holds an OVERLAPPING setting id (the same one alice resets) so a reset
+    # that crossed the namespace boundary would wrongly clear it.
+    store.set_preference("personal", "bob", "personal.landing_surface", "delivery", 0, "bob")
+    store.set_preference("personal", "bob", "personal.time_format", "format_12h", 0, "bob")
+    store.set_preference("project", "proj_1", "project.delivery_route", "route.delivery-heavy", 0, "alice")
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 60)
+    before_bob = dict(store.stored_values("personal", "bob"))
+    before_proj = dict(store.stored_values("project", "proj_1"))
+    before_policy = dict(store.stored_values("policy", "policy"))
+
+    service = _cfg_service(store)
+    envelope = {"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": [
+        {"setting_id": "personal.landing_surface", "value": "delivery"},
+    ]}
+    preview = service.import_preview(actor="alice", envelope=envelope)
+    service.import_apply(actor="alice", envelope=envelope, base_versions=preview["base_versions"])
+    assert any(a["action"] == "configuration.import" for a in service.audit_records())
+
+    # Scoped reset of alice.personal touches ONLY that namespace.
+    rprev = service.reset_preview(actor="alice", scope="personal")
+    service.reset_apply(actor="alice", scope="personal", base_versions=rprev["base_versions"])
+    assert store.stored_values("personal", "alice") == {}
+    assert store.stored_values("personal", "bob") == before_bob
+    assert store.stored_values("project", "proj_1") == before_proj
+    assert store.stored_values("policy", "policy") == before_policy
+    assert any(a["action"] == "configuration.reset" for a in service.audit_records())

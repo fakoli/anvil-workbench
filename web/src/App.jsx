@@ -17,6 +17,7 @@ import {
 } from './chat-api'
 import { submittedControls } from './advanced-chat'
 import SettingsView from './settings-view'
+import ConfigurationView from './configuration-view'
 import PluginCatalogView from './plugin-catalog-view'
 import AdvancedPanel from './advanced-chat-view'
 import {
@@ -1471,7 +1472,7 @@ function App() {
       {active === 'Chat'
         ? <div className="chat-grid"><ChatView append={setNotice} /></div>
         : active === 'Settings'
-        ? <div className="settings-grid"><SettingsView data={data} append={setNotice} /></div>
+        ? <div className="settings-grid"><SettingsView data={data} append={setNotice} /><ConfigurationView data={data} append={setNotice} /></div>
         : active === 'Explorer'
         ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} /></div>
         : active === 'Plugins'

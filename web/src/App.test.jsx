@@ -10,6 +10,8 @@ import {
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
   transcribeVoice, speakMessage, fetchPreferences,
+  fetchConfigurationExport, previewConfigurationImport, applyConfigurationImport,
+  previewConfigurationReset, applyConfigurationReset,
   fetchAdvancedRoutes, runAdvancedBranch,
 } from './api'
 
@@ -22,6 +24,8 @@ vi.mock('./api', () => ({
   retryTurn: vi.fn(), searchConversations: vi.fn(), sendMessage: vi.fn(), unarchiveConversation: vi.fn(),
   fetchPrdContent: vi.fn(), fetchPrdTasks: vi.fn(), fetchTaskReference: vi.fn(), fetchTaskEligibility: vi.fn(),
   transcribeVoice: vi.fn(), speakMessage: vi.fn(), fetchPreferences: vi.fn(),
+  fetchConfigurationExport: vi.fn(), previewConfigurationImport: vi.fn(), applyConfigurationImport: vi.fn(),
+  previewConfigurationReset: vi.fn(), applyConfigurationReset: vi.fn(),
   fetchAdvancedRoutes: vi.fn(), runAdvancedBranch: vi.fn(),
   // The panel keys its unconfigured-degrade branch off this SHARED sentinel by
   // value equality; the mock must export the exact string api.js throws on 503.
@@ -125,6 +129,14 @@ function resetChatMocks() {
   // Default served /api/preferences payload with autoplay OFF (the effective row
   // shape the hub actually serves). Individual tests override for autoplay-ON.
   fetchPreferences.mockResolvedValue({ catalog: { settings: [] }, effective: [{ setting_id: 'personal.voice_autoplay', scope: 'personal', value: false, source: 'default' }] })
+  // The configuration (backup & transfer) workflows default to safe, empty
+  // served shapes so navigating to Settings never crashes; individual tests
+  // override for the export/import/reset flows.
+  fetchConfigurationExport.mockResolvedValue({ schema_version: 'workbench-configuration-export/v1', source: { scope: 'personal', actor_ref: 'actorref:0123456789abcdef', catalog_id: 'workbench.settings.initial' }, settings: [] })
+  previewConfigurationImport.mockResolvedValue({ status: 'previewed', preview: { valid: true, creates: [], changes: [], resets: [], skipped_read_only: [], unavailable_references: [], repairable: [], no_ops: [], base_versions: {} } })
+  applyConfigurationImport.mockResolvedValue({ status: 'applied', result: { applied: [] }, applied: [], appliedCount: 0 })
+  previewConfigurationReset.mockResolvedValue({ status: 'previewed', preview: { scope: 'personal', changes: [], base_versions: {} } })
+  applyConfigurationReset.mockResolvedValue({ status: 'reset', result: { applied: [] }, applied: [], appliedCount: 0, scope: 'personal' })
   sendMessage.mockResolvedValue({ text: '', terminal: 'completed', needsRefresh: false })
   retryTurn.mockResolvedValue(assistantTurn('turn_retry', 'second answer', 'complete', 'retry'))
   branchTurn.mockResolvedValue(assistantTurn('turn_branch', 'branched answer', 'complete', 'branch'))
@@ -1688,5 +1700,118 @@ describe('Deliver controls (plan-task-delivery T006)', () => {
       await user.tab()
       expect(dialog.contains(document.activeElement)).toBe(true)
     }
+  })
+})
+
+// --- Configuration backup & transfer workflows (preferences-configuration T006.4) ---
+describe('Configuration backup & transfer workflows', () => {
+  async function openSettings() {
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('button', { name: 'Settings' })
+    await user.click(screen.getByRole('button', { name: 'Settings' }))
+    // A single <main> landmark per page: SettingsView owns it; the backup & transfer
+    // surface is a labeled region alongside it (acceptance N7), not a second <main>.
+    await screen.findByRole('region', { name: 'Backup and transfer' })
+    return user
+  }
+
+  it('renders a single main landmark in the Settings tab (backup & transfer is a region)', async () => {
+    await openSettings()
+    // SettingsView + the backup & transfer surface share one page; only ONE may be
+    // a <main> landmark (acceptance N7). The backup & transfer surface is a region.
+    expect(screen.getAllByRole('main')).toHaveLength(1)
+    expect(screen.getByRole('region', { name: 'Backup and transfer' })).toBeTruthy()
+  })
+
+  it('states what is excluded from exports before any download control is shown', async () => {
+    await openSettings()
+    const region = screen.getByRole('note', { name: 'What an export excludes' })
+    // The exclusion statement names secrets, paths, tokens, URLs, chat history.
+    expect(within(region).getByText(/Secrets, credentials, and API tokens/)).toBeTruthy()
+    expect(within(region).getByText(/Local filesystem paths/)).toBeTruthy()
+    expect(within(region).getByText(/Chat history and raw prompts/)).toBeTruthy()
+    // No Download control exists until an export is prepared — the exclusions are
+    // stated first, and download appears only after Prepare export.
+    expect(screen.queryByRole('link', { name: 'Download export' })).toBeNull()
+  })
+
+  it('exposes a download only after preparing a redacted, opaque-actor export', async () => {
+    fetchConfigurationExport.mockResolvedValue({
+      schema_version: 'workbench-configuration-export/v1',
+      source: { scope: 'personal', actor_ref: 'actorref:0123456789abcdef', catalog_id: 'workbench.settings.initial' },
+      settings: [{ setting_id: 'personal.time_format', scope: 'personal', value: 'format_12h' }],
+    })
+    const user = await openSettings()
+    await user.click(screen.getByRole('button', { name: 'Prepare export' }))
+    const download = await screen.findByRole('link', { name: 'Download export' })
+    expect(download.getAttribute('download')).toBe('workbench-configuration.json')
+    // The opaque actor reference is shown; no raw actor identity anywhere.
+    expect(screen.getByText('actorref:0123456789abcdef')).toBeTruthy()
+  })
+
+  it('previews an import as typed categories and blocks apply until previewed', async () => {
+    previewConfigurationImport.mockResolvedValue({ status: 'previewed', preview: {
+      valid: true,
+      creates: [{ setting_id: 'personal.time_format', scope: 'personal', value: 'format_12h' }],
+      changes: [{ setting_id: 'personal.landing_surface', scope: 'personal', from: 'chat', to: 'delivery' }],
+      resets: [{ setting_id: 'personal.chat_transcript_retention_days', scope: 'personal', from: 20, to_default: 30 }],
+      skipped_read_only: [{ setting_id: 'policy.transcript_retention_max_days', reason: 'owner-managed; not importable' }],
+      unavailable_references: [{ setting_id: 'personal.default_chat_route', ref_kind: 'route', value: 'route.ghost' }],
+      repairable: [], no_ops: [], base_versions: { 'personal.time_format': 0 },
+    } })
+    const user = await openSettings()
+    // Apply is disabled before any preview (no early apply).
+    expect(screen.getByRole('button', { name: 'Apply import' }).disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('Exported configuration'), { target: { value: '{"schema_version":"workbench-configuration-export/v1","settings":[]}' } })
+    await user.click(screen.getByRole('button', { name: 'Preview import' }))
+    const preview = await screen.findByRole('group', { name: 'Import preview' })
+    // Every typed category is distinctly rendered.
+    expect(within(preview).getByText('Will create', { exact: false })).toBeTruthy()
+    expect(within(preview).getByText('Will change', { exact: false })).toBeTruthy()
+    expect(within(preview).getByText('Will reset to default', { exact: false })).toBeTruthy()
+    expect(within(preview).getByText('policy.transcript_retention_max_days')).toBeTruthy()
+    expect(within(preview).getByText('personal.default_chat_route')).toBeTruthy()
+    // A valid preview enables apply.
+    expect(screen.getByRole('button', { name: 'Apply import' }).disabled).toBe(false)
+  })
+
+  it('cannot apply an invalid import and lists every repairable field', async () => {
+    previewConfigurationImport.mockResolvedValue({ status: 'previewed', preview: {
+      valid: false,
+      creates: [], changes: [], resets: [], skipped_read_only: [], unavailable_references: [],
+      repairable: [
+        { setting_id: 'personal.time_format', reason: 'not one of its allowed values' },
+        { setting_id: 'personal.chat_transcript_retention_days', reason: 'out of bounds' },
+      ],
+      no_ops: [], base_versions: {},
+    } })
+    const user = await openSettings()
+    fireEvent.change(screen.getByLabelText('Exported configuration'), { target: { value: '{"schema_version":"workbench-configuration-export/v1","settings":[]}' } })
+    await user.click(screen.getByRole('button', { name: 'Preview import' }))
+    await screen.findByRole('group', { name: 'Import preview' })
+    // Both repairable fields are named, and apply stays disabled.
+    expect(screen.getByText(/not one of its allowed values/)).toBeTruthy()
+    expect(screen.getByText(/out of bounds/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Apply import' }).disabled).toBe(true)
+    expect(applyConfigurationImport).not.toHaveBeenCalled()
+  })
+
+  it('previews a scoped reset and reports scope + result after applying', async () => {
+    previewConfigurationReset.mockResolvedValue({ status: 'previewed', preview: {
+      scope: 'personal',
+      changes: [{ setting_id: 'personal.landing_surface', scope: 'personal', from: 'dashboard', to_default: 'chat', expected_version: 1 }],
+      base_versions: { 'personal.landing_surface': 1 },
+    } })
+    applyConfigurationReset.mockResolvedValue({ status: 'reset', result: { applied: [{ setting_id: 'personal.landing_surface', scope: 'personal', op: 'reset' }] }, applied: [{ setting_id: 'personal.landing_surface' }], appliedCount: 1, scope: 'personal' })
+    const user = await openSettings()
+    const resetPanel = screen.getByRole('region', { name: 'Reset preferences' })
+    await user.click(within(resetPanel).getByRole('button', { name: 'Preview reset' }))
+    const preview = await screen.findByRole('group', { name: 'Reset preview' })
+    expect(within(preview).getByText('personal.landing_surface')).toBeTruthy()
+    await user.click(within(resetPanel).getByRole('button', { name: 'Apply reset' }))
+    // The result reports the scope and next remediation.
+    expect(await within(resetPanel).findByText(/personal preferences were reset/i)).toBeTruthy()
+    expect(applyConfigurationReset).toHaveBeenCalledWith(expect.objectContaining({ scope: 'personal', baseVersions: { 'personal.landing_surface': 1 } }))
   })
 })
