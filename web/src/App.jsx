@@ -15,6 +15,7 @@ import {
   voiceAutoplayFromPreferences,
 } from './chat-api'
 import SettingsView from './settings-view'
+import PluginCatalogView from './plugin-catalog-view'
 import {
   deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
   filterDescribedTasks, freshnessLabel, nextDeliverCandidate, progressSummaryLabel,
@@ -31,7 +32,7 @@ const emptyData = {
 // it (chat-first-voice T004.4). The order here IS the rendered nav order.
 const nav = [
   ['Chat', '◇'], ['Delivery', '⌘'], ['Explorer', '▦'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'], ['Settings', '⚙'],
-  ['Evidence', '◈'], ['Skills', '✦'], ['Sandbox', '□'],
+  ['Evidence', '◈'], ['Skills', '✦'], ['Plugins', '⧉'], ['Sandbox', '□'],
 ]
 
 function Mark() { return <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span> }
@@ -1356,7 +1357,7 @@ function App() {
   const addDirection = async (sessionId, text) => { const result = await addDirective(sessionId, text); if (result.recorded && result.event) { setData((current) => ({ ...current, directives: [...current.directives, result.event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.') } else { setNotice(`Direction was not recorded (${result.outcome}). No future work packet was changed.`) } await load() }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
   const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
-  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}`}>
+  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
     <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
     <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
@@ -1367,6 +1368,8 @@ function App() {
         ? <div className="settings-grid"><SettingsView data={data} append={setNotice} /></div>
         : active === 'Explorer'
         ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} /></div>
+        : active === 'Plugins'
+        ? <div className="pc-grid"><PluginCatalogView data={data} append={setNotice} /></div>
         : <div className="main-grid">
             {active === 'Delivery' ? <Delivery data={data} append={setNotice} onDirective={addDirection} onGuide={() => setGuideOpen(true)} onDeliverNext={() => setDeliverOpen(true)} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} append={setNotice} refresh={load} selectApproval={selectApproval} />}
             <Trace data={data} setActive={setActive} append={setNotice} refresh={load} selectedApprovalId={selectedApprovalId} clearApproval={() => setSelectedApprovalId(null)} />

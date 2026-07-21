@@ -559,3 +559,61 @@ export async function policyApprovalBinding(request) {
     return { status: 'unavailable', message: 'The approval surface could not be reached.' }
   }
 }
+
+// --- Reviewed plugin catalog + tool-dispatch receipts (reviewed-tools-plugins T006) --
+//
+// The browser half of the read-only plugin surface (workbench/api.py
+// build_plugin_router at /api/plugins). Every endpoint is GET-only and redacted
+// server-side on the last hop (scrub_config_payload), so this client assembles
+// only the safe path — no actor, token, endpoint, or credential — and returns
+// the exact wrapped shape the router serves: `{plugins}`, `{plugin}`,
+// `{receipt}`. The catalog is the redacted `PluginDiscovery.published()`
+// projection (approved + capability-enabled entries only); a plugin carries its
+// credential handling BY REFERENCE ONLY (requirement/owner_host/credential_refs),
+// never a value — the closed catalog schema makes a secret unrepresentable.
+//
+// The surface fails closed with 503 until a plugin host is configured (it is
+// deliberately NOT wired into the live bridge poll loop); that is surfaced as a
+// distinct, truthful "not configured" error so the UI renders an unconfigured
+// degraded state rather than a crash. A missing plugin/receipt is a plain 404
+// surfaced as a distinct not-found error (never an existence oracle). Any other
+// non-2xx throws a non-leaking Error.
+
+const PLUGINS = '/api/plugins'
+
+// The exact 503 "not configured" sentinel the fail-closed plugin surface emits.
+// It is a SHARED constant so the view can key its unconfigured-degrade branch off
+// value equality rather than a private regex: rewording the message here can no
+// longer silently break the view's 503 handling — both sides move together.
+export const PLUGIN_NOT_CONFIGURED = 'The plugin catalog is not configured for this hub'
+
+async function pluginJson(response, failure) {
+  if (response.status === 503) throw new Error(PLUGIN_NOT_CONFIGURED)
+  if (!response.ok) throw new Error(failure)
+  return response.json()
+}
+
+// The approved, capability-enabled plugin catalog: `{plugins: [projection…]}`.
+export async function fetchPlugins() {
+  return pluginJson(await fetch(PLUGINS), 'The plugin catalog is unavailable')
+}
+
+// One approved, enabled plugin by id: `{plugin: projection}`. A 404 (unknown or
+// reviewed-but-not-enabled — the same indistinct body upstream) is surfaced as a
+// distinct not-found error so it never becomes an existence oracle in the UI.
+export async function fetchPlugin(pluginId) {
+  const response = await fetch(`${PLUGINS}/${encodeURIComponent(pluginId)}`)
+  if (response.status === 404) throw new Error('This plugin is not in the reviewed catalog')
+  return pluginJson(response, 'This plugin is unavailable')
+}
+
+// One stored tool-dispatch / lifecycle receipt by request digest:
+// `{receipt: projection}`. A missing digest is a plain 404 surfaced as a
+// distinct not-found error. The receipt reports credential use BY REFERENCE only
+// and every human-readable field is a bounded safe string; no secret, endpoint,
+// or path is representable.
+export async function fetchPluginReceipt(requestDigest) {
+  const response = await fetch(`${PLUGINS}/receipts/${encodeURIComponent(requestDigest)}`)
+  if (response.status === 404) throw new Error('No receipt is stored for that request digest')
+  return pluginJson(response, 'The tool receipt is unavailable')
+}
