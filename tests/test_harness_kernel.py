@@ -3642,9 +3642,11 @@ def test_amp_t004_delimit_helper_stringifies_arbitrary_injection():
 from pathlib import Path as _T008_Path
 
 from workbench.bridge import (
+    Bridge as _T008_Bridge,
     BridgeError as _T008_BridgeError,
     BridgeSettings as _T008_BridgeSettings,
     CodexRunner as _T008_CodexRunner,
+    load_skill_adoption_store as _t008_load_ledger,
 )
 from workbench.capability_profiles import validate_project_profile as _t008_validate_profile
 from workbench.models import (
@@ -3791,6 +3793,114 @@ def test_t008_bridge_workflow_start_refuses_changed_skill_digest(tmp_path) -> No
     with pytest.raises(_T008_TypedError) as excinfo:
         runner.run("run_1", {"task_id": "release-beta:T001"}, "coding-local", skills=(changed,))
     assert excinfo.value.code == "skill.digest_changed"
+
+
+class _T008DispatchHub:
+    """Minimal hub double for driving Bridge.poll_once through one run_codex."""
+
+    def __init__(self, skill: "_T008_LocalSkill") -> None:
+        self._skill = skill
+        self.finalizations: list[tuple[str, str, str]] = []
+
+    def next_command(self):
+        return {
+            "id": "cmd_1",
+            "action_type": "run_codex",
+            "payload": {
+                "run_id": "run_1",
+                "task_id": "release-beta:T001",
+                "model": "coding-local",
+                "skills": [{"skill_id": self._skill.skill_id, "content_sha256": self._skill.content_sha256}],
+            },
+        }
+
+    def acknowledge_command(self, _command_id):
+        return None
+
+    def evidence(self, *_args):
+        return None
+
+    def event(self, *_args):
+        return None
+
+    def run_status(self, *_args):
+        return None
+
+    def finalize_run(self, run_id, status, command_id):
+        self.finalizations.append((run_id, status, command_id))
+
+
+def _t008_wire_bridge(bridge, skill, monkeypatch) -> None:
+    # Stub the State-reading edges that are unrelated to the adoption gate so the
+    # dispatch reaches the CodexRunner construction without touching a real project.
+    monkeypatch.setattr(bridge, "project_state_events", lambda: 0)
+    monkeypatch.setattr(bridge, "_publish_skills", lambda: {skill.skill_id: skill})
+    monkeypatch.setattr(bridge.state, "claim", lambda *_a: {"task_id": "release-beta:T001"})
+    monkeypatch.setattr(bridge.state, "work_packet", lambda *_a: {"task_id": "release-beta:T001", "task": {}})
+
+
+def test_t008_bridge_dispatch_enforces_the_gate_when_a_store_is_configured(tmp_path, monkeypatch) -> None:
+    # SHOULD-3: the SHIPPED Bridge.dispatch path constructs CodexRunner WITH the
+    # operator-configured adoption store, so an unacknowledged skill is refused at
+    # workflow start -- the gate (the first statement of CodexRunner.run, before
+    # the router/model/prompt) fires, so the runner/prompt is never reached.
+    settings = _t008_bridge_settings(tmp_path)
+    store = _T008_AckStore()  # empty ledger -> the selected skill is unacknowledged
+    skill = _t008_local_skill()
+    bridge = _T008_Bridge(settings, skill_adoption_store=store)
+    bridge.hub = _T008DispatchHub(skill)  # type: ignore[assignment]
+    _t008_wire_bridge(bridge, skill, monkeypatch)
+    with pytest.raises(_T008_TypedError) as excinfo:
+        bridge.poll_once()
+    assert excinfo.value.code == "skill.unacknowledged"
+
+    # Acknowledge the exact reviewed digest -> the gate passes and the run proceeds
+    # far enough to hit the (unconfigured) router boundary instead.
+    store.acknowledge(skill.skill_id, _t008_digest(skill), content_sha256=skill.content_sha256)
+    with pytest.raises(_T008_BridgeError):
+        bridge.poll_once()
+
+
+def test_t008_bridge_dispatch_is_legacy_ungated_when_unconfigured(tmp_path, monkeypatch) -> None:
+    # Revert-detection anchor: an UNCONFIGURED bridge (no injected store, no ledger)
+    # is legacy-ungated -- the same selected skill is NOT gated; the run proceeds
+    # past the (absent) gate to the router boundary and raises a BridgeError, never
+    # a skill.unacknowledged refusal.
+    settings = _t008_bridge_settings(tmp_path)
+    skill = _t008_local_skill()
+    bridge = _T008_Bridge(settings)
+    assert bridge.skill_adoption_store is None
+    bridge.hub = _T008DispatchHub(skill)  # type: ignore[assignment]
+    _t008_wire_bridge(bridge, skill, monkeypatch)
+    with pytest.raises(_T008_BridgeError):
+        bridge.poll_once()
+
+
+def test_t008_bridge_builds_the_gate_from_a_configured_ledger_file(tmp_path) -> None:
+    # The operator can ALSO enable the gate declaratively: a reviewed local JSON
+    # ledger on the settings is loaded into a store at Bridge construction, so the
+    # gate is enforceable without an injected store.
+    skill = _t008_local_skill()
+    ledger = tmp_path / "adoptions.json"
+    ledger.write_text(
+        json.dumps([{"skill_id": skill.skill_id, "digest": _t008_digest(skill), "content_sha256": skill.content_sha256}]),
+        encoding="utf-8",
+    )
+    settings = _t008_bridge_settings(tmp_path)
+    import dataclasses as _t008_dc
+
+    configured = _t008_dc.replace(settings, skill_adoption_ledger_file=ledger)
+    bridge = _T008_Bridge(configured)
+    assert bridge.skill_adoption_store is not None
+    # The declared acknowledgment satisfies the gate for the exact reviewed digest.
+    assert bridge.skill_adoption_store.acknowledgment_status(skill.skill_id, _t008_digest(skill)) == "acknowledged"
+
+
+def test_t008_ledger_loader_refuses_a_malformed_digest(tmp_path) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps([{"skill_id": "anvil:execute", "digest": "not-a-sha256"}]), encoding="utf-8")
+    with pytest.raises(_T008_BridgeError):
+        _t008_load_ledger(bad)
 
 
 # =========================================================================== #

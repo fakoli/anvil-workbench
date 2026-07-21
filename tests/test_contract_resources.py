@@ -1023,6 +1023,27 @@ def test_t011_detected_secret_field_by_default_shape_is_rejected():
             _t011_validate(catalog)
 
 
+def test_t011_enum_allowed_values_secret_option_is_refused():
+    # SHOULD-1: a secret/credential/host:port/path-shaped allowed_values OPTION is
+    # an actor-selectable value that would reach dispatch RAW, so it is refused at
+    # review time even when the field name and default are benign.
+    for hostile in (
+        "serving:8443", "AKIAIOSFODNN7EXAMPLE", "eyJhbGciOiJIUzI1NiJ9.a.b",
+        "postgresql://u:p@db/x", "/etc/passwd", "C:/creds/store",
+        "ghp_secretsecretsecret1234567890",
+    ):
+        catalog = _t011_catalog([{"name": "sort", "type": "enum", "scope": "actor",
+                                  "allowed_values": ["safe", hostile], "default": "safe"}])
+        with pytest.raises(ContractValidationError, match="secret/credential-bearing"):
+            _t011_validate(catalog)
+
+
+def test_t011_innocent_enum_allowed_values_still_pass():
+    catalog = _t011_catalog([{"name": "sort", "type": "enum", "scope": "actor",
+                              "allowed_values": ["newest", "oldest", "priority"], "default": "newest"}])
+    _t011_validate(catalog)
+
+
 def test_t011_enum_default_must_be_one_of_allowed_values():
     catalog = _t011_catalog([{"name": "sort", "type": "enum", "scope": "actor",
                               "allowed_values": ["newest", "oldest"], "default": "sideways"}])

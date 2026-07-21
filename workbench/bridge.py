@@ -141,6 +141,16 @@ class BridgeSettings:
     provider_catalog_files: Mapping[str, Path] = field(default_factory=dict)
     skill_roots: tuple[Path, ...] = ()
     verification_commands: tuple[str, ...] = ()
+    #: T008 (reviewed-tools-plugins): an OPTIONAL operator-declared LOCAL path to a
+    #: reviewed skill-adoption ledger (a JSON array of ``{skill_id, digest,
+    #: content_sha256?}`` acknowledgments).  When set, :class:`Bridge` builds the
+    #: workflow-start adoption gate from it and a run REFUSES to start on an
+    #: unacknowledged/since-changed skill digest (fail-closed, matching the browser
+    #: surfaces).  When UNSET (``None``) the bridge is legacy-ungated -- the shipped
+    #: poll loop runs selected skills exactly as before.  A live store may also be
+    #: INJECTED into ``Bridge`` directly (tests/embedders); an injected store
+    #: overrides this path, mirroring the ``create_app`` inject-or-default pattern.
+    skill_adoption_ledger_file: Path | None = None
 
 
 class HubTransport:
@@ -979,13 +989,65 @@ def preflight_operation_command(
     )
 
 
+def load_skill_adoption_store(path: Path) -> SkillAdoptionStore:
+    """Build the T008 adoption gate from an operator-reviewed LOCAL ledger file.
+
+    The ledger is a JSON array of acknowledgment records -- ``{skill_id, digest,
+    content_sha256?, description?, acknowledged_by?}``.  Each is replayed through
+    the store's validated ``acknowledge`` path, so a malformed ``sha256:`` digest
+    is refused AT LOAD TIME (the gate is never seeded from a bad record) and every
+    description is scrubbed before it can enter the ledger.  This is the operator's
+    opt-in: when this file is declared the workflow-start gate is ENFORCED; when it
+    is unset the bridge stays legacy-ungated.
+    """
+    from .store import MemorySkillAdoptionStore, SkillAdoptionStoreError
+
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BridgeError(f"skill adoption ledger is unreadable: {exc}") from exc
+    if not isinstance(raw, list):
+        raise BridgeError("skill adoption ledger must be a JSON array of acknowledgments")
+    store = MemorySkillAdoptionStore()
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            raise BridgeError("skill adoption ledger entry must be an object")
+        try:
+            store.acknowledge(
+                str(entry.get("skill_id", "")),
+                str(entry.get("digest", "")),
+                description=str(entry.get("description", "")),
+                content_sha256=str(entry.get("content_sha256", "")),
+                acknowledged_by=str(entry.get("acknowledged_by", "operator")),
+            )
+        except SkillAdoptionStoreError as exc:
+            raise BridgeError(f"skill adoption ledger has an invalid acknowledgment: {exc}") from exc
+    return store
+
+
 class Bridge:
-    def __init__(self, settings: BridgeSettings) -> None:
+    def __init__(
+        self,
+        settings: BridgeSettings,
+        *,
+        skill_adoption_store: SkillAdoptionStore | None = None,
+    ) -> None:
         self.settings = settings
         self.hub = HubTransport(settings.hub, settings.bridge_id, settings.token)
         self.state = StateReader(settings)
         self.skills = SkillRegistry(settings.skill_roots)
         self._published_skill_hash = ""
+        # T008 workflow-start adoption gate wiring.  UNCONFIGURED (no injected
+        # store and no declared ledger) is the legacy-UNGATED default: the shipped
+        # poll loop runs selected skills exactly as before, matching the
+        # already-tested opt-out.  CONFIGURED (an injected store, or a reviewed
+        # ledger declared on the settings) ENFORCES the gate -- CodexRunner then
+        # refuses an unacknowledged/since-changed skill digest at workflow start
+        # (fail-closed), like the browser surfaces.  An injected store overrides
+        # the ledger path, mirroring the create_app inject-or-default pattern.
+        if skill_adoption_store is None and settings.skill_adoption_ledger_file is not None:
+            skill_adoption_store = load_skill_adoption_store(settings.skill_adoption_ledger_file)
+        self.skill_adoption_store = skill_adoption_store
 
     def _emit(self, run_id: str, role: str, content: Any) -> None:
         self.hub.event(run_id, role, content)
@@ -1128,6 +1190,11 @@ class Bridge:
                 selected_skills = self._selected_skills(payload, available_skills)
                 exit_code = CodexRunner(
                     self.settings, lambda role, content: self._emit(run_id, role, content), worktree_root,
+                    # T008: when the operator configured an adoption ledger (or
+                    # injected a store) the runner refuses to START on an
+                    # unacknowledged/changed skill digest; when None the gate is
+                    # not exercised (legacy-ungated).
+                    skill_adoption_store=self.skill_adoption_store,
                 ).run(run_id, packet, model, selected_skills)
                 require_live_lease()
                 if exit_code:
@@ -1263,6 +1330,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow one reviewed local operation-catalog JSON file for a named provider",
     )
     parser.add_argument("--skills-root", action="append", default=[], type=Path, help="allow explicit local SKILL.md roots for this bridge")
+    parser.add_argument("--skill-adoption-ledger", type=Path, default=None, help="opt in to the T008 skill-adoption gate from a reviewed local JSON ledger; unset = legacy-ungated")
     parser.add_argument("--verification-command", action="append", default=[], help="allow one exact State verification command; it runs without a shell")
     parser.add_argument("--interval", type=float, default=3.0)
     parser.add_argument("--once", action="store_true")
@@ -1310,6 +1378,7 @@ def main(argv: list[str] | None = None) -> int:
         worktrees=worktrees, provider_catalog_files=provider_catalog_files,
         skill_roots=tuple(path.resolve() for path in args.skills_root),
         verification_commands=tuple(args.verification_command),
+        skill_adoption_ledger_file=args.skill_adoption_ledger.resolve() if args.skill_adoption_ledger else None,
     )
     bridge = Bridge(settings)
     while True:

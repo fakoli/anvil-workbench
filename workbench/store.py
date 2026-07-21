@@ -3013,6 +3013,15 @@ def resolve_plugin_tool_preferences(
     descriptor; an invalid stored value falls back to the safe default rather than
     reaching dispatch.  The returned mapping is the ONLY thing a dispatch uses --
     there is no other channel by which a browser-supplied value could ride in.
+
+    NOTE (T011): the actual dispatch-side CONSUMPTION of these resolved
+    preferences awaits the operation-layer integration (a bridge/operation that
+    reads the resolved mapping).  Today this resolver is the ONLY channel that
+    produces them, so its typed-check + safe-default fallback is the single place
+    an actor value is validated before it could reach an effect; a secret-shaped
+    value can never reach here because :func:`workbench.contracts.validate_plugin_catalog`
+    already refuses a secret name/default AND a secret-shaped ``allowed_values``
+    option at review time.
     """
     scopes = {
         "per_turn": dict(per_turn or {}),

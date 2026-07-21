@@ -2257,3 +2257,63 @@ def test_t011_actor_view_default_is_scrubbed_at_projection_last_hop():
     blob = _t011s_json.dumps(view)
     for marker in ("://", "ghp_", "AKIA", "serving:8443", "/etc", "C:/"):
         assert marker not in blob
+
+
+def test_t011_enum_allowed_values_secret_option_is_refused_across_the_corpus():
+    # SHOULD-1: an allowed_values OPTION is an actor-selectable channel --
+    # resolve_plugin_tool_preferences returns the selected option RAW to dispatch
+    # (dispatch is NOT scrubbed by the browser last hop) -- so a secret-shaped
+    # option must be refused at review time exactly like a secret name/default.
+    for hostile in (
+        "serving:8443", "neo4j:7687",                       # dotless host:port
+        "AKIAIOSFODNN7EXAMPLE",                             # AWS key id, no separator
+        "eyJhbGciOiJIUzI1NiJ9.payload.sig",                # JWT
+        "-----BEGIN RSA PRIVATE KEY-----",                 # PEM
+        "postgresql://user:pass@db.internal:5432/app",     # DB URL
+        "/etc/shadow", "C:/Users/op/secrets.env",          # POSIX + Windows path
+        "ghp_secretsecretsecret1234567890",                # GitHub PAT
+        "sk-ant-api03-REALKEYMATERIALHERE",                # provider key
+    ):
+        catalog = _t011s_catalog([{
+            "name": "sort", "type": "enum", "scope": "actor",
+            "allowed_values": ["safe", hostile], "default": "safe",
+        }])
+        with pytest.raises(_T011S_ContractError, match="secret/credential-bearing"):
+            _t011s_validate(catalog)
+
+
+def test_t011_innocent_enum_allowed_values_still_validate():
+    # The allowed_values scan must not over-reject: an enum of benign options
+    # (including a colon-free label and a numeric-looking token that is NOT a
+    # host:port) still passes.
+    catalog = _t011s_catalog([{
+        "name": "sort", "type": "enum", "scope": "actor",
+        "allowed_values": ["newest", "oldest", "priority", "v1"], "default": "newest",
+    }])
+    _t011s_validate(catalog)
+
+
+def test_t011_actor_view_projection_itself_neutralizes_hostport_and_akia():
+    # SHOULD-2: the inner defence-in-depth must use the CONFIG-strength scrubber,
+    # not the weak transcript redact_value (which neutralizes NEITHER a dotless
+    # host:port NOR an AKIA-no-separator key). A benign-named/benign-defaulted
+    # field whose PROJECTED free-text (description/allowed_values) carries those
+    # shapes must be scrubbed by the projection ITSELF -- proving the inner defence
+    # is real and not merely relying on the API scrub_config_payload last hop.
+    from workbench.contracts import plugin_preference_actor_view as _view
+    tool = {
+        "preference_fields": [
+            {
+                "name": "sort", "type": "enum", "scope": "actor", "default": "newest",
+                "description": "route via serving:8443 with key AKIAIOSFODNN7EXAMPLE",
+                "allowed_values": ["newest", "serving:8443", "AKIAIOSFODNN7EXAMPLE"],
+            }
+        ]
+    }
+    view = _view(tool)
+    # A benign-named field is PROJECTED (scrubbed), not dropped -- so the scrub, not
+    # the skip, is what neutralizes the leak shapes.
+    assert view, "a benign-named/defaulted field must be projected, then scrubbed"
+    blob = _t011s_json.dumps(view)
+    for marker in ("serving:8443", "AKIA", "AKIAIOSFODNN7EXAMPLE"):
+        assert marker not in blob

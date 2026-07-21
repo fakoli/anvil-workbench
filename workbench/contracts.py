@@ -2504,6 +2504,14 @@ def refuse_runtime_openapi_ingestion(what: str = "an OpenAPI document or URL") -
     URL or document must call; it ALWAYS raises, so a live/browser OpenAPI
     ingestion path can never quietly exist.  Compilation happens only during
     operator catalog review via :func:`compile_openapi_read_connector_plugin`.
+
+    NOTE (T009): this helper INTENTIONALLY has no production caller.  R016 is
+    carried by ENDPOINT ABSENCE -- ``create_app`` never reads an OpenAPI document
+    at runtime (see :attr:`workbench.config.Settings.plugin_openapi_document_file`)
+    and no browser/hub route ingests one -- so there is no live path to guard;
+    this is the fail-closed tripwire kept ready for any future runtime code that is
+    tempted to add one.  Its guarantee is proven directly by its own unit tests,
+    not by a wired call site.
     """
     raise RuntimeOpenApiIngestionError(
         "OpenAPI compilation is a review-time operator action only; "
@@ -2728,6 +2736,12 @@ def assert_connector_document_current(
     ``openapi_source``; if the currently-reviewed document's digest differs, the
     descriptors were compiled from a document that has since changed, so dispatch
     is refused AS DRIFT rather than served against a stale compilation.
+
+    NOTE (T009): this is a REVIEW-TIME/helper drift choke-point kept ready for the
+    proposed operation-layer dispatch; the v1 spine has no live connector-dispatch
+    call site (the document digest is also folded into the plugin_digest the spine
+    already drift-checks, so drift fails closed there today).  Its guarantee is
+    proven directly by its own unit tests, not by a wired call site.
     """
     source = plugin.get("openapi_source")
     if not isinstance(source, Mapping) or "document_digest" not in source:
@@ -2829,6 +2843,23 @@ def _validate_plugin_preference_field(plugin_id: str, tool_id: str, field: Any) 
             f"plugin preference field is detected as secret/credential-bearing and cannot be actor-selectable: "
             f"{plugin_id}:{tool_id}:{name}"
         )
+    # SHOULD-1 (T011): the secret-shape detector must ALSO cover every enum option.
+    # allowed_values is an actor-selectable channel -- resolve_plugin_tool_preferences
+    # returns the actor-selected option RAW to dispatch (dispatch is NOT scrubbed by
+    # the browser last-hop) -- so a secret/credential/host:port/path-shaped option
+    # (a dotless "serving:8443", an AKIA-no-separator key, a JWT, a PEM, a DB URL,
+    # "/etc/...", "C:\\...", "ghp_...", "sk-...") must be refused here at review time,
+    # exactly like a secret-shaped name or default.  Each option is scanned over the
+    # same shared redact_config_text corpus the name/default use.
+    allowed_values = field.get("allowed_values")
+    if isinstance(allowed_values, list):
+        for option in allowed_values:
+            if _looks_like_secret_preference(name, option):
+                raise ContractValidationError(
+                    f"plugin preference field has an allowed_values option detected as "
+                    f"secret/credential-bearing and cannot be actor-selectable: "
+                    f"{plugin_id}:{tool_id}:{name}"
+                )
     if field.get("type") == "enum" and not isinstance(field.get("allowed_values"), list):
         raise ContractValidationError(
             f"enum plugin preference field must declare allowed_values: {plugin_id}:{tool_id}:{name}"
@@ -2851,11 +2882,17 @@ def plugin_preference_actor_view(tool: Mapping[str, Any]) -> list[dict[str, Any]
     """Project a tool's actor-selectable preference field descriptors for the browser.
 
     Serializes only the declared NON-SECRET fields (the catalog validator already
-    refused any secret one) and, defence-in-depth, scrubs a string default through
-    the shared redactor before it can reach a browser -- so a connector-host
-    endpoint or a credential can never round-trip through this projection.
+    refused any secret one) and, defence-in-depth, scrubs every free-text field
+    (default/allowed_values/title/description) through the SHARED configuration
+    scrubber (:func:`scrub_config_payload`, the same corpus the API last hop uses)
+    before it can reach a browser.  SHOULD-2 (T011): the weaker transcript
+    ``redact_value`` neutralizes neither a dotless ``host:port`` (``serving:8443``)
+    nor an AKIA-no-separator key, so this inner defence-in-depth is only real when
+    it uses the config-strength scrubber -- the projection now genuinely neutralizes
+    a connector-host endpoint or a credential itself, rather than resting solely on
+    the API ``scrub_config_payload`` last hop.
     """
-    from .redaction import redact_value
+    from .redaction import scrub_config_payload
 
     view: list[dict[str, Any]] = []
     for field in tool.get("preference_fields", []) or []:
@@ -2870,6 +2907,6 @@ def plugin_preference_actor_view(tool: Mapping[str, Any]) -> list[dict[str, Any]
         for key, item in field.items():
             if key not in _PLUGIN_PREF_ACTOR_VIEW_FIELDS:
                 continue
-            projected[key] = redact_value(copy.deepcopy(item)) if key in ("default", "allowed_values", "title", "description") else copy.deepcopy(item)
+            projected[key] = scrub_config_payload(copy.deepcopy(item)) if key in ("default", "allowed_values", "title", "description") else copy.deepcopy(item)
         view.append(projected)
     return view
