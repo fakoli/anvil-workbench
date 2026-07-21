@@ -2048,3 +2048,129 @@ def test_t010_wired_search_fails_closed_when_unconfigured() -> None:
     with TestClient(app) as client:
         r = client.get("/api/conversation-search?query=x", headers={"X-Workbench-Actor": "operator"})
         assert r.status_code == 503
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T009: compiled OpenAPI descriptors carry READ-ONLY
+# effect classes only and validate under the existing manifest prohibitions;
+# document/digest drift after pinning refuses dispatch as drift through the
+# plugin spine (PluginDiscovery digest_drift).
+# =========================================================================== #
+
+from workbench.contracts import (
+    ContractValidationError as _T009S_ContractError,
+    compile_openapi_read_connector_plugin as _t009s_compile,
+    contract_digest as _t009s_digest,
+    openapi_document_digest as _t009s_doc_digest,
+)
+from workbench.plugin_host import PluginDiscovery as _T009S_Discovery, PluginHostError as _T009S_HostError
+
+_T009S_REVIEWS = {
+    "issues.read": {
+        "title": "Read one reviewed issue",
+        "summary": "Read one mirrored issue redacted summary.",
+        "output_schema": {
+            "type": "object", "additionalProperties": False, "required": ["title"],
+            "properties": {"title": {"type": "string", "maxLength": 200}},
+        },
+        "data_access": ["read_project_metadata"],
+        "host_access": [{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+        "receipts": ["plugin.issues.read"],
+    }
+}
+
+
+def _t009s_doc(version="1.0.0"):
+    return {
+        "openapi": "3.0.3", "info": {"title": "Issues", "version": version},
+        "servers": [{"url": "https://internal.evil.example/api"}],
+        "paths": {"/issues/{ref}": {"get": {
+            "operationId": "issues.read", "summary": "Read one issue",
+            "parameters": [{"name": "ref", "in": "path", "required": True,
+                            "schema": {"type": "string", "pattern": "^[a-z0-9-]{1,40}$"}}],
+        }}},
+    }
+
+
+def _t009s_plugin(version="1.0.0"):
+    return _t009s_compile(
+        _t009s_doc(version), plugin_id="reviewed-issues", title="Reviewed issues", version="1.0.0",
+        publisher={"name": "Anvil Workbench", "kind": "first_party"},
+        description="Read-only reviewed issue mirror compiled from a digest-pinned OpenAPI document.",
+        runtime={"kind": "connector", "api_version": "1.0.0", "min_host_version": "1.0.0"},
+        support_status="supported", data_access=["read_project_metadata"],
+        host_access=[{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+        retention="none", docs="docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed",
+        compiled_at="2026-07-21T00:00:00Z", tool_reviews=_T009S_REVIEWS,
+    )
+
+
+def _t009s_catalog(plugin):
+    catalog = {
+        "schema_version": "workbench-plugin-catalog/v1", "registry_id": "reviewed-connectors",
+        "revision": "1.0.0",
+        "provenance": {"signer_kind": "operator_owner_key", "key_id": "operator-key-01",
+                       "reviewed_at": "2026-07-21T00:00:00Z"},
+        "plugins": [plugin],
+    }
+    catalog["catalog_digest"] = _t009s_digest("plugin-catalog", catalog)
+    return catalog
+
+
+def _t009s_capability(plugin):
+    profile = {
+        "schema_version": "workbench-plugin-capability/v1", "profile_id": "reviewed-connectors",
+        "revision": "1.0.0", "scope": "chat", "binding": "enable_only",
+        "plugins": [{"plugin_id": plugin["id"], "plugin_digest": plugin["plugin_digest"],
+                     "enabled_tools": ["issues.read"]}],
+        "limits": {"max_enabled_tools": 16, "max_concurrent_tool_calls": 4},
+    }
+    profile["digest"] = _t009s_digest("plugin-capability", profile)
+    return profile
+
+
+def test_t009_compiled_descriptors_are_read_only_and_pass_manifest_prohibitions():
+    plugin = _t009s_plugin()
+    for tool in plugin["tools"]:
+        assert tool["effect"] == "read"                     # READ-ONLY effect classes only
+        assert tool["tool_kind"] == "read_only_connector"
+        assert tool["gates"]["human_approval"] == "not_required"
+    # The catalog validates under the existing prohibitions (no shell/fetch/cred,
+    # closed typed I/O) -- i.e. validate_plugin_catalog accepts the compiled shape.
+    from workbench.contracts import validate_plugin_catalog as _vpc
+    _vpc(_t009s_catalog(plugin))
+
+
+def test_t009_document_drift_after_pinning_refuses_dispatch_as_drift_via_the_spine():
+    # Operator compiled the connector at document D1 and enabled it in a profile.
+    v1 = _t009s_plugin("1.0.0")
+    # The operator later recompiles the SAME connector from a CHANGED document D2:
+    # the document digest changes, so the plugin_digest changes.
+    v2 = _t009s_plugin("2.0.0")
+    assert v1["plugin_digest"] != v2["plugin_digest"]
+    # The live reviewed catalog now carries the D2 plugin; a dispatch still pinning
+    # the D1 plugin_digest resolves against the spine and is refused AS DRIFT.
+    discovery = _T009S_Discovery(_t009s_catalog(v2), _t009s_capability(v2))
+    with pytest.raises(_T009S_HostError) as excinfo:
+        discovery.resolve(v2["id"], v1["plugin_digest"], "issues.read")
+    assert excinfo.value.code == "digest_drift"
+    # And the D2 pin resolves cleanly (the connector still works once re-pinned).
+    resolved = discovery.resolve(v2["id"], v2["plugin_digest"], "issues.read")
+    assert resolved.tool["effect"] == "read"
+
+
+def test_t009_compilation_refuses_a_smuggled_open_output_projection():
+    # An operator "review" that tried to declare an OPEN output object (a smuggle
+    # hole) is refused at compile time by the same closed-schema manifest guard.
+    hostile_reviews = {"issues.read": dict(_T009S_REVIEWS["issues.read"], output_schema={"type": "object"})}
+    with pytest.raises(_T009S_ContractError, match="close every object"):
+        _t009s_compile(
+            _t009s_doc(), plugin_id="reviewed-issues", title="Reviewed issues", version="1.0.0",
+            publisher={"name": "Anvil Workbench", "kind": "first_party"},
+            description="Read-only reviewed issue mirror.",
+            runtime={"kind": "connector", "api_version": "1.0.0", "min_host_version": "1.0.0"},
+            support_status="supported", data_access=["read_project_metadata"],
+            host_access=[{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+            retention="none", docs="docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed",
+            compiled_at="2026-07-21T00:00:00Z", tool_reviews=hostile_reviews,
+        )

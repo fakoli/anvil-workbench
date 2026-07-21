@@ -1771,3 +1771,35 @@ def test_chat_tools_served_reconciliation_is_scrubbed_and_unknown_is_a_plain_404
         missing = client_.get(
             "/api/chat/tools/reconciliations/sha256:" + "0" * 64, headers=_CTD_ACTOR)
         assert missing.status_code == 404
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T009: NO runtime or browser path accepts an OpenAPI URL
+# or document. The reviewed-plugin browser surface is read-only (GET), and there
+# is no compile/ingestion endpoint -- proven through the wired create_app router.
+# =========================================================================== #
+
+
+def test_t009_plugin_browser_surface_is_get_only_and_ingests_no_openapi():
+    service, _digest = _pl_service_with_install()
+    client = _pl_client(service)
+    # There is no OpenAPI ingestion / compile endpoint at all.
+    assert client.post("/api/plugins", json={"openapi": "3.0.3", "paths": {}}, headers=_PL_ACTOR).status_code in (404, 405)
+    assert client.post("/api/plugins/compile", json={"url": "https://x/openapi.json"}, headers=_PL_ACTOR).status_code in (404, 405)
+    # The discovery surface itself is GET-only: a write verb is refused.
+    assert client.post("/api/plugins/anvil-tasks-viewer", json={}, headers=_PL_ACTOR).status_code in (404, 405)
+    assert client.put("/api/plugins/anvil-tasks-viewer", json={}, headers=_PL_ACTOR).status_code in (404, 405)
+
+
+def test_t009_chat_tools_surface_ingests_no_openapi():
+    # The chat-tools surface is likewise read-only: no OpenAPI document can be
+    # POSTed to compile or dispatch a connector at runtime.
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    client = TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph()))
+    r = client.post("/api/chat/tools", json={"openapi": "3.0.3"}, headers=_PL_ACTOR)
+    assert r.status_code in (404, 405)

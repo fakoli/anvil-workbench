@@ -792,3 +792,159 @@ def _walk(value: object):
             yield from _walk(nested)
     else:
         yield value
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T009: reviewed OpenAPI -> read-only descriptor compile.
+#
+# Compilation is a REVIEW-TIME operator action: it emits read_only_connector
+# descriptors that validate under the EXISTING manifest prohibitions, carries
+# READ-ONLY effect classes only, ignores the document's server URLs, and NO
+# runtime/browser path ingests an OpenAPI URL/document. Document/digest drift
+# after pinning refuses dispatch as drift.
+# =========================================================================== #
+
+from workbench.config import reviewed_openapi_source_location as _t009_source
+from workbench.contracts import (
+    RuntimeOpenApiIngestionError as _T009_RuntimeError,
+    assert_connector_document_current as _t009_assert_current,
+    compile_openapi_read_connector_plugin as _t009_compile,
+    openapi_document_digest as _t009_doc_digest,
+    refuse_runtime_openapi_ingestion as _t009_refuse_runtime,
+    reviewed_openapi_catalog as _t009_catalog,
+    validate_plugin_catalog as _t009_validate,
+)
+
+_T009_PROVENANCE = {
+    "signer_kind": "operator_owner_key", "key_id": "operator-key-01",
+    "reviewed_at": "2026-07-21T00:00:00Z",
+}
+_T009_REVIEWS = {
+    "issues.read": {
+        "title": "Read one reviewed issue",
+        "summary": "Read one mirrored issue redacted summary through the host-mediated connector.",
+        "output_schema": {
+            "type": "object", "additionalProperties": False, "required": ["title"],
+            "properties": {"title": {"type": "string", "maxLength": 200}},
+        },
+        "data_access": ["read_project_metadata"],
+        "host_access": [{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+        "receipts": ["plugin.issues.read"],
+    }
+}
+
+
+def _t009_doc(extra_paths=None):
+    paths = {
+        "/issues/{ref}": {
+            "get": {
+                "operationId": "issues.read",
+                "summary": "Read one issue",
+                "parameters": [
+                    {"name": "ref", "in": "path", "required": True,
+                     "schema": {"type": "string", "pattern": "^[a-z0-9-]{1,40}$"}},
+                ],
+            }
+        }
+    }
+    if extra_paths:
+        paths.update(extra_paths)
+    return {
+        "openapi": "3.0.3",
+        "info": {"title": "Issues", "version": "1.0.0"},
+        # A server URL the compiler must IGNORE -- never carried into a descriptor.
+        "servers": [{"url": "https://internal.evil.example/api"}],
+        "paths": paths,
+    }
+
+
+def _t009_compile_plugin(doc=None, plugin_id="reviewed-issues"):
+    return _t009_compile(
+        doc or _t009_doc(),
+        plugin_id=plugin_id, title="Reviewed issues", version="1.0.0",
+        publisher={"name": "Anvil Workbench", "kind": "first_party"},
+        description="Read-only reviewed issue mirror compiled from a digest-pinned OpenAPI document.",
+        runtime={"kind": "connector", "api_version": "1.0.0", "min_host_version": "1.0.0"},
+        support_status="supported", data_access=["read_project_metadata"],
+        host_access=[{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+        retention="none", docs="docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed",
+        compiled_at="2026-07-21T00:00:00Z", tool_reviews=_T009_REVIEWS,
+    )
+
+
+def test_t009_compiles_read_only_connector_that_validates_under_manifest_prohibitions():
+    plugin = _t009_compile_plugin()
+    catalog = _t009_catalog([plugin], registry_id="reviewed-connectors", revision="1.0.0", provenance=_T009_PROVENANCE)
+    _t009_validate(catalog)  # existing manifest prohibitions enforce closed I/O, no shell/fetch/credential
+    tool = catalog["plugins"][0]["tools"][0]
+    assert tool["tool_kind"] == "read_only_connector"
+    assert tool["effect"] == "read"
+    assert tool["gates"]["human_approval"] == "not_required"
+    # openapi_source pins the reviewed document digest only -- never a URL/body.
+    assert catalog["plugins"][0]["openapi_source"]["document_digest"] == _t009_doc_digest(_t009_doc())
+
+
+def test_t009_compilation_refuses_a_write_operation():
+    write_doc = _t009_doc(extra_paths={
+        "/issues": {"post": {"operationId": "issues.create", "summary": "Create an issue"}}
+    })
+    with pytest.raises(ContractValidationError, match="only read-only GET"):
+        _t009_compile_plugin(doc=write_doc)
+
+
+def test_t009_compiled_descriptor_never_carries_a_server_url_or_document_body():
+    plugin = _t009_compile_plugin()
+    blob = json.dumps(plugin)
+    assert "evil.example" not in blob  # the server URL is ignored, never compiled in
+    assert "servers" not in plugin
+    assert "://" not in blob  # no URL/endpoint anywhere in the descriptor
+
+
+def test_t009_no_runtime_or_browser_path_ingests_openapi():
+    for what in ("a browser-supplied OpenAPI URL", "an inline document"):
+        with pytest.raises(_T009_RuntimeError):
+            _t009_refuse_runtime(what)
+
+
+def test_t009_a_smuggled_open_or_non_scalar_param_is_refused():
+    # An OpenAPI param that is a non-scalar object (a smuggle vector for
+    # {"command": "...", "cwd": "/etc"}) is refused at compile time.
+    hostile = _t009_doc(extra_paths={
+        "/run": {"get": {
+            "operationId": "issues.run", "summary": "hostile",
+            "parameters": [{"name": "payload", "in": "query", "required": True,
+                            "schema": {"type": "object"}}],
+        }}
+    })
+    reviews = dict(_T009_REVIEWS)
+    reviews["issues.run"] = dict(_T009_REVIEWS["issues.read"])
+    with pytest.raises(ContractValidationError, match="scalar"):
+        _t009_compile(
+            hostile, plugin_id="reviewed-issues", title="Reviewed issues", version="1.0.0",
+            publisher={"name": "Anvil Workbench", "kind": "first_party"},
+            description="Read-only reviewed issue mirror compiled from a digest-pinned OpenAPI document.",
+            runtime={"kind": "connector", "api_version": "1.0.0", "min_host_version": "1.0.0"},
+            support_status="supported", data_access=["read_project_metadata"],
+            host_access=[{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+            retention="none", docs="docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed",
+            compiled_at="2026-07-21T00:00:00Z", tool_reviews=reviews,
+        )
+
+
+def test_t009_document_digest_is_tamper_evident_and_drift_refuses():
+    plugin = _t009_compile_plugin()
+    live = _t009_doc_digest(_t009_doc())
+    _t009_assert_current(plugin, live)  # baseline: current
+    # A changed document yields a different digest -> drift refusal.
+    changed = _t009_doc()
+    changed["info"]["version"] = "2.0.0"
+    assert _t009_doc_digest(changed) != live
+    with pytest.raises(ContractValidationError, match="drift"):
+        _t009_assert_current(plugin, _t009_doc_digest(changed))
+
+
+def test_t009_config_openapi_source_is_local_only_never_a_url():
+    assert _t009_source("catalogs/issues.openapi.json") == "catalogs/issues.openapi.json"
+    for url in ("https://x/y.json", "//host/y.json", "http://10.0.0.7/api"):
+        with pytest.raises(ValueError, match="local path"):
+            _t009_source(url)

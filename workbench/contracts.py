@@ -9,7 +9,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from collections.abc import Iterator, Mapping
+import re
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import unquote
@@ -2449,3 +2450,283 @@ def validate_plugin_receipt(
             requested_tool = requested_tool.get("tool_id") if isinstance(requested_tool, Mapping) else None
             if receipt.get("tool_id") != requested_tool:
                 raise ContractValidationError("plugin receipt names a different tool than the request")
+
+
+# --------------------------------------------------------------------------- #
+# Reviewed OpenAPI -> read-only descriptor compilation (reviewed-tools-plugins
+# T009 / R016).
+#
+# Compilation is a REVIEW-TIME operator action: an operator-reviewed, digest-
+# pinned OpenAPI document is compiled into standard `read_only_connector` tool
+# descriptors that validate under the EXISTING plugin-catalog manifest
+# prohibitions (no raw shell, no arbitrary fetch/URL, no credential value, closed
+# typed I/O).  There is deliberately NO runtime or browser path that ingests an
+# OpenAPI URL or document: `refuse_runtime_openapi_ingestion` fails closed for any
+# such attempt, and the document's own `servers`/URLs are never carried into a
+# descriptor (egress stays host-mediated by the operator-declared scope).  A
+# compiled connector pins the reviewed document's digest, so a later document (or
+# digest) drift refuses dispatch as drift -- both directly
+# (`assert_connector_document_current`) and through the spine's plugin-digest
+# drift (the document digest is part of the plugin content the plugin_digest
+# covers).
+# --------------------------------------------------------------------------- #
+
+_OPENAPI_DOCUMENT_PREFIX = b"anvil-workbench/plugin-openapi-document/v1\0"
+_OPENAPI_READ_METHOD = "get"
+_OPENAPI_NON_READ_METHODS = frozenset(
+    {"post", "put", "patch", "delete", "options", "head", "trace", "connect"}
+)
+_OPENAPI_PARAM_KEYWORDS = frozenset(
+    {"type", "pattern", "enum", "format", "maxLength", "minLength", "minimum", "maximum", "multipleOf"}
+)
+_OPENAPI_SCALAR_TYPES = frozenset({"string", "integer", "number", "boolean"})
+_TOOL_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$")
+
+
+class RuntimeOpenApiIngestionError(ContractValidationError):
+    """A runtime or browser path attempted to ingest an OpenAPI URL or document.
+
+    OpenAPI compilation is a review-time operator action only; a runtime/browser
+    OpenAPI URL or document is never accepted, so this is raised to fail closed.
+    """
+
+
+def refuse_runtime_openapi_ingestion(what: str = "an OpenAPI document or URL") -> None:
+    """Fail closed: no runtime or browser path may ingest OpenAPI.
+
+    A single choke point any runtime code that is tempted to accept an OpenAPI
+    URL or document must call; it ALWAYS raises, so a live/browser OpenAPI
+    ingestion path can never quietly exist.  Compilation happens only during
+    operator catalog review via :func:`compile_openapi_read_connector_plugin`.
+    """
+    raise RuntimeOpenApiIngestionError(
+        "OpenAPI compilation is a review-time operator action only; "
+        f"no runtime or browser path may ingest {what}"
+    )
+
+
+def openapi_document_digest(document: Mapping[str, Any]) -> str:
+    """Return the tamper-evident ``sha256:`` digest of a reviewed OpenAPI document.
+
+    Domain-separated so it can never collide with a contract-resource digest.
+    The digest is what a compiled connector pins, so any edit to the reviewed
+    document changes it and drift is detectable at dispatch time.
+    """
+    if not isinstance(document, Mapping):
+        raise ContractValidationError("an OpenAPI document must be a JSON object")
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(_OPENAPI_DOCUMENT_PREFIX + payload).hexdigest()
+
+
+def _sanitize_openapi_param_schema(schema: Any, name: str) -> dict[str, Any]:
+    """Reduce one OpenAPI parameter schema to a safe, closed scalar schema.
+
+    A read connector takes scalar reference inputs only.  Any non-scalar type,
+    and every keyword outside the bounded allowlist (so a smuggled ``$ref``,
+    open ``additionalProperties``, or nested object cannot ride in), is dropped
+    or refused -- the resulting schema is re-checked by
+    :func:`check_plugin_tool_schema` at catalog validation regardless.
+    """
+    if not isinstance(schema, Mapping):
+        raise ContractValidationError(f"openapi parameter {name!r} has no schema object")
+    declared = schema.get("type")
+    if declared not in _OPENAPI_SCALAR_TYPES:
+        raise ContractValidationError(
+            f"openapi parameter {name!r} must be a scalar type (a read connector takes scalar refs), not {declared!r}"
+        )
+    return {key: copy.deepcopy(value) for key, value in schema.items() if key in _OPENAPI_PARAM_KEYWORDS}
+
+
+def _compile_connector_input_schema(operation: Mapping[str, Any], operation_id: str) -> dict[str, Any]:
+    """Build a closed object input schema from an OpenAPI operation's parameters."""
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for param in operation.get("parameters", []) or []:
+        if not isinstance(param, Mapping):
+            raise ContractValidationError(f"operation {operation_id!r} has a malformed parameter")
+        location = param.get("in")
+        if location not in ("query", "path"):
+            raise ContractValidationError(
+                f"operation {operation_id!r} parameter {param.get('name')!r} must be a query/path scalar ref, not {location!r}"
+            )
+        name = str(param.get("name") or "")
+        if not name:
+            raise ContractValidationError(f"operation {operation_id!r} has an unnamed parameter")
+        properties[name] = _sanitize_openapi_param_schema(param.get("schema"), name)
+        if param.get("required") is True or location == "path":
+            required.append(name)
+    schema: dict[str, Any] = {"type": "object", "additionalProperties": False, "properties": properties}
+    if required:
+        schema["required"] = sorted(set(required))
+    return schema
+
+
+def compile_openapi_read_connector_plugin(
+    document: Mapping[str, Any],
+    *,
+    plugin_id: str,
+    title: str,
+    version: str,
+    publisher: Mapping[str, Any],
+    description: str,
+    runtime: Mapping[str, Any],
+    support_status: str,
+    data_access: Sequence[str],
+    host_access: Sequence[Mapping[str, Any]],
+    retention: str,
+    docs: str,
+    compiled_at: str,
+    tool_reviews: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compile a reviewed OpenAPI document into a read-only connector plugin (T009).
+
+    Only ``GET`` operations compile -- any write method (``post``/``put``/...)
+    is refused, so a compiled plugin carries READ-ONLY effect classes only.  Each
+    ``GET`` operation must have a matching operator ``tool_reviews`` entry (the
+    reviewed output projection, receipts, and declared scopes), so the untrusted
+    OpenAPI structure decides only WHICH read operations exist and their scalar
+    inputs -- never the output shape, the host egress, or a URL.  The document's
+    ``servers``/URLs are ignored entirely.  The returned plugin pins the reviewed
+    document's digest in ``openapi_source`` and carries a recomputed
+    ``plugin_digest``, and it validates under the existing manifest prohibitions
+    (:func:`validate_plugin_catalog`) when placed in a catalog.
+    """
+    if not isinstance(document, Mapping) or not isinstance(document.get("paths"), Mapping):
+        raise ContractValidationError("an OpenAPI document must be an object with a paths map")
+
+    tools: list[dict[str, Any]] = []
+    for path, methods in sorted(document["paths"].items()):
+        if not isinstance(methods, Mapping):
+            raise ContractValidationError(f"openapi path {path!r} is not an operations object")
+        for method, operation in sorted(methods.items()):
+            lowered = str(method).lower()
+            if lowered in _OPENAPI_NON_READ_METHODS:
+                raise ContractValidationError(
+                    f"only read-only GET operations may compile to a connector; refusing {lowered.upper()} {path}"
+                )
+            if lowered != _OPENAPI_READ_METHOD:
+                # An unknown/non-HTTP key under a path (e.g. 'parameters', a
+                # vendor extension) is not an operation; skip it rather than
+                # treating it as a compilable read.
+                continue
+            if not isinstance(operation, Mapping):
+                raise ContractValidationError(f"openapi GET {path!r} is not an operation object")
+            operation_id = str(operation.get("operationId") or "")
+            if not _TOOL_ID_RE.fullmatch(operation_id):
+                raise ContractValidationError(
+                    f"openapi GET {path!r} needs an operationId that is a valid tool id"
+                )
+            review = tool_reviews.get(operation_id)
+            if not isinstance(review, Mapping):
+                raise ContractValidationError(
+                    f"openapi GET operation {operation_id!r} has no operator-reviewed tool metadata"
+                )
+            input_schema = _compile_connector_input_schema(operation, operation_id)
+            output_schema = review.get("output_schema")
+            # Both derived/reviewed schemas must pass the same closed+bounded
+            # manifest guard the catalog enforces, up front, so compilation fails
+            # closed rather than emitting a smuggle-hole descriptor.
+            check_plugin_tool_schema(input_schema)
+            check_plugin_tool_schema(output_schema)
+            tools.append({
+                "tool_kind": "read_only_connector",
+                "tool_id": operation_id,
+                "title": str(review.get("title") or operation.get("summary") or operation_id),
+                "summary": str(review.get("summary") or operation.get("summary") or "Read-only reviewed connector operation."),
+                "effect": "read",
+                "gates": {
+                    "preview": "not_supported",
+                    "confirmation": "not_required",
+                    "human_approval": "not_required",
+                    "approval_action": None,
+                },
+                "input_schema": input_schema,
+                "output_schema": copy.deepcopy(dict(output_schema)),
+                "data_access": [str(item) for item in review.get("data_access", [])],
+                "host_access": [dict(scope) for scope in review.get("host_access", host_access)],
+                "cancellation": "not_applicable",
+                "receipts": [str(item) for item in review.get("receipts", [f"plugin.{operation_id}"])],
+                "idempotency": {"key_scope": "tool_call", "replay": "return_prior_receipt", "max_attempts": 3},
+                "docs": str(review.get("docs", docs)),
+            })
+
+    if not tools:
+        raise ContractValidationError("the OpenAPI document declared no compilable GET operations")
+
+    plugin: dict[str, Any] = {
+        "id": str(plugin_id),
+        "title": str(title),
+        "version": str(version),
+        # plugin_digest is filled after the content is assembled.
+        "publisher": dict(publisher),
+        "description": str(description),
+        "runtime": dict(runtime),
+        "support_status": str(support_status),
+        # A compiled read connector holds no credential of its own.
+        "credential": {"requirement": "none"},
+        "data_access": [str(item) for item in data_access],
+        "host_access": [dict(scope) for scope in host_access],
+        "retention": str(retention),
+        # R016 provenance: the reviewed document's digest ONLY -- never a URL or
+        # the document body.
+        "openapi_source": {
+            "document_digest": openapi_document_digest(document),
+            "compiled_at": str(compiled_at),
+        },
+        "tools": tools,
+        "docs": str(docs),
+    }
+    plugin["plugin_digest"] = contract_digest("plugin", plugin)
+    return plugin
+
+
+def reviewed_openapi_catalog(
+    plugins: Sequence[Mapping[str, Any]],
+    *,
+    registry_id: str,
+    revision: str,
+    provenance: Mapping[str, Any],
+    generated_at: str | None = None,
+) -> dict[str, Any]:
+    """Wrap compiled connector plugins into a validated reviewed plugin catalog.
+
+    The returned catalog carries a recomputed ``catalog_digest`` and is
+    fail-closed validated by :func:`validate_plugin_catalog`, so a compiled
+    connector that would violate any manifest prohibition (a non-read effect, an
+    open I/O schema, an undeclared credential value) is refused here at review
+    time rather than reaching a runtime.
+    """
+    catalog: dict[str, Any] = {
+        "schema_version": "workbench-plugin-catalog/v1",
+        "registry_id": str(registry_id),
+        "revision": str(revision),
+        "provenance": dict(provenance),
+        "plugins": [dict(plugin) for plugin in plugins],
+    }
+    if generated_at is not None:
+        catalog["generated_at"] = str(generated_at)
+    catalog["catalog_digest"] = contract_digest("plugin-catalog", catalog)
+    validate_plugin_catalog(catalog)
+    return catalog
+
+
+def assert_connector_document_current(
+    plugin: Mapping[str, Any], live_document_digest: str,
+) -> None:
+    """Refuse dispatch when a compiled connector's reviewed OpenAPI document drifted.
+
+    Reuses the digest-drift discipline of the plugin spine at the document layer:
+    a connector plugin pins the exact reviewed document digest in
+    ``openapi_source``; if the currently-reviewed document's digest differs, the
+    descriptors were compiled from a document that has since changed, so dispatch
+    is refused AS DRIFT rather than served against a stale compilation.
+    """
+    source = plugin.get("openapi_source")
+    if not isinstance(source, Mapping) or "document_digest" not in source:
+        raise ContractValidationError("plugin has no compiled openapi_source document digest to drift-check")
+    if source.get("document_digest") != str(live_document_digest):
+        raise ContractValidationError(
+            "the connector's reviewed OpenAPI document digest has drifted; dispatch refused as drift"
+        )
