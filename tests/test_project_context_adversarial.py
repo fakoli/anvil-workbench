@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import threading
 from pathlib import Path
 
@@ -157,29 +158,121 @@ def test_stale_lower_revision_never_clobbers_latest():
 
 
 def test_concurrent_publishes_serialize_without_corruption():
-    store = MemoryProjectContextStore()
-    count = 16
-    projections = [synthetic("project_a", revision=1, seed=f"racer-{i}") for i in range(count)]
-    barrier = threading.Barrier(count)
-    errors: list[Exception] = []
+    # This contests the store's check-then-act in publish() -- the
+    # ``existing = namespace.get(digest)`` guard read at
+    # project_context_store.py just before ``namespace[digest] = projection`` --
+    # under maximally aggressive thread switching (setswitchinterval(1e-6)) with
+    # a Barrier releasing every racer at once.
+    #
+    # The prior version of this test raced N DISTINCT digests, which cannot
+    # detect lost serialization: distinct keys never contend, so any GIL-atomic
+    # interleaving trivially satisfies "all stored". Here we race the SAME
+    # digest, which is where the guard actually matters:
+    #   (a) N racers publishing the IDENTICAL projection must converge to exactly
+    #       one stored record with every caller getting an equal record back.
+    #   (b) a forged same-digest/DIFFERENT-content projection racing the honest
+    #       one must resolve to exactly one stored winner and one fail-closed
+    #       digest-collision error -- never both stored, never a silent overwrite.
+    # With the instance lock present both are deterministically correct on every
+    # round; with the lock disabled, round (b) loses its fail-closed guarantee
+    # (both racers slip past the guard and one silently overwrites the other),
+    # so this test genuinely exercises the serialization it asserts.
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        # (a) Identical projection, N racers -> one record, no duplicate.
+        for _ in range(8):
+            store = MemoryProjectContextStore()
+            count = 16
+            identical = synthetic("project_a", revision=1, seed="same")
+            barrier = threading.Barrier(count)
+            returned: list[ProjectContextProjection] = []
+            errors: list[Exception] = []
+            collect = threading.Lock()
 
-    def _worker(projection: ProjectContextProjection) -> None:
-        barrier.wait()
-        try:
-            store.publish("project_a", projection)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
+            def _same_worker() -> None:
+                barrier.wait()
+                try:
+                    result = store.publish("project_a", identical)
+                except Exception as exc:  # noqa: BLE001
+                    with collect:
+                        errors.append(exc)
+                else:
+                    with collect:
+                        returned.append(result)
 
-    threads = [threading.Thread(target=_worker, args=(p,)) for p in projections]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+            threads = [threading.Thread(target=_same_worker) for _ in range(count)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
-    assert errors == []
-    stored = store.rows.projections["project_a"]
-    assert len(stored) == count
-    assert store.get_latest("project_a").source_digest in stored
+            assert errors == []
+            assert len(returned) == count
+            assert all(r == identical for r in returned)  # every caller: same record
+            stored = store.rows.projections["project_a"]
+            assert list(stored) == [identical.source_digest]  # exactly one, no duplicate
+            assert store.get_latest("project_a") == identical
+
+        # (b) Forged same-digest/different-content racing the honest projection.
+        # Many threads per round split across the two contents so at least two
+        # racers collide in the guard window under aggressive switching. Honest
+        # and forged share a digest but differ in content; whichever content the
+        # single stored record ends up holding, EVERY successful return must
+        # equal that stored record and every other racer must fail closed with
+        # the collision error. Without the lock a racer can write-and-return its
+        # own content only to be silently overwritten -- leaving a "winner" whose
+        # content disagrees with storage -- which the invariants below catch.
+        per_content = 16
+        for _ in range(60):
+            store = MemoryProjectContextStore()
+            honest = synthetic("project_a", revision=1, seed="collide", name="Honest")
+            forged = synthetic("project_a", revision=1, seed="collide", name="Forged")
+            assert honest.source_digest == forged.source_digest
+            assert honest != forged
+
+            racers = [honest] * per_content + [forged] * per_content
+            barrier = threading.Barrier(len(racers))
+            winners: list[ProjectContextProjection] = []
+            failures: list[Exception] = []
+            collect = threading.Lock()
+
+            def _race(projection: ProjectContextProjection) -> None:
+                barrier.wait()
+                try:
+                    result = store.publish("project_a", projection)
+                except ProjectContextStoreError as exc:
+                    with collect:
+                        failures.append(exc)
+                else:
+                    with collect:
+                        winners.append(result)
+
+            threads = [threading.Thread(target=_race, args=(p,)) for p in racers]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            # Exactly one record is stored, and it is exactly one of the two
+            # contents (never a corrupted blend).
+            stored = store.rows.projections["project_a"]
+            assert len(stored) == 1
+            stored_proj = next(iter(stored.values()))
+            assert stored_proj in (honest, forged)
+            # No return was lost, and every successful return equals what is
+            # actually stored -- a silent overwrite would leave a winner that
+            # disagrees with storage.
+            assert len(winners) + len(failures) == len(racers)
+            assert all(w == stored_proj for w in winners), "a winner disagrees with the stored record"
+            # The losing content's racers all fail closed with the collision
+            # error; the winning content's racers all idempotently succeed.
+            expected_failures = sum(1 for p in racers if p != stored_proj)
+            assert len(failures) == expected_failures
+            assert all(isinstance(f, ProjectContextStoreError) for f in failures)
+            assert store.get_latest("project_a") == stored_proj
+    finally:
+        sys.setswitchinterval(previous_interval)
 
 
 # --- Criterion 2: cross-project publish / read / overwrite fail closed -------
@@ -223,12 +316,15 @@ def test_cross_project_read_is_indistinct_from_missing_at_store_and_api():
     assert str(foreign.value) == str(missing.value)
 
     # API level: byte-identical 404 bodies for foreign vs. never-published.
+    # Compare raw response bytes (not parsed JSON) so the assertion proves the
+    # "byte-identical" claim -- a foreign digest, a never-published digest, and a
+    # missing latest are indistinguishable down to the serialized bytes.
     with api_client(store) as client:
         a = client.get(f"/api/projects/intruder/context/{projection.source_digest}", headers=ACTOR)
         b = client.get("/api/projects/intruder/context/sha256:" + "0" * 64, headers=ACTOR)
         c = client.get("/api/projects/intruder/context", headers=ACTOR)
         assert a.status_code == b.status_code == c.status_code == 404
-        assert a.json() == b.json() == c.json()
+        assert a.content == b.content == c.content
 
 
 # --- Criterion 3: browser responses -- duplicate identity + no prohibited fields
@@ -285,6 +381,10 @@ def test_api_response_and_error_bodies_carry_no_prohibited_fields():
             lowered = key.lower()
             for marker in forbidden_key_markers:
                 assert marker not in lowered, f"response field {key!r} looks like a {marker!r} surface"
+        # Value scan: proves the projection does not SPLICE a State-internal path
+        # into any rendered value (the fixture prose is path-free). It is not a
+        # path-scrubbing guarantee for user-chosen prose -- display strings are
+        # served as-is apart from credential scrubbing.
         for value in strings:
             lowered = value.lower()
             for marker in ("state.db", ".anvil", "-wal", "-shm", "://"):

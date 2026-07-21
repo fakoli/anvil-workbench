@@ -141,9 +141,20 @@ def test_state_reader_tails_canonical_events_without_database_access(tmp_path: P
 
 
 # --- project-context browser response safety (state-context-operations T003.3 /
-# T003.4): the rendered read-model response can never carry a State storage
-# path, a credential/token, or a raw executable provider payload, even when the
-# underlying State prose is adversarially seeded with secrets. ----------------
+# T003.4): the rendered read-model response carries no State-internal FIELD
+# (storage path, credential, execution surface), and credential-shaped strings
+# seeded into readable State prose are scrubbed on the last hop, even when the
+# underlying State prose is adversarially seeded with secrets.
+#
+# Scope note: `redact_text` scrubs recognizable CREDENTIALS (api-key/token/
+# secret/Bearer patterns), not filesystem paths or URLs. `project_name` and
+# other display prose are untrusted State-owned strings that are served as-is
+# apart from credential scrubbing (a documented decision). This scan therefore
+# proves (a) no State-internal field name is representable and (b) credentials
+# are scrubbed -- NOT that a user who types a path-like string into a project
+# title would have it rewritten. The value-level path markers below assert the
+# fixture's own prose stays path-free, so a future projection field that DID
+# splice a State path into the response would trip this test. ------------------
 
 _CTX_ROOT = Path(__file__).resolve().parents[1]
 _CTX_CATALOG = _CTX_ROOT / "docs" / "contracts" / "examples" / "anvil-state.catalog.v1.json"
@@ -227,8 +238,12 @@ def test_project_context_browser_response_exposes_no_state_path_credential_or_pa
         assert leaked not in blob
     assert "[REDACTED]" in blob
 
-    # No serialized VALUE carries a concrete storage path, workspace, or URL,
-    # and no identifier/title field carries a path separator.
+    # No serialized VALUE carries a State-storage path or URL. This proves the
+    # projection does not SPLICE a State-internal path into any rendered value --
+    # not that user-chosen prose is path-scrubbed (`redact_text` scrubs
+    # credentials, not paths). The fixture prose is deliberately path-free, so a
+    # regression that started emitting a `state.db`/`.anvil` path into a value
+    # would trip here.
     for value in strings:
         lowered = value.lower()
         for marker in ("state.db", ".anvil", "-wal", "-shm", "://"):

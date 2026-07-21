@@ -359,7 +359,9 @@ def test_cross_project_context_read_is_indistinct_from_missing():
         assert missing_latest.status_code == 404
 
         # Reading project_example's real digest under another project's scope is
-        # byte-identical to reading a digest that was never published.
+        # byte-identical to reading a digest that was never published. Compare the
+        # raw response bytes (not parsed JSON) so the assertion proves the
+        # "byte-identical" claim it makes.
         foreign = client_.get(
             f"/api/projects/other-project/context/{projection.source_digest}", headers=CTX_ACTOR,
         )
@@ -367,9 +369,10 @@ def test_cross_project_context_read_is_indistinct_from_missing():
             "/api/projects/other-project/context/sha256:" + "0" * 64, headers=CTX_ACTOR,
         )
         assert foreign.status_code == never.status_code == 404
-        assert foreign.json() == never.json()
-        # And the same body a genuinely-missing latest returns.
-        assert missing_latest.json() == foreign.json()
+        assert foreign.content == never.content
+        # And the same bytes a genuinely-missing latest returns.
+        assert missing_latest.status_code == 404
+        assert missing_latest.content == foreign.content
 
 
 def test_project_context_response_carries_no_prohibited_fields():

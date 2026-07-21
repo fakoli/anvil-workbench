@@ -189,7 +189,10 @@ def test_cross_project_publish_read_and_overwrite_fail_closed():
         assert foreign.status_code == missing.status_code == 404
         assert foreign.json() == missing.json()
 
-    # A lower-or-equal revision under a new digest never clobbers the latest.
+    # Only a STRICTLY-LOWER revision under a new digest fails closed; an equal
+    # revision under a new digest legitimately supersedes (see the store's
+    # inline rule at project_context_store.py). Here revision_bump=2 sets the
+    # latest, so the un-bumped derive() is strictly lower and never clobbers it.
     store_stale = MemoryProjectContextStore()
     store_stale.publish("project_a", derive("project_a", revision_bump=2))
     with pytest.raises(StaleProjectionError):
@@ -234,6 +237,10 @@ def test_rendered_response_is_non_canonical_and_leaks_nothing():
         lowered = key.lower()
         for marker in forbidden_key_markers:
             assert marker not in lowered, f"response field {key!r} looks like a {marker!r} surface"
+    # Value scan: proves the projection does not SPLICE a State-internal path
+    # into any rendered value (the fixture prose is path-free). It is not a
+    # path-scrubbing guarantee for user-chosen prose -- display strings are
+    # served as-is apart from credential scrubbing.
     for value in strings:
         lowered = value.lower()
         for marker in ("state.db", ".anvil", "-wal", "-shm", "://"):
