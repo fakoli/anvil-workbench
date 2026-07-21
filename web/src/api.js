@@ -390,21 +390,44 @@ export async function fetchPreference(settingId, { scope = 'personal', projectId
 }
 
 // Classify a preference write/reset response into a typed result the UI keeps
-// distinguishable. NEVER collapses stale/invalid/unknown/unavailable together.
+// distinguishable. NEVER collapses stale/invalid/unknown/unavailable/
+// approval-required together (T005.1 criterion 2).
+//
+// The backend emits TWO distinct 409s from the SAME endpoints and they must not
+// be conflated:
+//   * OBJECT detail `{reload_required, current_version}` — a genuine optimistic-
+//     concurrency STALE write (api.py:812-820 / :843-851). Keep the draft; the
+//     actor reloads/compares.
+//   * STRING detail (or an object lacking those fields) — an authority REFUSAL,
+//     e.g. an approval-gated/env-managed write the store rejects with a plain
+//     message (api.py:825-826 PUT, :856-857 reset). This is NOT stale: reloading
+//     changes nothing. Surfaced as `approval_required` with the server's reason
+//     so the UI never shows a fabricated "changed elsewhere — reload" dead-end.
 async function classifyPreferenceWrite(response) {
   if (response.ok) return { status: 'saved', preference: (await response.json()).preference }
   let body = {}
   try { body = await response.json() } catch { /* non-JSON error body */ }
   const detail = body?.detail
   if (response.status === 409) {
-    // Stale optimistic write: the local draft must be preserved and the actor
-    // prompted to reload/compare, never silently overwritten.
-    const info = detail && typeof detail === 'object' ? detail : {}
+    const isStale = detail && typeof detail === 'object'
+      && ('reload_required' in detail || 'current_version' in detail)
+    if (isStale) {
+      // Stale optimistic write: the local draft must be preserved and the actor
+      // prompted to reload/compare, never silently overwritten.
+      return {
+        status: 'stale',
+        reloadRequired: detail.reload_required === true,
+        currentVersion: Number.isInteger(detail.current_version) ? detail.current_version : null,
+        message: 'This setting changed elsewhere. Reload to compare before saving.',
+      }
+    }
+    // Authority refusal (approval-gated / env-managed). Reloading is useless; the
+    // server's own message says why the write cannot proceed here.
     return {
-      status: 'stale',
-      reloadRequired: info.reload_required === true,
-      currentVersion: Number.isInteger(info.current_version) ? info.current_version : null,
-      message: 'This setting changed elsewhere. Reload to compare before saving.',
+      status: 'approval_required',
+      message: typeof detail === 'string' && detail
+        ? detail
+        : 'This change requires an approval and cannot be saved directly.',
     }
   }
   if (response.status === 422) {

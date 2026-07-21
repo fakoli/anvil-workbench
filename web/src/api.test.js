@@ -348,6 +348,35 @@ describe('settings / preferences API client (T005.1)', () => {
     expect((await writePreference('personal.time_format', { scope: 'personal', value: 'x', expectedVersion: 2 })).status).toBe('unavailable')
   })
 
+  it('classifies a 409 STRING detail (authority refusal) as approval_required, distinct from the object-detail 409 stale — on both PUT and reset (revert-detecting)', async () => {
+    // (a) OBJECT detail {reload_required, current_version} = genuine optimistic
+    // concurrency stale.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(409, { detail: { detail: 'reload required before writing', reload_required: true, current_version: 7 } }))
+    expect((await writePreference('personal.time_format', { scope: 'personal', value: 'x', expectedVersion: 2 })).status).toBe('stale')
+
+    // (b) STRING detail on PUT = an approval-gated/env-managed authority REFUSAL,
+    // NOT stale. Collapsing this back into `stale` (the old "every 409 is stale"
+    // behavior) flips these assertions — this test fails closed on that revert.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(409, { detail: 'setting is approval-gated and cannot be written without an approval' }))
+    const putRefusal = await writePreference('project.delivery_route', { scope: 'project', value: 'route.x', expectedVersion: 0, projectId: 'project_1' })
+    expect(putRefusal.status).toBe('approval_required')
+    expect(putRefusal.status).not.toBe('stale')
+    expect(putRefusal.message).toMatch(/approval-gated/) // the server's own reason, not a fabricated reload prompt
+    expect(putRefusal).not.toHaveProperty('reloadRequired')
+
+    // (c) STRING detail on RESET flows through the SAME classifier and is likewise
+    // approval_required, never a stale/reload loop.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(409, { detail: 'setting is env-managed and cannot be reset here' }))
+    const resetRefusal = await resetPreference('project.delivery_route', { scope: 'project', expectedVersion: 0, projectId: 'project_1' })
+    expect(resetRefusal.status).toBe('approval_required')
+    expect(resetRefusal.message).toMatch(/env-managed/)
+
+    // An OBJECT-detail 409 that lacks the stale fields is also treated as a refusal
+    // (not fabricated as stale), so the two 409 shapes stay decided by CONTENT.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(409, { detail: { reason: 'gated' } }))
+    expect((await writePreference('personal.time_format', { scope: 'personal', value: 'x', expectedVersion: 2 })).status).toBe('approval_required')
+  })
+
   it('resets ONLY the named scope with a valueless closed body', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ effective: { setting_id: 'project.delivery_route', scope: 'project', value: 'route.delivery-heavy', source: 'default' } }))
     const result = await resetPreference('project.delivery_route', { scope: 'project', expectedVersion: 4, projectId: 'project_1' })
