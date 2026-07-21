@@ -49,6 +49,10 @@ SCHEMA_FOR_EXAMPLE = {
     "chat.turn.user-voice.v1.json": "chat-turn.v1.schema.json",
     "chat.turn.assistant-interrupted.v1.json": "chat-turn.v1.schema.json",
     "settings-descriptor.v1.json": "settings-descriptor.v1.schema.json",
+    "advanced-branch.v1.json": "advanced-branch.v1.schema.json",
+    "advanced-trace.v1.json": "advanced-trace.v1.schema.json",
+    "advanced-preset.v1.json": "advanced-preset.v1.schema.json",
+    "advanced-comparison.v1.json": "advanced-comparison.v1.schema.json",
 }
 
 

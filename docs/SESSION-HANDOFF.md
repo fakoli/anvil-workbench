@@ -228,3 +228,29 @@ Decisions. Signed proof records live in the anvil workspace `proofs/` dir.
    `tests/test_chat_stream.py` is hermetic (scripted SSE transport, no
    network), and the relay is stateless: persistence stays in the store, not
    yet wired to a browser endpoint or the turn-append path.
+   The Advanced-mode contract surface (advanced-model-playground T001) now
+   exists too, as **proposed** contract resources — not an implemented
+   endpoint. Four versioned schemas plus examples under `docs/contracts/`
+   extend (never fork) the Chat contract: `advanced-branch.v1` (a versioned
+   Advanced-mode branch that references an EXISTING `conversation_id` + parent
+   turn and whose `advbranch_` id cannot mint a `conv_` identity — it carries
+   no turns/transcript array; route-capability descriptors declare each control
+   with type/bounds/default plus the route/profile digest; only mock/read-only
+   tool kinds; ephemeral vs durable retention; structured-output mode;
+   effective-value provenance; budgets; a repair marker), `advanced-trace.v1`
+   (a closed redaction-only request/route/tool/usage trace with no field for a
+   credential, raw header, hidden reasoning, path, or unredacted payload),
+   `advanced-preset.v1` (digest-bearing `preset_digest`; pins exact
+   route/profile/tool digests and repairs deterministically on drift), and
+   `advanced-comparison.v1` (factual metrics over 2–4 sibling turns; a ranking
+   is representable only with a named declared criterion). `workbench.contracts`
+   gains the reference validators `validate_advanced_branch` (declared-control /
+   bounds / policy-owned enforcement — criterion 1) and
+   `validate_advanced_preset` (digest recompute + deterministic drift/repair —
+   criterion 3), plus the `advanced-preset` digest kind (prefix +
+   DIGESTING.md row) and closed-object trust-root guards mirroring the
+   settings-descriptor sibling. `tests/test_advanced_contracts.py` binds each
+   acceptance criterion to a proof and the four examples are registered in
+   `tests/test_contract_resources.py::SCHEMA_FOR_EXAMPLE`. Full suite is 370
+   green (346 baseline + 24). These are shape-and-authority resources only:
+   no router, store, or API reads or writes them yet (T002–T010 remain).

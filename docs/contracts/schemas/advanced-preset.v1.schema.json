@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/advanced-preset.v1.schema.json",
+  "title": "Anvil Workbench advanced chat preset v1",
+  "description": "A named, actor-private, digest-pinned Advanced-mode preset (R012). It stores redacted instructions/template references, an exact route reference (route + profile digest), the supported control values, the response format, and the allowed mock/read-only tools by exact digest. Criterion 3: because a preset pins exact route/tool digests, a live digest drift is detectable and deterministic; the reference validator forces the repair block into repair_required, listing exactly the drifted references, and never silently substitutes a route or tool. The preset is contract-digest-bearing (preset_digest) for tamper evidence; the volatile repair block is excluded from the digest. All prose is untrusted task data, never control instructions. No credential, endpoint, url, header, path, or raw prompt/tool payload field is representable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "preset_id", "actor", "route", "control_values", "response_format", "tools", "preset_digest", "repair", "created_at"],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "token": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+    "refId": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"}
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-advanced-preset/v1"},
+    "preset_id": {"type": "string", "pattern": "^advpreset_[a-zA-Z0-9_-]{8,128}$"},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_id", "kind"],
+      "properties": {
+        "actor_id": {"type": "string", "pattern": "^[a-zA-Z0-9._-]{1,128}$"},
+        "kind": {"const": "operator"}
+      }
+    },
+    "name": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "text"],
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "text": {"type": "string", "maxLength": 200}
+      }
+    },
+    "instructions_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "template_id", "template_digest"],
+      "description": "The preset stores its instructions as a redacted digest-pinned template reference, not raw prompt text, so no hidden prompt can ride in and export stays redacted.",
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "template_id": {"$ref": "#/$defs/token"},
+        "template_digest": {"$ref": "#/$defs/digest"},
+        "summary_chars": {"type": "integer", "minimum": 0, "maximum": 20000}
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "route_id", "route_digest", "profile_digest"],
+      "description": "The exact pinned route/profile. Ids and digests only; drift on either digest opens repair mode.",
+      "properties": {
+        "provider": {"const": "anvil-serving"},
+        "route_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+        "route_digest": {"$ref": "#/$defs/digest"},
+        "profile_digest": {"$ref": "#/$defs/digest"},
+        "model_profile": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"}
+      }
+    },
+    "control_values": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value"],
+        "properties": {
+          "name": {"$ref": "#/$defs/token"},
+          "value": {"type": ["boolean", "integer", "string"]}
+        }
+      }
+    },
+    "response_format": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"enum": ["text", "json_schema"]},
+        "schema_ref": {"$ref": "#/$defs/token"},
+        "schema_digest": {"$ref": "#/$defs/digest"}
+      },
+      "allOf": [
+        {"if": {"properties": {"mode": {"const": "json_schema"}}, "required": ["mode"]},
+         "then": {"required": ["schema_digest"]}}
+      ]
+    },
+    "tools": {
+      "type": "array", "maxItems": 16, "uniqueItems": true,
+      "description": "Allowed mock/read-only tools by exact digest. No effectful or plugin-lifecycle tool kind is representable.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool_id", "kind", "tool_digest"],
+        "properties": {
+          "tool_id": {"$ref": "#/$defs/token"},
+          "kind": {"enum": ["mock", "read_only"]},
+          "tool_digest": {"$ref": "#/$defs/digest"}
+        }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "max_tool_calls": {"type": "integer", "minimum": 0, "maximum": 256},
+        "max_duration_ms": {"type": "integer", "minimum": 1, "maximum": 3600000}
+      }
+    },
+    "preset_digest": {"$ref": "#/$defs/digest"},
+    "repair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "description": "Deterministic drift state (criterion 3). ready only when every pinned digest matches live; repair_required lists exactly the drifted references. A drifted preset never silently substitutes a capability.",
+      "properties": {
+        "status": {"enum": ["ready", "repair_required"]},
+        "drifted_refs": {
+          "type": "array", "maxItems": 32, "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ref_kind", "id", "pinned_digest"],
+            "properties": {
+              "ref_kind": {"enum": ["route", "profile", "tool", "response_schema"]},
+              "id": {"$ref": "#/$defs/refId"},
+              "pinned_digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        }
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "ready"}}, "required": ["status"]},
+         "then": {"properties": {"drifted_refs": {"maxItems": 0}}}},
+        {"if": {"properties": {"status": {"const": "repair_required"}}, "required": ["status"]},
+         "then": {"required": ["drifted_refs"], "properties": {"drifted_refs": {"minItems": 1}}}}
+      ]
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  }
+}

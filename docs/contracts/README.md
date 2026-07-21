@@ -34,6 +34,10 @@ These resources are the implementation-facing companion to
 | Persist one chat/voice conversation identity with display-only project/PRD/task context | [chat conversation](schemas/chat-conversation.v1.schema.json) | [conversation](examples/chat.conversation.v1.json) |
 | Append one immutable chat/voice turn with lineage, route reference, and voice events | [chat turn](schemas/chat-turn.v1.schema.json) | [user voice turn](examples/chat.turn.user-voice.v1.json), [interrupted assistant turn](examples/chat.turn.assistant-interrupted.v1.json) |
 | Declare every initial setting's type, scope, sensitivity, mutability, precedence, and typed reference defaults | [settings descriptor](schemas/settings-descriptor.v1.schema.json) | [settings descriptor catalog](examples/settings-descriptor.v1.json) |
+| Open an Advanced-mode experiment over an existing conversation with route-declared controls and mock/read-only tools | [advanced branch](schemas/advanced-branch.v1.schema.json) | [advanced branch](examples/advanced-branch.v1.json) |
+| Inspect one Advanced attempt as a normalized, redacted request/route/tool/usage trace | [advanced trace](schemas/advanced-trace.v1.schema.json) | [advanced trace](examples/advanced-trace.v1.json) |
+| Save a digest-pinned, actor-private Advanced preset that repairs on route/tool drift | [advanced preset](schemas/advanced-preset.v1.schema.json) | [advanced preset](examples/advanced-preset.v1.json) |
+| Compare two to four sibling attempts by factual metrics with no invented winner | [advanced comparison](schemas/advanced-comparison.v1.schema.json) | [advanced comparison](examples/advanced-comparison.v1.json) |
 
 ## Normative conventions
 
@@ -107,6 +111,35 @@ These resources are the implementation-facing companion to
     enforced by the Workbench hub store at append time, fail-closed: a
     violating append is refused. Chat records are hub-durable records, not
     bridge-verified snapshots, so they are not contract-digest-bearing.
+
+12. Advanced chat mode extends the chat contract; it never forks it. An
+    advanced branch (`advanced-branch.v1`) references an EXISTING
+    `conversation_id` and an existing parent turn, and its own turns are
+    ordinary `chat-turn.v1` records under the same `(parent_turn_id,
+    sibling_index)` lineage — the branch record carries no conversation-identity
+    field and no turns/messages/transcript array, and its `advbranch_` id is
+    grammatically disjoint from a `conv_` identity, so a branch can never mint a
+    parallel transcript. A control is submittable only when the pinned route
+    capability declares it with a type, bounds/allowed values, and a default,
+    and the capability itself carries the route and profile digests; an
+    undeclared, out-of-bounds, or policy-owned-overridden control is refused by
+    `workbench.contracts.validate_advanced_branch`. The trace/export shape
+    (`advanced-trace.v1`) is redaction-only: every object is closed and there is
+    no field for a credential, a raw header, hidden/encrypted reasoning, a
+    filesystem path, or an unredacted provider/tool payload — a tool result
+    carries a digest and character count, never raw output. A preset
+    (`advanced-preset.v1`) pins exact route/profile/tool digests and is
+    digest-bearing (`preset_digest`, excluding the volatile repair block); on a
+    live-digest drift `workbench.contracts.validate_advanced_preset` forces the
+    deterministic `repair_required` state listing exactly the drifted
+    references and never silently substitutes a route or tool. A comparison
+    (`advanced-comparison.v1`) reports factual integer metrics over 2–4 existing
+    sibling turns and can express a ranking only alongside a named declared
+    criterion, so no winner is representable without its criterion. Only
+    deterministic mock and installed read-only tool kinds are representable in
+    any Advanced resource; there is no effectful, plugin-lifecycle, generic-HTTP,
+    or arbitrary-schema tool. Advanced records are hub-durable records and carry
+    no delivery or State authority.
 
 ## Contract-extension checklist
 
