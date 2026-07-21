@@ -13,7 +13,7 @@ This audit distinguishes a functional hub-backed control from a configuration bo
 | Hub-backed interactive workflows covered | 7 / 7 |
 | Utility and onboarding controls covered | 5 / 5 |
 | Web component scenarios | **50 / 50 passed** |
-| Backend and bridge contract tests | **49 / 49 passed** |
+| Backend and bridge contract tests | **661 / 661 passed** |
 | Production web build | passed |
 
 The component suites are [`web/src/App.test.jsx`](../web/src/App.test.jsx), [`web/src/api.test.js`](../web/src/api.test.js), and [`web/src/chat-api.test.js`](../web/src/chat-api.test.js). They mock only the HTTP boundary, then assert the request a real control makes; they do not rely on a delivery seed. Backend tests assert the corresponding durable commands and security checks, including exact verification-command allowlisting without a shell, typed operation inputs, atomic approval consumption plus lease renewal, session-lease-bound GitHub worktrees, PR-to-merge lease retention, and action-failure reconciliation.
