@@ -22,6 +22,7 @@ from .conversation_api import (
 from .conversation_store import ConversationStore, MemoryConversationStore
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .project_context_store import ProjectContextStore, UnknownProjectionError
+from .run_context_store import RunContextStore, UnknownRunContextError
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
@@ -179,6 +180,16 @@ _UNKNOWN_PROJECTION_DETAIL = "unknown project context"
 _PROJECT_ID_PATTERN = r"^[a-zA-Z0-9._-]{1,128}$"
 _SOURCE_DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
 
+#: The single non-leaking body every unknown-or-foreign run-context lookup gets,
+#: so a cross-project probe cannot distinguish "missing" from "belongs to
+#: another project".
+_UNKNOWN_RUN_CONTEXT_DETAIL = "unknown run context"
+
+#: The run-id path grammar, mirrored from the run context's identity grammar so a
+#: malformed run id is rejected at the edge (422) before it can reach the store
+#: as a distinguishable error.
+_RUN_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+
 
 def build_project_context_router(
     actor_dependency: Callable[..., str],
@@ -234,6 +245,68 @@ def build_project_context_router(
         this detail endpoint is not an existence oracle for foreign records.
         """
         return {"context": context_store().get(project_id, source_digest).as_dict()}
+
+    return router
+
+
+def build_run_context_router(
+    actor_dependency: Callable[..., str],
+    run_context_store: RunContextStore | None,
+) -> APIRouter:
+    """Build the read-only, project-scoped historical run-context surface.
+
+    A single endpoint returns the immutable queue-time run context captured for
+    one run (state-context-operations:T005.3).  It reads ONLY the persisted
+    snapshot, so a later task/PRD rename or catalog/route/skill refresh cannot
+    change the titles, revisions, or digests it returns.  The serialized
+    :meth:`RunContext.as_dict` keeps trusted execution policy and untrusted
+    PRD/task data in two separately labeled structures whose closed field set
+    structurally cannot carry a secret, host path, raw command, or provider
+    payload.
+
+    Project scoping is a hard boundary: a run that belongs to another project is
+    not in this project's namespace, so a cross-project read is refused with the
+    same indistinct not-found a genuinely missing run raises
+    (``UnknownRunContextError`` -> the fixed 404 body).  When
+    ``run_context_store`` is ``None`` the surface is not configured and refuses
+    with 503, mirroring the project-context and chat stores.
+    """
+    router = APIRouter(prefix="/api/projects")
+
+    def context_store() -> RunContextStore:
+        if run_context_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="run-context history is not configured",
+            )
+        return run_context_store
+
+    @router.get("/{project_id}/runs/{run_id}/context")
+    def historical_run_context(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        run_id: str = Path(pattern=_RUN_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The project's captured queue-time run context, read as stored.
+
+        A run owned by another project resolves to the indistinct 404, so this
+        endpoint is not an existence oracle for foreign runs.
+
+        Last-hop redaction (security lens, mirroring
+        :func:`build_system_health_router`): the ``untrusted`` PRD/task channel
+        carries whatever prose a PRD title/criterion/scope/evidence happened to
+        contain, so it is re-scrubbed here with
+        :func:`~workbench.redaction.scrub_config_payload`.  Construction-time
+        scrubbing already ran (so the store never held the secret), but this
+        closes a rogue or duck-typed record whose ``as_dict()`` bypassed it. The
+        ``trusted`` policy structure is left untouched -- it is a closed set of
+        typed identifiers/digests/enums with no free-form host/secret field, and
+        the config scrubber's path/URL patterns would otherwise mangle safe
+        ``sha256:`` digests and ``.../v1`` versions.
+        """
+        context = context_store().get(project_id, run_id).as_dict()
+        context["untrusted"] = scrub_config_payload(context["untrusted"])
+        return {"context": context}
 
     return router
 
@@ -311,6 +384,7 @@ def create_app(
     conversation_store: ConversationStore | None = None,
     idempotency_store: IdempotencyStore | None = None,
     project_context_store: ProjectContextStore | None = None,
+    run_context_store: RunContextStore | None = None,
     system_health: SystemHealthService | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
@@ -333,6 +407,10 @@ def create_app(
     # deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless an instance is injected, so the browser surface fails closed (503).
     app.state.project_context_store = project_context_store
+    # The historical run-context store is likewise a hub-side supervision
+    # read-model that is deliberately NOT wired into the live bridge poll loop;
+    # it stays ``None`` unless injected, so the browser surface fails closed (503).
+    app.state.run_context_store = run_context_store
     app.state.system_health = system_health
 
     def actor(request: Request) -> str:
@@ -378,6 +456,16 @@ def create_app(
             status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_PROJECTION_DETAIL}
         )
 
+    # A missing run context and another project's run context raise the same
+    # ``UnknownRunContextError``; both render the identical fixed 404 body so the
+    # historical run-context surface is never an existence oracle. More specific
+    # than the ``StoreError`` handler, so it wins for that subclass.
+    @app.exception_handler(UnknownRunContextError)
+    async def unknown_run_context_handler(_: Request, __: UnknownRunContextError):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_RUN_CONTEXT_DETAIL}
+        )
+
     # An unknown system-health integration id renders a plain fixed 404. The
     # declared-integration set is a public, deployment-invariant catalog, so this
     # is a genuine not-found, not a cross-tenant existence oracle.
@@ -401,6 +489,13 @@ def create_app(
     # (503) until a projection store is configured. Serves only the explicitly
     # non-canonical display read-model; never canonical State.
     app.include_router(build_project_context_router(actor, project_context_store))
+    # Read-only, project-scoped historical run-context surface
+    # (state-context-operations T005.3): authenticated by the same trusted
+    # ``actor`` dependency, scoped by the path ``project_id``/``run_id``, and
+    # fail-closed (503) until a run-context store is configured. Serves only the
+    # immutable queue-time snapshot with trusted policy and untrusted PRD/task
+    # data separately labeled; never a secret, path, command, or provider payload.
+    app.include_router(build_run_context_router(actor, run_context_store))
     # Read-only system-health + observational posture surface (preferences-
     # configuration T003.2 / T008): authenticated by the same trusted ``actor``
     # dependency, GET-only, and serving only the closed descriptor/posture display

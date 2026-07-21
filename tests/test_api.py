@@ -437,6 +437,271 @@ def test_malformed_project_scope_or_digest_is_rejected_before_the_store():
 
 
 # ---------------------------------------------------------------------------
+# Historical run-context read surface (state-context-operations:T005.3)
+# ---------------------------------------------------------------------------
+
+import copy as _copy
+
+from workbench.capability_profiles import validate_project_profile
+from workbench.models import (
+    RunConstraints,
+    RunContext,
+    RunCursor,
+    RunIdentity,
+    RunReceipt,
+    UntrustedEvidence,
+    UntrustedTask,
+    UntrustedTaskRef,
+    RunWorkflowPin,
+    run_capabilities_from_snapshot,
+    run_skills_from_snapshot,
+)
+from workbench.provider_catalogs import (
+    DEFAULT_PROVIDER_ALLOWLIST,
+    PublishedCatalogSet,
+    validate_provider_catalog,
+)
+from workbench.run_context_store import MemoryRunContextStore
+from workbench.workflow_snapshot import compile_workflow_snapshot
+
+_EXAMPLES_DIR = _ROOT / "docs" / "contracts" / "examples"
+
+
+def _rc_example(name: str) -> dict:
+    return _json.loads((_EXAMPLES_DIR / name).read_text(encoding="utf-8"))
+
+
+def _rc_snapshot():
+    published = PublishedCatalogSet(
+        catalogs=tuple(
+            validate_provider_catalog(provider, _rc_example(f"{provider}.catalog.v1.json"))
+            for provider in sorted(DEFAULT_PROVIDER_ALLOWLIST)
+        )
+    )
+    profile = validate_project_profile(
+        _rc_example("project-capability-profile.v1.json"), published,
+        configured_model_profiles=("coding-local", "planning-local"),
+        configured_skills={"anvil:execute": "sha256:" + "7" * 64},
+        approval_actions=("commit_pr", "merge_and_accept"),
+    )
+    workflow = _rc_example("delivery.workflow.v2.json")
+    selected: list[dict] = []
+    seen: set[tuple] = set()
+    for step in workflow["steps"]:
+        if step["kind"] != "operation":
+            continue
+        key = tuple(sorted(step["operation"].items()))
+        if key not in seen:
+            seen.add(key)
+            selected.append(_copy.deepcopy(step["operation"]))
+    return compile_workflow_snapshot(
+        workflow, profile, published, selected_operations=selected,
+        selected_skills=[{"id": "anvil:execute", "digest": "sha256:" + "7" * 64}],
+        route="coding-local",
+    )
+
+
+def _run_context(**task_overrides) -> RunContext:
+    snapshot = _rc_snapshot()
+    task = task_overrides.pop("task", None) or UntrustedTask(
+        ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=5),
+        title="Add a documented operation contract",
+        acceptance_criteria=("Add a versioned resource", "Validate its JSON shape"),
+        work_packet_digest="sha256:" + "8" * 64,
+        scope=("docs/contracts",),
+    )
+    return RunContext.capture(
+        context_id="ctx_run_history_0001",
+        identity=RunIdentity(
+            run_id="run_history_1", session_id="sess_1", bridge_id="bridge_1",
+            worktree_name="checkout-a", task_id="release-beta:T001",
+        ),
+        workflow=RunWorkflowPin.from_snapshot(snapshot),
+        capabilities=run_capabilities_from_snapshot(snapshot),
+        skills=run_skills_from_snapshot(snapshot, {"anvil:execute": "State-backed guidance."}),
+        constraints=RunConstraints(
+            turn_limit=12, tool_limit=24,
+            stop_conditions=("Do not submit evidence before verification passes.",),
+        ),
+        cursor=RunCursor(
+            step_id="implement", attempt=1,
+            completed_receipts=(RunReceipt(receipt_id="rcpt_claim", summary="claim succeeded"),),
+        ),
+        task=task,
+        evidence=(UntrustedEvidence(citation="state-event:claim", summary="Task claim is active."),),
+    )
+
+
+def run_context_client(store: MemoryRunContextStore | None) -> TestClient:
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), run_context_store=store,
+    ))
+
+
+def test_run_context_history_round_trips_trusted_and_untrusted():
+    # T005.3 criterion 1 + 3: the API returns the stored snapshot with trusted
+    # policy and untrusted PRD/task data in two separately labeled structures.
+    store = MemoryRunContextStore()
+    context = _run_context()
+    store.capture("project_a", context)
+    with run_context_client(store) as client_:
+        response = client_.get(
+            "/api/projects/project_a/runs/run_history_1/context", headers=CTX_ACTOR,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()["context"]
+        assert body == context.as_dict()
+        assert body["trusted"]["trust"] == "trusted_execution_policy"
+        assert body["untrusted"]["content_trust"] == "untrusted_task_data"
+
+
+def test_run_context_history_reads_only_the_stored_snapshot_immune_to_renames():
+    # T005.3 criterion 2: a later task/PRD rename does not change the titles or
+    # revisions the historical read returns -- it reads only the stored snapshot.
+    store = MemoryRunContextStore()
+    context = _run_context()
+    store.capture("project_a", context)
+
+    # A later rename produces a DIFFERENT context for the same run; the store
+    # refuses to rewrite it (immutability), so the read is unaffected.
+    from workbench.run_context_store import RunContextImmutableError
+
+    renamed = _run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=9),
+            title="Renamed long after queue time",
+            acceptance_criteria=("Totally different criterion",),
+            work_packet_digest="sha256:" + "c" * 64,
+        ),
+    )
+    import pytest
+
+    with pytest.raises(RunContextImmutableError):
+        store.capture("project_a", renamed)
+
+    with run_context_client(store) as client_:
+        body = client_.get(
+            "/api/projects/project_a/runs/run_history_1/context", headers=CTX_ACTOR,
+        ).json()["context"]
+    assert body["untrusted"]["task"]["title"] == "Add a documented operation contract"
+    assert body["untrusted"]["task"]["ref"]["prd_revision"] == 5
+
+
+def test_cross_project_run_context_read_is_indistinct_from_missing():
+    # T005.3 criterion 1: a run owned by another project is byte-identical to a
+    # genuinely missing run -- no existence oracle across the project boundary.
+    store = MemoryRunContextStore()
+    store.capture("project_b", _run_context())
+    with run_context_client(store) as client_:
+        foreign = client_.get(
+            "/api/projects/project_a/runs/run_history_1/context", headers=CTX_ACTOR,
+        )
+        never = client_.get(
+            "/api/projects/project_a/runs/run_absent/context", headers=CTX_ACTOR,
+        )
+        missing_owner = client_.get(
+            "/api/projects/project_b/runs/run_absent/context", headers=CTX_ACTOR,
+        )
+        assert foreign.status_code == never.status_code == missing_owner.status_code == 404
+        # Byte-identical bodies (raw content, not parsed JSON).
+        assert foreign.content == never.content == missing_owner.content
+
+
+def test_run_context_history_carries_no_secret_path_command_or_payload():
+    # T005.3 criterion 3: seed the untrusted prose with credentials; the stored
+    # + rendered snapshot scrubs them and the closed field set exposes no State
+    # path, credential field, raw command, or provider payload.
+    store = MemoryRunContextStore()
+    seeded = _run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=5),
+            title="Fix token=supersecretvalue and Bearer sk-live-abc123DEADBEEF",
+            acceptance_criteria=("Rotate api_key=leakvalue",),
+            work_packet_digest="sha256:" + "8" * 64,
+        ),
+    )
+    store.capture("project_a", seeded)
+    with run_context_client(store) as client_:
+        raw = client_.get(
+            "/api/projects/project_a/runs/run_history_1/context", headers=CTX_ACTOR,
+        ).text
+
+    for leaked in ("supersecretvalue", "sk-live-abc123DEADBEEF", "leakvalue"):
+        assert leaked not in raw
+    assert "[REDACTED]" in raw
+    lowered = raw.lower()
+    for marker in ("state.db", ".anvil", "-wal", "-shm", "://", "sqlite"):
+        assert marker not in lowered, f"run-context response leaked marker {marker!r}"
+
+    # No serialized FIELD NAME names a State-storage, credential, or raw
+    # execution surface (derive the key set from the actual response).
+    body = _json.loads(raw)
+
+    def _keys(value, acc):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                acc.append(key)
+                _keys(nested, acc)
+        elif isinstance(value, list):
+            for nested in value:
+                _keys(nested, acc)
+
+    keys: list[str] = []
+    _keys(body, keys)
+    forbidden = (
+        "state_db", "sqlite", "journal", "wal", "shm", "path", "mount",
+        "token", "secret", "api_key", "apikey", "password", "credential", "bearer",
+        "adapter", "argv", "command", "endpoint", "input_schema", "output_schema",
+    )
+    for key in keys:
+        lowered_key = key.lower()
+        for marker in forbidden:
+            assert marker not in lowered_key, f"run-context field {key!r} looks like a {marker!r} surface"
+
+
+def test_unconfigured_run_context_store_fails_closed():
+    with run_context_client(None) as client_:
+        assert client_.get(
+            "/api/projects/project_a/runs/run_history_1/context", headers=CTX_ACTOR,
+        ).status_code == 503
+
+
+def test_run_context_history_requires_a_trusted_allowlisted_actor():
+    store = MemoryRunContextStore()
+    store.capture("project_a", _run_context())
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=False,
+    )
+    with TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), run_context_store=store,
+    )) as client_:
+        assert client_.get("/api/projects/project_a/runs/run_history_1/context").status_code == 401
+        assert client_.get(
+            "/api/projects/project_a/runs/run_history_1/context",
+            headers={"X-Workbench-Actor": "intruder"},
+        ).status_code == 403
+
+
+def test_malformed_run_id_is_rejected_before_the_store():
+    store = MemoryRunContextStore()
+    store.capture("project_a", _run_context())
+    with run_context_client(store) as client_:
+        # A run id containing a path separator is rejected by the path pattern
+        # (422 or 404 for a non-matching route), never reaching the store as a
+        # distinguishable error. A space is not in the grammar -> 422.
+        assert client_.get(
+            "/api/projects/project_a/runs/has%20space/context", headers=CTX_ACTOR,
+        ).status_code == 422
+
 # Read-only system-health + observational posture surface (preferences-
 # configuration T003.2 / T008): every declared integration's descriptor,
 # truthful disabled/degraded states, a closed leak-proof response, GET-only (no
@@ -445,7 +710,7 @@ def test_malformed_project_scope_or_digest_is_rejected_before_the_store():
 
 from datetime import datetime as _datetime, timezone as _timezone
 
-from conftest import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+from _support import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
 
 from workbench.cli import main as _cli_main
 from workbench.system_health import (
