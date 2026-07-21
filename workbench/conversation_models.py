@@ -65,6 +65,10 @@ _DELETION_REQUIRED_STATUSES = frozenset({"deletion_pending", "deleted"})
 DELETION_MODES = frozenset({"purge_content_keep_tombstone", "purge_all_records"})
 ACTOR_KINDS = frozenset({"operator"})
 RETENTION_VALUES = frozenset({"retained_redacted", "metadata_only"})
+#: Why a conversation appears in an off-read-path retention preview/pass.
+RETENTION_PREVIEW_REASONS = frozenset({"retention_expired", "deletion_pending"})
+#: The policy id an ephemeral (metadata_only) conversation is created under.
+EPHEMERAL_RETENTION_POLICY_ID = "workbench.ephemeral"
 
 TURN_ROLES = frozenset({"user", "assistant"})
 TURN_MODES = frozenset({"ordinary", "advanced"})
@@ -148,6 +152,31 @@ class RetentionPolicy:
                 isinstance(self.delete_after, datetime) and self.delete_after.tzinfo is not None,
                 "retention delete_after must be a timezone-aware datetime",
             )
+
+
+def is_metadata_only(retention: RetentionPolicy) -> bool:
+    """True only when BOTH content kinds are ``metadata_only``.
+
+    This is the truthful "ephemeral" predicate a badge reads: a conversation
+    whose ``transcript_text`` and ``voice_transcript_text`` are both
+    ``metadata_only`` can never persist a transcript content block for either
+    kind (:func:`validate_turn_append` enforces the mapping), so the badge is a
+    fact about the durable policy, not a label the caller asserts.
+    """
+    return (
+        isinstance(retention, RetentionPolicy)
+        and retention.transcript_text == "metadata_only"
+        and retention.voice_transcript_text == "metadata_only"
+    )
+
+
+def ephemeral_retention_policy() -> RetentionPolicy:
+    """The metadata_only retention policy for a one-action ephemeral chat.
+
+    Both content kinds are ``metadata_only``, so the resulting conversation is
+    ephemeral by construction and :func:`is_metadata_only` reports it truthfully.
+    """
+    return RetentionPolicy(EPHEMERAL_RETENTION_POLICY_ID, "metadata_only", "metadata_only")
 
 
 @dataclass(frozen=True)
@@ -591,6 +620,51 @@ def turn_audit(turn: Turn) -> TurnAudit:
         content_purged=turn.content_purged,
         created_at=turn.created_at,
         completed_at=turn.completed_at,
+    )
+
+
+@dataclass(frozen=True)
+class RetentionPreview:
+    """Content-free projection of a conversation a batched retention pass WOULD act on.
+
+    Identity, the lifecycle timestamps, the ``delete_after`` ceiling, and
+    bounded turn counts only — deliberately no ``title`` and no message content
+    of any kind, so an operator can review the scope of the off-read-path pass
+    (:meth:`~workbench.conversation_store.MemoryConversationStore.retention_preview`)
+    without content leaking into the preview and without a read ever triggering
+    deletion.
+    """
+
+    conversation_id: str
+    reason: str
+    turn_count: int
+    committed_turn_count: int
+    interrupted_turn_count: int
+    created_at: datetime
+    updated_at: datetime
+    delete_after: datetime | None
+
+    def __post_init__(self) -> None:
+        _require(
+            self.reason in RETENTION_PREVIEW_REASONS,
+            f"retention preview reason is not allowlisted: {self.reason!r}",
+        )
+
+
+def retention_preview_of(
+    conversation: Conversation, turns: tuple[Turn, ...] | list[Turn], reason: str,
+) -> RetentionPreview:
+    """Project one conversation into its content-free retention-preview row."""
+    own = [turn for turn in turns if turn.conversation_id == conversation.id]
+    return RetentionPreview(
+        conversation_id=conversation.id,
+        reason=reason,
+        turn_count=len(own),
+        committed_turn_count=sum(1 for turn in own if turn.committed),
+        interrupted_turn_count=sum(1 for turn in own if turn.interrupted),
+        created_at=conversation.created_at,
+        updated_at=conversation.updated_at,
+        delete_after=conversation.retention.delete_after,
     )
 
 

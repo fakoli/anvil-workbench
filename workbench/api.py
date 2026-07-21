@@ -14,7 +14,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
-from .conversation_api import build_conversation_router, register_conversation_handlers
+from .conversation_api import (
+    build_conversation_router,
+    build_hub_retention_router,
+    register_conversation_handlers,
+)
 from .conversation_store import ConversationStore, MemoryConversationStore
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
@@ -217,6 +221,10 @@ def create_app(
     # the same trusted ``actor`` dependency; the store enforces ownership.
     register_conversation_handlers(app)
     app.include_router(build_conversation_router(actor, conversation_store, idempotency_store))
+    # Off-read-path retention (chat-first-voice T009): the preview + explicit
+    # batched enforce pass are operator-only and mounted OFF the actor surface;
+    # a single actor can neither preview across nor delete another actor's records.
+    app.include_router(build_hub_retention_router(owner, conversation_store))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:
