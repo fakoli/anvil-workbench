@@ -166,6 +166,12 @@ class RelayEvent:
     kind: str  # "delta" | "terminal"
     text: str = ""
     outcome: StreamOutcome | None = None
+    #: The strictly-monotonic per-conversation sequence number stamped on this
+    #: frame (T008).  ``None`` on an un-sequenced frame the relay emits itself;
+    #: the sequencing layer (``workbench.stream_sequence``) stamps a bounded
+    #: non-negative int drawn from the durable per-conversation allocator so a
+    #: client can detect a dropped frame.
+    seq: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind == "delta":
@@ -176,6 +182,9 @@ class RelayEvent:
                 raise ChatStreamError("a terminal relay event requires a StreamOutcome")
         else:
             raise ChatStreamError(f"unknown relay event kind: {self.kind!r}")
+        if self.seq is not None:
+            if not isinstance(self.seq, int) or isinstance(self.seq, bool) or self.seq < 0:
+                raise ChatStreamError("a relay event seq must be a non-negative int")
 
 
 def build_bounded_request(selection: ChatRouteSelection, prompt: str) -> dict[str, Any]:
