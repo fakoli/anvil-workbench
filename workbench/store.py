@@ -17,10 +17,12 @@ from typing import Any, Callable, Mapping, Protocol
 
 from .contracts import validate_operation_receipt
 from .models import (
-    Approval, AuditEvent, Bridge, BridgeSkill, OperationRef, OperationReceipt,
-    OperationRefusal, Project, RECONCILIATION_REASONS, ReconciliationItem, ResourceLease,
+    Approval, AuditEvent, Bridge, BridgeSkill, EffectiveValue, OperationRef, OperationReceipt,
+    OperationRefusal, PreferenceRecord, PreferenceValidationError, Project,
+    RECONCILIATION_REASONS, ReconciliationItem, ResourceLease,
     Run, Session, Workflow, WorkflowEvent,
-    new_id, new_receipt_id, new_reconciliation_id, now_utc,
+    new_id, new_receipt_id, new_reconciliation_id, now_utc, resolve_effective_value,
+    validate_setting_value,
 )
 from .redaction import redact_value
 from .workflows import WorkflowError, advance_cursor, step_by_id, validate_definition
@@ -2455,3 +2457,202 @@ class MemoryOperationApprovalStore:
             if not secrets.compare_digest(grant.payload_hash, payload_hash):
                 raise OperationReceiptStoreError("approval payload hash does not match the grant")
             self.grants[grant_id] = replace(grant, consumed_at=now_utc())
+
+
+# ---------------------------------------------------------------------------
+# Scoped durable preference storage + stale-write rejection
+# (preferences-configuration: T002.2)
+# ---------------------------------------------------------------------------
+
+
+class PreferenceStoreError(StoreError):
+    """A preference store operation violates its scoping or concurrency contract."""
+
+
+class UnknownPreferenceError(PreferenceStoreError):
+    """No such stored preference for this scope.
+
+    Raised identically for a genuinely missing preference and for another
+    actor's or project's preference, so a cross-scope probe can never learn
+    whether the record exists — the indistinct not-found mirrors the
+    run-context and project-context stores.
+    """
+
+
+class StalePreferenceWriteError(PreferenceStoreError):
+    """An optimistic write lost a version race; the caller must reload.
+
+    Deliberately distinct from :class:`~workbench.models.PreferenceValidationError`
+    (a malformed value): a stale write is a reload-required conflict, not a bad
+    request, and the stored value is left unchanged.  Carries the current stored
+    ``write_version`` so the caller can reload and retry against it.
+    """
+
+    def __init__(self, current_version: int) -> None:
+        self.current_version = current_version
+        self.reload_required = True
+        super().__init__("a newer version exists; reload required before writing")
+
+
+@dataclass
+class PreferenceRows:
+    """The persisted row container shared by preference-store instances.
+
+    ``records`` maps ``(scope, scope_key) -> {setting_id -> PreferenceRecord}``.
+    The ``(scope, scope_key)`` namespace is the hard cross-scope boundary:
+    ``(personal, alice)`` and ``(personal, bob)`` and ``(project, proj_1)`` are
+    three disjoint namespaces.  Handing the same rows to a fresh
+    :class:`MemoryPreferenceStore` simulates a hub restart over the same records.
+    """
+
+    records: dict[tuple[str, str], dict[str, PreferenceRecord]] = field(default_factory=dict)
+
+
+class MemoryPreferenceStore:
+    """Hermetic, lock-serialized scoped preference store with stale-write rejection.
+
+    Every mutation runs the read-current-version check and the write under one
+    reentrant lock, so two concurrent same-version writers cannot both commit:
+    the first increments the version, the second observes it and is rejected as
+    stale.  A setting is writable only at the scope its descriptor owns, so a
+    personal actor can never write a project/deployment/policy value, and each
+    ``(scope, scope_key)`` namespace is isolated so a cross-actor or cross-project
+    read returns the indistinct not-found.
+    """
+
+    def __init__(self, catalog: Mapping[str, Any], rows: PreferenceRows | None = None) -> None:
+        self._lock = threading.RLock()
+        self.catalog = catalog
+        self._by_id: dict[str, Mapping[str, Any]] = {
+            str(setting.get("id")): setting
+            for setting in catalog.get("settings", [])
+            if isinstance(setting, Mapping)
+        }
+        self.rows = rows if rows is not None else PreferenceRows()
+
+    @staticmethod
+    def _require_scope(scope: str, scope_key: str) -> tuple[str, str]:
+        if scope not in ("personal", "project", "deployment", "policy"):
+            raise PreferenceStoreError(f"unknown preference scope: {scope!r}")
+        if not isinstance(scope_key, str) or not scope_key:
+            raise PreferenceStoreError("a preference operation requires a scope key")
+        return scope, scope_key
+
+    def _descriptor(self, setting_id: str) -> Mapping[str, Any]:
+        descriptor = self._by_id.get(setting_id)
+        if descriptor is None:
+            raise UnknownPreferenceError("unknown preference")
+        return descriptor
+
+    def _writable_descriptor(self, scope: str, setting_id: str) -> Mapping[str, Any]:
+        """Return the descriptor only if this scope may write it; else fail closed."""
+        descriptor = self._descriptor(setting_id)
+        if descriptor.get("scope") != scope:
+            # A setting is owned by exactly one scope. Writing it from another
+            # scope is a cross-scope write attempt and is refused without
+            # disclosing the owning-scope value.
+            raise PreferenceStoreError("setting is not owned by this scope")
+        if descriptor.get("mutability") == "env_only":
+            raise PreferenceStoreError("setting is environment-managed and not writable through the store")
+        return descriptor
+
+    def get(self, scope: str, scope_key: str, setting_id: str) -> PreferenceRecord:
+        """Return one stored preference record, or the indistinct not-found.
+
+        A record in another actor's or project's namespace is not in this
+        namespace, so a cross-scope read raises the same
+        :class:`UnknownPreferenceError` a genuinely missing record raises.
+        """
+        scope, scope_key = self._require_scope(scope, scope_key)
+        namespace = self.rows.records.get((scope, scope_key))
+        if namespace is None or setting_id not in namespace:
+            raise UnknownPreferenceError("unknown preference")
+        return namespace[setting_id]
+
+    def current_version(self, scope: str, scope_key: str, setting_id: str) -> int:
+        """The stored write version for a setting in this namespace, or 0 if unset."""
+        scope, scope_key = self._require_scope(scope, scope_key)
+        namespace = self.rows.records.get((scope, scope_key))
+        record = namespace.get(setting_id) if namespace is not None else None
+        return record.write_version if record is not None else 0
+
+    def stored_values(self, scope: str, scope_key: str) -> dict[str, Any]:
+        """The ``{setting_id: value}`` map for one namespace, for the resolver.
+
+        Returns only this ``(scope, scope_key)`` namespace's own values; the
+        caller merges the scopes it is authorized to read.
+        """
+        scope, scope_key = self._require_scope(scope, scope_key)
+        namespace = self.rows.records.get((scope, scope_key), {})
+        return {setting_id: record.value for setting_id, record in namespace.items()}
+
+    def set_preference(
+        self,
+        scope: str,
+        scope_key: str,
+        setting_id: str,
+        value: Any,
+        expected_version: int,
+        actor: str,
+    ) -> PreferenceRecord:
+        """Commit one scoped preference write under optimistic concurrency.
+
+        The value is typed-validated against its descriptor BEFORE any version
+        check, so a malformed value raises :class:`PreferenceValidationError`
+        (a 422) rather than a stale-write conflict.  A stale ``expected_version``
+        raises :class:`StalePreferenceWriteError` (a reload-required 409) and
+        leaves the stored value unchanged.  A valid write commits atomically and
+        increments the version by exactly one.
+        """
+        scope, scope_key = self._require_scope(scope, scope_key)
+        descriptor = self._writable_descriptor(scope, setting_id)
+        # Typed value validation is first and is NOT a concurrency conflict.
+        validate_setting_value(descriptor, value)
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
+            raise PreferenceStoreError("expected_version must be a non-negative integer")
+        with self._lock:
+            namespace = self.rows.records.get((scope, scope_key))
+            existing = namespace.get(setting_id) if namespace is not None else None
+            current = existing.write_version if existing is not None else 0
+            if expected_version != current:
+                # Reload-required: the stored value is left exactly as it was.
+                raise StalePreferenceWriteError(current)
+            record = PreferenceRecord(
+                setting_id=setting_id,
+                scope=scope,
+                scope_key=scope_key,
+                value=value,
+                write_version=current + 1,
+                updated_by=actor,
+            )
+            self.rows.records.setdefault((scope, scope_key), {})[setting_id] = record
+            return record
+
+    def reset_preference(
+        self,
+        scope: str,
+        scope_key: str,
+        setting_id: str,
+        expected_version: int,
+        actor: str,
+    ) -> EffectiveValue:
+        """Reset one preference to its declared inherited/default state.
+
+        Subject to the same optimistic check as a write (a stale reset is
+        reload-required and leaves the stored value untouched).  On success the
+        stored override is removed, so the setting falls back to its descriptor
+        default (or unset), and that resolved fallback is returned.
+        """
+        scope, scope_key = self._require_scope(scope, scope_key)
+        descriptor = self._writable_descriptor(scope, setting_id)
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
+            raise PreferenceStoreError("expected_version must be a non-negative integer")
+        with self._lock:
+            namespace = self.rows.records.get((scope, scope_key))
+            existing = namespace.get(setting_id) if namespace is not None else None
+            current = existing.write_version if existing is not None else 0
+            if expected_version != current:
+                raise StalePreferenceWriteError(current)
+            if namespace is not None and setting_id in namespace:
+                del namespace[setting_id]
+            return resolve_effective_value(descriptor)
