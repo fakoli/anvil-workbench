@@ -2656,7 +2656,8 @@ class MemoryPreferenceStore:
         }
 
     def seed_authority_value(
-        self, scope: str, setting_id: str, value: Any, *, updated_by: str = "authority",
+        self, scope: str, setting_id: str, value: Any, *,
+        updated_by: str = "authority", expected_version: int | None = None,
     ) -> PreferenceRecord:
         """Seed a deployment/policy authority value, bypassing the actor gate.
 
@@ -2667,6 +2668,14 @@ class MemoryPreferenceStore:
         environment/approval layer) so the hub — and tests standing in for it —
         can establish a ceiling/allowlist without minting an unapproved actor
         write. It refuses any actor scope, and still typed-validates the value.
+
+        When ``expected_version`` is supplied the write is optimistic-concurrency
+        guarded exactly like :meth:`set_preference`: the read-current-version
+        check and the write run under one lock, so a stale authority commit
+        (e.g. a policy operation whose bound version has been overtaken) raises
+        :class:`StalePreferenceWriteError` and leaves the stored value UNCHANGED
+        rather than double-applying. ``None`` keeps the unguarded seed behaviour
+        for the environment/ceiling-seeding callers that do not race.
         """
         if scope not in ("deployment", "policy"):
             raise PreferenceStoreError("seed_authority_value is only for deployment/policy scopes")
@@ -2674,19 +2683,54 @@ class MemoryPreferenceStore:
         if descriptor.get("scope") != scope:
             raise PreferenceStoreError("authority seed setting is not owned by this scope")
         validate_setting_value(descriptor, value)
+        if expected_version is not None and (
+            not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0
+        ):
+            raise PreferenceStoreError("expected_version must be a non-negative integer")
         with self._lock:
             namespace = self.rows.records.setdefault((scope, scope), {})
             existing = namespace.get(setting_id)
+            current = existing.write_version if existing is not None else 0
+            if expected_version is not None and expected_version != current:
+                # Reload-required: the stored authority value is left untouched.
+                raise StalePreferenceWriteError(current)
             record = PreferenceRecord(
                 setting_id=setting_id,
                 scope=scope,
                 scope_key=scope,
                 value=value,
-                write_version=(existing.write_version + 1) if existing is not None else 1,
+                write_version=current + 1,
                 updated_by=updated_by,
             )
             namespace[setting_id] = record
             return record
+
+    def clear_authority_value(
+        self, scope: str, setting_id: str, *, expected_version: int, updated_by: str = "authority",
+    ) -> None:
+        """Remove a deployment/policy authority override under an optimistic guard.
+
+        The authority-scope counterpart to :meth:`reset_preference`: it drops the
+        stored override so the setting falls back to its descriptor default. Used
+        by the policy-operation gate for an approved ``preference.reset`` of a
+        policy setting. A stale ``expected_version`` raises
+        :class:`StalePreferenceWriteError` and leaves the stored value unchanged.
+        """
+        if scope not in ("deployment", "policy"):
+            raise PreferenceStoreError("clear_authority_value is only for deployment/policy scopes")
+        descriptor = self._descriptor(setting_id)
+        if descriptor.get("scope") != scope:
+            raise PreferenceStoreError("authority setting is not owned by this scope")
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
+            raise PreferenceStoreError("expected_version must be a non-negative integer")
+        with self._lock:
+            namespace = self.rows.records.get((scope, scope))
+            existing = namespace.get(setting_id) if namespace is not None else None
+            current = existing.write_version if existing is not None else 0
+            if expected_version != current:
+                raise StalePreferenceWriteError(current)
+            if namespace is not None and setting_id in namespace:
+                del namespace[setting_id]
 
     def _resolved_effective(
         self, scope: str, scope_key: str, setting_id: str, *, live_valid_refs: Mapping[str, Any] | None,
