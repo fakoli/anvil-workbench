@@ -21,7 +21,8 @@ from .models import (
     OperationRefusal, PreferenceRecord, PreferenceValidationError, Project,
     RECONCILIATION_REASONS, ReconciliationItem, ResourceLease,
     Run, Session, Workflow, WorkflowEvent,
-    new_id, new_receipt_id, new_reconciliation_id, now_utc, resolve_effective_value,
+    new_id, new_receipt_id, new_reconciliation_id, now_utc,
+    resolve_effective_settings, reviewed_catalog_valid_refs,
     validate_setting_value,
 )
 from .redaction import redact_value
@@ -2549,11 +2550,23 @@ class MemoryPreferenceStore:
         descriptor = self._descriptor(setting_id)
         if descriptor.get("scope") != scope:
             # A setting is owned by exactly one scope. Writing it from another
-            # scope is a cross-scope write attempt and is refused without
-            # disclosing the owning-scope value.
-            raise PreferenceStoreError("setting is not owned by this scope")
+            # scope is a cross-scope write attempt and must be INDISTINGUISHABLE
+            # from an unknown id: raising a distinct "not owned by this scope"
+            # error made the write surface an existence oracle (a probe could
+            # tell that an authority setting id exists — the very ids the read
+            # surface hides). Raise the SAME indistinct not-found so a
+            # cross-scope write leaks neither the id's existence nor its value.
+            raise UnknownPreferenceError("unknown preference")
         if descriptor.get("mutability") == "env_only":
             raise PreferenceStoreError("setting is environment-managed and not writable through the store")
+        if descriptor.get("mutability") == "approval_gated":
+            # An approval-gated setting (a policy) requires a bound, consumed
+            # approval before it commits. That approval layer is not wired into
+            # this store, so a direct actor write must FAIL CLOSED rather than
+            # commit unapproved. Authority values are seeded via
+            # :meth:`seed_authority_value`, which represents the already-approved
+            # / environment-derived write, never an actor-proposed one.
+            raise PreferenceStoreError("setting is approval-gated and cannot be written without an approval")
         return descriptor
 
     def get(self, scope: str, scope_key: str, setting_id: str) -> PreferenceRecord:
@@ -2585,6 +2598,78 @@ class MemoryPreferenceStore:
         scope, scope_key = self._require_scope(scope, scope_key)
         namespace = self.rows.records.get((scope, scope_key), {})
         return {setting_id: record.value for setting_id, record in namespace.items()}
+
+    def owned_values(self, scope: str, scope_key: str) -> dict[str, Any]:
+        """Namespace values RESTRICTED to setting ids this scope actually owns.
+
+        A durable row is keyed by ``(scope, scope_key)`` but its ``setting_id``
+        is not otherwise pinned to that scope, so a corrupt or injected row could
+        carry a foreign-scope id (e.g. a ``policy.*`` id sitting in a personal
+        namespace). Merging such a row would let a lower-authority scope override
+        a higher-authority value against the declared ``scope_precedence``. This
+        filters to only the ids whose descriptor is owned by ``scope``, so a
+        mis-scoped row is dropped at the merge boundary and cannot escalate.
+        """
+        return {
+            setting_id: value
+            for setting_id, value in self.stored_values(scope, scope_key).items()
+            if self._by_id.get(setting_id, {}).get("scope") == scope
+        }
+
+    def seed_authority_value(
+        self, scope: str, setting_id: str, value: Any, *, updated_by: str = "authority",
+    ) -> PreferenceRecord:
+        """Seed a deployment/policy authority value, bypassing the actor gate.
+
+        Actor writes (:meth:`set_preference`) fail closed for authority scopes:
+        an ``env_only`` deployment value comes from the environment and an
+        ``approval_gated`` policy value requires a consumed approval. This method
+        represents that already-authorized authority write (the output of the
+        environment/approval layer) so the hub — and tests standing in for it —
+        can establish a ceiling/allowlist without minting an unapproved actor
+        write. It refuses any actor scope, and still typed-validates the value.
+        """
+        if scope not in ("deployment", "policy"):
+            raise PreferenceStoreError("seed_authority_value is only for deployment/policy scopes")
+        descriptor = self._descriptor(setting_id)
+        if descriptor.get("scope") != scope:
+            raise PreferenceStoreError("authority seed setting is not owned by this scope")
+        validate_setting_value(descriptor, value)
+        with self._lock:
+            namespace = self.rows.records.setdefault((scope, scope), {})
+            existing = namespace.get(setting_id)
+            record = PreferenceRecord(
+                setting_id=setting_id,
+                scope=scope,
+                scope_key=scope,
+                value=value,
+                write_version=(existing.write_version + 1) if existing is not None else 1,
+                updated_by=updated_by,
+            )
+            namespace[setting_id] = record
+            return record
+
+    def _resolved_effective(
+        self, scope: str, scope_key: str, setting_id: str, *, live_valid_refs: Mapping[str, Any] | None,
+    ) -> EffectiveValue:
+        """Resolve one setting's effective value through the SHARED resolver.
+
+        Builds the same merged view the GET endpoint resolves for this setting —
+        the authority namespaces (deployment/policy, the source of any ceiling)
+        plus the setting's own ``(scope, scope_key)`` namespace — ownership
+        filtered so a mis-scoped row cannot cross over, then runs the one shared
+        :func:`resolve_effective_settings` with the same ceiling + ref-validity
+        inputs. Because each setting is single-scope and every ceiling is
+        authority-owned, this agrees byte-for-byte with the API GET effective
+        value for the same setting (T002.3 criterion 3).
+        """
+        refs = live_valid_refs if live_valid_refs is not None else reviewed_catalog_valid_refs(self.catalog)
+        merged: dict[str, Any] = {}
+        merged.update(self.owned_values("deployment", "deployment"))
+        merged.update(self.owned_values("policy", "policy"))
+        merged.update(self.owned_values(scope, scope_key))
+        resolved = resolve_effective_settings(self.catalog, merged, live_valid_refs=refs)
+        return resolved[setting_id]
 
     def set_preference(
         self,
@@ -2635,16 +2720,29 @@ class MemoryPreferenceStore:
         setting_id: str,
         expected_version: int,
         actor: str,
+        *,
+        live_valid_refs: Mapping[str, Any] | None = None,
     ) -> EffectiveValue:
         """Reset one preference to its declared inherited/default state.
 
         Subject to the same optimistic check as a write (a stale reset is
         reload-required and leaves the stored value untouched).  On success the
         stored override is removed, so the setting falls back to its descriptor
-        default (or unset), and that resolved fallback is returned.
+        default (or unset).
+
+        The returned effective value is resolved through the SAME shared resolver
+        the GET endpoint uses — applying the policy ceiling and the ref-validity
+        set — so ``reset`` and ``GET /api/preferences`` report the identical
+        effective value for the identical state (T002.3 criterion 3). Reporting a
+        bare descriptor default here (ignoring the ceiling/refs) made the two
+        surfaces disagree — e.g. reset saying 30/default while GET said the
+        clamped value. The API passes the same ``live_valid_refs`` it resolves
+        GET with; ``None`` falls back to the reviewed-catalog baseline.
         """
         scope, scope_key = self._require_scope(scope, scope_key)
-        descriptor = self._writable_descriptor(scope, setting_id)
+        # Ownership/gate is still enforced (a cross-scope reset is the indistinct
+        # not-found, an authority reset fails closed) exactly like a write.
+        self._writable_descriptor(scope, setting_id)
         if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
             raise PreferenceStoreError("expected_version must be a non-negative integer")
         with self._lock:
@@ -2655,4 +2753,6 @@ class MemoryPreferenceStore:
                 raise StalePreferenceWriteError(current)
             if namespace is not None and setting_id in namespace:
                 del namespace[setting_id]
-            return resolve_effective_value(descriptor)
+            return self._resolved_effective(
+                scope, scope_key, setting_id, live_valid_refs=live_valid_refs
+            )

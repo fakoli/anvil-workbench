@@ -7,6 +7,7 @@ reimplements State transitions.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -1412,6 +1413,26 @@ _PREF_SCOPE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
 #: to a falsy value.
 _PREF_MISSING: Any = object()
 
+#: Domain separation + minimum key length for the KEYED scope-key audit
+#: fingerprint, mirroring the chat-content fingerprint idiom
+#: (:func:`workbench.conversation_models.turn_content_hash`).  The scope key is
+#: an actor/project identity (often a guessable email or slug); an UNSALTED
+#: ``sha256(scope:scope_key)`` of it is dictionary-recoverable, so the audit
+#: fingerprint is a keyed HMAC-SHA256 whose server-held key never sits beside
+#: the fingerprints it protects.  Without the key a holder of audit metadata
+#: cannot run a dictionary of candidate actors against the tag.
+_PREF_AUDIT_FINGERPRINT_PREFIX = b"anvil-workbench/preference-scope-key/v1\0"
+MIN_PREF_AUDIT_KEY_BYTES = 16
+
+
+def require_pref_audit_key(key: bytes) -> bytes:
+    """Fail closed unless ``key`` is a usable server-held audit-fingerprint key."""
+    if not isinstance(key, (bytes, bytearray)) or len(key) < MIN_PREF_AUDIT_KEY_BYTES:
+        raise PreferenceValidationError(
+            f"preference audit fingerprint key must be bytes of at least {MIN_PREF_AUDIT_KEY_BYTES} octets"
+        )
+    return bytes(key)
+
 
 class PreferenceValidationError(ValueError):
     """A preference value is malformed or out of range for its descriptor.
@@ -1508,6 +1529,16 @@ class PolicyOperation:
             raise PolicyOperationError(f"policy operation names an invalid setting id: {self.setting_id!r}")
         if self.scope not in _PREF_SCOPES:
             raise PolicyOperationError(f"policy operation names an unknown scope: {self.scope!r}")
+        # Fail closed on the frozen value itself, not only in the builder: a
+        # ``deployment`` scope is owner/environment-managed and can never be
+        # represented as an actor/model-proposable policy operation.  A direct
+        # construction that names it is refused here so no code path (test,
+        # deserialization, or a future caller) can mint a deployment-scoped
+        # operation that bypasses :func:`build_policy_operation`.
+        if self.scope == "deployment":
+            raise PolicyOperationError(
+                "a deployment-owned setting is owner-managed and cannot be a policy operation"
+            )
         if not isinstance(self.op_version, int) or isinstance(self.op_version, bool) or self.op_version < 1:
             raise PolicyOperationError("policy operation op_version must be an integer >= 1")
         if self.operation == "preference.reset" and self.value is not None:
@@ -1537,6 +1568,11 @@ class PolicyOperation:
 
     @property
     def digest(self) -> str:
+        # Function-local import purely to defer loading the heavier ``contracts``
+        # module (jsonschema + schema files) until a digest is actually taken.
+        # It is NOT breaking an import cycle: ``contracts`` imports nothing from
+        # ``models``, so a module-level import here would be acyclic — the
+        # laziness is a load-cost choice, not a correctness one.
         from .contracts import preference_operation_digest
 
         return preference_operation_digest(self.payload())
@@ -1681,15 +1717,23 @@ class PreferenceRecord:
         if not isinstance(self.updated_by, str) or not self.updated_by:
             raise PreferenceValidationError("preference record requires an updater identity")
 
-    def audit_metadata(self) -> dict[str, Any]:
+    def audit_metadata(self, *, key: bytes) -> dict[str, Any]:
         """Non-identifying audit metadata (T002.1 criterion 3).
 
         Excludes the raw ``value`` (which may be personally identifying) and the
         raw updater/scope-key identity; the scope key is reduced to a short,
         one-way fingerprint so a record can be correlated in an audit log without
-        exposing who owns it or what they set.
+        exposing who owns it.
+
+        The fingerprint is a KEYED HMAC-SHA256 over ``scope:scope_key`` (the
+        server-held ``key`` is required and never stored beside the tag), so a
+        guessable actor identity cannot be recovered by hashing a dictionary of
+        candidates — the same protection the chat-content fingerprint uses.  An
+        unsalted digest of a known email/slug would be trivially reversible; this
+        is not.
         """
-        fingerprint = hashlib.sha256(f"{self.scope}:{self.scope_key}".encode("utf-8")).hexdigest()[:12]
+        material = _PREF_AUDIT_FINGERPRINT_PREFIX + f"{self.scope}:{self.scope_key}".encode("utf-8")
+        fingerprint = hmac.new(require_pref_audit_key(key), material, hashlib.sha256).hexdigest()[:12]
         return {
             "setting_id": self.setting_id,
             "scope": self.scope,
@@ -1803,6 +1847,19 @@ def resolve_effective_value(
     otherwise unset) with a repair notice — never a hard failure; finally, if the
     setting declares a policy ceiling and the value exceeds the (higher-authority)
     ceiling, clamp it down.
+
+    The numeric ceiling clamp below is INT-ONLY BY DESIGN: it bounds a scalar
+    value against a scalar ceiling (e.g. a retention day count against the
+    operator maximum).  A ``policy_ceiling`` whose values are non-scalar
+    references — such as ``personal.default_chat_route`` bounded by the
+    ``policy.route_allowlist_profile`` capability digest — is NOT numerically
+    clamped here; its membership is enforced through ``live_valid_refs``.  The
+    live consumer scopes the reference-validity set for the setting's
+    ``ref_kind`` to exactly the routes/ids the approved profile admits, so an
+    out-of-profile reference falls out of that set and is repaired to the safe
+    default above — the same fail-safe path an invalidated reference takes.  A
+    ref-kind setting therefore stays within its profile via the ref-validity
+    path, never via a silent no-op numeric clamp.
     """
     setting_id = str(descriptor.get("id"))
     scope = str(descriptor.get("scope"))
@@ -1832,6 +1889,9 @@ def resolve_effective_value(
                 repair=f"{setting_id} referenced an unavailable {ref_kind}; unset to a safe state",
             )
 
+    # Int-only clamp: a ref/non-scalar ceiling (e.g. a route bounded by a
+    # capability-profile digest) is intentionally NOT handled here — its
+    # enforcement is the ref-validity path above, not this scalar bound.
     if (
         isinstance(descriptor.get("policy_ceiling"), Mapping)
         and ceiling_value is not _PREF_MISSING
@@ -1889,3 +1949,34 @@ def resolve_effective_settings(
             descriptor, stored_value, ceiling_value=ceiling_value, live_valid_refs=live_valid_refs
         )
     return result
+
+
+def reviewed_catalog_valid_refs(catalog: Mapping[str, Any]) -> dict[str, set[Any]]:
+    """The conservative reference-validity baseline derived from the catalog.
+
+    Every reference-kind setting in the reviewed descriptor catalog declares a
+    reviewed default reference (a route id, a capability digest, …).  Those
+    declared defaults are, by construction, the references the reviewer vouched
+    for; nothing else is known-valid without a live source.  This returns
+    ``{ref_kind -> {reviewed default reference values}}`` so a resolver given
+    this baseline serves an unset (default) reference normally while REPAIRING a
+    stored reference that is not among the reviewed defaults — i.e. a stale or
+    since-removed reference falls back to the safe default instead of being
+    served verbatim.
+
+    It is the documented default source :func:`resolve_effective_settings`
+    consumers use when no richer LIVE validity source (e.g. the chat-first-voice
+    route discovery / the profile-scoped route allowlist) is injected.  A live
+    provider, when supplied, replaces this baseline with the actual live set so
+    the enforcement tracks the operator's current profile exactly.
+    """
+    valid: dict[str, set[Any]] = {}
+    for setting in catalog.get("settings", []):
+        if not isinstance(setting, Mapping):
+            continue
+        ref_kind = setting.get("ref_kind")
+        if ref_kind is None or setting.get("type") not in ("id_ref", "digest_ref"):
+            continue
+        if "default" in setting:
+            valid.setdefault(str(ref_kind), set()).add(setting["default"])
+    return valid

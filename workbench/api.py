@@ -7,11 +7,11 @@ bridge credential.  An identity-aware tailnet proxy should set
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, WebSocket, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Settings
 from .contracts import settings_actor_view
@@ -25,7 +25,9 @@ from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .project_context_store import ProjectContextStore, UnknownProjectionError
 from .run_context_store import RunContextStore, UnknownRunContextError
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
-from .models import PreferenceValidationError, as_json, resolve_effective_settings
+from .models import (
+    PreferenceValidationError, as_json, resolve_effective_settings, reviewed_catalog_valid_refs,
+)
 from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
 from .redaction import scrub_config_payload
@@ -393,6 +395,10 @@ _UNKNOWN_PREFERENCE_DETAIL = "unknown preference"
 
 
 class PreferenceWriteInput(BaseModel):
+    # Reject any unknown body field: a client can never smuggle an undeclared
+    # key (e.g. a spoofed actor/scope_key) past the typed edge.
+    model_config = ConfigDict(extra="forbid")
+
     scope: str = Field(pattern=r"^(personal|project)$")
     value: Any
     expected_version: int = Field(ge=0)
@@ -400,6 +406,8 @@ class PreferenceWriteInput(BaseModel):
 
 
 class PreferenceResetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     scope: str = Field(pattern=r"^(personal|project)$")
     expected_version: int = Field(ge=0)
     project_id: str | None = Field(default=None, max_length=128)
@@ -408,6 +416,7 @@ class PreferenceResetInput(BaseModel):
 def build_preferences_router(
     actor_dependency: Callable[..., str],
     preference_store: MemoryPreferenceStore | None,
+    live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> APIRouter:
     """Build the actor-scoped preference read/write browser surface (T002.3).
 
@@ -426,6 +435,17 @@ def build_preferences_router(
     reload-required 409 distinct from the 422 a malformed value raises. When
     ``preference_store`` is ``None`` the surface is not configured and refuses
     with 503, mirroring the other injectable read-models.
+
+    ``live_valid_refs_provider`` is the reference-validity source the shared
+    resolver uses to detect an invalidated capability/route reference. When
+    supplied it is called per request and must return
+    ``{ref_kind -> valid ref values}`` (e.g. the chat-first-voice route
+    discovery / the profile-scoped route allowlist); a stored reference outside
+    that live set falls back to the safe default with a repair notice. When it
+    is ``None`` the endpoint falls back to the reviewed-catalog baseline
+    (:func:`~workbench.models.reviewed_catalog_valid_refs` — the reviewed default
+    refs), so a stale/since-removed reference is STILL repaired out of the box
+    rather than served verbatim.
     """
     router = APIRouter(prefix="/api/preferences")
 
@@ -436,6 +456,15 @@ def build_preferences_router(
                 detail="preference store is not configured",
             )
         return preference_store
+
+    def _live_valid_refs(store: MemoryPreferenceStore) -> Mapping[str, Any]:
+        # The one ref-validity source both the effective read and the reset
+        # share, so they resolve identical effective values. An injected live
+        # provider (the operator's current route allowlist) wins; otherwise the
+        # reviewed-catalog default baseline still repairs a stale reference.
+        if live_valid_refs_provider is not None:
+            return live_valid_refs_provider()
+        return reviewed_catalog_valid_refs(store.catalog)
 
     def _scope_key(scope: str, actor: str, project_id: str | None) -> str:
         # The personal namespace is bound to the authenticated actor and can
@@ -464,13 +493,19 @@ def build_preferences_router(
         """
         store = pref_store()
         catalog = store.catalog
+        # Ownership-filtered merge: each namespace contributes only the setting
+        # ids IT owns, so a corrupt/injected row bearing a foreign-scope id (e.g.
+        # a personal row carrying a ``policy.*`` id) cannot override a
+        # higher-authority value against the declared scope_precedence. Merge is
+        # authority-first, actor-last; because ownership filtering makes the
+        # namespaces disjoint, no lower-authority row can shadow an authority one.
         stored: dict[str, Any] = {}
-        stored.update(store.stored_values("deployment", "deployment"))
-        stored.update(store.stored_values("policy", "policy"))
+        stored.update(store.owned_values("deployment", "deployment"))
+        stored.update(store.owned_values("policy", "policy"))
         if project_id:
-            stored.update(store.stored_values("project", project_id))
-        stored.update(store.stored_values("personal", actor))
-        resolved = resolve_effective_settings(catalog, stored)
+            stored.update(store.owned_values("project", project_id))
+        stored.update(store.owned_values("personal", actor))
+        resolved = resolve_effective_settings(catalog, stored, live_valid_refs=_live_valid_refs(store))
         actor_view = settings_actor_view(catalog)
         actor_setting_ids = {setting["id"] for setting in actor_view["settings"]}
         effective = [
@@ -548,6 +583,7 @@ def build_preferences_router(
         try:
             effective = store.reset_preference(
                 payload.scope, scope_key, setting_id, payload.expected_version, actor,
+                live_valid_refs=_live_valid_refs(store),
             )
         except StalePreferenceWriteError as exc:
             raise HTTPException(
@@ -579,6 +615,7 @@ def create_app(
     run_context_store: RunContextStore | None = None,
     system_health: SystemHealthService | None = None,
     preference_store: MemoryPreferenceStore | None = None,
+    live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
@@ -705,7 +742,7 @@ def create_app(
     # preference store is configured. Serves only the settings actor-view and
     # actor-scope effective values; a stale write is a reload-required 409
     # distinct from the 422 a malformed value raises.
-    app.include_router(build_preferences_router(actor, preference_store))
+    app.include_router(build_preferences_router(actor, preference_store, live_valid_refs_provider))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:

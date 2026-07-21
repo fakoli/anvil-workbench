@@ -996,8 +996,10 @@ def test_preference_free_text_value_serializations_scrub_the_proven_leak_corpus(
     for fragment in ("AKIAIOSFODNN7", "eyJhbGci", "BEGIN RSA PRIVATE KEY", "100.64.0.5", "db.internal", "state.db"):
         for blob in blobs:
             assert fragment not in blob, f"a preference serialization leaked fragment {fragment!r}"
-    # The audit metadata never carries the value at all (no leak surface).
-    assert poison not in json.dumps(record.audit_metadata())
+    # The audit metadata never carries the value at all (no leak surface). The
+    # scope-key fingerprint is a keyed HMAC, so the metadata carries neither the
+    # value nor a dictionary-recoverable tag.
+    assert poison not in json.dumps(record.audit_metadata(key=b"pref-audit-key-0123456789"))
 
 
 def test_preference_store_cross_scope_reads_are_byte_identical():
@@ -1021,3 +1023,48 @@ def test_preference_store_cross_scope_reads_are_byte_identical():
     foreign_project = _raw(lambda: store.get("project", "proj_9", "project.delivery_route"))
     missing = _raw(lambda: store.get("personal", "nobody", "personal.landing_surface"))
     assert foreign_actor == foreign_project == missing
+
+
+def test_preference_store_cross_scope_write_is_indistinct_from_unknown_id():
+    # T002.3 crit 2 (store lens): a cross-scope WRITE raises the SAME
+    # UnknownPreferenceError an unknown id raises, byte-for-byte, so the write
+    # surface is not an existence oracle for authority setting ids.
+    from workbench.store import MemoryPreferenceStore, UnknownPreferenceError
+
+    store = MemoryPreferenceStore(_pref_catalog_doc())
+
+    def _raw(fn) -> bytes:
+        try:
+            fn()
+        except UnknownPreferenceError as exc:
+            return repr(exc.args).encode("utf-8")
+        raise AssertionError("expected UnknownPreferenceError")
+
+    # A real authority id written from a personal scope, and a genuinely unknown
+    # id, produce identical not-found bytes.
+    authority = _raw(lambda: store.set_preference(
+        "personal", "alice", "deployment.state_read_location", "x", 0, "alice"))
+    unknown = _raw(lambda: store.set_preference(
+        "personal", "alice", "personal.i_do_not_exist", "x", 0, "alice"))
+    assert authority == unknown
+
+
+def test_preference_store_refuses_approval_gated_write_without_an_approval():
+    # Finding 7: an approval-gated policy write must fail closed until the
+    # approval layer is wired -- a policy value can never commit unapproved
+    # through the actor-facing set_preference. The authority seed path is the
+    # only way an already-approved policy value lands.
+    from workbench.store import MemoryPreferenceStore, PreferenceStoreError, UnknownPreferenceError
+
+    store = MemoryPreferenceStore(_pref_catalog_doc())
+    # Writing the policy setting from its OWN policy scope is refused (no approval).
+    with pytest.raises(PreferenceStoreError):
+        store.set_preference(
+            "policy", "policy", "policy.transcript_retention_max_days", 120, 0, "operator")
+    # It never committed.
+    with pytest.raises(UnknownPreferenceError):
+        store.get("policy", "policy", "policy.transcript_retention_max_days")
+    # The authority seed path DOES land it (represents the approved/env write).
+    seeded = store.seed_authority_value("policy", "policy.transcript_retention_max_days", 120)
+    assert seeded.value == 120
+    assert store.get("policy", "policy", "policy.transcript_retention_max_days").value == 120

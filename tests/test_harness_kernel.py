@@ -1174,6 +1174,40 @@ def _descriptor(catalog: dict, setting_id: str) -> dict:
     return next(s for s in catalog["settings"] if s["id"] == setting_id)
 
 
+#: A server-held key standing in for the hub's audit-fingerprint key (>= 16 octets).
+_PREF_AUDIT_KEY = b"pref-audit-key-0123456789"
+
+
+def _pref_api_client(store, live_valid_refs_provider=None):
+    """A real create_app TestClient over the injected preference store.
+
+    Used so the effective/repair/reset assertions run through the ACTUAL wired
+    GET/POST /api/preferences path (not a hand-passed-refs vacuum), and thus fail
+    if the endpoint stops threading the ceiling / ref-validity into the shared
+    resolver.
+    """
+    from fastapi.testclient import TestClient
+
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.graph import NullGraph
+    from workbench.store import MemoryStore
+
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="alice", approvers=frozenset({"alice"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://serving", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(),
+        preference_store=store, live_valid_refs_provider=live_valid_refs_provider,
+    ))
+
+
+_PREF_API_ACTOR = {"X-Workbench-Actor": "alice"}
+
+
 # --- T004.1: typed policy operations + canonical payload hashing -------------
 
 
@@ -1230,6 +1264,18 @@ def test_policy_operation_refuses_secret_and_deployment_only_values():
         operation="preference.set", op_version=1, value=120,
     )
     assert policy_op.scope == "policy"
+
+
+def test_policy_operation_dataclass_refuses_a_deployment_scope_on_construction():
+    # Finding 9: the frozen dataclass itself fails closed on a deployment scope,
+    # not only the builder -- so no direct construction/deserialization can mint a
+    # deployment-owned operation that bypasses build_policy_operation.
+    with pytest.raises(PolicyOperationError):
+        PolicyOperation("preference.set", "deployment.state_read_location", "deployment", 1, "x")
+    # Actor/policy scopes still construct (regression guard for the digest tests).
+    assert PolicyOperation("preference.reset", "personal.time_format", "personal", 1).scope == "personal"
+    assert PolicyOperation("preference.set", "policy.route_allowlist_profile", "policy", 1,
+                           "sha256:" + "b" * 64).scope == "policy"
 
 
 def test_policy_operation_preview_shares_digest_and_cannot_mutate_a_store():
@@ -1296,7 +1342,7 @@ def test_preference_audit_metadata_excludes_secret_and_pii():
         scope_key="alice@example.com", value="route.private-abc",
         write_version=2, updated_by="alice@example.com",
     )
-    meta = record.audit_metadata()
+    meta = record.audit_metadata(key=_PREF_AUDIT_KEY)
     assert meta["setting_id"] == "personal.default_chat_route"
     assert meta["write_version"] == 2 and meta["schema_version"] == PREFERENCE_RECORD_SCHEMA_VERSION
     # No value and no identifying fields (raw scope key / updater) leak.
@@ -1305,6 +1351,14 @@ def test_preference_audit_metadata_excludes_secret_and_pii():
     assert "alice@example.com" not in json.dumps(meta)
     assert "route.private-abc" not in json.dumps(meta)
     assert meta["scope_key_fingerprint"] != "alice@example.com"
+    # The fingerprint is KEYED: the same scope key under a different server key
+    # yields a different tag, so a holder of the tag without the key cannot run a
+    # dictionary of candidate actors against it. An unsalted sha256 could not do
+    # this. A too-short key fails closed.
+    other = record.audit_metadata(key=b"a-different-key-0123456789")
+    assert other["scope_key_fingerprint"] != meta["scope_key_fingerprint"]
+    with pytest.raises(PreferenceValidationError):
+        record.audit_metadata(key=b"too-short")
 
 
 def test_malformed_or_out_of_range_value_raises_typed_error_before_persistence():
@@ -1470,18 +1524,40 @@ def test_concurrent_same_version_preference_writes_commit_exactly_one():
 # --- T002.3: shared effective-value resolver ---------------------------------
 
 
-def test_shared_resolver_gives_all_four_consumers_identical_effective_values():
-    # Criterion 3: one shared resolver, so four consumers (chat, delivery,
-    # dashboard, run-context) with identical inputs resolve identical values.
+def test_shared_resolver_gives_real_consumer_surfaces_identical_effective_values():
+    # Criterion 3: the REAL consumer surfaces resolve identical effective values
+    # for identical state. This diffs two genuine call sites -- the API GET
+    # effective value and the store reset effective value -- rather than calling
+    # one pure function four times (a tautology). It FAILS if the two surfaces
+    # diverge, mirroring the CLI/System-Health identical-posture precedent.
     catalog = _settings_catalog()
-    stored = {"personal.landing_surface": "delivery", "personal.chat_transcript_retention_days": 45}
+    store = MemoryPreferenceStore(catalog)
+    # A tightened operator ceiling (7) BELOW even the reviewed default (30): so
+    # the clamp is observable post-reset. Before reset the personal 60 clamps to
+    # 7; after reset the override is gone but the default 30 STILL clamps to 7.
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 7)
+    store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 60, 0, "alice")
 
-    def consumer():  # every consumer delegates to the one shared resolver
-        return {sid: value.as_dict() for sid, value in resolve_effective_settings(catalog, stored).items()}
+    setting = "personal.chat_transcript_retention_days"
+    with _pref_api_client(store) as client:
+        api_before = {item["setting_id"]: item for item in
+                      client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}[setting]
+        # The store reset surface (via POST): removes the override and reports
+        # the effective value it resolves.
+        reset_effective = client.post(
+            f"/api/preferences/{setting}/reset", headers=_PREF_API_ACTOR,
+            json={"scope": "personal", "expected_version": 1},
+        ).json()["effective"]
+        api_after = {item["setting_id"]: item for item in
+                     client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}[setting]
 
-    results = [consumer() for _ in range(4)]
-    assert results[0] == results[1] == results[2] == results[3]
-    assert results[0]["personal.landing_surface"]["value"] == "delivery"
+    # Reset (store surface) and GET (api surface) agree on the SAME effective
+    # value for the SAME post-reset state -- both the clamped ceiling 7, not a
+    # bare default 30. If reset ignored the ceiling (the old bug: value=30
+    # source=default) these two real surfaces diverge and the test fails.
+    assert reset_effective == api_after
+    assert reset_effective["value"] == 7 and reset_effective["source"] == "clamped"
+    assert api_before["value"] == 7 and api_before["source"] == "clamped"
 
 
 def test_policy_ceiling_clamps_a_personal_value_that_exceeds_the_bound():
@@ -1497,24 +1573,69 @@ def test_policy_ceiling_clamps_a_personal_value_that_exceeds_the_bound():
     assert clamped.repair is not None
 
 
-def test_invalidated_capability_resolves_to_safe_state_with_repair_notice():
-    # Criterion 4: an invalidated capability reference falls back to a safe state
-    # with a repair notice -- never a hard failure.
+def test_route_ceiling_is_enforced_via_ref_validity_not_a_silent_numeric_noop():
+    # Finding 5: personal.default_chat_route carries a policy_ceiling that names
+    # the route_allowlist_profile capability digest. That ref/non-scalar ceiling
+    # is NOT a numeric clamp (which would be a silent no-op for a route string);
+    # enforcement is the ref-validity path -- the live route set is scoped to the
+    # approved profile, so an out-of-profile route falls back to the safe default.
     catalog = _settings_catalog()
-    # The pinned default route is not in the live valid set -> unset safe state.
-    resolved = resolve_effective_settings(
-        catalog, {}, live_valid_refs={"route": {"route.some-other"}},
-    )
-    repaired = resolved["personal.default_chat_route"]
-    assert repaired.source == "repaired" and repaired.value is None
-    assert repaired.repair is not None
-    # When the default IS valid, the fallback lands on it rather than unset.
-    resolved2 = resolve_effective_settings(
-        catalog, {"personal.default_chat_route": "route.gone"},
+    # The profile admits route.chat-fast only. An out-of-profile stored route
+    # repairs to the reviewed default (which is in-profile), NOT served verbatim.
+    out_of_profile = resolve_effective_settings(
+        catalog, {"personal.default_chat_route": "route.premium-unapproved"},
         live_valid_refs={"route": {"route.chat-fast"}},
-    )
-    repaired2 = resolved2["personal.default_chat_route"]
-    assert repaired2.source == "repaired" and repaired2.value == "route.chat-fast"
+    )["personal.default_chat_route"]
+    assert out_of_profile.source == "repaired" and out_of_profile.value == "route.chat-fast"
+    assert out_of_profile.repair is not None
+    # An in-profile route is served unchanged -- no false clamp/repair.
+    in_profile = resolve_effective_settings(
+        catalog, {"personal.default_chat_route": "route.chat-fast"},
+        live_valid_refs={"route": {"route.chat-fast", "route.premium-unapproved"}},
+    )["personal.default_chat_route"]
+    assert in_profile.source == "stored" and in_profile.value == "route.chat-fast"
+
+
+def test_invalidated_capability_resolves_to_safe_state_with_repair_notice():
+    # Criterion 4 (T002 crit 3 / T002.3 crit 4): an invalidated capability/route
+    # reference served by the WIRED GET /api/preferences endpoint falls back to a
+    # safe state with a repair notice -- never the stale value. This goes through
+    # the real API path so it FAILS if the endpoint stops threading ref-validity
+    # into the shared resolver (the fallback-never-fires regression).
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    # A stored route that the live valid set no longer admits (deleted long ago).
+    store.set_preference("personal", "alice", "personal.default_chat_route", "route.deleted-long-ago", 0, "alice")
+
+    # The live valid set contains the reviewed default but NOT the stale route.
+    with _pref_api_client(store, live_valid_refs_provider=lambda: {"route": {"route.chat-fast"}}) as client:
+        effective = {item["setting_id"]: item for item in
+                     client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    repaired = effective["personal.default_chat_route"]
+    # The stale value is NOT served; it is repaired to the reviewed default with a
+    # notice (the default IS in the live valid set).
+    assert repaired["source"] == "repaired" and repaired["value"] == "route.chat-fast"
+    assert repaired.get("repair") is not None
+    assert repaired["value"] != "route.deleted-long-ago"
+
+    # With the reviewed-catalog baseline (NO injected provider), a stale stored
+    # route is STILL repaired out of the box rather than served verbatim -- the
+    # default source fires in the wired endpoint, not only when refs are injected.
+    with _pref_api_client(store) as client:
+        effective2 = {item["setting_id"]: item for item in
+                      client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    repaired2 = effective2["personal.default_chat_route"]
+    assert repaired2["source"] == "repaired" and repaired2["value"] == "route.chat-fast"
+
+    # When the live set DOES admit the stored route, it is served unchanged (no
+    # false repair): proves the fallback keys off validity, not blanket repair.
+    with _pref_api_client(
+        store, live_valid_refs_provider=lambda: {"route": {"route.deleted-long-ago", "route.chat-fast"}},
+    ) as client:
+        effective3 = {item["setting_id"]: item for item in
+                      client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    served = effective3["personal.default_chat_route"]
+    assert served["source"] == "stored" and served["value"] == "route.deleted-long-ago"
 
 
 # --- T002: whole-slice integration -------------------------------------------
@@ -1526,12 +1647,13 @@ def test_preferences_slice_integration_scope_stale_migration_and_fallback():
     store = MemoryPreferenceStore(catalog, rows)
 
     # 1) Scope resolution through the one shared resolver, with a policy ceiling
-    #    clamping a personal value.
+    #    clamping a personal value. The policy ceiling is seeded via the authority
+    #    path (an approval-gated policy write is refused for an actor).
     store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 90, 0, "alice")
-    store.set_preference("policy", "policy", "policy.transcript_retention_max_days", 60, 0, "operator")
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 60)
     stored = {}
-    stored.update(store.stored_values("policy", "policy"))
-    stored.update(store.stored_values("personal", "alice"))
+    stored.update(store.owned_values("policy", "policy"))
+    stored.update(store.owned_values("personal", "alice"))
     resolved = resolve_effective_settings(catalog, stored)
     assert resolved["personal.chat_transcript_retention_days"].value == 60  # clamped to the tightened ceiling
 
@@ -1547,9 +1669,12 @@ def test_preferences_slice_integration_scope_stale_migration_and_fallback():
     })
     assert migrated.schema_version == PREFERENCE_RECORD_SCHEMA_VERSION and migrated.write_version == 4
 
-    # 4) Capability invalidation falls back to a safe state, not a hard failure.
-    fallback = resolve_effective_settings(
-        catalog, store.stored_values("personal", "alice"),
-        live_valid_refs={"route": set()},
-    )
-    assert fallback["personal.default_chat_route"].source == "repaired"
+    # 4) Capability invalidation through the WIRED endpoint falls back to a safe
+    #    state, not a hard failure and not the stale value. Exercised via the real
+    #    GET /api/preferences so a regression that drops ref-validity is caught.
+    store.set_preference("personal", "alice", "personal.default_chat_route", "route.gone", 0, "alice")
+    with _pref_api_client(store, live_valid_refs_provider=lambda: {"route": set()}) as client:
+        effective = {item["setting_id"]: item for item in
+                     client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    fallback = effective["personal.default_chat_route"]
+    assert fallback["source"] == "repaired" and fallback["value"] != "route.gone"

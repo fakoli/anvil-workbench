@@ -1036,8 +1036,10 @@ def test_preferences_surface_fails_closed_when_unconfigured():
 
 def test_preferences_effective_view_serializes_only_actor_view_and_clamps():
     store = _MemoryPreferenceStore(_pref_catalog())
-    # Tighten the policy ceiling to 30 and set a personal value above it.
-    store.set_preference("policy", "policy", "policy.transcript_retention_max_days", 30, 0, "operator")
+    # Tighten the policy ceiling to 30 and set a personal value above it. The
+    # policy ceiling is seeded via the authority path (an actor cannot write an
+    # approval-gated policy value through set_preference).
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 30)
     store.set_preference("personal", "operator", "personal.chat_transcript_retention_days", 60, 0, "operator")
     with _pref_client(store) as test_client:
         body = test_client.get("/api/preferences", headers=_PREF_ACTOR).json()
@@ -1120,3 +1122,70 @@ def test_malformed_setting_id_is_rejected_at_the_edge():
         assert test_client.get(
             "/api/preferences/NotAValidId", headers=_PREF_ACTOR,
         ).status_code == 422
+
+
+def test_cross_scope_write_is_indistinct_from_an_unknown_id_not_an_oracle():
+    # T002.3 crit 2: a cross-scope WRITE must not be an existence oracle. Writing
+    # a REAL authority setting id from a personal scope returns the SAME indistinct
+    # 404 body as writing a genuinely unknown id -- so the write surface cannot be
+    # used to learn which authority setting ids exist (the ids the read surface
+    # hides). A distinct 409 "not owned by this scope" here would leak existence.
+    store = _MemoryPreferenceStore(_pref_catalog())
+    with _pref_client(store) as test_client:
+        authority = test_client.put(
+            "/api/preferences/deployment.state_read_location", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "x", "expected_version": 0},
+        )
+        unknown = test_client.put(
+            "/api/preferences/personal.i_do_not_exist", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "x", "expected_version": 0},
+        )
+        # A policy (approval-gated) id is likewise indistinct from an unknown id.
+        policy_id = test_client.put(
+            "/api/preferences/policy.route_allowlist_profile", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "x", "expected_version": 0},
+        )
+    assert authority.status_code == unknown.status_code == policy_id.status_code == 404
+    assert authority.json() == unknown.json() == policy_id.json() == {"detail": "unknown preference"}
+
+
+def test_mis_scoped_injected_row_cannot_escalate_over_declared_precedence():
+    # Finding 6: the GET merge is ownership-filtered, so a corrupt/injected row
+    # bearing a foreign-scope id (a personal namespace carrying a policy ceiling
+    # id) cannot override the real authority value against scope_precedence.
+    from workbench.models import PreferenceRecord
+    from workbench.store import PreferenceRows
+
+    store = _MemoryPreferenceStore(_pref_catalog())
+    # Seed the genuine authority ceiling at 30.
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 30)
+    # Inject a corrupt personal-namespace row that spoofs the POLICY ceiling id
+    # with a wide-open 365, plus a personal value of 60 that a lifted ceiling
+    # would fail to clamp. (Constructed directly: set_preference would refuse the
+    # spoofed policy-id row; 60 is within the personal bound [1, 90].)
+    store.rows.records.setdefault(("personal", "operator"), {})
+    store.rows.records[("personal", "operator")]["policy.transcript_retention_max_days"] = PreferenceRecord(
+        setting_id="policy.transcript_retention_max_days", scope="personal", scope_key="operator",
+        value=365, write_version=1, updated_by="operator",
+    )
+    store.set_preference("personal", "operator", "personal.chat_transcript_retention_days", 60, 0, "operator")
+    with _pref_client(store) as test_client:
+        body = test_client.get("/api/preferences", headers=_PREF_ACTOR).json()
+    effective = {item["setting_id"]: item for item in body["effective"]}
+    # The real authority ceiling (30) wins: the injected personal row is dropped
+    # at the ownership-filtered merge, so the personal 200 is clamped to 30, not
+    # to the spoofed 365.
+    assert effective["personal.chat_transcript_retention_days"]["value"] == 30
+    assert effective["personal.chat_transcript_retention_days"]["source"] == "clamped"
+
+
+def test_preference_write_rejects_unknown_body_fields():
+    # Finding 8: the write/reset inputs forbid unknown fields, so a client cannot
+    # smuggle an undeclared key (e.g. a spoofed scope_key) past the typed edge.
+    store = _MemoryPreferenceStore(_pref_catalog())
+    with _pref_client(store) as test_client:
+        resp = test_client.put(
+            "/api/preferences/personal.time_format", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "format_12h", "expected_version": 0, "scope_key": "victim"},
+        )
+        assert resp.status_code == 422
