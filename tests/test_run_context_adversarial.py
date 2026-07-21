@@ -44,7 +44,7 @@ from workbench.run_context_store import (
 )
 from workbench.store import MemoryStore
 
-from conftest import build_run_context, compile_delivery_snapshot, load_example
+from _support import build_run_context, compile_delivery_snapshot, load_example
 
 ACTOR = {"X-Workbench-Actor": "operator"}
 

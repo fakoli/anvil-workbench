@@ -710,7 +710,7 @@ def test_malformed_run_id_is_rejected_before_the_store():
 
 from datetime import datetime as _datetime, timezone as _timezone
 
-from conftest import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+from _support import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
 
 from workbench.cli import main as _cli_main
 from workbench.system_health import (

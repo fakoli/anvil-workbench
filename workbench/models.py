@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
-from .redaction import redact_text
+from .redaction import redact_config_text, redact_text
 
 
 def now_utc() -> datetime:
@@ -187,7 +187,16 @@ def as_json(value: object) -> dict[str, Any]:
 # required authority or human-readable field cannot be constructed, so a
 # dispatch that depends on it fails closed (T005.2).
 
-RUN_CONTEXT_SCHEMA_VERSION = "workbench-run-context/v1"
+#: The internal serialization identifier for :meth:`RunContext.as_dict`.  It is
+#: DELIBERATELY DISTINCT from the published flat contract const
+#: ``workbench-run-context/v1`` (``docs/contracts/schemas/run-context.v1.schema
+#: .json``).  ``as_dict`` emits a two-structure ``trusted``/``untrusted`` split
+#: (the accepted internal design), which does not validate against the flat
+#: published schema; stamping the flat const on it would let a consumer that
+#: dispatches on the version string validate the split shape against the flat
+#: schema and reject every response.  A separate ``-internal`` const makes the
+#: two shapes unmistakable and non-substitutable.
+RUN_CONTEXT_SCHEMA_VERSION = "workbench-run-context-internal/v1"
 
 #: The two trust labels the run context serializes under.  ``trusted`` carries
 #: pinned execution policy; ``untrusted`` carries PRD/task-derived prose.
@@ -200,6 +209,13 @@ RUN_EFFECTS = frozenset(
     {"read", "bounded_execution", "state_mutation", "external_effect", "policy_mutation"}
 )
 RUN_GATES = frozenset({"none", "preview", "approval"})
+
+#: Gate strictness order (weakest -> strongest).  A per-operation gate override
+#: supplied to :func:`run_capabilities_from_snapshot` may only STRENGTHEN the
+#: conservative default (raise the gate); an attempt to weaken it below the
+#: default -- e.g. downgrading an ``external_effect`` from ``approval`` to
+#: ``none`` -- fails closed rather than silently widening authority.
+_GATE_STRICTNESS = {"none": 0, "preview": 1, "approval": 2}
 
 #: The conservative default gate policy: an effect that leaves the local sandbox
 #: (an external side effect or a policy mutation) requires an approval gate;
@@ -238,9 +254,32 @@ def _rc_prose(value: Any, limit: int, label: str, *, allow_empty: bool = False) 
         isinstance(value, str) and lower <= len(value) <= limit,
         f"{label} must be bounded readable text",
     )
-    # Defense in depth: scrub any credential the untrusted prose might carry
-    # before it is ever persisted or rendered.
+    # Defense in depth: scrub any credential the prose might carry before it is
+    # ever persisted or rendered.  Trusted-side prose (capability summaries,
+    # skill purposes, stop conditions, receipt summaries) is State-backed
+    # guidance, so the transcript credential scrub is the right, non-destructive
+    # domain here.
     return redact_text(value)
+
+
+def _rc_untrusted_prose(value: Any, limit: int, label: str, *, allow_empty: bool = False) -> str:
+    """Bound + scrub PRD/task-derived prose with the wider config-class scrubber.
+
+    The untrusted channel carries whatever a PRD title, acceptance criterion,
+    scope entry, verification step, or evidence citation/summary happens to say.
+    That prose can contain a credential shape the transcript scrub misses (a bare
+    ``AKIA…`` key, a JWT, a PEM block), a raw endpoint/DB URL, an ``ip:port``, or
+    a State-storage/host path.  Routing it through
+    :func:`~workbench.redaction.redact_config_text` closes every one of those
+    classes at construction time, so the persisted snapshot never holds the
+    secret; the API boundary re-scrubs the same channel as a last hop.
+    """
+    lower = 0 if allow_empty else 1
+    _rc_require(
+        isinstance(value, str) and lower <= len(value) <= limit,
+        f"{label} must be bounded readable text",
+    )
+    return redact_config_text(value)
 
 
 def _rc_digest(value: Any, label: str) -> str:
@@ -579,17 +618,17 @@ class UntrustedTask:
         object.__setattr__(self, "scope", tuple(self.scope))
         object.__setattr__(self, "verification_plan", tuple(self.verification_plan))
         _rc_require(isinstance(self.ref, UntrustedTaskRef), "task ref must be an UntrustedTaskRef")
-        object.__setattr__(self, "title", _rc_prose(self.title, 500, "task title"))
+        object.__setattr__(self, "title", _rc_untrusted_prose(self.title, 500, "task title"))
         _rc_require(len(self.acceptance_criteria) >= 1, "task must carry at least one acceptance criterion")
         object.__setattr__(
             self, "acceptance_criteria",
-            tuple(_rc_prose(item, 2000, "acceptance criterion") for item in self.acceptance_criteria),
+            tuple(_rc_untrusted_prose(item, 2000, "acceptance criterion") for item in self.acceptance_criteria),
         )
         object.__setattr__(self, "work_packet_digest", _rc_digest(self.work_packet_digest, "work_packet_digest"))
-        object.__setattr__(self, "scope", tuple(_rc_prose(item, 500, "scope entry") for item in self.scope))
+        object.__setattr__(self, "scope", tuple(_rc_untrusted_prose(item, 500, "scope entry") for item in self.scope))
         object.__setattr__(
             self, "verification_plan",
-            tuple(_rc_prose(item, 1000, "verification step") for item in self.verification_plan),
+            tuple(_rc_untrusted_prose(item, 1000, "verification step") for item in self.verification_plan),
         )
         _rc_require(self.content_trust == UNTRUSTED_TASK_LABEL, "task prose is always untrusted task data")
 
@@ -617,8 +656,8 @@ class UntrustedEvidence:
     content_trust: str = UNTRUSTED_TASK_LABEL
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "citation", _rc_prose(self.citation, 500, "evidence citation"))
-        object.__setattr__(self, "summary", _rc_prose(self.summary, 2000, "evidence summary"))
+        object.__setattr__(self, "citation", _rc_untrusted_prose(self.citation, 500, "evidence citation"))
+        object.__setattr__(self, "summary", _rc_untrusted_prose(self.summary, 2000, "evidence summary"))
         _rc_require(self.content_trust == UNTRUSTED_TASK_LABEL, "evidence prose is always untrusted task data")
 
     def as_dict(self) -> dict[str, str]:
@@ -654,6 +693,12 @@ class RunContext:
     execution policy) and ``untrusted`` (PRD/task-derived prose).  Frozen at
     every level; its closed field set structurally cannot carry a State-storage
     path, a credential, a raw command, or a provider payload.
+
+    This internal split shape is intentionally NOT the published flat run-context
+    contract (``docs/contracts/schemas/run-context.v1.schema.json``): it stamps
+    the distinct ``schema_version`` :data:`RUN_CONTEXT_SCHEMA_VERSION`
+    (``workbench-run-context-internal/v1``) so a consumer can never mistake it
+    for the flat contract and validate the split against the wrong schema.
     """
 
     context_id: str
@@ -753,6 +798,11 @@ class RunContext:
             {"content_trust", "ref", "title", "acceptance_criteria", "work_packet_digest", "scope", "verification_plan"},
             "task",
         )
+        # A nested content_trust, when present, must be the untrusted label. The
+        # constructor would otherwise silently normalize a mislabeled value; the
+        # closed-set posture rejects it instead of quietly rewriting trust.
+        if "content_trust" in task_data:
+            _rc_require(task_data["content_trust"] == UNTRUSTED_TASK_LABEL, "task content_trust label is wrong")
         for capability in trusted["capabilities"]:
             _rc_reject_unknown(
                 capability,
@@ -765,6 +815,8 @@ class RunContext:
             _rc_reject_unknown(receipt, {"receipt_id", "summary"}, "receipt")
         for item in untrusted.get("evidence", ()):
             _rc_reject_unknown(item, {"content_trust", "citation", "summary"}, "evidence")
+            if "content_trust" in item:
+                _rc_require(item["content_trust"] == UNTRUSTED_TASK_LABEL, "evidence content_trust label is wrong")
         _rc_reject_unknown(task_data["ref"], {"prd_id", "task_id", "prd_revision"}, "task ref")
         for catalog in workflow_data["catalogs"]:
             _rc_reject_unknown(catalog, {"provider", "digest"}, "catalog pin")
@@ -853,6 +905,12 @@ def run_capabilities_from_snapshot(
     snapshot.  The gate defaults from :data:`_DEFAULT_GATE_FOR_EFFECT` (approval
     for effects that leave the sandbox) and may be overridden per
     ``(provider, operation_id)``; an override to an undeclared gate fails closed.
+
+    An override may only STRENGTHEN the conservative default -- raise the gate up
+    the ``none < preview < approval`` order.  An override that would WEAKEN the
+    default (e.g. downgrade an ``external_effect`` from ``approval`` to ``none``)
+    fails closed with :class:`RunContextError`, so a caller can never quietly
+    widen authority by supplying a laxer gate than the reviewed default.
     """
     from .workflow_snapshot import WorkflowSnapshot
 
@@ -862,7 +920,14 @@ def run_capabilities_from_snapshot(
     capabilities: list[RunCapability] = []
     for operation in snapshot.operations:
         key = (operation.provider, operation.id)
-        gate = gates.get(key, _DEFAULT_GATE_FOR_EFFECT.get(operation.effect, "approval"))
+        default_gate = _DEFAULT_GATE_FOR_EFFECT.get(operation.effect, "approval")
+        gate = gates.get(key, default_gate)
+        if key in gates:
+            _rc_require(gate in RUN_GATES, f"capability gate is not declared: {gate!r}")
+            _rc_require(
+                _GATE_STRICTNESS[gate] >= _GATE_STRICTNESS[default_gate],
+                f"gate override for {key} would weaken the default {default_gate!r} to {gate!r}",
+            )
         capabilities.append(
             RunCapability(
                 operation_id=operation.id,

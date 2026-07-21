@@ -1,114 +1,50 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import dataclasses
 import json
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
-from workbench.capability_profiles import validate_project_profile
 from workbench.models import (
-    RunCapability,
-    RunConstraints,
     RunContext,
     RunContextError,
-    RunCursor,
     RunIdentity,
-    RunReceipt,
-    RunSkill,
     RunWorkflowPin,
-    UntrustedEvidence,
     UntrustedTask,
     UntrustedTaskRef,
     run_capabilities_from_snapshot,
     run_skills_from_snapshot,
 )
-from workbench.provider_catalogs import (
-    DEFAULT_PROVIDER_ALLOWLIST,
-    PublishedCatalogSet,
-    validate_provider_catalog,
-)
 from workbench.store import MemoryStore, StoreError
 from workbench.voice import VoiceRelayError, relay_realtime, sanitize_client_event, summarize_server_event
-from workbench.workflow_snapshot import compile_workflow_snapshot
 from workbench.workflows import WorkflowError, validate_definition
 
-_EXAMPLES = Path(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+from _support import build_run_context, compile_delivery_snapshot
 
-
-def _load_example(name: str) -> dict:
-    return json.loads((_EXAMPLES / name).read_text(encoding="utf-8"))
-
-
-def compiled_delivery_snapshot():
-    """Compile the reviewed delivery snapshot from the checked-in examples."""
-    published = PublishedCatalogSet(
-        catalogs=tuple(
-            validate_provider_catalog(provider, _load_example(f"{provider}.catalog.v1.json"))
-            for provider in sorted(DEFAULT_PROVIDER_ALLOWLIST)
-        )
-    )
-    profile = validate_project_profile(
-        _load_example("project-capability-profile.v1.json"),
-        published,
-        configured_model_profiles=("coding-local", "planning-local"),
-        configured_skills={"anvil:execute": "sha256:" + "7" * 64},
-        approval_actions=("commit_pr", "merge_and_accept"),
-    )
-    workflow = _load_example("delivery.workflow.v2.json")
-    selected_ops: list[dict] = []
-    seen: set[tuple] = set()
-    for step in workflow["steps"]:
-        if step["kind"] != "operation":
-            continue
-        key = tuple(sorted(step["operation"].items()))
-        if key not in seen:
-            seen.add(key)
-            selected_ops.append(copy.deepcopy(step["operation"]))
-    return compile_workflow_snapshot(
-        workflow, profile, published,
-        selected_operations=selected_ops,
-        selected_skills=[{"id": "anvil:execute", "digest": "sha256:" + "7" * 64}],
-        route="coding-local",
-    )
+# The hermetic discovery -> profile -> snapshot -> capture pipeline is defined
+# once in ``tests/_support`` and shared with conftest and the run-context tests
+# (no per-module re-implementation).  ``compiled_delivery_snapshot`` is a thin
+# alias; ``valid_run_context`` delegates to the shared factory, supplying only
+# the harness-kernel-specific identity, context id, and skill purpose.
+compiled_delivery_snapshot = compile_delivery_snapshot
 
 
 def valid_run_context(**overrides) -> RunContext:
     """Build a complete, valid run context; overrides replace capture kwargs."""
-    snapshot = overrides.pop("snapshot", None) or compiled_delivery_snapshot()
-    kwargs = dict(
+    snapshot = overrides.pop("snapshot", None) or compile_delivery_snapshot()
+    defaults: dict[str, object] = dict(
         context_id="ctx_run_example_0001",
         identity=RunIdentity(
             run_id="run_1", session_id="sess_1", bridge_id="bridge_1",
             worktree_name="checkout-a", task_id="release-beta:T001", request_id="req_1",
         ),
-        workflow=RunWorkflowPin.from_snapshot(snapshot),
-        capabilities=run_capabilities_from_snapshot(snapshot),
         skills=run_skills_from_snapshot(snapshot, {"anvil:execute": "State-backed implementation guidance."}),
-        constraints=RunConstraints(
-            turn_limit=12, tool_limit=24,
-            stop_conditions=("Do not submit evidence before verification passes.",),
-        ),
-        cursor=RunCursor(
-            step_id="implement", attempt=1,
-            completed_receipts=(RunReceipt(receipt_id="rcpt_claim", summary="claim succeeded"),),
-        ),
-        task=UntrustedTask(
-            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=5),
-            title="Add a documented operation contract",
-            acceptance_criteria=("Add a versioned resource", "Validate its JSON shape"),
-            work_packet_digest="sha256:" + "8" * 64,
-            scope=("docs/contracts",),
-            verification_plan=("Run the allowlisted verification command.",),
-        ),
-        evidence=(UntrustedEvidence(citation="state-event:claim", summary="Task claim is active."),),
     )
-    kwargs.update(overrides)
-    return RunContext.capture(**kwargs)
+    defaults.update(overrides)
+    return build_run_context(snapshot=snapshot, **defaults)
 
 
 def delivery_workflow() -> dict[str, object]:
@@ -444,6 +380,45 @@ def test_run_context_captures_every_required_authority_and_readable_field():
     assert task["title"] == "Add a documented operation contract"
     assert task["acceptance_criteria"] == ["Add a versioned resource", "Validate its JSON shape"]
     assert data["trusted"]["skills"][0]["purpose"] == "State-backed implementation guidance."
+
+
+def test_gate_override_may_strengthen_but_never_weaken_the_default():
+    """Security floor: a per-operation gate override may only raise the
+    conservative default up the ``none < preview < approval`` order.  A downgrade
+    of an ``external_effect`` from ``approval`` to a laxer gate fails closed, so a
+    caller can never quietly widen authority; a strengthening (or equal) override
+    is accepted."""
+    snapshot = compiled_delivery_snapshot()
+    external = next(o for o in snapshot.operations if o.effect == "external_effect")
+    ungated = next(
+        o for o in snapshot.operations
+        if o.effect in {"read", "bounded_execution", "state_mutation"}
+    )
+
+    # Weakening an approval-defaulted external effect is refused for every laxer gate.
+    for weaker in ("none", "preview"):
+        with pytest.raises(RunContextError):
+            run_capabilities_from_snapshot(snapshot, gates={(external.provider, external.id): weaker})
+
+    # Strengthening an ungated (default none) operation up to approval is accepted.
+    strengthened = {
+        (c.provider, c.operation_id): c
+        for c in run_capabilities_from_snapshot(
+            snapshot, gates={(ungated.provider, ungated.id): "approval"}
+        )
+    }
+    assert strengthened[(ungated.provider, ungated.id)].gate == "approval"
+    # The external effect keeps its conservative approval default (unweakened).
+    assert strengthened[(external.provider, external.id)].gate == "approval"
+
+    # An equal-strictness override (approval on an already-approval effect) is fine.
+    same = {
+        (c.provider, c.operation_id): c
+        for c in run_capabilities_from_snapshot(
+            snapshot, gates={(external.provider, external.id): "approval"}
+        )
+    }
+    assert same[(external.provider, external.id)].gate == "approval"
 
 
 def test_run_context_fails_closed_when_a_required_field_is_unresolved():

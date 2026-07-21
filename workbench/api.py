@@ -291,8 +291,22 @@ def build_run_context_router(
 
         A run owned by another project resolves to the indistinct 404, so this
         endpoint is not an existence oracle for foreign runs.
+
+        Last-hop redaction (security lens, mirroring
+        :func:`build_system_health_router`): the ``untrusted`` PRD/task channel
+        carries whatever prose a PRD title/criterion/scope/evidence happened to
+        contain, so it is re-scrubbed here with
+        :func:`~workbench.redaction.scrub_config_payload`.  Construction-time
+        scrubbing already ran (so the store never held the secret), but this
+        closes a rogue or duck-typed record whose ``as_dict()`` bypassed it. The
+        ``trusted`` policy structure is left untouched -- it is a closed set of
+        typed identifiers/digests/enums with no free-form host/secret field, and
+        the config scrubber's path/URL patterns would otherwise mangle safe
+        ``sha256:`` digests and ``.../v1`` versions.
         """
-        return {"context": context_store().get(project_id, run_id).as_dict()}
+        context = context_store().get(project_id, run_id).as_dict()
+        context["untrusted"] = scrub_config_payload(context["untrusted"])
+        return {"context": context}
 
     return router
 

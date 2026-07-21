@@ -261,7 +261,7 @@ def _seeded_run_context_response() -> dict:
     """Render a historical run-context response from secret-seeded task prose."""
     from fastapi.testclient import TestClient
 
-    from conftest import build_run_context
+    from _support import build_run_context
     from workbench.api import create_app
     from workbench.config import Settings
     from workbench.models import UntrustedEvidence, UntrustedTask, UntrustedTaskRef
@@ -331,6 +331,97 @@ def test_run_context_browser_response_separates_trust_and_exposes_no_leak():
             assert marker not in lowered, f"run-context value {value!r} leaked {marker!r}"
 
 
+#: The proven-leak corpus (state-context-operations security lens): every one of
+#: these classes was demonstrated to ride UNSCRUBBED through the run-context
+#: response before the untrusted channel was routed through the hardened
+#: config-class scrubber.  Each is a shape the transcript credential scrub
+#: (``redact_text``) misses -- so a revert of the untrusted-prose scrub or the
+#: API last-hop back to ``redact_text`` MUST make the assertions below fail.
+_RUN_CONTEXT_LEAK_CORPUS = {
+    "AKIA-no-separator": "AKIAIOSFODNN7EXAMPLE",
+    "JWT": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    "PEM-private-key": "-----BEGIN RSA PRIVATE KEY-----MIIBdeadbeefCAFE-----END RSA PRIVATE KEY-----",
+    "ip:port": "100.64.0.5:8443",
+    "postgres-url": "postgres://svc:pw@db.internal:5432/anvil",
+    "state.db-path": "/var/anvil/state.db",
+}
+
+
+def _corpus_field(prefix: str) -> str:
+    """Readable prose carrying every proven-leak class in one untrusted field."""
+    return prefix + " " + " ".join(_RUN_CONTEXT_LEAK_CORPUS.values())
+
+
+def _seeded_run_context_response_full_corpus() -> dict:
+    """Render a run-context response with the full corpus in EVERY untrusted field."""
+    from fastapi.testclient import TestClient
+
+    from _support import build_run_context
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.models import UntrustedEvidence, UntrustedTask, UntrustedTaskRef
+    from workbench.run_context_store import MemoryRunContextStore
+
+    context = build_run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=5),
+            title=_corpus_field("title"),
+            acceptance_criteria=(_corpus_field("criterion"),),
+            work_packet_digest="sha256:" + "8" * 64,
+            scope=(_corpus_field("scope"),),
+            verification_plan=(_corpus_field("verify"),),
+        ),
+        evidence=(
+            UntrustedEvidence(
+                citation=_corpus_field("cite"),
+                summary=_corpus_field("summary"),
+            ),
+        ),
+    )
+    store = MemoryRunContextStore()
+    store.capture("project_a", context)
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    app = create_app(settings=settings, store=MemoryStore(), graph=NullGraph(), run_context_store=store)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/projects/project_a/runs/{context.run_id}/context",
+            headers={"X-Workbench-Actor": "operator"},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["context"]
+
+
+def test_run_context_untrusted_prose_scrubs_full_proven_leak_corpus():
+    # Security lens (proven end-to-end): a secret/host-path/DB-URL/PEM/JWT/AKIA
+    # seeded into ANY untrusted PRD/task/acceptance/scope/evidence prose field
+    # must NOT render through GET .../runs/{run_id}/context. Each class is a
+    # separate negative assertion with its class marker, so a revert of the
+    # untrusted-channel scrub back to the transcript scrub fails this test.
+    context = _seeded_run_context_response_full_corpus()
+
+    # The trusted structure is left byte-for-byte as captured (no over-redaction).
+    assert context["trusted"]["trust"] == "trusted_execution_policy"
+    assert context["untrusted"]["content_trust"] == "untrusted_task_data"
+
+    blob = json.dumps(context)
+    for marker, literal in _RUN_CONTEXT_LEAK_CORPUS.items():
+        assert literal not in blob, f"untrusted run-context prose leaked a {marker!r} value: {literal!r}"
+
+    # Distinctive fragments (a partial leak is still a leak) are gone too.
+    for fragment in ("AKIAIOSFODNN7", "eyJhbGci", "BEGIN RSA PRIVATE KEY", "100.64.0.5", "db.internal", "state.db"):
+        assert fragment not in blob, f"untrusted run-context prose leaked fragment {fragment!r}"
+
+    # And the untrusted channel actually carried a redaction marker (proof the
+    # scrub ran rather than the corpus silently vanishing).
+    untrusted_blob = json.dumps(context["untrusted"])
+    assert "[REDACTED" in untrusted_blob
+
+
 # --- system-health integration descriptors + observational posture audit
 # (preferences-configuration T003.1 / T008): every descriptor and posture check
 # is an observational display record whose closed field set structurally cannot
@@ -340,7 +431,7 @@ def test_run_context_browser_response_separates_trust_and_exposes_no_leak():
 # BOTH the descriptor safety (T003.1) and the audit's no-mutation claim (T008
 # criterion 2, "proven by the same fixtures that guard T003"). --------------
 
-from conftest import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+from _support import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
 
 from workbench.config import Settings as _SHSettings
 from workbench.system_health import (
