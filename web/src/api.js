@@ -119,24 +119,31 @@ export async function createConversation({ title, retention } = {}) {
   return chatJson(await jsonPost(CONVERSATIONS, body), 'Conversation could not be created')
 }
 
-export async function listConversations({ includeArchived = false, pinned, tag, folder } = {}) {
+// An optional caller-owned AbortSignal lets a superseding list/search abort the
+// previous in-flight request. It is threaded in only when present so an
+// unsignalled call keeps its single-argument `fetch(url)` shape.
+function getSignalArgs(signal) {
+  return signal ? [{ signal }] : []
+}
+
+export async function listConversations({ includeArchived = false, pinned, tag, folder, signal } = {}) {
   const params = new URLSearchParams()
   if (includeArchived) params.set('include_archived', 'true')
   if (pinned != null) params.set('pinned', String(pinned))
   if (tag) params.set('tag', tag)
   if (folder) params.set('folder', folder)
   const qs = params.toString()
-  return chatJson(await fetch(`${CONVERSATIONS}${qs ? `?${qs}` : ''}`), 'Conversations are unavailable')
+  return chatJson(await fetch(`${CONVERSATIONS}${qs ? `?${qs}` : ''}`, ...getSignalArgs(signal)), 'Conversations are unavailable')
 }
 
-export async function searchConversations(query, { includeArchived = false, pinned, tag, folder } = {}) {
+export async function searchConversations(query, { includeArchived = false, pinned, tag, folder, signal } = {}) {
   const params = new URLSearchParams()
   params.set('query', query)
   if (includeArchived) params.set('include_archived', 'true')
   if (pinned != null) params.set('pinned', String(pinned))
   if (tag) params.set('tag', tag)
   if (folder) params.set('folder', folder)
-  return chatJson(await fetch(`${CONVERSATIONS}/search?${params.toString()}`), 'Conversation search is unavailable')
+  return chatJson(await fetch(`${CONVERSATIONS}/search?${params.toString()}`, ...getSignalArgs(signal)), 'Conversation search is unavailable')
 }
 
 export async function getConversation(conversationId) {

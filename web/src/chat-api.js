@@ -131,3 +131,28 @@ export function selectChatRoute(routes, routeId) {
   if (!match) throw new Error(`chat route is not in the reviewed allowlist: ${routeId}`)
   return match
 }
+
+// Normalize the text of a rendered turn into the EXACT content-block shape the
+// server's `ContentBlockInput` accepts (`extra="forbid"`, `kind` required):
+// `{kind: 'text', text}` only. This strips every other field — notably the
+// server-projected `content_trust` (which a server-loaded turn carries and
+// which the append models forbid) — and supplies a `kind` for a locally
+// streamed block that has only `{text}`. Posting a block verbatim off a
+// `getConversation` read or a local stream is otherwise rejected 422
+// (extra_forbidden `content_trust`, or missing `kind`).
+export function toTurnContent(blocks) {
+  return (Array.isArray(blocks) ? blocks : [])
+    .map((block) => ({ kind: 'text', text: typeof block?.text === 'string' ? block.text : '' }))
+}
+
+// Build the caller-supplied slice of a retry/branch successor turn in the shape
+// `TurnBodyInput` requires (workbench/conversation_api.py:152). The server
+// derives the lineage (kind/parent/sibling) itself, so the body carries only
+// `role`, `status`, `mode`, and normalized `content`. The role differs by
+// operation to match the server's turn tree (test_conversation_api.py:140-155):
+// a `retry` appends a sibling ASSISTANT regeneration of the retried answer; a
+// `branch` opens a new USER turn continuing from that answer. Neither reposts a
+// server-loaded block verbatim (that leaked `content_trust` → 422).
+export function successorTurnBody(turn, { role, mode = 'ordinary' } = {}) {
+  return { role, status: 'complete', mode, content: toTurnContent(turn?.content) }
+}

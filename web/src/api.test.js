@@ -14,7 +14,7 @@ import {
   sendMessage,
   unarchiveConversation,
 } from './api'
-import { describeConversation, selectChatRoute } from './chat-api'
+import { describeConversation, selectChatRoute, successorTurnBody, toTurnContent } from './chat-api'
 
 describe('Workbench browser API', () => {
   afterEach(() => vi.restoreAllMocks())
@@ -117,6 +117,41 @@ describe('conversation API client (T004.1)', () => {
     expect(fetch).toHaveBeenLastCalledWith('/api/conversations/conv_1/turns/turn_1/retry', expect.any(Object))
     await branchTurn('conv_1', 'turn_1', { role: 'assistant', status: 'complete' })
     expect(fetch).toHaveBeenLastCalledWith('/api/conversations/conv_1/turns/turn_1/branch', expect.any(Object))
+  })
+
+  // Correctness #1 (PROVEN 422): the real pydantic ContentBlockInput forbids
+  // extra fields and requires `kind`. A server-loaded block carries
+  // `content_trust` (turn_json) → 422 extra_forbidden; a locally-streamed block
+  // is `{text}` with no `kind` → 422 missing. successorTurnBody must emit
+  // `{kind:'text', text}` ONLY, for both origins.
+  it('normalizes successor content to {kind:"text", text} only, from either turn origin', () => {
+    expect(toTurnContent([{ kind: 'text', text: 'loaded', content_trust: 'untrusted_task_data' }]))
+      .toEqual([{ kind: 'text', text: 'loaded' }]) // content_trust stripped
+    expect(toTurnContent([{ text: 'streamed' }]))
+      .toEqual([{ kind: 'text', text: 'streamed' }]) // missing kind supplied
+    expect(toTurnContent(undefined)).toEqual([])
+  })
+
+  it('posts the exact retry/branch successor body the server accepts (revert-detecting)', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ id: 'turn_2' }))
+    // A turn exactly as `getConversation` returns it: blocks carry content_trust.
+    const loadedTurn = { id: 'turn_1', content: [{ kind: 'text', text: 'first answer', content_trust: 'untrusted_task_data' }] }
+
+    // Retry appends a sibling ASSISTANT regeneration.
+    await retryTurn('conv_1', 'turn_1', successorTurnBody(loadedTurn, { role: 'assistant' }))
+    expect(fetch).toHaveBeenLastCalledWith('/api/conversations/conv_1/turns/turn_1/retry', expect.objectContaining({
+      method: 'POST',
+      // Exact body — a revert to `content: turn.content` re-introduces
+      // content_trust and fails this equality (422 on the real server).
+      body: JSON.stringify({ role: 'assistant', status: 'complete', mode: 'ordinary', content: [{ kind: 'text', text: 'first answer' }] }),
+    }))
+
+    // Branch opens a follow-up USER turn (test_conversation_api.py:149-151).
+    await branchTurn('conv_1', 'turn_1', successorTurnBody(loadedTurn, { role: 'user', mode: 'advanced' }))
+    expect(fetch).toHaveBeenLastCalledWith('/api/conversations/conv_1/turns/turn_1/branch', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ role: 'user', status: 'complete', mode: 'advanced', content: [{ kind: 'text', text: 'first answer' }] }),
+    }))
   })
 
   it('surfaces a distinct failure message when a management request is rejected', async () => {
