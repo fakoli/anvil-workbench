@@ -126,6 +126,65 @@ export function describeEligibility(eligibility) {
   }
 }
 
+// The single next Deliver candidate (plan-task-delivery T006 criterion 2).
+//
+// State serves its task references in plan/ranked order, so the ONE candidate a
+// "Deliver next" flow previews is the FIRST served row — index 0 — described for
+// display. Taking the head (never re-sorting by a fabricated score, never
+// scanning ahead for the first `ready` row) is what makes the preview both
+// "exactly one" AND "never silently skips a blocked dependency": if the ranked
+// head is blocked, the blocked head IS the candidate and the flow surfaces it
+// blocked rather than quietly reaching past it to a later ready task. Returns
+// null for an empty/absent list so the caller renders a truthful no-candidate
+// state instead of fabricating one.
+export function nextDeliverCandidate(tasks) {
+  const list = Array.isArray(tasks) ? tasks : []
+  if (!list.length) return null
+  return describeTaskReference(list[0])
+}
+
+// The truthful reason a Deliver is blocked, or null when it can start
+// (plan-task-delivery T006 criteria 2 + 4). The order is what the operator must
+// resolve first: a startable session, then a loaded candidate, then State's own
+// eligibility verdict. Nothing here is fabricated — a blocked verdict's own
+// leading reason (its code + human-safe explanation) is surfaced verbatim, so
+// the disabled control always states WHY in text and never invents a cause.
+//
+// `eligibility` is the caller's async wrapper `{status, value, message}` (value
+// is a describeEligibility() verdict), mirroring the explorer's eligibility
+// state, so a still-loading or failed eligibility read blocks the start with its
+// own distinct, truthful reason rather than silently enabling it.
+export function deliverBlockReason({ candidate, eligibility, hasSession } = {}) {
+  if (!hasSession) {
+    return { code: 'deliver.no_session', text: 'Select a startable session (a draft workflow with no active run) to deliver into.' }
+  }
+  if (!candidate) {
+    return { code: 'deliver.no_candidate', text: 'Load a PRD to preview its next ranked candidate.' }
+  }
+  const status = eligibility?.status
+  if (!status || status === 'idle') {
+    return { code: 'deliver.eligibility_unloaded', text: 'The candidate’s delivery eligibility has not been checked yet.' }
+  }
+  if (status === 'loading') {
+    return { code: 'deliver.eligibility_loading', text: 'Checking the candidate’s delivery eligibility…' }
+  }
+  if (status === 'error') {
+    return { code: 'deliver.eligibility_unavailable', text: eligibility.message || 'Delivery eligibility is unavailable for this candidate.' }
+  }
+  const verdict = eligibility.value
+  if (!verdict) {
+    return { code: 'deliver.eligibility_missing', text: 'No delivery eligibility verdict for this candidate.' }
+  }
+  if (!verdict.eligible) {
+    const primary = verdict.reasons[0]
+    return {
+      code: primary?.code || 'deliver.blocked',
+      text: primary?.explanation || `Blocked by State (${verdict.state}).`,
+    }
+  }
+  return null
+}
+
 // Filter already-described task rows by a case-insensitive query over the
 // human-visible fields (title, scoped id, status, delivery status). An empty
 // query returns the rows unchanged.

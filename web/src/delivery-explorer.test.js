@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  deliverBlockReason,
   describeEligibility,
   describePrdContent,
   describeTaskReference,
   filterDescribedTasks,
   freshnessLabel,
+  nextDeliverCandidate,
   progressSummaryLabel,
   scopedTaskId,
   summarizeProgress,
@@ -134,6 +136,60 @@ describe('describeEligibility', () => {
   it('returns null when no verdict is present so the UI degrades truthfully', () => {
     expect(describeEligibility(null)).toBeNull()
     expect(describeEligibility(undefined)).toBeNull()
+  })
+})
+
+describe('nextDeliverCandidate (T006 criterion 2)', () => {
+  it('previews the FIRST State-ranked row as the single candidate', () => {
+    const cand = nextDeliverCandidate([
+      taskRef('release-alpha', 'T001', { title: 'Add routed chat' }),
+      taskRef('release-alpha', 'T002', { title: 'Persist retention' }),
+    ])
+    expect(cand.scopedId).toBe('release-alpha:T001')
+    expect(cand.title).toBe('Add routed chat')
+  })
+
+  it('never skips a blocked ranked head to reach a later ready task', () => {
+    // The head is blocked and a later row is ready; the candidate is still the
+    // blocked head — the flow must surface it blocked, not silently skip it.
+    const cand = nextDeliverCandidate([
+      taskRef('release-alpha', 'T001', { title: 'Blocked head', status: 'blocked' }),
+      taskRef('release-alpha', 'T002', { title: 'Ready later', status: 'ready' }),
+    ])
+    expect(cand.scopedId).toBe('release-alpha:T001')
+    expect(cand.status).toBe('blocked')
+  })
+
+  it('is truthfully null for an empty or absent list', () => {
+    expect(nextDeliverCandidate([])).toBeNull()
+    expect(nextDeliverCandidate(undefined)).toBeNull()
+  })
+})
+
+describe('deliverBlockReason (T006 criteria 2 + 4)', () => {
+  const candidate = describeTaskReference(taskRef('release-alpha', 'T001'))
+  const ready = { status: 'loaded', value: describeEligibility({ eligible: true, state: 'ready', reasons: [{ class: 'ready', code: 'ready.all_clear', explanation: 'All clear.' }] }), message: null }
+
+  it('requires a startable session first', () => {
+    expect(deliverBlockReason({ candidate, eligibility: ready, hasSession: false })).toMatchObject({ code: 'deliver.no_session' })
+  })
+
+  it('requires a loaded candidate', () => {
+    expect(deliverBlockReason({ candidate: null, eligibility: ready, hasSession: true })).toMatchObject({ code: 'deliver.no_candidate' })
+  })
+
+  it('blocks while eligibility is still loading or failed', () => {
+    expect(deliverBlockReason({ candidate, eligibility: { status: 'loading' }, hasSession: true })).toMatchObject({ code: 'deliver.eligibility_loading' })
+    expect(deliverBlockReason({ candidate, eligibility: { status: 'error', message: 'down' }, hasSession: true })).toMatchObject({ code: 'deliver.eligibility_unavailable', text: 'down' })
+  })
+
+  it('surfaces a blocked verdict’s own leading reason verbatim (no fabrication)', () => {
+    const eligibility = { status: 'loaded', value: describeEligibility({ eligible: false, state: 'blocked', reasons: [{ class: 'blocked', code: 'blocked.dependency_unmet', explanation: 'A dependency has not merged.' }] }), message: null }
+    expect(deliverBlockReason({ candidate, eligibility, hasSession: true })).toEqual({ code: 'blocked.dependency_unmet', text: 'A dependency has not merged.' })
+  })
+
+  it('returns null (deliverable) only when session, candidate, and an eligible verdict all hold', () => {
+    expect(deliverBlockReason({ candidate, eligibility: ready, hasSession: true })).toBeNull()
   })
 })
 
