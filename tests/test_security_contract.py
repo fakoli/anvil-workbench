@@ -1772,3 +1772,51 @@ def test_voice_relay_sources_reach_no_raw_provider():
     for token in forbidden:
         assert token not in voice_src, f"voice.py references a raw provider: {token}"
         assert token not in router_src, f"router.py references a raw provider: {token}"
+
+
+# --------------------------------------------------------------------------- #
+# advanced-model-playground T004 -- a deterministic mock/read tool run's SERVED
+# advanced trace never ferries a credential, endpoint, or path, even when the
+# tool's OWN output is saturated with the leak corpus.  The output is reduced to
+# a digest in the served record and the whole record is scrubbed on the last hop,
+# so untrusted tool output cannot ride out.  Driven through the wired dispatch
+# entrypoint (run_mock_tool_sequence over ChatToolDispatchService.dispatch).
+# --------------------------------------------------------------------------- #
+
+from workbench.advanced_routes import discover_advanced_routes as _amp_sec_discover
+from workbench.advanced_tools import (
+    DeterministicMockTools as _AmpSecTools,
+    MockToolFixture as _AmpSecFixture,
+    run_mock_tool_sequence as _amp_sec_run,
+)
+
+
+def _amp_sec_route():
+    return _amp_sec_discover([{
+        "route_id": "route.chat-fast", "serving_contract_version": "1.0.0",
+        "route_digest": "sha256:" + "a" * 64, "profile_digest": "sha256:" + "b" * 64,
+        "model_profile": "chat-fast",
+        "supported_controls": [{"name": "temperature_milli", "type": "int", "default": 300,
+                                "bounds": {"min": 0, "max": 1000}}],
+    }]).route("route.chat-fast")
+
+
+def test_amp_t004_served_tool_trace_never_leaks_the_corpus_from_tool_output():
+    # The read tool's output is the full leak corpus (a hostile connector); the
+    # served, scrubbed advanced trace must carry NONE of it -- only a digest.
+    service = _rtpsec_service()
+    hostile_output = {"leaked": _ptd_leaky_text(), "corpus": list(_PTD_CORPUS)}
+    tools = _AmpSecTools([_AmpSecFixture("tasks.list", "read_only", hostile_output)])
+    run = _amp_sec_run(
+        dispatch=service, tools=tools, script=[_rtpsec_read_request()], route=_amp_sec_route(),
+        branch_id="advbranch_ampsecure0001", conversation_id="conv_ampsecure0001",
+        turn_id="turn_ampsecure0001",
+    )
+    assert run.steps[0].outcome == "result"
+    served = _rtpsec_json.dumps(_ptd_scrub({"trace": run.trace}))
+    for secret in _PTD_CORPUS:
+        assert secret not in served, f"leak survived in served tool trace: {secret}"
+    # The raw output lives only in the inert delimited envelope, never the trace.
+    result_events = [e for e in run.trace["events"] if e["kind"] == "tool_result"]
+    assert result_events and "output" not in result_events[0]
+    assert run.steps[0].delimited_output["content_trust"] == "untrusted_task_data"
