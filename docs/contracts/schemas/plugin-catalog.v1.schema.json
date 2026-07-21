@@ -55,7 +55,7 @@
         "preview": {"enum": ["not_supported", "optional", "required"]},
         "confirmation": {"enum": ["not_required", "required"]},
         "human_approval": {"enum": ["not_required", "required"]},
-        "approval_action": {"type": ["string", "null"], "enum": ["invoke_effect_tool", "install_plugin", "upgrade_plugin", "downgrade_plugin", null]}
+        "approval_action": {"type": ["string", "null"], "enum": ["invoke_effect_tool", null], "description": "A tool gate can only bind the tool-invocation approval action. The lifecycle actions (install_plugin/upgrade_plugin/downgrade_plugin) are request-kind gates, never tool gates; constraining this enum to invoke_effect_tool|null keeps a catalog tool from declaring a dead lifecycle gate that validate_plugin_request would never honour."}
       },
       "allOf": [
         {"if": {"properties": {"human_approval": {"const": "required"}}, "required": ["human_approval"]},

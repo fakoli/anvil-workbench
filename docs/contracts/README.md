@@ -42,7 +42,7 @@ These resources are the implementation-facing companion to
 | State whether a scoped task may enter a Deliver flow, with stable blocked/stale codes and human-safe explanations | [delivery eligibility](schemas/delivery-eligibility.v1.schema.json) | [delivery eligibility](examples/delivery-eligibility.v1.json) |
 | Start delivering a scoped task with an idempotent, ids-only Deliver intent | [deliver intent](schemas/deliver-intent.v1.schema.json) | [deliver intent](examples/deliver-intent.v1.json) |
 | Acknowledge a Deliver intent with a typed accepted/duplicate/denied start receipt | [deliver start receipt](schemas/deliver-start-receipt.v1.schema.json) | [start receipt](examples/deliver-start-receipt.v1.json), [start refusal](examples/deliver-start-receipt.refusal.v1.json) |
-| Publish a reviewed, operator-signed registry of installable plugins with typed tools, effect classes, gates, and reference-only credentials | [plugin catalog](schemas/plugin-catalog.v1.schema.json) | [plugin catalog](examples/plugin.catalog.v1.json) |
+| Publish a reviewed, operator-authored registry of installable plugins with typed tools, effect classes, gates, and reference-only credentials (signatures deferred; the local reviewed bytes are the trust root) | [plugin catalog](schemas/plugin-catalog.v1.schema.json) | [plugin catalog](examples/plugin.catalog.v1.json) |
 | Scope which installed plugin tools one project or chat may enable, by pinned id/digest | [plugin capability](schemas/plugin-capability.v1.schema.json) | [plugin capability](examples/plugin.capability.v1.json) |
 | Invoke a plugin tool or run a lifecycle action with an idempotent, ids-only request | [plugin request](schemas/plugin-request.v1.schema.json) | [tool call](examples/plugin.request.tool-call.v1.json), [install](examples/plugin.request.install.v1.json) |
 | Show the redacted, hash-bound effect an owner approves before a gated plugin action | [plugin preview](schemas/plugin-preview.v1.schema.json) | [install preview](examples/plugin.preview.v1.json) |
@@ -150,8 +150,12 @@ These resources are the implementation-facing companion to
     or arbitrary-schema tool. Advanced records are hub-durable records and carry
     no delivery or State authority.
 
-13. A plugin catalog (`plugin-catalog.v1`) is a reviewed, operator-signed,
+13. A plugin catalog (`plugin-catalog.v1`) is a reviewed, operator-authored,
     version-pinned registry projection — there is no live remote marketplace.
+    Cryptographic signatures are intentionally deferred (see
+    [DIGESTING.md](DIGESTING.md)); the operator's configured local reviewed bytes
+    and the reviewed `provenance` block are the trust root, and the recomputed
+    `plugin_digest`/`catalog_digest` are the tamper-evidence.
     Every object is closed, so a raw shell command, an arbitrary URL/endpoint, a
     local path, a generic code/executable body, or a credential value is
     unrepresentable; host and data access are declared named scopes, never URLs,

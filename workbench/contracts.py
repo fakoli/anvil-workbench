@@ -509,14 +509,33 @@ def plugin_catalog_contract_validator() -> Draft202012Validator:
                 "plugin-catalog contract schema no longer closes its root object; "
                 "refusing to validate catalogs"
             )
+        defs = schema.get("$defs", {})
         for name in ("plugin", "tool", "gates", "credential", "hostAccess"):
-            node = schema.get("$defs", {}).get(name)
+            node = defs.get(name)
             if not isinstance(node, dict) or node.get("additionalProperties") is not False:
                 raise ContractValidationError(
                     f"plugin-catalog contract schema no longer closes its {name} object; "
                     "refusing to validate catalogs"
                 )
-        bound = schema.get("$defs", {}).get("rfc3339", {})
+        # Extend the tripwire to the remaining closed objects nested inside the
+        # root/plugin/tool, so a schema edit that reopened any of them (letting an
+        # unreviewed field ride in) also fails closed.
+        _plugin_def = defs.get("plugin", {}).get("properties", {}) if isinstance(defs.get("plugin"), dict) else {}
+        _tool_def = defs.get("tool", {}).get("properties", {}) if isinstance(defs.get("tool"), dict) else {}
+        _nested_closed = (
+            ("provenance", schema.get("properties", {}).get("provenance")),
+            ("publisher", _plugin_def.get("publisher")),
+            ("runtime", _plugin_def.get("runtime")),
+            ("openapi_source", _plugin_def.get("openapi_source")),
+            ("idempotency", _tool_def.get("idempotency")),
+        )
+        for name, node in _nested_closed:
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"plugin-catalog contract schema no longer closes its {name} object; "
+                    "refusing to validate catalogs"
+                )
+        bound = defs.get("rfc3339", {})
         if not isinstance(bound.get("maxLength"), int) or "pattern" not in bound:
             raise ContractValidationError(
                 "plugin-catalog contract schema no longer bounds its timestamps; "
@@ -607,9 +626,13 @@ def plugin_request_contract_validator() -> Draft202012Validator:
                 "plugin-request contract schema no longer closes its root object; "
                 "refusing to validate requests"
             )
+        props = schema.get("properties", {})
         for name, node in (
-            ("tool_call", schema.get("properties", {}).get("tool_call")),
-            ("approval", schema.get("properties", {}).get("approval")),
+            ("tool_call", props.get("tool_call")),
+            ("approval", props.get("approval")),
+            ("lifecycle", props.get("lifecycle")),
+            ("actor", props.get("actor")),
+            ("pluginRef", schema.get("$defs", {}).get("pluginRef")),
         ):
             if not isinstance(node, dict) or node.get("additionalProperties") is not False:
                 raise ContractValidationError(
@@ -793,6 +816,94 @@ def check_operation_schema(schema: Any) -> None:
         if not target.startswith("#"):
             raise ContractValidationError(f"declares a non-local {keyword}: {target!r}")
         _resolve_local_pointer(schema, keyword, target)
+
+
+_PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES = 64
+_PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH = 8
+
+# JSON Schema applicator keywords whose values are (or contain) subschemas. The
+# walk is confined to these so a data-bearing keyword (enum/const/default/
+# examples) can never be mistaken for a schema to close or count.
+_SCHEMA_SUBSCHEMA_KEYWORDS = (
+    "additionalProperties", "unevaluatedProperties", "propertyNames",
+    "items", "contains", "not", "if", "then", "else",
+)
+_SCHEMA_SUBSCHEMA_LIST_KEYWORDS = ("allOf", "anyOf", "oneOf", "prefixItems")
+_SCHEMA_SUBSCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "dependentSchemas")
+
+
+def _is_object_schema(node: Mapping[str, Any]) -> bool:
+    """True when a subschema constrains an object (by ``type`` or by properties)."""
+    declared = node.get("type")
+    if declared == "object" or (isinstance(declared, list) and "object" in declared):
+        return True
+    return isinstance(node.get("properties"), Mapping) or isinstance(node.get("patternProperties"), Mapping)
+
+
+def _check_plugin_schema_closed_and_bounded(node: Any, object_depth: int) -> None:
+    """Recursively enforce closed, size-bounded object schemas; fail closed.
+
+    Every object schema anywhere in the tree must declare
+    ``additionalProperties: false`` (an open nested object is the same smuggle
+    hole as an open root, one level down); no object may declare more than
+    :data:`_PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES` properties; and object schemas may
+    not nest deeper than :data:`_PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH` levels.
+    """
+    if not isinstance(node, Mapping):
+        return
+    depth = object_depth
+    if _is_object_schema(node):
+        if node.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "must close every object with additionalProperties:false "
+                "(an open nested object schema is a smuggle hole)"
+            )
+        depth += 1
+        if depth > _PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH:
+            raise ContractValidationError(
+                f"nests object schemas deeper than the {_PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH}-level bound"
+            )
+        properties = node.get("properties")
+        if isinstance(properties, Mapping) and len(properties) > _PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES:
+            raise ContractValidationError(
+                f"declares more than the {_PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES}-property bound on one object"
+            )
+    for keyword in _SCHEMA_SUBSCHEMA_KEYWORDS:
+        _check_plugin_schema_closed_and_bounded(node.get(keyword), depth)
+    for keyword in _SCHEMA_SUBSCHEMA_LIST_KEYWORDS:
+        seq = node.get(keyword)
+        if isinstance(seq, (list, tuple)):
+            for item in seq:
+                _check_plugin_schema_closed_and_bounded(item, depth)
+    for keyword in _SCHEMA_SUBSCHEMA_MAP_KEYWORDS:
+        mapping = node.get(keyword)
+        if isinstance(mapping, Mapping):
+            for item in mapping.values():
+                _check_plugin_schema_closed_and_bounded(item, depth)
+
+
+def check_plugin_tool_schema(schema: Any) -> None:
+    """Fail closed unless a plugin tool I/O schema is a *closed, bounded* object schema.
+
+    Extends :func:`check_operation_schema` (well-formedness, draft-2020-12
+    dialect, object root, intra-document ``#``-pointer refs only) with the two
+    properties a plugin tool's typed I/O boundary needs that a provider operation
+    schema does not guarantee: the root object *and every locally-reachable
+    nested object schema* must declare ``additionalProperties: false``, and the
+    schema is size-bounded (at most 64 properties per object, object nesting no
+    deeper than 8).  Without recursive closure an open ``{"type":"object"}``
+    field would let ``{"command":"curl … | sh","cwd":"/etc"}`` ride through the
+    typed boundary a reviewer thought was closed.
+
+    Kept plugin-specific rather than folded into ``check_operation_schema``: the
+    provider operation contract applies that helper only to operation *inputs*
+    and deliberately leaves operation *outputs* open, so recursive closure and
+    the size bound are plugin criterion-1 properties, not shared ones.  Hardening
+    the shared helper would change the operation contract's guarantees and its
+    review boundary for no plugin benefit.
+    """
+    check_operation_schema(schema)
+    _check_plugin_schema_closed_and_bounded(schema, 0)
 
 
 class ApprovalConsumer(Protocol):
@@ -1717,15 +1828,36 @@ _PLUGIN_LIFECYCLE_ACTION = {
     "upgrade": "upgrade_plugin",
     "downgrade": "downgrade_plugin",
 }
+# disable/remove are management actions: an approval is not mandatory (a
+# descriptor MAY require one to tighten the gate per R003), but when present its
+# action must correspond to the kind and its hash must bind the subject.
+_PLUGIN_MANAGEMENT_ACTION = {
+    "disable": "disable_plugin",
+    "remove": "remove_plugin",
+}
+# The single source of truth for kind->approval_action correspondence, so any
+# attached approval is validated fail-closed on EVERY kind, never only lifecycle.
+_PLUGIN_KIND_APPROVAL_ACTION = {
+    "tool_call": "invoke_effect_tool",
+    **_PLUGIN_LIFECYCLE_ACTION,
+    **_PLUGIN_MANAGEMENT_ACTION,
+}
 
 
 def _plugin_approval_subject(request: Mapping[str, Any]) -> dict[str, Any]:
     """Build the exact typed subject a plugin request's approval must bind.
 
     For a ``tool_call`` the subject is the target tool plus its typed inputs; for
-    a lifecycle action it is the pinned plugin and the selected version.  Hashing
-    this subject (never the whole request, never a raw command) is what binds a
-    one-time approval to the precise effect the owner reviewed.
+    a lifecycle or management action it is the pinned plugin and (for a lifecycle
+    action) the selected version.  Hashing this subject (never the whole request,
+    never a raw command) is what binds a one-time approval to the precise effect
+    the owner reviewed.
+
+    The subject intentionally pins ``plugin_digest`` (the installed/target
+    entry's tamper-evident identity) and, for a lifecycle action, only the
+    ``target_version``; ``lifecycle.from_version`` is deliberately omitted because
+    the pinned ``plugin_digest`` already fixes the exact entry the effect acts on,
+    so a replayed or drifted ``from_version`` cannot change what was approved.
     """
     plugin = request.get("plugin") if isinstance(request.get("plugin"), Mapping) else {}
     kind = request.get("kind")
@@ -1803,7 +1935,7 @@ def validate_plugin_catalog(catalog: Mapping[str, Any]) -> None:
 
             for field in ("input_schema", "output_schema"):
                 try:
-                    check_operation_schema(tool.get(field))
+                    check_plugin_tool_schema(tool.get(field))
                 except ContractValidationError as exc:
                     raise ContractValidationError(
                         f"plugin tool {plugin_id}:{tool_id} {field} {exc}"
@@ -1821,6 +1953,16 @@ def validate_plugin_catalog(catalog: Mapping[str, Any]) -> None:
                 if gates.get("human_approval") != "required" or not gates.get("approval_action"):
                     raise ContractValidationError(
                         f"effect-capable plugin tool must require a hash-bound approval: {plugin_id}:{tool_id}"
+                    )
+                # A tool gate binds the tool-invocation action only. A catalog
+                # tool cannot declare a lifecycle approval_action (install/
+                # upgrade/downgrade_plugin): validate_plugin_request hardcodes
+                # invoke_effect_tool for a tool_call, so any other declared gate
+                # would be dead text a reviewer might trust. Refuse it here as
+                # defence-in-depth behind the schema enum.
+                if gates.get("approval_action") != "invoke_effect_tool":
+                    raise ContractValidationError(
+                        f"plugin tool approval gate must be invoke_effect_tool: {plugin_id}:{tool_id}"
                     )
             elif effect == "read":
                 if gates.get("human_approval") != "not_required":
@@ -1913,11 +2055,15 @@ def validate_plugin_request(
       content, so it is a tamper-evident idempotency key — replaying an
       identical request is the same action, and a mutated request fails closed
       (R003 idempotency);
-    * an ``install``/``upgrade``/``downgrade`` carries a hash-bound approval
-      whose action matches the kind and whose ``payload_hash`` binds the exact
-      plugin/version subject (the R003 floor);
-    * an effectful ``tool_call`` approval, when present, binds the exact tool
-      inputs, never a raw command;
+    * an ``install``/``upgrade``/``downgrade`` carries both a ``preview_ref`` and
+      a hash-bound approval whose action matches the kind and whose
+      ``payload_hash`` binds the exact plugin/version subject (the R003 floor: a
+      preview AND an approval);
+    * an attached approval is validated fail-closed on EVERY kind — including
+      ``disable``/``remove`` and a ``tool_call`` — so a bogus or mismatched
+      action (e.g. ``install_plugin`` on a ``disable``) is refused, never
+      silently ignored; when present its ``payload_hash`` binds the exact typed
+      subject, never a raw command;
     * when a trusted ``catalog`` is supplied for a ``tool_call``, the plugin
       must be present at its pinned digest, the tool must exist, the typed
       inputs must validate against that tool's reviewed input schema, and an
@@ -1933,20 +2079,38 @@ def validate_plugin_request(
 
     kind = request.get("kind")
     approval = request.get("approval")
+
+    # R003 floor: an install/upgrade/downgrade always carries BOTH a preview_ref
+    # and a hash-bound approval. The schema already requires both, but the
+    # validator enforces it independently so a request never reaches an effect
+    # path on schema drift alone.
     if kind in _PLUGIN_LIFECYCLE_ACTION:
         if not isinstance(approval, Mapping):
             raise ContractValidationError(f"lifecycle {kind} requires a hash-bound approval")
-        if approval.get("action") != _PLUGIN_LIFECYCLE_ACTION[kind]:
-            raise ContractValidationError(f"approval action does not match the lifecycle kind: {kind}")
-        if approval.get("payload_hash") != approval_payload_digest(_plugin_approval_subject(request)):
-            raise ContractValidationError("approval hash does not bind the exact plugin/version subject")
+        if not isinstance(request.get("preview_ref"), Mapping):
+            raise ContractValidationError(f"lifecycle {kind} requires a preview_ref (R003: a preview AND an approval)")
+
+    # Fail-closed on EVERY kind: an attached approval must name the action that
+    # corresponds to the request kind and its payload_hash must bind the exact
+    # typed subject. A bogus {action: install_plugin} on a disable, or an
+    # unexpected approval on a read tool_call, is refused rather than ignored.
+    if isinstance(approval, Mapping):
+        expected_action = _PLUGIN_KIND_APPROVAL_ACTION.get(kind)
+        if approval.get("action") != expected_action:
+            if kind in _PLUGIN_LIFECYCLE_ACTION:
+                raise ContractValidationError(f"approval action does not match the lifecycle kind: {kind}")
+            if kind == "tool_call":
+                raise ContractValidationError("tool-call approval action must be invoke_effect_tool")
+            raise ContractValidationError(f"approval action does not match the request kind: {kind}")
+        subject_hash = approval_payload_digest(_plugin_approval_subject(request))
+        if approval.get("payload_hash") != subject_hash:
+            if kind == "tool_call":
+                raise ContractValidationError("approval hash does not bind the exact tool inputs")
+            if kind in _PLUGIN_LIFECYCLE_ACTION:
+                raise ContractValidationError("approval hash does not bind the exact plugin/version subject")
+            raise ContractValidationError("approval hash does not bind the exact plugin subject")
 
     if kind == "tool_call":
-        if isinstance(approval, Mapping):
-            if approval.get("action") != "invoke_effect_tool":
-                raise ContractValidationError("tool-call approval action must be invoke_effect_tool")
-            if approval.get("payload_hash") != approval_payload_digest(_plugin_approval_subject(request)):
-                raise ContractValidationError("approval hash does not bind the exact tool inputs")
         if catalog is not None:
             validate_plugin_catalog(catalog)
             plugin_ref = request.get("plugin")
@@ -1970,7 +2134,7 @@ def validate_plugin_request(
                 raise ContractValidationError("tool-call inputs must be an object")
             input_schema = tool.get("input_schema")
             try:
-                check_operation_schema(input_schema)
+                check_plugin_tool_schema(input_schema)
             except ContractValidationError as exc:
                 raise ContractValidationError(f"selected tool input schema {exc}") from exc
             try:

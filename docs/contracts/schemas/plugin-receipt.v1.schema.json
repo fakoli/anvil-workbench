@@ -16,7 +16,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 400,
-      "pattern": "^(?!.*(?:://|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\\\|[Bb]earer\\s|\\bsk-|\\bghp_|\\bxox|authorization|api[_-]?key|secret|token\\s*[:=])).{1,400}$"
+      "description": "A bounded, human-readable string held to a structurally constrained best-effort denylist: the negative lookahead refuses common URL, protocol-relative, IP/host:port, filesystem-path, backslash, connection-string, and credential/key shapes (AWS key ids, JWTs, PEM headers, bearer/authorization/api-key/secret/token markers, and .env/.pem-style cred file suffixes) so a routine receipt line cannot ferry a raw endpoint, path, or token into the UI. It is not a proof of unrepresentability — redaction remains the emitting plugin host's obligation; this pattern is a defence-in-depth backstop, not the primary redaction boundary.",
+      "pattern": "^(?!.*(?:://|//|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\\\|[Bb]earer\\s|\\bsk-|\\bghp_|\\bxox|authorization|api[_-]?key|secret|token\\s*[:=]|\\d{1,3}(?:\\.\\d{1,3}){3}|:\\d{2,5}/|AKIA[A-Z0-9]|eyJ|-----BEGIN|\\w+=\\w+|\\.(?:env|pem|key|crt|pfx|p12)\\b)).{1,400}$"
     },
     "pluginRef": {
       "type": "object",
