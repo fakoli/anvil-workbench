@@ -938,3 +938,205 @@ def test_a_model_operation_request_cannot_select_an_unprofiled_capability():
     with pytest.raises(TypedOperationError) as excinfo:
         resolve_operation_request(proposal, compile_delivery_snapshot(), published_catalog_set())
     assert excinfo.value.code == "operation.unprofiled"
+
+
+# ---------------------------------------------------------------------------
+# Reviewed-plugin credential-reference and health/redaction boundaries
+# (reviewed-tools-plugins T002 criterion 2 / T003): a credential value is never
+# representable, never accepted from nor returned to the browser/model, a
+# scope-mismatched credential blocks before dispatch, and every human-readable
+# receipt field is scrubbed even in the served response.
+# ---------------------------------------------------------------------------
+
+import dataclasses as _pl_dc
+import json as _pl_json
+from pathlib import Path as _PlPath
+
+import pytest as _pl_pytest
+from fastapi.testclient import TestClient as _PlTestClient
+
+from workbench.api import create_app as _pl_create_app
+from workbench.config import Settings as _PlSettings
+from workbench.contracts import (
+    ContractValidationError as _PlContractError,
+    approval_payload_digest as _pl_approval_hash,
+    contract_digest as _pl_digest,
+    validate_plugin_request as _pl_validate_request,
+)
+from workbench.graph import NullGraph as _PlNullGraph
+from workbench.plugin_host import (
+    CredentialBroker as _PlBroker,
+    CredentialHandle as _PlHandle,
+    HostInstallOutcome as _PlOutcome,
+    MemoryPluginHostStore as _PlStore,
+    PluginDiscovery as _PlDiscovery,
+    PluginHostError as _PlHostError,
+    PluginHostFailure as _PlHostFailure,
+    PluginHostService as _PlService,
+)
+from workbench.store import MemoryStore as _PlMemoryStore
+
+_PL_SEC_EXAMPLES = _PlPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+_PL_SEC_NOTIFIER_DIGEST = "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+
+# The adversarial corpus the gate seeds: distinctive raw markers that must never
+# survive into a persisted or served receipt.
+_PL_CORPUS = {
+    "akia": "AKIAIOSFODNN7EXAMPLE",
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+    "pem": "-----BEGIN RSA PRIVATE KEY-----",
+    "ipport": "10.0.0.5:5432",
+    "dottedhost": "internal.db.corp:9200",
+    "etcpath": "/etc/anvil/secrets.yaml",
+    "dburl": "postgresql://user:pw@db:5432/anvil",
+    "skproj": "sk-proj-ABCDEFGH12345678",
+    "ghp": "ghp_ABCDEFGHIJKLMNOP0123456789",
+    "cpath": "C:" + chr(92) + "Users" + chr(92) + "admin",
+    "tailnet": "serving.tail1234.ts.net",
+}
+_PL_CORPUS_TEXT = "install failed: " + " ".join(_PL_CORPUS.values())
+
+
+def _pl_sec_load(name):
+    return _pl_json.loads((_PL_SEC_EXAMPLES / name).read_text(encoding="utf-8"))
+
+
+def _pl_sec_install_request():
+    subject = {
+        "kind": "install", "plugin_id": "deploy-notifier",
+        "plugin_digest": _PL_SEC_NOTIFIER_DIGEST, "target_version": "1.0.0",
+    }
+    request = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_installnotifier01",
+        "request_digest": "sha256:" + "0" * 64,
+        "kind": "install",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": _PL_SEC_NOTIFIER_DIGEST},
+        "lifecycle": {"target_version": "1.0.0"},
+        "approval": {
+            "grant_id": "approval_installnotifier01", "action": "install_plugin",
+            "payload_hash": _pl_approval_hash(subject),
+        },
+        "preview_ref": {"preview_id": "plugprev_installnotifier01"},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    request["request_digest"] = _pl_digest("plugin-request", request)
+    return request
+
+
+def _pl_sec_discovery():
+    return _PlDiscovery(_pl_sec_load("plugin.catalog.v1.json"), _pl_sec_load("plugin.capability.v1.json"))
+
+
+def test_plugin_credential_value_is_structurally_unrepresentable_in_the_host():
+    # A credential handle carries a reference and an opaque token only -- there is
+    # no value/secret/material field, so a credential value cannot be constructed
+    # or serialized anywhere in the isolated host.
+    fields = {f.name for f in _pl_dc.fields(_PlHandle)}
+    assert fields == {"owner_host", "ref", "handle"}
+    for forbidden in ("value", "secret", "material", "password", "token_value", "key"):
+        assert forbidden not in fields
+    # And a minted handle serializes with no value.
+    handle = _PlHandle(owner_host="anvil-connector-host", ref="deploy-channel-ref", handle="abc123")
+    assert "value" not in _pl_dc.asdict(handle)
+
+
+def test_plugin_host_source_never_reads_a_credential_value_field():
+    # Static guarantee: the plugin-host module resolves credentials by reference
+    # only; it never dereferences a value/secret/password field off a credential.
+    src = (_PlPath(__file__).resolve().parents[1] / "workbench" / "plugin_host.py").read_text(encoding="utf-8")
+    for forbidden in ('credential["value"]', "credential.get(\"value\")",
+                      'credential["secret"]', 'credential["password"]',
+                      "credential_value", ".secret_value"):
+        assert forbidden not in src, f"plugin_host reads a credential value: {forbidden!r}"
+
+
+def test_plugin_request_cannot_carry_a_credential_value_from_the_browser():
+    # T003 criterion 1 (accept direction): the closed plugin-request schema makes
+    # a credential value unrepresentable -- an injected value field is refused, so
+    # no auth material can be accepted from the browser/model.
+    for injected in ("credential", "credential_value", "token", "secret", "api_key", "password"):
+        request = _pl_sec_install_request()
+        request[injected] = "s3cr3t-value"
+        request["request_digest"] = _pl_digest("plugin-request", request)
+        with _pl_pytest.raises(_PlContractError):
+            _pl_validate_request(request)
+
+
+def test_plugin_install_cannot_reach_a_workbench_or_bridge_credential():
+    # T002 criterion 2: even when the broker holds Workbench/bridge/provider
+    # secrets under other hosts, the notifier install resolves ONLY its own
+    # declared reference -- the unrelated secrets are structurally unreachable.
+    broker = _PlBroker({
+        "anvil-connector-host": ["deploy-channel-ref"],
+        "workbench-hub": ["workbench-db-password", "bridge-bootstrap-token", "github-token"],
+    })
+    store = _PlStore()
+    seen = {}
+
+    def runner(discovered, handles):
+        seen["refs"] = tuple(h.ref for h in handles)
+        seen["hosts"] = tuple(h.owner_host for h in handles)
+        return _PlOutcome(status="installed", output={"ok": True})
+
+    receipt = store.install(_pl_sec_install_request(), _pl_sec_discovery(), broker, runner)
+    assert receipt["status"] == "accepted"
+    assert seen["refs"] == ("deploy-channel-ref",)
+    assert seen["hosts"] == ("anvil-connector-host",)
+    # The receipt's credential_use likewise names only the plugin's own ref.
+    assert receipt["credential_use"]["credential_refs"] == ["deploy-channel-ref"]
+    for secret in ("workbench-db-password", "bridge-bootstrap-token", "github-token"):
+        assert secret not in _pl_json.dumps(receipt)
+
+
+def test_plugin_scope_mismatched_credential_blocks_before_dispatch():
+    # T003 criterion 2: a declared reference the host does not own is refused
+    # BEFORE the host runner is ever called; the install denies and persists
+    # nothing.
+    broker = _PlBroker({"anvil-connector-host": ["a-different-ref"]})
+    store = _PlStore()
+    ran = []
+
+    def runner(discovered, handles):
+        ran.append(True)
+        return _PlOutcome(status="installed")
+
+    receipt = store.install(_pl_sec_install_request(), _pl_sec_discovery(), broker, runner)
+    assert receipt["status"] == "denied"
+    assert receipt["error"]["code"] == "credential_unavailable"
+    assert ran == []
+    assert store.rows.receipts == {}
+
+
+def _pl_sec_client(service):
+    settings = _PlSettings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return _PlTestClient(_pl_create_app(
+        settings=settings, store=_PlMemoryStore(), graph=_PlNullGraph(), plugin_host_service=service,
+    ))
+
+
+def test_plugin_receipt_adversarial_prose_is_scrubbed_in_the_served_response():
+    # T003 criterion 3: an in-flight (reconcile) receipt whose host summary ferries
+    # the full credential/endpoint/path corpus is scrubbed both at construction
+    # and again at the API last hop -- the served response leaks nothing.
+    service = _PlService(_pl_sec_discovery())
+    request = _pl_sec_install_request()
+    service.store.install(
+        request, _pl_sec_discovery(), _PlBroker({"anvil-connector-host": ["deploy-channel-ref"]}),
+        lambda discovered, handles: _PlOutcome(status="unknown", summary=_PL_CORPUS_TEXT),
+    )
+    with _pl_sec_client(service) as client_:
+        served = client_.get(
+            f"/api/plugins/receipts/{request['request_digest']}", headers={"X-Workbench-Actor": "operator"}
+        )
+        assert served.status_code == 200
+        assert served.json()["receipt"]["status"] == "reconcile"
+        blob = served.text
+        for name, marker in _PL_CORPUS.items():
+            assert marker not in blob, f"served receipt leaked corpus item {name!r}: {marker!r}"
