@@ -1,0 +1,37 @@
+{
+  "schema_version": "workbench-task-reference/v1",
+  "ref": {
+    "prd_id": "release-alpha",
+    "task_id": "T001",
+    "prd_revision": 4
+  },
+  "scoped_id": "release-alpha:T001",
+  "run_label": "release-alpha:T001@r4",
+  "source": {
+    "provider": "anvil-state",
+    "provider_contract_version": "1.0.0",
+    "read_operation_id": "state.project.snapshot",
+    "snapshot_digest": "sha256:5ddaacfaf8405e6e3f0d0a920e0f1f2b20afadded4f8d98748fb42868da0ad2e"
+  },
+  "hierarchy": {
+    "prd_id": "release-alpha",
+    "prd_title": "Chat-first Workbench",
+    "feature_id": "release-alpha:F001"
+  },
+  "summary": {
+    "content_trust": "untrusted_task_data",
+    "title": "Add routed chat",
+    "status": "ready",
+    "priority": "critical",
+    "latest_delivery_status": "not_started",
+    "acceptance_criteria_count": 3,
+    "verification_summary": "Three acceptance criteria; one automated verification defined.",
+    "depends_on": [
+      {
+        "prd_id": "release-alpha",
+        "task_id": "T000",
+        "prd_revision": 4
+      }
+    ]
+  }
+}

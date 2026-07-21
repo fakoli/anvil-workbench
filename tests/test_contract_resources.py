@@ -53,6 +53,11 @@ SCHEMA_FOR_EXAMPLE = {
     "advanced-trace.v1.json": "advanced-trace.v1.schema.json",
     "advanced-preset.v1.json": "advanced-preset.v1.schema.json",
     "advanced-comparison.v1.json": "advanced-comparison.v1.schema.json",
+    "task-reference.v1.json": "task-reference.v1.schema.json",
+    "delivery-eligibility.v1.json": "delivery-eligibility.v1.schema.json",
+    "deliver-intent.v1.json": "deliver-intent.v1.schema.json",
+    "deliver-start-receipt.v1.json": "deliver-start-receipt.v1.schema.json",
+    "deliver-start-receipt.refusal.v1.json": "deliver-start-receipt.v1.schema.json",
 }
 
 
