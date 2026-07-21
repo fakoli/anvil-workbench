@@ -6,10 +6,13 @@ reimplements State transitions.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping, Sequence
 from uuid import uuid4
+
+from .redaction import redact_text
 
 
 def now_utc() -> datetime:
@@ -156,3 +159,740 @@ def as_json(value: object) -> dict[str, Any]:
         if isinstance(item, datetime):
             result[key] = item.isoformat()
     return result
+
+
+# ---------------------------------------------------------------------------
+# Immutable run context (state-context-operations:T005.1)
+# ---------------------------------------------------------------------------
+#
+# The run context is the bounded, frozen record captured at queue time for one
+# delivery run, BEFORE the bridge is dispatched.  It deliberately separates two
+# trust domains into two labeled top-level structures:
+#
+# * ``trusted`` -- the execution policy the hub pins: run/session/bridge/worktree
+#   identity, the immutable workflow snapshot pins (workflow + catalog +
+#   capability-profile digests), the capability grants (with effect + gate), the
+#   pinned skills, the run constraints, and the workflow cursor.  These are exact
+#   authority fields (``sha256:`` digests, semantic versions, enumerations); a
+#   model turn may read them but cannot widen them.
+# * ``untrusted`` -- PRD/task-derived prose: the task reference, title,
+#   acceptance criteria, scope, verification plan, work-packet digest, and the
+#   evidence citations.  Every prose field here is ``untrusted_task_data`` --
+#   readable for display, NEVER a control instruction.
+#
+# The shapes are frozen and their prose is credential-scrubbed on construction
+# (defense in depth on the last hop before the browser/model context).  The
+# closed field set means a State storage path, a credential, a raw command, or a
+# provider payload has no field to arrive through: a run context that omits a
+# required authority or human-readable field cannot be constructed, so a
+# dispatch that depends on it fails closed (T005.2).
+
+RUN_CONTEXT_SCHEMA_VERSION = "workbench-run-context/v1"
+
+#: The two trust labels the run context serializes under.  ``trusted`` carries
+#: pinned execution policy; ``untrusted`` carries PRD/task-derived prose.
+TRUSTED_POLICY_LABEL = "trusted_execution_policy"
+UNTRUSTED_TASK_LABEL = "untrusted_task_data"
+
+#: Closed enumerations mirrored from ``run-context.v1.schema.json`` so an
+#: unknown effect/gate fails closed rather than riding through as opaque text.
+RUN_EFFECTS = frozenset(
+    {"read", "bounded_execution", "state_mutation", "external_effect", "policy_mutation"}
+)
+RUN_GATES = frozenset({"none", "preview", "approval"})
+
+#: The conservative default gate policy: an effect that leaves the local sandbox
+#: (an external side effect or a policy mutation) requires an approval gate;
+#: everything else is ungated.  This is the reviewed default a snapshot-derived
+#: capability inherits when no explicit gate is supplied; it is intentionally
+#: fail-safe (approval, not none) for the effects that can escape the worktree.
+_DEFAULT_GATE_FOR_EFFECT = {
+    "read": "none",
+    "bounded_execution": "none",
+    "state_mutation": "none",
+    "external_effect": "approval",
+    "policy_mutation": "approval",
+}
+
+_RC_CONTEXT_ID = re.compile(r"^ctx_[a-zA-Z0-9_-]{8,128}$")
+_RC_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
+_RC_PRD_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_RC_TASK_ID = re.compile(r"^T[0-9]{3}(\.[0-9]{1,3})?$")
+_RC_CONTRACT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+_RC_WORKTREE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
+_RC_IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+
+
+class RunContextError(ValueError):
+    """A run context would omit or corrupt a required trusted/untrusted field."""
+
+
+def _rc_require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RunContextError(message)
+
+
+def _rc_prose(value: Any, limit: int, label: str, *, allow_empty: bool = False) -> str:
+    lower = 0 if allow_empty else 1
+    _rc_require(
+        isinstance(value, str) and lower <= len(value) <= limit,
+        f"{label} must be bounded readable text",
+    )
+    # Defense in depth: scrub any credential the untrusted prose might carry
+    # before it is ever persisted or rendered.
+    return redact_text(value)
+
+
+def _rc_digest(value: Any, label: str) -> str:
+    _rc_require(isinstance(value, str) and bool(_RC_DIGEST.match(value)), f"{label} must be a sha256 digest")
+    return value
+
+
+def _rc_ident(value: Any, label: str) -> str:
+    _rc_require(isinstance(value, str) and bool(_RC_IDENT.match(value)), f"{label} is not a valid identifier")
+    return value
+
+
+def _rc_int(value: Any, label: str, *, minimum: int, maximum: int | None = None) -> int:
+    _rc_require(
+        isinstance(value, int) and not isinstance(value, bool) and value >= minimum,
+        f"{label} must be an integer >= {minimum}",
+    )
+    if maximum is not None:
+        _rc_require(value <= maximum, f"{label} must be <= {maximum}")
+    return value
+
+
+def _rc_reject_unknown(data: Mapping[str, Any], allowed: set[str], label: str) -> None:
+    _rc_require(isinstance(data, Mapping), f"{label} must be an object")
+    unknown = set(data) - allowed
+    _rc_require(not unknown, f"{label} carries undeclared fields: {sorted(unknown)}")
+
+
+@dataclass(frozen=True)
+class RunIdentity:
+    """Trusted run/session/bridge/worktree identity captured at queue time."""
+
+    run_id: str
+    session_id: str
+    bridge_id: str
+    worktree_name: str
+    task_id: str | None = None
+    request_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run_id", _rc_ident(self.run_id, "identity run_id"))
+        object.__setattr__(self, "session_id", _rc_ident(self.session_id, "identity session_id"))
+        object.__setattr__(self, "bridge_id", _rc_ident(self.bridge_id, "identity bridge_id"))
+        _rc_require(
+            isinstance(self.worktree_name, str) and bool(_RC_WORKTREE.match(self.worktree_name)),
+            "identity worktree_name is invalid",
+        )
+        if self.task_id is not None:
+            object.__setattr__(self, "task_id", _rc_ident(self.task_id, "identity task_id"))
+        if self.request_id is not None:
+            object.__setattr__(self, "request_id", _rc_ident(self.request_id, "identity request_id"))
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "bridge_id": self.bridge_id,
+            "worktree_name": self.worktree_name,
+        }
+        if self.task_id is not None:
+            data["task_id"] = self.task_id
+        if self.request_id is not None:
+            data["request_id"] = self.request_id
+        return data
+
+
+@dataclass(frozen=True)
+class RunCatalogPin:
+    """One provider catalog pinned into the run context at its exact digest."""
+
+    provider: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", _rc_ident(self.provider, "catalog pin provider"))
+        object.__setattr__(self, "digest", _rc_digest(self.digest, "catalog pin digest"))
+
+    def as_dict(self) -> dict[str, str]:
+        return {"provider": self.provider, "digest": self.digest}
+
+
+@dataclass(frozen=True)
+class RunWorkflowPin:
+    """The immutable workflow snapshot pins the run context is bound to."""
+
+    workflow_id: str
+    workflow_revision: str
+    workflow_digest: str
+    catalogs: tuple[RunCatalogPin, ...]
+    capability_profile_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "catalogs", tuple(self.catalogs))
+        object.__setattr__(self, "workflow_id", _rc_ident(self.workflow_id, "workflow id"))
+        _rc_require(
+            isinstance(self.workflow_revision, str) and bool(self.workflow_revision),
+            "workflow revision is required",
+        )
+        object.__setattr__(self, "workflow_digest", _rc_digest(self.workflow_digest, "workflow digest"))
+        _rc_require(len(self.catalogs) >= 1, "workflow pin must carry at least one catalog digest")
+        for catalog in self.catalogs:
+            _rc_require(isinstance(catalog, RunCatalogPin), "workflow catalogs must be typed catalog pins")
+        providers = [catalog.provider for catalog in self.catalogs]
+        _rc_require(len(providers) == len(set(providers)), "workflow pin has duplicate catalog providers")
+        object.__setattr__(
+            self, "capability_profile_digest",
+            _rc_digest(self.capability_profile_digest, "capability_profile_digest"),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.workflow_id,
+            "revision": self.workflow_revision,
+            "digest": self.workflow_digest,
+            "catalogs": [catalog.as_dict() for catalog in self.catalogs],
+            "capability_profile_digest": self.capability_profile_digest,
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Any) -> "RunWorkflowPin":
+        """Derive the trusted workflow pin from a compiled ``WorkflowSnapshot``.
+
+        Only the immutable, source-attributed pins cross over — the workflow
+        identity/digest, each provider catalog digest, and the capability
+        profile digest — never an execution block, command, or path.
+        """
+        from .workflow_snapshot import WorkflowSnapshot
+
+        _rc_require(isinstance(snapshot, WorkflowSnapshot), "from_snapshot requires a WorkflowSnapshot")
+        return cls(
+            workflow_id=snapshot.workflow_id,
+            workflow_revision=snapshot.workflow_revision,
+            workflow_digest=snapshot.workflow_digest,
+            catalogs=tuple(
+                RunCatalogPin(provider=catalog.provider, digest=catalog.catalog_digest)
+                for catalog in snapshot.catalogs
+            ),
+            capability_profile_digest=snapshot.capability_profile_digest,
+        )
+
+
+@dataclass(frozen=True)
+class RunCapability:
+    """One pinned, gated operation grant the run may propose."""
+
+    operation_id: str
+    provider: str
+    contract_version: str
+    operation_digest: str
+    effect: str
+    gate: str
+    summary: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operation_id", _rc_ident(self.operation_id, "capability operation_id"))
+        object.__setattr__(self, "provider", _rc_ident(self.provider, "capability provider"))
+        _rc_require(
+            isinstance(self.contract_version, str) and bool(_RC_CONTRACT_VERSION.match(self.contract_version)),
+            "capability contract_version is not semantic",
+        )
+        object.__setattr__(self, "operation_digest", _rc_digest(self.operation_digest, "capability operation_digest"))
+        _rc_require(self.effect in RUN_EFFECTS, f"capability effect is not declared: {self.effect!r}")
+        _rc_require(self.gate in RUN_GATES, f"capability gate is not declared: {self.gate!r}")
+        if self.summary is not None:
+            object.__setattr__(self, "summary", _rc_prose(self.summary, 500, "capability summary"))
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "operation_id": self.operation_id,
+            "provider": self.provider,
+            "contract_version": self.contract_version,
+            "operation_digest": self.operation_digest,
+            "effect": self.effect,
+            "gate": self.gate,
+        }
+        if self.summary is not None:
+            data["summary"] = self.summary
+        return data
+
+
+@dataclass(frozen=True)
+class RunSkill:
+    """One pinned skill the run may invoke, with a human-readable purpose."""
+
+    id: str
+    digest: str
+    purpose: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _rc_ident(self.id, "skill id"))
+        object.__setattr__(self, "digest", _rc_digest(self.digest, "skill digest"))
+        object.__setattr__(self, "purpose", _rc_prose(self.purpose, 500, "skill purpose"))
+
+    def as_dict(self) -> dict[str, str]:
+        return {"id": self.id, "digest": self.digest, "purpose": self.purpose}
+
+
+@dataclass(frozen=True)
+class RunConstraints:
+    """Trusted run budget and stop conditions."""
+
+    turn_limit: int
+    tool_limit: int
+    stop_conditions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stop_conditions", tuple(self.stop_conditions))
+        _rc_int(self.turn_limit, "turn_limit", minimum=1, maximum=100)
+        _rc_int(self.tool_limit, "tool_limit", minimum=0, maximum=100)
+        _rc_require(len(self.stop_conditions) >= 1, "constraints require at least one stop condition")
+        object.__setattr__(
+            self, "stop_conditions",
+            tuple(_rc_prose(item, 500, "stop condition") for item in self.stop_conditions),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "turn_limit": self.turn_limit,
+            "tool_limit": self.tool_limit,
+            "stop_conditions": list(self.stop_conditions),
+        }
+
+
+@dataclass(frozen=True)
+class RunReceipt:
+    """One completed-step receipt reference on the workflow cursor."""
+
+    receipt_id: str
+    summary: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "receipt_id", _rc_ident(self.receipt_id, "receipt_id"))
+        object.__setattr__(self, "summary", _rc_prose(self.summary, 1000, "receipt summary"))
+
+    def as_dict(self) -> dict[str, str]:
+        return {"receipt_id": self.receipt_id, "summary": self.summary}
+
+
+@dataclass(frozen=True)
+class RunCursor:
+    """Trusted workflow cursor at capture time."""
+
+    step_id: str
+    attempt: int
+    completed_receipts: tuple[RunReceipt, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "completed_receipts", tuple(self.completed_receipts))
+        object.__setattr__(self, "step_id", _rc_ident(self.step_id, "cursor step_id"))
+        _rc_int(self.attempt, "cursor attempt", minimum=1)
+        for receipt in self.completed_receipts:
+            _rc_require(isinstance(receipt, RunReceipt), "cursor receipts must be typed receipts")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "step_id": self.step_id,
+            "attempt": self.attempt,
+            "completed_receipts": [receipt.as_dict() for receipt in self.completed_receipts],
+        }
+
+
+@dataclass(frozen=True)
+class TrustedRunPolicy:
+    """The pinned execution policy: exact authority, model-readable but unwidenable."""
+
+    identity: RunIdentity
+    workflow: RunWorkflowPin
+    capabilities: tuple[RunCapability, ...]
+    skills: tuple[RunSkill, ...]
+    constraints: RunConstraints
+    cursor: RunCursor
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "capabilities", tuple(self.capabilities))
+        object.__setattr__(self, "skills", tuple(self.skills))
+        _rc_require(isinstance(self.identity, RunIdentity), "policy identity must be a RunIdentity")
+        _rc_require(isinstance(self.workflow, RunWorkflowPin), "policy workflow must be a RunWorkflowPin")
+        _rc_require(isinstance(self.constraints, RunConstraints), "policy constraints must be RunConstraints")
+        _rc_require(isinstance(self.cursor, RunCursor), "policy cursor must be a RunCursor")
+        for capability in self.capabilities:
+            _rc_require(isinstance(capability, RunCapability), "policy capabilities must be typed grants")
+        seen_caps = {
+            (c.provider, c.operation_id, c.contract_version, c.operation_digest) for c in self.capabilities
+        }
+        _rc_require(len(seen_caps) == len(self.capabilities), "policy declares a duplicate capability grant")
+        for skill in self.skills:
+            _rc_require(isinstance(skill, RunSkill), "policy skills must be typed skills")
+        _rc_require(
+            len({skill.id for skill in self.skills}) == len(self.skills),
+            "policy declares a duplicate skill",
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "trust": TRUSTED_POLICY_LABEL,
+            "identity": self.identity.as_dict(),
+            "workflow": self.workflow.as_dict(),
+            "capabilities": [capability.as_dict() for capability in self.capabilities],
+            "skills": [skill.as_dict() for skill in self.skills],
+            "constraints": self.constraints.as_dict(),
+            "cursor": self.cursor.as_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class UntrustedTaskRef:
+    """The typed task reference (untrusted project data)."""
+
+    prd_id: str
+    task_id: str
+    prd_revision: int
+
+    def __post_init__(self) -> None:
+        _rc_require(isinstance(self.prd_id, str) and bool(_RC_PRD_ID.match(self.prd_id)), "task ref prd_id is invalid")
+        _rc_require(isinstance(self.task_id, str) and bool(_RC_TASK_ID.match(self.task_id)), "task ref task_id is invalid")
+        _rc_int(self.prd_revision, "task ref prd_revision", minimum=1)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"prd_id": self.prd_id, "task_id": self.task_id, "prd_revision": self.prd_revision}
+
+
+@dataclass(frozen=True)
+class UntrustedTask:
+    """PRD/task-derived prose captured for display; never a control instruction."""
+
+    ref: UntrustedTaskRef
+    title: str
+    acceptance_criteria: tuple[str, ...]
+    work_packet_digest: str
+    scope: tuple[str, ...] = ()
+    verification_plan: tuple[str, ...] = ()
+    content_trust: str = UNTRUSTED_TASK_LABEL
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "acceptance_criteria", tuple(self.acceptance_criteria))
+        object.__setattr__(self, "scope", tuple(self.scope))
+        object.__setattr__(self, "verification_plan", tuple(self.verification_plan))
+        _rc_require(isinstance(self.ref, UntrustedTaskRef), "task ref must be an UntrustedTaskRef")
+        object.__setattr__(self, "title", _rc_prose(self.title, 500, "task title"))
+        _rc_require(len(self.acceptance_criteria) >= 1, "task must carry at least one acceptance criterion")
+        object.__setattr__(
+            self, "acceptance_criteria",
+            tuple(_rc_prose(item, 2000, "acceptance criterion") for item in self.acceptance_criteria),
+        )
+        object.__setattr__(self, "work_packet_digest", _rc_digest(self.work_packet_digest, "work_packet_digest"))
+        object.__setattr__(self, "scope", tuple(_rc_prose(item, 500, "scope entry") for item in self.scope))
+        object.__setattr__(
+            self, "verification_plan",
+            tuple(_rc_prose(item, 1000, "verification step") for item in self.verification_plan),
+        )
+        _rc_require(self.content_trust == UNTRUSTED_TASK_LABEL, "task prose is always untrusted task data")
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "content_trust": self.content_trust,
+            "ref": self.ref.as_dict(),
+            "title": self.title,
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "work_packet_digest": self.work_packet_digest,
+        }
+        if self.scope:
+            data["scope"] = list(self.scope)
+        if self.verification_plan:
+            data["verification_plan"] = list(self.verification_plan)
+        return data
+
+
+@dataclass(frozen=True)
+class UntrustedEvidence:
+    """One evidence citation (untrusted project data)."""
+
+    citation: str
+    summary: str
+    content_trust: str = UNTRUSTED_TASK_LABEL
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "citation", _rc_prose(self.citation, 500, "evidence citation"))
+        object.__setattr__(self, "summary", _rc_prose(self.summary, 2000, "evidence summary"))
+        _rc_require(self.content_trust == UNTRUSTED_TASK_LABEL, "evidence prose is always untrusted task data")
+
+    def as_dict(self) -> dict[str, str]:
+        return {"content_trust": self.content_trust, "citation": self.citation, "summary": self.summary}
+
+
+@dataclass(frozen=True)
+class UntrustedProjectData:
+    """The untrusted PRD/task structure, labeled separately from trusted policy."""
+
+    task: UntrustedTask
+    evidence: tuple[UntrustedEvidence, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence", tuple(self.evidence))
+        _rc_require(isinstance(self.task, UntrustedTask), "untrusted data task must be an UntrustedTask")
+        for item in self.evidence:
+            _rc_require(isinstance(item, UntrustedEvidence), "untrusted evidence must be typed evidence")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "content_trust": UNTRUSTED_TASK_LABEL,
+            "task": self.task.as_dict(),
+            "evidence": [item.as_dict() for item in self.evidence],
+        }
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """The bounded, immutable run context captured at queue time.
+
+    Serializes into two separately labeled structures: ``trusted`` (pinned
+    execution policy) and ``untrusted`` (PRD/task-derived prose).  Frozen at
+    every level; its closed field set structurally cannot carry a State-storage
+    path, a credential, a raw command, or a provider payload.
+    """
+
+    context_id: str
+    trusted: TrustedRunPolicy
+    untrusted: UntrustedProjectData
+    schema_version: str = RUN_CONTEXT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _rc_require(
+            isinstance(self.context_id, str) and bool(_RC_CONTEXT_ID.match(self.context_id)),
+            "run context_id is invalid",
+        )
+        _rc_require(isinstance(self.trusted, TrustedRunPolicy), "run context trusted must be a TrustedRunPolicy")
+        _rc_require(isinstance(self.untrusted, UntrustedProjectData), "run context untrusted must be UntrustedProjectData")
+        _rc_require(self.schema_version == RUN_CONTEXT_SCHEMA_VERSION, "run context schema_version is unexpected")
+
+    @property
+    def run_id(self) -> str:
+        return self.trusted.identity.run_id
+
+    def as_dict(self) -> dict[str, Any]:
+        """Deterministic serialization; round-trips via :meth:`from_dict`."""
+        return {
+            "schema_version": self.schema_version,
+            "context_id": self.context_id,
+            "trusted": self.trusted.as_dict(),
+            "untrusted": self.untrusted.as_dict(),
+        }
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        context_id: str,
+        identity: RunIdentity,
+        workflow: RunWorkflowPin,
+        capabilities: Sequence[RunCapability],
+        skills: Sequence[RunSkill],
+        constraints: RunConstraints,
+        cursor: RunCursor,
+        task: UntrustedTask,
+        evidence: Sequence[UntrustedEvidence] = (),
+    ) -> "RunContext":
+        """Assemble and freeze a run context from typed trusted/untrusted parts.
+
+        Every required authority field (digests, versions, enums) and every
+        required human-readable field (title, acceptance criteria, skill
+        purposes, stop conditions) is validated by the component constructors;
+        a missing or malformed field raises :class:`RunContextError` here, so a
+        dispatch that captures this context first fails closed before any bridge
+        effect (T005.2).
+        """
+        return cls(
+            context_id=context_id,
+            trusted=TrustedRunPolicy(
+                identity=identity,
+                workflow=workflow,
+                capabilities=tuple(capabilities),
+                skills=tuple(skills),
+                constraints=constraints,
+                cursor=cursor,
+            ),
+            untrusted=UntrustedProjectData(task=task, evidence=tuple(evidence)),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RunContext":
+        _rc_reject_unknown(data, {"schema_version", "context_id", "trusted", "untrusted"}, "run context")
+        trusted = data["trusted"]
+        untrusted = data["untrusted"]
+        _rc_reject_unknown(
+            trusted,
+            {"trust", "identity", "workflow", "capabilities", "skills", "constraints", "cursor"},
+            "trusted policy",
+        )
+        _rc_reject_unknown(untrusted, {"content_trust", "task", "evidence"}, "untrusted data")
+        _rc_require(trusted.get("trust") == TRUSTED_POLICY_LABEL, "trusted policy label is wrong")
+        _rc_require(untrusted.get("content_trust") == UNTRUSTED_TASK_LABEL, "untrusted data label is wrong")
+
+        identity_data = trusted["identity"]
+        _rc_reject_unknown(
+            identity_data,
+            {"run_id", "session_id", "bridge_id", "worktree_name", "task_id", "request_id"},
+            "identity",
+        )
+        workflow_data = trusted["workflow"]
+        _rc_reject_unknown(
+            workflow_data, {"id", "revision", "digest", "catalogs", "capability_profile_digest"}, "workflow pin"
+        )
+        constraints_data = trusted["constraints"]
+        _rc_reject_unknown(constraints_data, {"turn_limit", "tool_limit", "stop_conditions"}, "constraints")
+        cursor_data = trusted["cursor"]
+        _rc_reject_unknown(cursor_data, {"step_id", "attempt", "completed_receipts"}, "cursor")
+        task_data = untrusted["task"]
+        _rc_reject_unknown(
+            task_data,
+            {"content_trust", "ref", "title", "acceptance_criteria", "work_packet_digest", "scope", "verification_plan"},
+            "task",
+        )
+        for capability in trusted["capabilities"]:
+            _rc_reject_unknown(
+                capability,
+                {"operation_id", "provider", "contract_version", "operation_digest", "effect", "gate", "summary"},
+                "capability",
+            )
+        for skill in trusted["skills"]:
+            _rc_reject_unknown(skill, {"id", "digest", "purpose"}, "skill")
+        for receipt in cursor_data.get("completed_receipts", ()):
+            _rc_reject_unknown(receipt, {"receipt_id", "summary"}, "receipt")
+        for item in untrusted.get("evidence", ()):
+            _rc_reject_unknown(item, {"content_trust", "citation", "summary"}, "evidence")
+        _rc_reject_unknown(task_data["ref"], {"prd_id", "task_id", "prd_revision"}, "task ref")
+        for catalog in workflow_data["catalogs"]:
+            _rc_reject_unknown(catalog, {"provider", "digest"}, "catalog pin")
+
+        return cls(
+            context_id=str(data["context_id"]),
+            schema_version=str(data.get("schema_version", RUN_CONTEXT_SCHEMA_VERSION)),
+            trusted=TrustedRunPolicy(
+                identity=RunIdentity(
+                    run_id=str(identity_data["run_id"]),
+                    session_id=str(identity_data["session_id"]),
+                    bridge_id=str(identity_data["bridge_id"]),
+                    worktree_name=str(identity_data["worktree_name"]),
+                    task_id=str(identity_data["task_id"]) if identity_data.get("task_id") is not None else None,
+                    request_id=str(identity_data["request_id"]) if identity_data.get("request_id") is not None else None,
+                ),
+                workflow=RunWorkflowPin(
+                    workflow_id=str(workflow_data["id"]),
+                    workflow_revision=str(workflow_data["revision"]),
+                    workflow_digest=str(workflow_data["digest"]),
+                    catalogs=tuple(
+                        RunCatalogPin(provider=str(c["provider"]), digest=str(c["digest"]))
+                        for c in workflow_data["catalogs"]
+                    ),
+                    capability_profile_digest=str(workflow_data["capability_profile_digest"]),
+                ),
+                capabilities=tuple(
+                    RunCapability(
+                        operation_id=str(c["operation_id"]),
+                        provider=str(c["provider"]),
+                        contract_version=str(c["contract_version"]),
+                        operation_digest=str(c["operation_digest"]),
+                        effect=str(c["effect"]),
+                        gate=str(c["gate"]),
+                        summary=str(c["summary"]) if c.get("summary") is not None else None,
+                    )
+                    for c in trusted["capabilities"]
+                ),
+                skills=tuple(
+                    RunSkill(id=str(s["id"]), digest=str(s["digest"]), purpose=str(s["purpose"]))
+                    for s in trusted["skills"]
+                ),
+                constraints=RunConstraints(
+                    turn_limit=constraints_data["turn_limit"],
+                    tool_limit=constraints_data["tool_limit"],
+                    stop_conditions=tuple(str(item) for item in constraints_data["stop_conditions"]),
+                ),
+                cursor=RunCursor(
+                    step_id=str(cursor_data["step_id"]),
+                    attempt=cursor_data["attempt"],
+                    completed_receipts=tuple(
+                        RunReceipt(receipt_id=str(r["receipt_id"]), summary=str(r["summary"]))
+                        for r in cursor_data.get("completed_receipts", ())
+                    ),
+                ),
+            ),
+            untrusted=UntrustedProjectData(
+                task=UntrustedTask(
+                    ref=UntrustedTaskRef(
+                        prd_id=str(task_data["ref"]["prd_id"]),
+                        task_id=str(task_data["ref"]["task_id"]),
+                        prd_revision=task_data["ref"]["prd_revision"],
+                    ),
+                    title=str(task_data["title"]),
+                    acceptance_criteria=tuple(str(item) for item in task_data["acceptance_criteria"]),
+                    work_packet_digest=str(task_data["work_packet_digest"]),
+                    scope=tuple(str(item) for item in task_data.get("scope", ())),
+                    verification_plan=tuple(str(item) for item in task_data.get("verification_plan", ())),
+                ),
+                evidence=tuple(
+                    UntrustedEvidence(citation=str(e["citation"]), summary=str(e["summary"]))
+                    for e in untrusted.get("evidence", ())
+                ),
+            ),
+        )
+
+
+def run_capabilities_from_snapshot(
+    snapshot: Any, *, gates: Mapping[tuple[str, str], str] | None = None,
+    summaries: Mapping[tuple[str, str], str] | None = None,
+) -> tuple[RunCapability, ...]:
+    """Derive gated run capabilities from a compiled ``WorkflowSnapshot``.
+
+    Each pinned operation becomes a :class:`RunCapability` carrying the exact
+    ``(provider, id, contract_version, operation_digest, effect)`` from the
+    snapshot.  The gate defaults from :data:`_DEFAULT_GATE_FOR_EFFECT` (approval
+    for effects that leave the sandbox) and may be overridden per
+    ``(provider, operation_id)``; an override to an undeclared gate fails closed.
+    """
+    from .workflow_snapshot import WorkflowSnapshot
+
+    _rc_require(isinstance(snapshot, WorkflowSnapshot), "run_capabilities_from_snapshot requires a WorkflowSnapshot")
+    gates = gates or {}
+    summaries = summaries or {}
+    capabilities: list[RunCapability] = []
+    for operation in snapshot.operations:
+        key = (operation.provider, operation.id)
+        gate = gates.get(key, _DEFAULT_GATE_FOR_EFFECT.get(operation.effect, "approval"))
+        capabilities.append(
+            RunCapability(
+                operation_id=operation.id,
+                provider=operation.provider,
+                contract_version=operation.contract_version,
+                operation_digest=operation.operation_digest,
+                effect=operation.effect,
+                gate=gate,
+                summary=summaries.get(key),
+            )
+        )
+    return tuple(capabilities)
+
+
+def run_skills_from_snapshot(snapshot: Any, purposes: Mapping[str, str]) -> tuple[RunSkill, ...]:
+    """Derive pinned run skills from a snapshot, requiring a purpose per skill.
+
+    A skill selected into the snapshot with no reviewed purpose is a missing
+    required human-readable field and fails closed, so it can never be captured
+    (and therefore never dispatched) without one.
+    """
+    from .workflow_snapshot import WorkflowSnapshot
+
+    _rc_require(isinstance(snapshot, WorkflowSnapshot), "run_skills_from_snapshot requires a WorkflowSnapshot")
+    skills: list[RunSkill] = []
+    for skill in snapshot.skills:
+        purpose = purposes.get(skill.id)
+        _rc_require(
+            isinstance(purpose, str) and bool(purpose),
+            f"run skill is missing a required human-readable purpose: {skill.id}",
+        )
+        skills.append(RunSkill(id=skill.id, digest=skill.digest, purpose=purpose))
+    return tuple(skills)
