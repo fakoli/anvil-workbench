@@ -1020,6 +1020,19 @@ OPERATION_REFUSAL_CODES = frozenset({
     "approval.action_mismatch",
     "approval.hash_mismatch",
     "approval.invalid",
+    # --- preferences-configuration:T004.2/T004.3 policy-operation gates ---
+    # A hub-routed policy operation naming an external provider's policy (a
+    # Serving route/profile change, or any other provider-owned effect) for which
+    # the owning provider has NOT declared the exact allowed operation: the hub
+    # refuses truthfully rather than pretending it mutated a resource it does not
+    # own.  A denied receipt carrying this code is the truthful "read-only /
+    # disabled" result (T004.2 criterion 4 / T004 criterion 4).
+    "policy.external_read_only",
+    # A hub-local policy commit lost its optimistic version race (the stored value
+    # moved since the operation was built).  The prior value is preserved and the
+    # attempt stays retriable after a reload -- an unambiguous failure, never a
+    # fabricated success (T004.3 criterion 2).
+    "policy.stale_version",
 })
 
 #: The credential-class token guard mirrored from the ``error.safe_summary``

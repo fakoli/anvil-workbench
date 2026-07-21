@@ -720,7 +720,7 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
       : { tasks: [taskRef('release-beta', 'T001', 'Persist retention')] }))
     fetchTaskEligibility.mockImplementation((_p, prdId) => prdId === 'release-alpha'
       ? new Promise((resolve) => { resolveAlpha = () => resolve(eligibilityVerdict('release-alpha', 'T001', { reasons: [{ class: 'blocked', code: 'blocked.alpha_stale', explanation: 'Alpha resolved late.' }] })) })
-      : Promise.resolve(eligibilityVerdict('release-beta', 'T001', { eligible: true, state: 'ready', reasons: [{ class: 'ready', code: 'ready.beta_current', explanation: 'Beta is current.' }] })))
+      : Promise.resolve(eligibilityVerdict('release-beta', 'T001', { eligible: true, state: 'eligible', reasons: [{ class: 'info', code: 'info.ready', explanation: 'Beta is current.' }] })))
     const user = await renderExplorer()
     await openPrd(user, 'release-alpha')
     await screen.findByRole('article', { name: 'PRD Chat-first Workbench' })
@@ -730,11 +730,11 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     await user.click(screen.getByRole('button', { name: /release-alpha:T001/ }))
     await user.click(screen.getByRole('button', { name: /release-beta:T001/ }))
     const detailB = await screen.findByRole('region', { name: /release-beta:T001/ })
-    expect(await within(detailB).findByText('ready.beta_current')).toBeTruthy()
+    expect(await within(detailB).findByText('info.ready')).toBeTruthy() // beta's contract-valid eligible verdict
     // Now alpha's late fetch resolves. It must NOT repaint beta's open pane.
     await act(async () => { resolveAlpha(); await Promise.resolve() })
     expect(within(detailB).queryByText('blocked.alpha_stale')).toBeNull() // stale verdict dropped
-    expect(within(detailB).getByText('ready.beta_current')).toBeTruthy() // beta's own verdict stands
+    expect(within(detailB).getByText('info.ready')).toBeTruthy() // beta's own verdict stands
   })
 
   it('closes the detail with a visible Close button, returns focus to the rail, and clears the hash (#3/#4)', async () => {
@@ -790,5 +790,285 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     await user.click(screen.getByRole('button', { name: 'Delivery' }))
     await screen.findByRole('heading', { name: 'Task TASK-1' })
     expect(document.querySelector('.app-shell').classList.contains('explorer-active')).toBe(false)
+  })
+})
+
+// --- Deliver controls, setup sheet, and truthful blocked states (T006) --------
+//
+// The Deliver sheet reads the SAME merged delivery-projection GET shapes the
+// explorer proves (fetchPrdTasks → {tasks}, fetchTaskEligibility → {eligibility},
+// via the taskRef/eligibilityVerdict fixtures above), and starts through the REAL
+// wired POST /api/workflows/{id}/start (startWorkflow → {workflow, run}). There is
+// no separate Deliver route, so a drift in any of these served shapes breaks these
+// tests rather than passing against a mock's own return.
+
+describe('Deliver controls (plan-task-delivery T006)', () => {
+  // The ONLY contract-valid eligible verdict (delivery-eligibility.v1): state is
+  // 'eligible' (never 'ready'), the reason class is 'info' and its code is
+  // 'info.ready'. `state`/`code`/`class` of 'ready' is a shape the server can
+  // NEVER serve — the state enum is ["eligible","blocked","stale"], the code
+  // enum ends at "info.ready", and workbench/contracts.py requires state to
+  // equal the derived "eligible" — so it must not appear even in a fixture.
+  const readyVerdict = (prdId, taskId) => eligibilityVerdict(prdId, taskId, {
+    eligible: true, state: 'eligible',
+    reasons: [{ class: 'info', code: 'info.ready', explanation: 'All preconditions pass.' }],
+  })
+
+  async function openSheet(user) {
+    await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
+    return screen.getByRole('dialog', { name: 'Deliver next task' })
+  }
+
+  async function loadCandidate(user, prdId, { session = 'workflow_1' } = {}) {
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Deliver into session' }), session)
+    await user.type(screen.getByRole('textbox', { name: 'PRD id' }), prdId)
+    await user.click(screen.getByRole('button', { name: 'Load ranked candidate' }))
+  }
+
+  it('starts a ready candidate in one activation through the real workflow-start route and routes to the run', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' })] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    // The started run appears on reload so "routes to the run" is a rendered fact.
+    const startedRun = { id: 'run_2', project_id: 'project_1', session_id: 'session_1', task_id: 'T001', model: 'planning', status: 'queued' }
+    startWorkflow.mockResolvedValue({ workflow: {}, run: startedRun })
+    bootstrap.mockResolvedValue({ ...fixture, runs: [startedRun, ...fixture.runs] })
+    const deliver = await screen.findByRole('button', { name: /Deliver Add routed chat/ })
+    await waitFor(() => expect(deliver.disabled).toBe(false))
+    // The eligible verdict renders its state as 'eligible' (the ONLY
+    // contract-servable eligible state). Reverting the fixture to the unservable
+    // state:'ready' regresses the eligibility Status to render 'ready', leaving no
+    // 'eligible' node, so this getByText throws and fails (MUST #1 regression
+    // guard). The candidate's own status pill is a separate 'ready', so we assert
+    // on the presence of the distinct 'eligible' verdict state rather than its
+    // absence.
+    const dialog = screen.getByRole('dialog', { name: 'Deliver next task' })
+    expect(within(dialog).getByText('eligible')).toBeTruthy()
+    await user.click(deliver)
+    // The REAL wired route, called exactly once with the approved ids (plus the
+    // dismissal AbortSignal threaded for the hung-start escape hatch, #4).
+    expect(startWorkflow).toHaveBeenCalledTimes(1)
+    expect(startWorkflow).toHaveBeenCalledWith('workflow_1', { task_id: 'T001', model: 'planning' }, { signal: expect.any(AbortSignal) })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+    expect(await screen.findByRole('heading', { name: 'Task T001' })).toBeTruthy() // routed to the resulting run
+  })
+
+  it('previews exactly one State-ranked candidate and never a batch of tasks', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [
+      taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' }),
+      taskRef('release-alpha', 'T002', 'Persist retention', { status: 'ready' }),
+      taskRef('release-alpha', 'T003', 'Third candidate', { status: 'ready' }),
+    ] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    expect(await screen.findByText('Add routed chat')).toBeTruthy() // the single ranked head
+    expect(screen.queryByText('Persist retention')).toBeNull() // no batch/list
+    expect(screen.queryByText('Third candidate')).toBeNull()
+    // Eligibility is checked for the one candidate only, never the whole plan.
+    expect(fetchTaskEligibility).toHaveBeenCalledWith('project_1', 'release-alpha', 'T001')
+    expect(fetchTaskEligibility).not.toHaveBeenCalledWith('project_1', 'release-alpha', 'T002')
+  })
+
+  it('shows a blocked ranked head truthfully, disables Deliver with an accessible reason, and never skips it', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [
+      taskRef('release-alpha', 'T001', 'Blocked head', { status: 'blocked' }),
+      taskRef('release-alpha', 'T002', 'Ready later task', { status: 'ready' }),
+    ] })
+    fetchTaskEligibility.mockResolvedValue(eligibilityVerdict('release-alpha', 'T001')) // eligible:false, blocked.dependency_unmet
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    // The candidate is the blocked head, not the later ready row (no silent skip).
+    expect(await screen.findByText('Blocked head')).toBeTruthy()
+    expect(screen.queryByText('Ready later task')).toBeNull()
+    const deliver = screen.getByRole('button', { name: /Deliver Blocked head/ })
+    await waitFor(() => expect(deliver.disabled).toBe(true))
+    expect(deliver.getAttribute('aria-disabled')).toBe('true')
+    // The reason is real TEXT bound to the control (not colour alone).
+    const describedById = deliver.getAttribute('aria-describedby')
+    expect(describedById).toBeTruthy()
+    const reason = document.getElementById(describedById)
+    expect(reason.textContent).toMatch(/dependency has not merged/i)
+    expect(reason.textContent).toMatch(/blocked\.dependency_unmet/)
+    // A blocked Deliver never starts a run, even when clicked.
+    await user.click(deliver)
+    expect(startWorkflow).not.toHaveBeenCalled()
+  })
+
+  it('offers only approved session ids/titles and never asks for a path or a raw command', async () => {
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    const sessionSelect = screen.getByRole('combobox', { name: 'Deliver into session' })
+    const values = within(sessionSelect).getAllByRole('option').map((option) => option.value)
+    expect(values.filter(Boolean)).toEqual(['workflow_1']) // only an approved workflow/session id
+    // The one free-text field is the approved PRD id — no path, command, or route field.
+    expect(screen.getByRole('textbox', { name: 'PRD id' })).toBeTruthy()
+    expect(screen.queryByRole('textbox', { name: /path|command|model|route/i })).toBeNull()
+    expect(screen.queryByLabelText(/path|command/i)).toBeNull()
+  })
+
+  it('fires the Deliver call exactly once even when activated twice quickly (no double-submit)', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' })] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    let resolveStart
+    startWorkflow.mockImplementation(() => new Promise((resolve) => {
+      resolveStart = () => resolve({ workflow: {}, run: { id: 'run_2', session_id: 'session_1', task_id: 'T001', model: 'planning', status: 'queued' } })
+    }))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    const deliver = await screen.findByRole('button', { name: /Deliver Add routed chat/ })
+    await waitFor(() => expect(deliver.disabled).toBe(false))
+    await user.click(deliver)
+    await user.click(deliver) // second activation while the first start is in flight
+    expect(startWorkflow).toHaveBeenCalledTimes(1)
+    resolveStart()
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+  })
+
+  it('opens a focus-managed setup sheet closable by a visible Close and by Escape', async () => {
+    const user = userEvent.setup(); await renderLive()
+    await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
+    const dialog = screen.getByRole('dialog', { name: 'Deliver next task' })
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true)) // focus moved into the sheet
+    await user.keyboard('{Escape}') // Escape works even with focus inside the sheet
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+    // Focus is restored to the specific opener, not merely "not body" (NOTE #8).
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Deliver next task' }))
+    // Reopen and close via the discoverable Close control.
+    await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
+    await user.click(screen.getByRole('button', { name: 'Close Deliver next task' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+  })
+
+  it('announces the blocked state in an updating live region', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Blocked head', { status: 'blocked' })] })
+    fetchTaskEligibility.mockResolvedValue(eligibilityVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    const dialog = await openSheet(user)
+    const live = within(dialog).getByRole('status')
+    expect(live.getAttribute('aria-live')).toBe('polite')
+    await loadCandidate(user, 'release-alpha')
+    await waitFor(() => expect(live.textContent).toMatch(/blocked/i)) // start/blocked announced, not silent
+  })
+
+  // SHOULD #2: the displayed route + the start payload derive from the workflow's
+  // entry agent step (workbench/store.py `step.get("model")`), the real source,
+  // not a phantom top-level `workflow.model` that the served shape never carries.
+  const withEntryModel = (model) => ({
+    ...fixture,
+    workflows: [{ ...fixture.workflows[0], definition: { entry: 'implement', steps: [{ id: 'implement', kind: 'agent', model, skills: [], next: [] }] } }],
+  })
+
+  it('derives the displayed route and the start payload from the workflow entry-step model (#2)', async () => {
+    bootstrap.mockResolvedValue(withEntryModel('heavy-local'))
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' })] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    // The candidate meta shows the entry-step route verbatim, not the default.
+    expect(await screen.findByText(/route heavy-local/)).toBeTruthy()
+    expect(screen.queryByText(/route heavy-local \(default\)/)).toBeNull()
+    startWorkflow.mockResolvedValue({ workflow: {}, run: { id: 'run_2', session_id: 'session_1', task_id: 'T001', model: 'heavy-local', status: 'queued' } })
+    bootstrap.mockResolvedValue({ ...withEntryModel('heavy-local'), runs: [{ id: 'run_2', session_id: 'session_1', task_id: 'T001', model: 'heavy-local', status: 'queued' }, ...fixture.runs] })
+    const deliver = await screen.findByRole('button', { name: /Deliver Add routed chat/ })
+    await waitFor(() => expect(deliver.disabled).toBe(false))
+    await user.click(deliver)
+    // The derived route feeds the REAL POST, proving the derivation is not cosmetic.
+    expect(startWorkflow).toHaveBeenCalledWith('workflow_1', { task_id: 'T001', model: 'heavy-local' }, { signal: expect.any(AbortSignal) })
+  })
+
+  it('labels the route as the hub default when the definition pins no entry-step model (#2 fallback)', async () => {
+    // The default fixture workflow carries no `definition`, so no route is derived.
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' })] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    expect(await screen.findByText(/route planning \(default\)/)).toBeTruthy() // honest default, not a claimed derivation
+  })
+
+  it('drops a superseded out-of-order candidate load so the sheet shows the current PRD (#3 loadSeq)', async () => {
+    // Reproduces the sheet's own T001-vs-T001 hazard: a slow alpha load then a fast
+    // beta load. Without the loadSeq guard, alpha's late resolve repaints the sheet
+    // with the superseded candidate under the current (beta) selection.
+    let resolveAlphaTasks
+    fetchPrdTasks.mockImplementation((_p, prdId) => prdId === 'release-alpha'
+      ? new Promise((resolve) => { resolveAlphaTasks = () => resolve({ tasks: [taskRef('release-alpha', 'T001', 'Alpha head', { status: 'ready' })] }) })
+      : Promise.resolve({ tasks: [taskRef('release-beta', 'T002', 'Beta head', { status: 'ready' })] }))
+    fetchTaskEligibility.mockImplementation((_p, prdId, taskId) => Promise.resolve(readyVerdict(prdId, taskId)))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Deliver into session' }), 'workflow_1')
+    await user.type(screen.getByRole('textbox', { name: 'PRD id' }), 'release-alpha')
+    await user.click(screen.getByRole('button', { name: 'Load ranked candidate' })) // slow alpha load starts
+    await user.clear(screen.getByRole('textbox', { name: 'PRD id' }))
+    await user.type(screen.getByRole('textbox', { name: 'PRD id' }), 'release-beta')
+    await user.click(screen.getByRole('button', { name: 'Load ranked candidate' })) // fast beta load supersedes it
+    expect(await screen.findByText('Beta head')).toBeTruthy()
+    // Alpha's late resolve must be dropped by the loadSeq guard.
+    await act(async () => { resolveAlphaTasks(); await Promise.resolve() })
+    expect(screen.getByText('Beta head')).toBeTruthy()
+    expect(screen.queryByText('Alpha head')).toBeNull() // superseded head never repaints the current sheet
+  })
+
+  it('lets the user dismiss a hung Deliver whose start never resolves, without trapping them (#4)', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' })] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    startWorkflow.mockImplementation(() => new Promise(() => {})) // hung bridge: the start never settles
+    const user = userEvent.setup(); await renderLive()
+    const dialog = await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    const deliver = await screen.findByRole('button', { name: /Deliver Add routed chat/ })
+    await waitFor(() => expect(deliver.disabled).toBe(false))
+    await user.click(deliver)
+    await waitFor(() => expect(deliver.disabled).toBe(true)) // busy: the start is in flight
+    // Cancel stays enabled during busy so a hung POST is never a permanent trap.
+    const cancel = within(dialog).getByRole('button', { name: 'Cancel' })
+    expect(cancel.disabled).toBe(false)
+    await user.click(cancel)
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+  })
+
+  it('does not close the sheet when Escape is pressed on the session select (native dropdown dismissal) (#5)', async () => {
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    const select = screen.getByRole('combobox', { name: 'Deliver into session' })
+    select.focus()
+    await user.keyboard('{Escape}') // Escape here dismisses the select's own listbox, not the sheet
+    expect(screen.getByRole('dialog', { name: 'Deliver next task' })).toBeTruthy() // the sheet's loaded state is preserved
+  })
+
+  it('binds an accessible reason to the disabled Deliver in every pre-load state (#6)', async () => {
+    const user = userEvent.setup(); await renderLive()
+    const dialog = await openSheet(user)
+    // No session chosen yet: the disabled Deliver still names why, bound by id.
+    const deliverNoSession = within(dialog).getByRole('button', { name: 'Deliver' })
+    expect(deliverNoSession.disabled).toBe(true)
+    const noSessionId = deliverNoSession.getAttribute('aria-describedby')
+    expect(noSessionId).toBeTruthy()
+    expect(document.getElementById(noSessionId).textContent).toMatch(/startable session/i)
+    expect(document.getElementById(noSessionId).textContent).toMatch(/deliver\.no_session/)
+    // Choose a session; the bound reason now names the missing candidate.
+    await user.selectOptions(within(dialog).getByRole('combobox', { name: 'Deliver into session' }), 'workflow_1')
+    const noCandidateId = within(dialog).getByRole('button', { name: 'Deliver' }).getAttribute('aria-describedby')
+    expect(noCandidateId).toBeTruthy()
+    expect(document.getElementById(noCandidateId).textContent).toMatch(/Load a PRD/i)
+    expect(document.getElementById(noCandidateId).textContent).toMatch(/deliver\.no_candidate/)
+  })
+
+  it('traps Tab focus within the sheet so keyboard users cannot reach the occluded background (#7)', async () => {
+    const user = userEvent.setup(); await renderLive()
+    const dialog = await openSheet(user)
+    // Tabbing repeatedly cycles within the dialog and never lands on a background control.
+    for (let i = 0; i < 12; i += 1) {
+      await user.tab()
+      expect(dialog.contains(document.activeElement)).toBe(true)
+    }
   })
 })

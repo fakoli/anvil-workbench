@@ -29,11 +29,17 @@ from .directives import session_directive_view, submit_directive
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .plugin_host import PluginHostService
 from .tool_dispatch import ChatToolDispatchService
+from .preference_gates import (
+    PolicyGateError,
+    PolicyGateService,
+    PolicyOperationRequest,
+)
 from .project_context_store import ProjectContextStore, UnknownProjectionError
 from .run_context_store import RunContextStore, UnknownRunContextError
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import (
-    PreferenceValidationError, as_json, resolve_effective_settings, reviewed_catalog_valid_refs,
+    PolicyOperationError, PreferenceValidationError, as_json, resolve_effective_settings,
+    reviewed_catalog_valid_refs,
 )
 from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
@@ -921,6 +927,146 @@ def build_preferences_router(
     return router
 
 
+class PolicyOperationBody(BaseModel):
+    # Closed body: a policy-changing form can only name a declared operation
+    # against a declared setting -- never a raw command, path, or extra field.
+    model_config = ConfigDict(extra="forbid")
+
+    setting_id: str = Field(pattern=_SETTING_ID_PATTERN)
+    scope: str = Field(pattern=r"^(personal|project|policy)$")
+    operation: str = Field(pattern=r"^(preference\.set|preference\.reset)$")
+    op_version: int = Field(ge=1)
+    value: Any = None
+    project_id: str | None = Field(default=None, max_length=128)
+    provider: str = Field(default="anvil-preferences", pattern=r"^[a-z][a-z0-9-]{0,63}$")
+
+
+class PolicyOperationApplyBody(PolicyOperationBody):
+    # An apply must name the human approval grant that authorizes THIS effect.
+    grant_id: str = Field(min_length=1, max_length=128)
+
+
+def build_policy_operations_router(
+    actor_dependency: Callable[..., str],
+    policy_gate_service: PolicyGateService | None,
+) -> APIRouter:
+    """Route project/system policy-changing forms through typed operations (T004).
+
+    Preview, approval-binding, and apply are distinct endpoints so previewing or
+    requesting is never performing.  ``apply`` consumes a one-time, hash-bound
+    approval and commits atomically (hub-local) or returns a truthful read-only
+    result (external provider), recording exactly one redacted typed receipt and,
+    for an unknown outcome, one reconciliation item.  Every response is scrubbed
+    on the last hop with :func:`~workbench.redaction.scrub_config_payload`.  When
+    ``policy_gate_service`` is ``None`` the surface is not configured and fails
+    closed with 503, mirroring the other injectable supervision models.
+    """
+    router = APIRouter(prefix="/api/policy-operations")
+
+    def gate() -> PolicyGateService:
+        if policy_gate_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="policy operation gate is not configured",
+            )
+        return policy_gate_service
+
+    def _request(body: PolicyOperationBody) -> PolicyOperationRequest:
+        try:
+            return PolicyOperationRequest(
+                setting_id=body.setting_id,
+                scope=body.scope,
+                operation=body.operation,
+                op_version=body.op_version,
+                value=body.value,
+                project_id=body.project_id,
+                provider=body.provider,
+            )
+        except PolicyGateError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+
+    def _build_or_422(service: PolicyGateService, request: PolicyOperationRequest, fn):
+        # Shared translation of the typed build/validation refusals a policy
+        # operation raises before any effect.  An unknown/cross-scope setting is
+        # the indistinct 404 the read surface uses; a malformed value is a 422.
+        try:
+            return fn()
+        except UnknownPreferenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PREFERENCE_DETAIL
+            ) from exc
+        except (PreferenceValidationError, PolicyOperationError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+
+    @router.post("/preview")
+    def preview_operation(
+        body: PolicyOperationBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Preview an operation and its bound digest; mutate nothing."""
+        service = gate()
+        request = _request(body)
+        result = _build_or_422(service, request, lambda: service.preview(request, actor))
+        return scrub_config_payload(result)
+
+    @router.post("/approval-binding")
+    def approval_binding(
+        body: PolicyOperationBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The exact (action, payload_hash, actor, scope_key) an approval must bind.
+
+        The gate never mints its own approval; this exposes the binding an
+        operator's out-of-band approval decision commits to, so a granted approval
+        is bound to precisely the previewed effect.
+        """
+        service = gate()
+        request = _request(body)
+        result = _build_or_422(service, request, lambda: service.approval_binding(request, actor))
+        return scrub_config_payload(result)
+
+    @router.post("/apply")
+    def apply_operation(
+        body: PolicyOperationApplyBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Perform the operation once under its one-time approval; record a receipt."""
+        service = gate()
+        request = _request(body)
+        receipt, replayed = _build_or_422(
+            service, request, lambda: service.apply(request, actor=actor, grant_id=body.grant_id),
+        )
+        return scrub_config_payload({"receipt": receipt, "replayed": replayed})
+
+    @router.get("/receipts/{idempotency_key:path}")
+    def get_receipt(
+        idempotency_key: str,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The stored terminal receipt for an operation identity (browser-safe)."""
+        service = gate()
+        receipt = service.receipt(idempotency_key)
+        if receipt is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="unknown policy operation receipt"
+            )
+        return scrub_config_payload({"receipt": receipt})
+
+    @router.get("/reconciliations")
+    def list_reconciliations(
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """All open reconciliation items for unknown policy outcomes (browser-safe)."""
+        service = gate()
+        return scrub_config_payload({"reconciliations": service.reconciliations()})
+
+    return router
+
+
 def create_app(
     settings: Settings | None = None,
     store: WorkbenchStore | None = None,
@@ -935,6 +1081,7 @@ def create_app(
     chat_tool_dispatch_service: "ChatToolDispatchService | None" = None,
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
+    policy_gate_service: PolicyGateService | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
@@ -986,6 +1133,12 @@ def create_app(
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless injected, so the browser surface fails closed (503).
     app.state.preference_store = preference_store
+    # The policy-operation gate routes policy-changing forms through the typed
+    # operation spine (preview/approval/apply -> receipt/reconciliation). Like the
+    # preference store it is a hub-side supervision model that is deliberately NOT
+    # wired into the live bridge poll loop; it stays ``None`` unless injected, so
+    # the browser surface fails closed (503).
+    app.state.policy_gate_service = policy_gate_service
 
     def actor(request: Request) -> str:
         name = (request.headers.get(settings.identity_header) or "").strip()
@@ -1114,6 +1267,10 @@ def create_app(
     # actor-scope effective values; a stale write is a reload-required 409
     # distinct from the 422 a malformed value raises.
     app.include_router(build_preferences_router(actor, preference_store, live_valid_refs_provider))
+    # Typed policy-operation surface (preferences-configuration:T004 / T004.2 /
+    # T004.3): preview, approval-binding, apply, and browser-safe receipt /
+    # reconciliation status. Fails closed (503) until a gate service is injected.
+    app.include_router(build_policy_operations_router(actor, policy_gate_service))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:
