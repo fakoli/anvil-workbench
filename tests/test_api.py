@@ -1095,6 +1095,64 @@ def test_plugin_discovery_lists_only_approved_and_enabled_plugins():
         assert {t["tool_id"] for t in viewer["tools"]} == {"tasks.list", "issues.read"}
 
 
+def test_plugin_discovery_omits_reviewed_but_not_enabled_plugins_and_tools():
+    # Finding 2 (discriminating fixture): the catalog reviews BOTH plugins and all
+    # tools, but the profile enables ONLY anvil-tasks-viewer's tasks.list. GET
+    # /api/plugins must reflect the ENABLED set -- omitting the not-enabled
+    # deploy-notifier plugin AND the not-enabled issues.read tool. It fails if the
+    # projection iterates the catalog instead of the enabled set. (The prior
+    # fixture enabled every plugin and tool, so a catalog-iterating regression
+    # would have passed unnoticed.)
+    catalog = _pl_load("plugin.catalog.v1.json")
+    capability = _pl_load("plugin.capability.v1.json")
+    capability["plugins"] = [e for e in capability["plugins"] if e["plugin_id"] == "anvil-tasks-viewer"]
+    for entry in capability["plugins"]:
+        entry["enabled_tools"] = ["tasks.list"]
+    capability["digest"] = _pl_digest("plugin-capability", capability)
+    service = _PlService(_PlDiscovery(catalog, capability))
+    with _pl_client(service) as client_:
+        body = client_.get("/api/plugins", headers=_PL_ACTOR).json()
+        ids = {p["plugin_id"] for p in body["plugins"]}
+        assert ids == {"anvil-tasks-viewer"}
+        assert "deploy-notifier" not in ids
+        viewer = next(p for p in body["plugins"] if p["plugin_id"] == "anvil-tasks-viewer")
+        assert {t["tool_id"] for t in viewer["tools"]} == {"tasks.list"}
+        assert "issues.read" not in {t["tool_id"] for t in viewer["tools"]}
+        # The reviewed-but-not-enabled plugin is also a plain 404 at the detail hop.
+        assert client_.get("/api/plugins/deploy-notifier", headers=_PL_ACTOR).status_code == 404
+
+
+def test_plugin_host_wired_from_settings_when_both_files_declared(tmp_path):
+    # Finding 3: an operator who declares BOTH the reviewed catalog and the
+    # capability profile files gets a live read-only discovery surface built by
+    # create_app from Settings -- no manual service injection. With neither declared
+    # the plugin host stays unconfigured and fails closed (503).
+    cat = tmp_path / "catalog.json"
+    cap = tmp_path / "capability.json"
+    cat.write_text(_pl_json.dumps(_pl_load("plugin.catalog.v1.json")), encoding="utf-8")
+    cap.write_text(_pl_json.dumps(_pl_load("plugin.capability.v1.json")), encoding="utf-8")
+    wired = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+        plugin_catalog_file=str(cat), plugin_capability_file=str(cap),
+    )
+    with TestClient(create_app(settings=wired, store=MemoryStore(), graph=NullGraph())) as client_:
+        resp = client_.get("/api/plugins", headers=_PL_ACTOR)
+        assert resp.status_code == 200
+        assert {p["plugin_id"] for p in resp.json()["plugins"]} == {"anvil-tasks-viewer", "deploy-notifier"}
+
+    unset = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    with TestClient(create_app(settings=unset, store=MemoryStore(), graph=NullGraph())) as client_:
+        assert client_.get("/api/plugins", headers=_PL_ACTOR).status_code == 503
+
+
 def test_plugin_discovery_returns_no_credential_value_to_the_browser():
     # T003 criterion 1 (return direction): the discovery projection reports
     # credentials by opaque reference only -- never a value.

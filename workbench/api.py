@@ -158,6 +158,26 @@ def _conversation_store(settings: Settings) -> ConversationStore | None:
     )
 
 
+def _plugin_host_service(settings: Settings) -> "PluginHostService | None":
+    """Build the read-only reviewed-plugin discovery surface from operator config.
+
+    Mirrors how the provider catalog and system health derive from operator-
+    declared config: when BOTH the reviewed catalog and the enable-only capability
+    profile paths are declared, load and fail-closed validate them into a
+    :class:`PluginHostService`.  This is operator trust-root config, not live-loop
+    wiring — the service is a read-only discovery + stored-receipt surface, the
+    router stays GET-only, and the install effect remains a service/bridge concern.
+    When either path is unset the plugin host is not configured and stays ``None``
+    so the browser surface fails closed (503).  A configured-but-invalid file
+    raises loudly here rather than serving a drifted catalog.
+    """
+    if not settings.plugin_catalog_file or not settings.plugin_capability_file:
+        return None
+    return PluginHostService.from_files(
+        settings.plugin_catalog_file, settings.plugin_capability_file,
+    )
+
+
 def _graph(settings: Settings) -> EvidenceGraph:
     if not settings.neo4j_password:
         return NullGraph()
@@ -479,6 +499,12 @@ def create_app(
     # failing closed. An injected service lets tests exercise mock bridge health
     # or seeded prose without env plumbing.
     system_health = system_health or SystemHealthService(settings)
+    # The reviewed-plugin discovery surface derives from operator-declared config
+    # (both the reviewed catalog and the capability profile paths), mirroring the
+    # provider-catalog / system-health precedent. An injected service overrides for
+    # tests; otherwise it is built from Settings when both files are declared, and
+    # stays None (503) when they are not.
+    plugin_host_service = plugin_host_service or _plugin_host_service(settings)
     app = FastAPI(title="Anvil Workbench", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.settings = settings
     app.state.store = store

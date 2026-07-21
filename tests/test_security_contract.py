@@ -970,8 +970,6 @@ from workbench.plugin_host import (
     HostInstallOutcome as _PlOutcome,
     MemoryPluginHostStore as _PlStore,
     PluginDiscovery as _PlDiscovery,
-    PluginHostError as _PlHostError,
-    PluginHostFailure as _PlHostFailure,
     PluginHostService as _PlService,
 )
 from workbench.store import MemoryStore as _PlMemoryStore
@@ -987,6 +985,10 @@ _PL_CORPUS = {
     "pem": "-----BEGIN RSA PRIVATE KEY-----",
     "ipport": "10.0.0.5:5432",
     "dottedhost": "internal.db.corp:9200",
+    # A scheme-less single-label host:port (a tailnet compose service name): the
+    # shared redact_config_text leaves a DOTLESS label:port intact (its host rule
+    # needs a dot), so only the receipt safeText backstop stops it (finding 1).
+    "dotlesshost": "serving:8443",
     "etcpath": "/etc/anvil/secrets.yaml",
     "dburl": "postgresql://user:pw@db:5432/anvil",
     "skproj": "sk-proj-ABCDEFGH12345678",
@@ -1140,3 +1142,25 @@ def test_plugin_receipt_adversarial_prose_is_scrubbed_in_the_served_response():
         blob = served.text
         for name, marker in _PL_CORPUS.items():
             assert marker not in blob, f"served receipt leaked corpus item {name!r}: {marker!r}"
+
+
+def test_plugin_receipt_scheme_less_host_port_is_scrubbed_in_the_served_response():
+    # Finding 1 (isolated revert-detection): a dotless single-label serving:8443
+    # (a tailnet compose service name) is NOT removed by the shared
+    # redact_config_text -- its host rule requires a dot -- so ONLY the receipt
+    # safeText backstop stops it. The summary carries no other sensitive shape, so
+    # reverting the backstop's lowercase-anchored host:port alternative lets
+    # serving:8443 ride out to the served response and makes this fail.
+    service = _PlService(_pl_sec_discovery())
+    request = _pl_sec_install_request()
+    service.store.install(
+        request, _pl_sec_discovery(), _PlBroker({"anvil-connector-host": ["deploy-channel-ref"]}),
+        lambda discovered, handles: _PlOutcome(status="unknown", summary="in-flight at serving:8443"),
+    )
+    with _pl_sec_client(service) as client_:
+        served = client_.get(
+            f"/api/plugins/receipts/{request['request_digest']}", headers={"X-Workbench-Actor": "operator"}
+        )
+        assert served.status_code == 200
+        assert served.json()["receipt"]["status"] == "reconcile"
+        assert "serving:8443" not in served.text

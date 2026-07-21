@@ -38,9 +38,12 @@ class Settings:
     #: Operator-reviewed local paths to the signed reviewed plugin catalog and the
     #: enable-only capability profile (reviewed-tools-plugins T002).  They are the
     #: operator-declared trust root for :class:`workbench.plugin_host.PluginHostService`,
-    #: mirroring the provider-catalog local-JSON precedent.  Both unset means the
-    #: plugin host is not configured and its browser surface fails closed (503);
-    #: the lane is deliberately not wired into the live poll loop yet.
+    #: mirroring the provider-catalog local-JSON precedent.  When BOTH are declared,
+    #: ``create_app`` builds the read-only discovery surface from them (an injected
+    #: service overrides for tests); if EITHER is unset the plugin host is not
+    #: configured and its browser surface fails closed (503).  This wires only the
+    #: operator-declared read-only discovery projection -- the install effect stays a
+    #: service/bridge concern and is deliberately not on the live poll loop.
     plugin_catalog_file: str = ""
     plugin_capability_file: str = ""
 

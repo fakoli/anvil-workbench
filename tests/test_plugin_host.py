@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from workbench.contracts import approval_payload_digest, contract_digest
+from workbench.contracts import ContractValidationError, approval_payload_digest, contract_digest
 from workbench.plugin_host import (
     CredentialBroker,
     CredentialHandle,
@@ -198,8 +198,35 @@ def test_discovery_rejects_an_undeclared_transport() -> None:
 def test_discovery_fails_closed_on_a_drifted_catalog_document() -> None:
     catalog = _catalog()
     catalog["plugins"][0]["title"] = "tampered"  # digest no longer recomputes
-    with pytest.raises(Exception):
+    # The refusal is the typed contract error (a per-plugin digest mismatch), not
+    # an incidental Exception -- matching every other refusal proof in this suite.
+    with pytest.raises(ContractValidationError):
         PluginDiscovery(catalog, _capability())
+
+
+def test_published_projection_is_the_enabled_set_not_the_catalog() -> None:
+    # Finding 2 (discriminating fixture): the catalog reviews BOTH plugins and all
+    # their tools, but the capability profile enables ONLY anvil-tasks-viewer's
+    # tasks.list. deploy-notifier is reviewed-but-NOT-enabled, and issues.read is a
+    # reviewed-but-NOT-enabled tool. published() must project the ENABLED set, so
+    # both are omitted; it fails if published() iterates the catalog (``_by_id``)
+    # instead of the enabled set (``_enabled``).
+    catalog = _catalog()
+    capability = _capability()
+    # Keep only the viewer in the profile, and narrow it to a single enabled tool.
+    capability["plugins"] = [e for e in capability["plugins"] if e["plugin_id"] == VIEWER_ID]
+    for entry in capability["plugins"]:
+        entry["enabled_tools"] = ["tasks.list"]
+    capability["digest"] = contract_digest("plugin-capability", capability)
+
+    published = PluginDiscovery(catalog, capability).published()
+    ids = {p["plugin_id"] for p in published}
+    assert ids == {VIEWER_ID}  # deploy-notifier is reviewed but omitted (not enabled)
+    assert NOTIFIER_ID not in ids
+    viewer = next(p for p in published if p["plugin_id"] == VIEWER_ID)
+    tool_ids = {t["tool_id"] for t in viewer["tools"]}
+    assert tool_ids == {"tasks.list"}  # issues.read reviewed but omitted (not enabled)
+    assert "issues.read" not in tool_ids
 
 
 def test_from_sources_loads_operator_reviewed_local_files(tmp_path: Path) -> None:
@@ -372,12 +399,27 @@ def test_lifecycle_unknown_outcome_reconciles_and_persists() -> None:
 
 
 def test_lifecycle_refuses_a_non_install_kind() -> None:
+    # Build a SCHEMA-VALID, digest-consistent non-install lifecycle request (an
+    # upgrade) so it passes validate_plugin_request and actually reaches the
+    # install-only guard -- recomputing the approval hash and the request digest
+    # over the mutated kind. A prior version mutated only ``kind`` and tripped
+    # ``invalid_request`` (digest mismatch), so the ``unsupported_kind`` guard was
+    # never exercised.
     store = MemoryPluginHostStore()
     request = make_install_request()
-    request["kind"] = "tool_call"  # break the kind; digest no longer matches either
+    request["kind"] = "upgrade"
+    subject = {
+        "kind": "upgrade",
+        "plugin_id": NOTIFIER_ID,
+        "plugin_digest": NOTIFIER_DIGEST,
+        "target_version": "1.0.0",
+    }
+    request["approval"]["action"] = "upgrade_plugin"
+    request["approval"]["payload_hash"] = approval_payload_digest(subject)
+    request["request_digest"] = contract_digest("plugin-request", request)
     with pytest.raises(PluginHostError) as exc:
         store.install(request, _discovery(), _broker(), _installed_runner())
-    assert exc.value.code in {"invalid_request", "unsupported_kind"}
+    assert exc.value.code == "unsupported_kind"
 
 
 def test_receipt_lookup_returns_a_persisted_receipt_or_none() -> None:
@@ -446,6 +488,11 @@ _CORPUS = {
     "pem": "-----BEGIN RSA PRIVATE KEY-----",
     "ipport": "10.0.0.5:5432",
     "dottedhost": "internal.db.corp:9200",
+    # A scheme-less single-label host:port (a tailnet compose service name like
+    # serving/neo4j/state-db): the shared redact_config_text leaves a DOTLESS
+    # label:port intact (its host rule needs a dot), so only the receipt safeText
+    # backstop stops it (finding 1).
+    "dotlesshost": "serving:8443",
     "etcpath": "/etc/anvil/secrets.yaml",
     "dburl": "postgresql://user:pw@db:5432/anvil",
     "skproj": "sk-proj-ABCDEFGH12345678",
@@ -493,6 +540,38 @@ def test_redaction_accepted_output_summary_is_scrubbed() -> None:
     )
     assert receipt["status"] == "accepted"
     _assert_no_corpus(json.dumps(receipt))
+
+
+def test_redaction_scheme_less_host_port_is_caught_by_the_receipt_backstop() -> None:
+    # Finding 1 (unit revert-detection): the shared redact_config_text leaves a
+    # DOTLESS single-label serving:8443 intact (its host rule requires a dot), so
+    # the receipt safeText backstop is the ONLY boundary. _safe_receipt_summary
+    # therefore downgrades it to the fixed safe fallback. Reverting the backstop's
+    # lowercase-anchored host:port alternative makes both assertions fail.
+    from workbench.plugin_host import _SAFE_FALLBACK
+    from workbench.redaction import redact_config_text
+
+    raw = "install pending at serving:8443"
+    assert "serving:8443" in redact_config_text(raw)  # shared scrub leaves it intact
+    summary = _safe_receipt_summary(raw)
+    assert "serving:8443" not in summary
+    assert summary == _SAFE_FALLBACK  # backstop tripped -> fixed safe fallback
+
+
+def test_redaction_scheme_less_host_port_scrubbed_in_served_and_persisted_receipt() -> None:
+    # Finding 1 (end-to-end persisted revert-detection): a reconcile receipt whose
+    # ONLY sensitive token is a dotless serving:8443 leaks it into BOTH the returned
+    # and the durably persisted receipt unless the safeText backstop catches it.
+    store = MemoryPluginHostStore()
+
+    def unknown(discovered, handles):
+        return HostInstallOutcome(status="unknown", summary="in-flight at serving:8443")
+
+    request = make_install_request()
+    receipt = store.install(request, _discovery(), _broker(), unknown)
+    assert receipt["status"] == "reconcile"
+    assert "serving:8443" not in json.dumps(receipt)
+    assert "serving:8443" not in json.dumps(store.receipt(request["request_digest"]))
 
 
 def test_redaction_falls_back_when_a_residual_shape_would_trip_the_backstop() -> None:

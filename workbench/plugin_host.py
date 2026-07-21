@@ -136,15 +136,26 @@ _SAFE_TEXT = _load_safe_text_pattern()
 _SAFE_FALLBACK = "The plugin host reported an error; details are withheld for safety."
 
 
+# NOTE (shared-redaction follow-up): the scheme-less single-label ``host:port``
+# shape (``serving:8443``, ``neo4j:7687`` — a tailnet compose service name) is
+# caught HERE by the receipt ``safeText`` backstop (see the lowercase-anchored
+# ``[a-z][a-z0-9-]*:\d{2,5}`` alternative in plugin-receipt.v1.schema.json), which
+# downgrades such a line to the fixed safe fallback.  The SHARED
+# :func:`workbench.redaction.redact_config_text` still only removes a *dotted*
+# ``host:port`` (its host rule requires >=1 dot), so a dotless label:port survives
+# that scrub.  Extending the shared scrubber with the same coverage is a deliberate
+# careful follow-up (NOT done here): it is used by five lanes and must first gain a
+# timestamp/digest exclusion (``sha256:...``, an ISO ``T09:15``) so it does not
+# over-redact legitimate audit fields.  This lane fixes only its own backstop.
 def _safe_receipt_summary(raw: str, fallback: str = _SAFE_FALLBACK) -> str:
     """Return a bounded, scrubbed, ``safeText``-valid summary for a receipt.
 
     Runs the configuration/health scrub first (which neutralizes the credential,
     endpoint, and path corpus), bounds the result, then enforces the receipt
     contract's structural backstop.  If anything survives that the backstop still
-    forbids (e.g. a residual ``key=value`` shape the scrub leaves), the fixed safe
-    fallback is used — a receipt is always safe to persist and serve, never a
-    channel for a leak.
+    forbids (e.g. a residual ``key=value`` shape, or a scheme-less ``host:port``
+    the dotted-host scrub leaves), the fixed safe fallback is used — a receipt is
+    always safe to persist and serve, never a channel for a leak.
     """
     redacted = redact_config_text(raw).strip()[:400]
     if not redacted:
