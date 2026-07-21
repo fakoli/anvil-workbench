@@ -71,7 +71,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   bootstrap.mockResolvedValue(fixture)
   approve.mockResolvedValue({ status: 'approved' })
-  addDirective.mockResolvedValue({ id: 'event_2', session_id: 'session_1', sequence: 4, kind: 'operator.directive', data: { content: 'Check route evidence.' } })
+  addDirective.mockResolvedValue({ outcome: 'directive.queued_pending', recorded: true, event: { id: 'event_2', session_id: 'session_1', sequence: 4, kind: 'operator.directive', data: { content: 'Check route evidence.' } } })
   createProject.mockResolvedValue({ id: 'project_2', name: 'Checkout', state_root: '.anvil', bridge_id: null })
   createSession.mockResolvedValue({ session: { id: 'session_2', project_id: 'project_1', title: 'Checkout', worktree_id: 'checkout', status: 'active' }, workflow: { id: 'workflow_2', session_id: 'session_2', version: 1, status: 'draft' } })
   startWorkflow.mockResolvedValue({ run: { id: 'run_2', project_id: 'project_1', session_id: 'session_2', task_id: 'TASK-2', model: 'planning', status: 'queued' } })
@@ -113,11 +113,33 @@ describe('Workbench delivery cockpit', () => {
   })
 
   it('persists a delivery direction for the next local bridge work packet', async () => {
+    // The reload after submit reflects the recorded directive (the real API
+    // returns {outcome, recorded, event}; the app must read result.event, not
+    // append the raw response).
+    bootstrap.mockResolvedValue({ ...fixture, directives: [...fixture.directives, { id: 'event_2', session_id: 'session_1', sequence: 4, kind: 'operator.directive', data: { content: 'Check route evidence.' } }] })
     const user = userEvent.setup(); await renderLive()
     await user.type(screen.getByRole('textbox', { name: 'Add direction to this delivery' }), 'Check route evidence.')
     await user.click(screen.getByRole('button', { name: 'Send delivery direction' }))
     expect(addDirective).toHaveBeenCalledWith('session_1', 'Check route evidence.')
     expect((await screen.findByRole('status')).textContent).toContain('included only in the next bridge work packet')
+    // The recorded directive is rendered as a delivery direction, proving the
+    // {outcome, recorded, event} shape flowed through without dropping it.
+    expect(await screen.findByText('Check route evidence.')).toBeTruthy()
+  })
+
+  it('surfaces a typed directive refusal truthfully and never announces it was recorded', async () => {
+    // A recorded:false outcome is served 202 with no event row: the UI must not
+    // claim "Direction recorded." and must surface the typed outcome code. A
+    // regression to the old raw-event shape would append the refusal object and
+    // still announce success, failing this test.
+    addDirective.mockResolvedValueOnce({ outcome: 'directive.rejected_too_long', recorded: false })
+    const user = userEvent.setup(); await renderLive()
+    await user.type(screen.getByRole('textbox', { name: 'Add direction to this delivery' }), 'way too long')
+    await user.click(screen.getByRole('button', { name: 'Send delivery direction' }))
+    const notice = (await screen.findByRole('status')).textContent
+    expect(notice).toContain('was not recorded')
+    expect(notice).toContain('directive.rejected_too_long')
+    expect(notice).not.toContain('Direction recorded')
   })
 
   it('operates routes, evidence, skills, and sandbox through their dedicated APIs', async () => {

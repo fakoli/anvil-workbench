@@ -39,6 +39,7 @@ production backend uses row-level transactions instead of the instance lock.
 """
 from __future__ import annotations
 
+import copy
 import re
 import threading
 from dataclasses import dataclass, field, replace
@@ -302,16 +303,18 @@ class MemoryDeliveryProjectionStore:
         except ContractValidationError as exc:
             raise DeliveryProjectionError(f"prd content is not valid: {exc}") from exc
         prd_id = str(payload["prd"]["prd_id"])
-        stored = dict(payload)
+        # Deep-copy so a caller retaining the nested ``content`` dict it passed in
+        # cannot later mutate this "immutable" stored record.
+        stored = copy.deepcopy(dict(payload))
         self.rows.prd_content.setdefault(scope, {})[prd_id] = stored
-        return dict(stored)
+        return copy.deepcopy(stored)
 
     def get_prd_content(self, project_id: str, prd_id: str) -> dict[str, Any]:
         scope = self._scope(project_id)
         namespace = self.rows.prd_content.get(scope)
         if namespace is None or prd_id not in namespace:
             raise UnknownDeliveryRecordError(_UNKNOWN)
-        return dict(namespace[prd_id])
+        return copy.deepcopy(namespace[prd_id])
 
     # --- Task references ----------------------------------------------------
 
@@ -323,14 +326,16 @@ class MemoryDeliveryProjectionStore:
             raise DeliveryProjectionError(f"task reference is not valid: {exc}") from exc
         ref = reference["ref"]
         key = (str(ref["prd_id"]), str(ref["task_id"]))
-        stored = dict(reference)
+        # Deep-copy so a caller keeping the nested summary/source dict cannot
+        # later mutate this "immutable" stored task reference.
+        stored = copy.deepcopy(dict(reference))
         self.rows.references.setdefault(scope, {})[key] = stored
-        return dict(stored)
+        return copy.deepcopy(stored)
 
     def list_task_references(self, project_id: str, prd_id: str) -> list[dict[str, Any]]:
         scope = self._scope(project_id)
         namespace = self.rows.references.get(scope, {})
-        rows = [dict(value) for (pid, _tid), value in namespace.items() if pid == prd_id]
+        rows = [copy.deepcopy(value) for (pid, _tid), value in namespace.items() if pid == prd_id]
         # Sort on the full (prd_id, task_id) key so ordering is total and stable.
         rows.sort(key=lambda r: (r["ref"]["prd_id"], r["ref"]["task_id"]))
         return rows
@@ -341,7 +346,7 @@ class MemoryDeliveryProjectionStore:
         key = (prd_id, task_id)
         if namespace is None or key not in namespace:
             raise UnknownDeliveryRecordError(_UNKNOWN)
-        return dict(namespace[key])
+        return copy.deepcopy(namespace[key])
 
     # --- Delivery eligibility ----------------------------------------------
 
@@ -363,9 +368,21 @@ class MemoryDeliveryProjectionStore:
             raise DeliveryProjectionError(
                 "cannot capture eligibility without a task reference to bind its source snapshot"
             )
+        # Fail closed on a capture-time TOCTOU: binding only the current snapshot
+        # digest would let a verdict computed against a SUPERSEDED source (its
+        # pinned ref.prd_revision / scoped_id) be captured against an already
+        # advanced reference, then served fresh and reused for start. Refuse
+        # unless the verdict's own pinned revision and scoped id still match the
+        # current reference, so a pre-capture source advance is caught too.
+        if int(ref["prd_revision"]) != int(reference["ref"]["prd_revision"]) or str(
+            verdict["scoped_id"]
+        ) != str(reference["scoped_id"]):
+            raise StaleEligibilityError(
+                "eligibility verdict pins a superseded source revision; recompute it against the current reference"
+            )
         bound_digest = str(reference["source"]["snapshot_digest"])
-        self.rows.eligibility.setdefault(scope, {})[key] = (dict(verdict), bound_digest)
-        return dict(verdict)
+        self.rows.eligibility.setdefault(scope, {})[key] = (copy.deepcopy(dict(verdict)), bound_digest)
+        return copy.deepcopy(verdict)
 
     def _current_snapshot_digest(self, scope: str, key: tuple[str, str]) -> str | None:
         reference = self.rows.references.get(scope, {}).get(key)
@@ -393,7 +410,13 @@ class MemoryDeliveryProjectionStore:
         A stored verdict that is not ``eligible``, whose bound snapshot differs
         from the current task reference, or whose current reference differs from
         the caller's pinned ``expected_snapshot_digest`` cannot be reused for
-        start (T002 criterion 2). This is the wired staleness gate T005 calls.
+        start (T002 criterion 2).
+
+        Not-wired seam (reviewer-flagged, not a bug): this fail-closed staleness
+        gate is not yet JOINED to the Deliver coordinator (:mod:`workbench.deliver`).
+        The Deliver flow currently receives an injected ``preconditions`` callable;
+        threading this gate in as the delivery precondition is the remaining wiring
+        step, not a defect in this method.
         """
         scope = self._scope(project_id)
         key = (prd_id, task_id)
@@ -449,6 +472,13 @@ class MemoryDeliveryProjectionStore:
         Sorted on the full ``(started_at, run_id)`` tuple so repeated attempts
         for one task are ordered deterministically and distinguished by their
         human attempt label and start time.
+
+        Not-wired seam (reviewer-flagged, not a bug): the ``since``/``until`` time
+        window is a lexicographic string comparison over the RFC3339
+        ``started_at``. It assumes the Z-form (``...Z``) that every wired producer
+        here emits; a mixed offset form (``+00:00``) would not lexicographically
+        order against a Z-form. Normalizing offsets before compare is follow-up
+        debt, not a live bug, because no wired producer emits an offset form.
         """
         scope = self._scope(project_id)
         rows = list(self.rows.run_rows.get(scope, {}).values())

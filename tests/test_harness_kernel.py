@@ -1802,6 +1802,45 @@ def test_ptd_t002_eligibility_for_start_fails_closed_when_not_eligible():
         store.eligibility_for_start("proj", "release-alpha", "T001", _DIGEST_A)
 
 
+def test_ptd_t002_capture_rejects_a_verdict_pinned_to_a_superseded_revision():
+    # SHOULD-FIX 2 (capture-time TOCTOU): binding only the CURRENT snapshot digest
+    # let a verdict computed against a superseded source (revision 4) be captured
+    # against an already-advanced reference (revision 5), then served fresh and
+    # reused for start. Capture must fail closed when the verdict's own pinned
+    # prd_revision / scoped_id no longer matches the current reference.
+    store = MemoryDeliveryProjectionStore()
+    advanced = _reference("release-alpha", _DIGEST_B)
+    advanced["ref"]["prd_revision"] = 5
+    advanced["run_label"] = "release-alpha:T001@r5"
+    store.capture_task_reference("proj", advanced)
+    stale_verdict = _eligible_verdict("release-alpha")  # still pins prd_revision 4
+    with pytest.raises(StaleEligibilityError):
+        store.capture_eligibility("proj", stale_verdict)
+
+
+def test_ptd_immutable_records_are_isolated_from_caller_mutation():
+    # NOTE 5: capture_prd_content / capture_task_reference must deep-copy so a
+    # caller retaining the nested content dict cannot mutate a stored "immutable"
+    # record (through either the input alias or a returned read).
+    store = MemoryDeliveryProjectionStore()
+    ref = _reference("release-alpha")
+    store.capture_task_reference("proj", ref)
+    ref["summary"]["title"] = "MUTATED-VIA-INPUT"
+    ref["ref"]["prd_revision"] = 999
+    stored = store.get_task_reference("proj", "release-alpha", "T001")
+    assert stored["summary"]["title"] != "MUTATED-VIA-INPUT"
+    assert stored["ref"]["prd_revision"] == 4
+    stored["summary"]["title"] = "MUTATED-VIA-READ"
+    again = store.get_task_reference("proj", "release-alpha", "T001")
+    assert again["summary"]["title"] != "MUTATED-VIA-READ"
+
+    prd = _load_example("anvil-state.prd-content.v1.json")
+    store.capture_prd_content("proj", prd)
+    prd["content"]["body"] = "MUTATED-BODY"
+    stored_prd = store.get_prd_content("proj", prd["prd"]["prd_id"])
+    assert stored_prd["content"]["body"] != "MUTATED-BODY"
+
+
 def _run_row(run_id: str = "run_alpha_t001_0001", **overrides) -> RunDisplayRow:
     defaults = dict(
         run_id=run_id, run_label="release-alpha:T001@r4", scoped_id="release-alpha:T001",

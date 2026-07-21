@@ -1092,6 +1092,13 @@ def create_app(
         # scrubbed append-only session event queued for the next work packet. It
         # cannot signal, interrupt, or retarget a running Codex process; the only
         # effect is recording the event. The outcome is one stable typed code.
+        #
+        # Not-wired seam (reviewer-flagged, not a bug): the
+        # ``directive.rejected_unknown_session`` typed outcome is unreachable on
+        # THIS wired path — ``store.get_session`` below raises a 404 for an unknown
+        # session first, so the API never returns that typed code. It is reachable
+        # only by a direct ``submit_directive`` store-layer caller (covered by
+        # ``tests/test_harness_kernel.py::test_ptd_t008_directive_outcomes_are_typed_and_append_only``).
         session = store.get_session(session_id)
         workflow = next(iter(store.list_workflows(session_id)), None)
         result = submit_directive(

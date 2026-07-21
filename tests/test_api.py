@@ -1599,3 +1599,67 @@ def test_ptd_t008_directive_content_is_scrubbed_before_persist():
         content = view["pending"][0]["content"]
         assert "state.db" not in content and "supersecretvalue" not in content
         assert "[REDACTED" in content
+
+
+def test_ptd_t008_persisted_directive_scrubs_dotless_host_port():
+    # Finding 4 (persisted channel): a scheme-less single-label host:port
+    # (serving:8443) must be scrubbed before a directive is persisted/served. The
+    # shared redact_config_text now removes the dotless label:port; reverting that
+    # pattern lets serving:8443 ride out to the served directive view.
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "demo", "state_root": ".anvil"}).json()
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "s", "worktree_id": "checkout-a",
+        }).json()["session"]
+        test_client.post(
+            f"/api/sessions/{session['id']}/directives",
+            json={"content": "point the run at serving:8443 before the gate"},
+        )
+        view = test_client.get(f"/api/sessions/{session['id']}/directives", headers=_PTD_ACTOR).json()
+        content = view["pending"][0]["content"]
+        assert "serving:8443" not in content
+        assert "[REDACTED" in content
+
+
+def test_ptd_t008_directive_reports_included_after_real_packet_assembly():
+    # MUST-FIX 1 (wired, vacuum-proof): a directive already carried in a queued
+    # run_codex packet must report INCLUDED, not pending forever. The live packet
+    # assembler (workflow start -> start_workflow_run) now records the
+    # operator.directive_packet marker; session_directive_view derives the split
+    # from it. Reverting the marker recording makes this fail (still pending).
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "wired", "state_root": ".anvil"}).json()
+        registered = test_client.post(f"/api/projects/{project['id']}/bridges", json={"name": "bridge"}).json()
+        bridge, token = registered["bridge"], registered["bootstrap_token"]
+        headers = {"X-Workbench-Bridge": bridge["id"], "Authorization": f"Bearer {token}"}
+        digest = "a" * 64
+        test_client.post(f"/api/bridge/{bridge['id']}/skills", headers=headers, json={"skills": [{
+            "skill_id": "anvil:review", "description": "Review state evidence.", "content_sha256": digest,
+        }]})
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "wired", "worktree_id": "default", "skills": ["anvil:review"],
+        }).json()
+        posted = test_client.post(
+            f"/api/sessions/{session['session']['id']}/directives",
+            json={"content": "Run the independent evidence check."},
+        ).json()
+        directive_sequence = posted["event"]["sequence"]
+
+        # Before packet assembly the directive is pending.
+        before = test_client.get(
+            f"/api/sessions/{session['session']['id']}/directives", headers=_PTD_ACTOR,
+        ).json()
+        assert [d["content"] for d in before["pending"]] == ["Run the independent evidence check."]
+        assert before["included"] == [] and before["included_up_to_sequence"] == 0
+
+        # Start the workflow: the real packet assembler snapshots the directive
+        # into the queued run_codex payload AND records the packet-inclusion marker.
+        started = test_client.post(f"/api/workflows/{session['workflow']['id']}/start", json={"task_id": "TASK-9"})
+        assert started.status_code == 201
+
+        after = test_client.get(
+            f"/api/sessions/{session['session']['id']}/directives", headers=_PTD_ACTOR,
+        ).json()
+        assert [d["content"] for d in after["included"]] == ["Run the independent evidence check."]
+        assert after["pending"] == []
+        assert after["included_up_to_sequence"] >= directive_sequence

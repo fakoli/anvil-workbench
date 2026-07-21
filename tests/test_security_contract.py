@@ -1310,6 +1310,10 @@ _PTD_CORPUS = (
     "AKIA1234567890ABCDEF", "token=supersecretvalue", "C:/Users/op/.anvil/state.db",
     "/etc/anvil/prod.env", "eyJhbGciOiJI", "ghp_abcdefghijklmnopqrstuvwxyz012345",
     "sk-proj-abcdefghijklmnop", "db.tail1234.ts.net:7687", "100.64.0.5", "hunter2",
+    # The systemic scheme-less single-label host:port (serving:8443) that leaked
+    # through every free-text channel until the shared redact_config_text gained
+    # the dotless label:port pattern.
+    "serving:8443",
 )
 
 
@@ -1317,7 +1321,8 @@ def _ptd_leaky_text():
     return (
         "See AKIA1234567890ABCDEF and token=supersecretvalue at C:/Users/op/.anvil/state.db "
         "and /etc/anvil/prod.env. JWT eyJhbGciOiJI.eyJzdWIi.sig ghp_abcdefghijklmnopqrstuvwxyz012345 "
-        "sk-proj-abcdefghijklmnop reaches db.tail1234.ts.net:7687 at 100.64.0.5:8443 Password=hunter2"
+        "sk-proj-abcdefghijklmnop reaches db.tail1234.ts.net:7687 at 100.64.0.5:8443 Password=hunter2 "
+        "queued in-flight at serving:8443 for the bridge"
     )
 
 
@@ -1355,14 +1360,14 @@ def test_ptd_t005_denied_receipt_summary_never_leaks():
     intent = _ptd_sec_load_example("deliver-intent.v1.json")
     leaky_refusal = _PtdDeliverRefusal(
         code="deliver.invalid_worktree",
-        safe_summary="blocked at C:/Users/op/.anvil/state.db token=supersecretvalue",
+        safe_summary="blocked at C:/Users/op/.anvil/state.db token=supersecretvalue via serving:8443",
         retryable=False,
     )
     receipt, _ = store.start(intent, launch=lambda: store.default_run_block("run_x_00001"),
                              preconditions=lambda: leaky_refusal)
     assert receipt["status"] == "denied"
     summary = receipt["error"]["safe_summary"]
-    for secret in ("state.db", "supersecretvalue", "C:/Users"):
+    for secret in ("state.db", "supersecretvalue", "C:/Users", "serving:8443"):
         assert secret not in summary, f"leak survived in denied receipt: {secret}"
     # And the accepted receipt carries only ids/digests/timestamps — the closed
     # schema structurally admits no path/command/token field.
