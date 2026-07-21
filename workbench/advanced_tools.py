@@ -76,7 +76,7 @@ from .contracts import validate_advanced_trace
 from .models import new_id, now_utc
 from .redaction import redact_config_text
 from .tool_dispatch import ChatToolDispatchService, ToolDispatchError
-from .advanced_runtime import _SAFE_SUMMARY_RE, _SAFE_SUMMARY_FALLBACK
+from .advanced_runtime import SAFE_SUMMARY_RE, SAFE_SUMMARY_FALLBACK
 
 #: The two execution kinds the advanced-trace.v1 schema allows for a tool event.
 #: ``mock`` is a deterministic fixture; ``read_only`` is a reviewed read tool
@@ -128,7 +128,7 @@ def _safe_summary(text: str) -> str:
     scrubbed and schema-valid.
     """
     scrubbed = redact_config_text(text)[:200]
-    return scrubbed if _SAFE_SUMMARY_RE.fullmatch(scrubbed) else _SAFE_SUMMARY_FALLBACK
+    return scrubbed if SAFE_SUMMARY_RE.fullmatch(scrubbed) else SAFE_SUMMARY_FALLBACK
 
 
 def _ts() -> str:
@@ -431,8 +431,24 @@ def run_mock_tool_sequence(
 
         # A dispatched call: reduce the output to a digest + char count for the
         # served trace, and keep the raw output only as an inert delimited envelope.
-        payload = holder["payload"]
-        output_digest = str(holder["output_digest"])
+        #
+        # A byte-identical repeat of an earlier call (same tool + same inputs ->
+        # same request_digest) hits the spine's idempotent-replay path: it returns
+        # the stored receipt WITHOUT invoking the runner (``result.replayed`` is
+        # True), so the holder stays unset.  A "fixed sequence" legitimately
+        # includes such a repeat, so it must NOT crash on ``_UNSET`` reaching
+        # ``_canonical_json``.  The mock fixture is a pure function of tool+inputs,
+        # so recomputing it here reproduces the SAME output the first identical
+        # call produced -- the replay's output_digest / output_chars / safe_summary
+        # are byte-identical, keeping the trace deterministic.  ``holder['reached']``
+        # (never ``_UNSET``) is the source of truth for whether the runner ran.
+        runner_reached = holder["reached"]
+        if runner_reached:
+            payload = holder["payload"]
+            output_digest = str(holder["output_digest"])
+        else:  # idempotent replay: resolve the deterministic fixture output afresh
+            payload = fixture.produce(inputs)
+            output_digest = _digest("output", payload)
         output_chars = min(len(_canonical_json(payload)), _MAX_TRACE_CHARS)
         delimited = delimit_untrusted_output(payload)
         events.append({
@@ -446,7 +462,7 @@ def run_mock_tool_sequence(
             index=index, tool_id=tool_id, tool_kind=tool_kind, outcome="result",
             input_digest=input_digest, output_digest=output_digest, output_chars=output_chars,
             refusal_code=None, receipt_status=str(result.receipt.get("status")),
-            runner_reached=True, delimited_output=delimited,
+            runner_reached=runner_reached, delimited_output=delimited,
         ))
 
     events.append({

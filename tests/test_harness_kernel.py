@@ -3444,6 +3444,44 @@ def test_amp_t004_output_digest_is_content_sensitive_and_input_bound():
     assert run_ready.steps[0].output_digest != run_claimed.steps[0].output_digest
 
 
+def test_amp_t004_repeated_identical_call_in_a_fixed_script_is_deterministic_and_valid():
+    # A fixed sequence may legitimately include a BYTE-IDENTICAL repeat (same tool
+    # + same inputs -> same request_digest).  The second call hits the spine's
+    # idempotent-replay path: the runner is NOT invoked (correct -- it is a
+    # replay), so the runner-output holder stays unset.  The runtime must still
+    # emit a VALID, deterministic trace for it -- recomputing the SAME
+    # deterministic fixture output -- rather than crash on the unset holder.
+    # Revert-detection: WITHOUT the fix, `_canonical_json(_UNSET)` raises
+    # TypeError (and output_digest would be the string "None"), so building the
+    # run below raises instead of returning a valid trace.
+    script = [_rtp_read_request("ready"), _rtp_read_request("ready")]
+    run_a = _amp_go(_rtp_service(), [dict(r) for r in script])
+    run_b = _amp_go(_rtp_service(), [dict(r) for r in script], branch="advbranch_ampsequence42")
+
+    # Fully visible, ordered: request_start + (tool_request, tool_result) per call
+    # + response_complete.  No hidden step; the repeat is a full second pair.
+    kinds = [e["kind"] for e in run_a.trace["events"]]
+    assert kinds == ["request_start", "tool_request", "tool_result",
+                     "tool_request", "tool_result", "response_complete"]
+    assert [s.outcome for s in run_a.steps] == ["result", "result"]
+
+    # The replay resolved the SAME deterministic fixture output -- never `_UNSET`
+    # and never the string "None": its digest/char-count equal the first call's.
+    first, replay = run_a.steps[0], run_a.steps[1]
+    assert replay.output_digest == first.output_digest
+    assert replay.output_digest.startswith("sha256:")
+    assert replay.output_chars == first.output_chars
+    assert replay.input_digest == first.input_digest
+    assert replay.runner_reached is False  # the runner is (correctly) not re-run
+    assert first.runner_reached is True
+
+    # The served trace is valid against the closed, redaction-only schema, and two
+    # independent runs are byte-identical (only the wall-clock `at` differs).
+    _amp_validate_trace(run_a.trace)
+    assert _amp_canon(run_a.trace["events"]) == _amp_canon(run_b.trace["events"])
+    assert run_a.step_signature() == run_b.step_signature()
+
+
 # --- Criterion 2: reject-before-dispatch is surfaced, runner never reached --- #
 
 def _amp_single_refusal(dispatch, request, tools=None):
