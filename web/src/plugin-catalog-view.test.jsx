@@ -7,6 +7,10 @@ import { fetchPlugins, fetchPluginReceipt } from './api'
 vi.mock('./api', () => ({
   fetchPlugins: vi.fn(),
   fetchPluginReceipt: vi.fn(),
+  // The view now keys its unconfigured-degrade branch off this SHARED sentinel by
+  // value equality; the mock must export the exact same string the real api.js
+  // throws on 503 (the 503-degrade test rejects with this verbatim).
+  PLUGIN_NOT_CONFIGURED: 'The plugin catalog is not configured for this hub',
 }))
 
 // The served /api/plugins shape, traceable to `_published_plugin`
@@ -62,7 +66,8 @@ const served = {
 const data = {
   projects: [{ id: 'project_1', name: 'Qualification' }],
   router_configured: true,
-  skills: [{ skill_id: 'lint', description: 'Run repository linters', content_sha256: 'sha256:' + 'b'.repeat(64), bridge_id: 'bridge_1' }],
+  // content_sha256 is served BARE 64-hex (no `sha256:` prefix; api.py/models.py).
+  skills: [{ skill_id: 'lint', description: 'Run repository linters', content_sha256: 'b'.repeat(64), bridge_id: 'bridge_1' }],
 }
 
 const acceptedReceipt = {
@@ -222,6 +227,24 @@ describe('criterion 3 — tool selection + result/error cards (keyboard + SR)', 
     await user.keyboard('{Escape}')
     await waitFor(() => expect(screen.queryByRole('heading', { level: 3, name: 'Post note' })).toBeNull())
     await waitFor(() => expect(document.activeElement).toBe(select)) // focus restored
+  })
+})
+
+describe('a11y — the live region announces load then selection (announce wiring)', () => {
+  it('the .pc-live status region carries the loaded count, then the selected tool', async () => {
+    const user = userEvent.setup()
+    renderView()
+    await screen.findByRole('article', { name: 'Plugin Deploy Notifier' })
+    // Target the dedicated announce region by class (several transient role=status
+    // nodes exist); assert it is a real live region, not a silent div.
+    const live = document.querySelector('.pc-live')
+    expect(live).toBeTruthy()
+    expect(live.getAttribute('role')).toBe('status')
+    expect(live.getAttribute('aria-live')).toBe('polite')
+    await waitFor(() => expect(live.textContent).toMatch(/Loaded 2 plugins\./))
+
+    await user.click(screen.getByRole('button', { name: /Select tool Post note from Deploy Notifier/i }))
+    await waitFor(() => expect(live.textContent).toMatch(/Selected tool Post note\./))
   })
 })
 

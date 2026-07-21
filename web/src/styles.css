@@ -294,7 +294,8 @@
 .pc-tool-select:focus-visible,.pc-close:focus-visible,.pc-receipt-form button:focus-visible,.pc-receipt-form input:focus-visible,.pc-state button:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
 .pc-tool-detail{margin-top:12px;border:1px solid #315b55;background:#0c1a1d;border-radius:9px;padding:14px;display:grid;gap:10px}
 .pc-tool-detail-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.pc-tool-detail-head h3{margin:0;font-size:14px;letter-spacing:-.02em;color:#eafffb}
+.pc-tool-detail-head h3{margin:0;font-size:14px;letter-spacing:-.02em;color:#eafffb;outline:none}
+.pc-tool-detail-head h3:focus-visible{outline:1px solid #3aa08e;outline-offset:3px}
 .pc-close{border:1px solid #33484d;background:transparent;color:#adbec1;border-radius:6px;padding:5px 11px;font-size:10px;font-weight:800}
 .pc-tool-perm-line{margin:0;font-size:10px;color:#84a29c}
 .pc-receipt-form{display:grid;gap:6px;margin-top:4px}
@@ -311,5 +312,19 @@
 .pc-receipt-head b{font-size:12px;color:#e6f1ee}
 .pc-receipt-summary{margin:0;font-size:11px;color:#c4d4d1;line-height:1.5;overflow-wrap:anywhere}
 .pc-live{position:fixed;bottom:14px;left:262px;font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:#7fbfb2}
-@media(max-width:1100px){.rail{width:206px}}
-@media(max-width:900px){.pc-inner{padding:20px 16px 40px}.pc-live{left:16px}.pc-kv{grid-template-columns:1fr}}
+@media(max-width:900px){.pc-inner{padding:20px 16px 40px}.pc-live{left:16px}.pc-kv{grid-template-columns:1fr}
+/* Plugins narrow/zoom layout (a11y): the app nav rail is position:fixed at full
+   width. Without this, the Plugins lane keeps the fixed 206px rail while every
+   sibling lane (Chat/Explorer/Settings) reflows it, occluding the catalog — and
+   .pc-live{left:16px} then overlaps the fixed rail footer, intercepting its
+   controls. Under .plugins-active only, drop the rail out of the fixed layer into
+   a stacked top bar (mirroring .settings-active) so it pushes content down
+   instead of overlaying it, and free the bottom-left corner .pc-live uses. Scoped
+   so Delivery keeps its own fixed rail. */
+.app-shell.plugins-active{flex-direction:column}
+.app-shell.plugins-active .rail{position:static;inset:auto;width:100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:12px 16px}
+.app-shell.plugins-active .rail nav{grid-auto-flow:column;grid-template-columns:none;display:flex;flex-wrap:wrap;gap:4px}
+.app-shell.plugins-active .rail .brand{padding:0 12px 0 0}
+.app-shell.plugins-active .rail-footer{margin:0 0 0 auto}
+.app-shell.plugins-active .workspace{margin-left:0;width:100%}
+.app-shell.plugins-active .toast{left:16px;right:16px}}

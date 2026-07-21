@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { fetchPlugins, fetchPluginReceipt } from './api'
+import { fetchPlugins, fetchPluginReceipt, PLUGIN_NOT_CONFIGURED } from './api'
 import {
   buildCategoryModel, describePlugin, toolPermissionSummary, describeReceipt, receiptCardKind,
   credentialSummary,
@@ -56,7 +56,7 @@ function PluginCard({ plugin }) {
             reference ids. There is no value/secret/token field in the shape. */}
         <div className="pc-kv-wide"><dt>Credential</dt><dd className="pc-credential">{credentialSummary(plugin.credential)}</dd></div>
       </dl>
-      <div className="pc-plugin-tools" aria-label={`Tools in ${plugin.title}`}>
+      <section className="pc-plugin-tools" aria-label={`Tools in ${plugin.title}`}>
         <p className="pc-subhead">Tools ({plugin.tools.length})</p>
         <ul>
           {plugin.tools.map((tool) => (
@@ -66,7 +66,7 @@ function PluginCard({ plugin }) {
             </li>
           ))}
         </ul>
-      </div>
+      </section>
     </article>
   )
 }
@@ -255,7 +255,10 @@ export default function PluginCatalogView({ data, append }) {
       setAnnounce(list.length ? `Loaded ${list.length} plugin${list.length === 1 ? '' : 's'}.` : 'No plugins are enabled.')
     } catch (error) {
       if (seq !== loadSeq.current || !mountedRef.current) return
-      const unconfigured = /not configured/i.test(error.message || '')
+      // Key the unconfigured-degrade branch off the SHARED sentinel value, not a
+      // private regex, so an api.js reword can't silently drop us out of the
+      // truthful "not configured" state (both sides move with PLUGIN_NOT_CONFIGURED).
+      const unconfigured = (error.message || '') === PLUGIN_NOT_CONFIGURED
       setStatus(unconfigured ? 'unavailable' : 'error')
       setErrorMessage(error.message)
       setAnnounce(error.message || 'The plugin catalog is unavailable.')

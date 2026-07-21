@@ -148,7 +148,7 @@ describe('five distinguishable categories (criterion 1)', () => {
   it('buildCategoryModel returns the five categories in order with distinct labels + permission models', () => {
     const model = buildCategoryModel({
       plugins: [servedPlugin],
-      skills: [{ skill_id: 'lint', description: 'Run linters', content_sha256: 'sha256:' + 'b'.repeat(64), bridge_id: 'br1' }],
+      skills: [{ skill_id: 'lint', description: 'Run linters', content_sha256: 'b'.repeat(64), bridge_id: 'br1' }],
       routerConfigured: true,
     })
     expect(model.map((c) => c.kind)).toEqual(CATEGORY_KINDS)
@@ -176,8 +176,10 @@ describe('five distinguishable categories (criterion 1)', () => {
   })
 
   it('describeSkill exposes name/description/digest only — never a path or body', () => {
-    const skill = describeSkill({ skill_id: 'lint', description: 'Run linters', content_sha256: 'sha256:' + 'b'.repeat(64), bridge_id: 'br1', path: '/home/x/skill' })
+    // The served content_sha256 is BARE 64-hex (no `sha256:` prefix; api.py/models.py).
+    const skill = describeSkill({ skill_id: 'lint', description: 'Run linters', content_sha256: 'b'.repeat(64), bridge_id: 'br1', path: '/home/x/skill' })
     expect('path' in skill).toBe(false)
+    expect(skill.digest).toBe('b'.repeat(64))
     expect(skill.permissionSummary).toMatch(/digest/)
   })
 })

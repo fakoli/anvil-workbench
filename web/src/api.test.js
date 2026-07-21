@@ -552,3 +552,57 @@ describe('voice relay clients (T005.2 / T005.3)', () => {
       .rejects.toThrow('Read-aloud is not configured for this hub')
   })
 })
+
+import { fetchPlugins, fetchPlugin, fetchPluginReceipt, PLUGIN_NOT_CONFIGURED } from './api'
+
+// The three GET-only plugin-surface helpers had no DIRECT tests, so a reword of
+// the 503 sentinel could have silently broken the view's `/not configured/`
+// branch while the component tests stayed green. These pin: the unwrapped
+// envelopes, the encoded scoped paths, the SHARED 503 sentinel the view keys off
+// by equality, the distinct 404 not-found (never an existence oracle), and the
+// non-leaking fallback for any other non-2xx.
+describe('reviewed plugin catalog API client (T006)', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('fetchPlugins unwraps the {plugins} envelope from the GET path', async () => {
+    const served = { plugins: [{ plugin_id: 'deploy-notify' }] }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(served))
+    await expect(fetchPlugins()).resolves.toEqual(served)
+    expect(fetch).toHaveBeenLastCalledWith('/api/plugins')
+  })
+
+  it('fetchPlugin encodes the id and unwraps the {plugin} envelope', async () => {
+    const served = { plugin: { plugin_id: 'a/b' } }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(served))
+    await expect(fetchPlugin('a/b')).resolves.toEqual(served)
+    expect(fetch).toHaveBeenLastCalledWith('/api/plugins/a%2Fb')
+  })
+
+  it('fetchPluginReceipt encodes the request digest and unwraps the {receipt} envelope', async () => {
+    const served = { receipt: { receipt_id: 'plugrcpt_x' } }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(served))
+    await expect(fetchPluginReceipt('sha256:abc')).resolves.toEqual(served)
+    expect(fetch).toHaveBeenLastCalledWith('/api/plugins/receipts/sha256%3Aabc')
+  })
+
+  it('a 503 is the SHARED not-configured sentinel the view keys its degrade branch off (fail-closed)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(503))
+    // The shared constant must remain a "not configured" message: the view now
+    // matches it by VALUE equality, so this is the single point the contract lives.
+    expect(PLUGIN_NOT_CONFIGURED).toMatch(/not configured/i)
+    await expect(fetchPlugins()).rejects.toThrow(PLUGIN_NOT_CONFIGURED)
+  })
+
+  it('a 404 on a plugin or a receipt is a DISTINCT not-found error, never an existence oracle', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(404))
+    await expect(fetchPlugin('nope')).rejects.toThrow('This plugin is not in the reviewed catalog')
+    await expect(fetchPluginReceipt('sha256:missing')).rejects.toThrow('No receipt is stored for that request digest')
+  })
+
+  it('any other non-2xx throws a distinct non-leaking failure', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(500))
+    await expect(fetchPlugins()).rejects.toThrow('The plugin catalog is unavailable')
+    await expect(fetchPlugin('x')).rejects.toThrow('This plugin is unavailable')
+    await expect(fetchPluginReceipt('y')).rejects.toThrow('The tool receipt is unavailable')
+  })
+})

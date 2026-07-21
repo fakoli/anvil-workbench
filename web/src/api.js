@@ -581,8 +581,14 @@ export async function policyApprovalBinding(request) {
 
 const PLUGINS = '/api/plugins'
 
+// The exact 503 "not configured" sentinel the fail-closed plugin surface emits.
+// It is a SHARED constant so the view can key its unconfigured-degrade branch off
+// value equality rather than a private regex: rewording the message here can no
+// longer silently break the view's 503 handling — both sides move together.
+export const PLUGIN_NOT_CONFIGURED = 'The plugin catalog is not configured for this hub'
+
 async function pluginJson(response, failure) {
-  if (response.status === 503) throw new Error('The plugin catalog is not configured for this hub')
+  if (response.status === 503) throw new Error(PLUGIN_NOT_CONFIGURED)
   if (!response.ok) throw new Error(failure)
   return response.json()
 }
