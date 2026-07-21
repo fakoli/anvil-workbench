@@ -1065,6 +1065,7 @@ _PREFIXES = {
     "plugin": b"anvil-workbench/plugin/v1\0",
     "plugin-capability": b"anvil-workbench/plugin-capability/v1\0",
     "plugin-request": b"anvil-workbench/plugin-request/v1\0",
+    "preference-operation": b"anvil-workbench/preference-operation/v1\0",
 }
 
 
@@ -1275,6 +1276,21 @@ def contract_digest(kind: str, value: Mapping[str, Any]) -> str:
 def approval_payload_digest(value: Mapping[str, Any]) -> str:
     """Hash the exact approved operation input object, never an arbitrary command."""
     return contract_digest("approval-payload", value)
+
+
+def preference_operation_digest(value: Mapping[str, Any]) -> str:
+    """Hash the exact typed policy-operation payload, never a generic command.
+
+    Mirrors :func:`approval_payload_digest`: the canonical form covers the FULL
+    payload (no field escapes), so two equivalent payloads — same operation,
+    setting, scope, value, version, expiry regardless of key order — hash
+    identically, while any material change to the scope, value, digest/reference,
+    version, or expiry produces a different digest.  Because a preview and the
+    applied operation share the identical payload, they share this digest, so an
+    approval bound to a preview commits to exactly the effect that is applied and
+    building a preview cannot silently diverge from it.
+    """
+    return contract_digest("preference-operation", value)
 
 
 def validate_catalog(catalog: Mapping[str, Any]) -> None:
