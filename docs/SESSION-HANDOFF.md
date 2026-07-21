@@ -64,6 +64,63 @@ rewrite it as part of Workbench work without a separate review of those changes.
 - No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 - No browser-supplied worktree paths, model/tool controls on the voice relay, raw audio storage, or transcript retention without the explicit environment switch.
 
+## 2026-07-20 chat-first-voice T011 — conversation pinning, tags, folders, filterable search
+
+Conversation-level ORGANIZATION metadata (a `pinned` flag, a bounded set of
+safe `tags`, one optional `folder` label) plus actor-scoped filters on
+list/search. All backend + API; the rail UI that renders/edits these is T004.2
+and is NOT in this task, so no `web/src` change was made.
+
+- **`workbench/conversation_models.py` (+~55):** `Conversation` gains
+  `pinned: bool`, `tags: tuple[str, ...]`, `folder: str | None`. Tags/folder are
+  safe `^[a-z0-9][a-z0-9._-]{0,63}$` tokens (`_ORG_TOKEN`) — structurally no
+  prose/path/URL; `tags` normalized to a sorted, unique tuple via `normalize_tags`
+  and bounded to `MAX_TAGS = 32`. A `deleted` tombstone must retain NO
+  organization metadata (mirrors the existing title-drop rule). Deliberately did
+  NOT extend `ConversationAudit`: its scalar-only field set is locked by
+  `test_audit_models_structurally_carry_no_message_content_field`, and a `tags`
+  tuple would breach that safety guard — so organization changes are audited
+  through the store event `kind` over the unchanged content-free shape instead
+  (consistent with how a title never appears in audit either).
+- **`workbench/conversation_store.py` (+~70):** six actor-scoped mutations —
+  `pin`/`unpin`, `add`/`remove_conversation_tag`, `set`/`clear_conversation_folder`
+  — each routed through `_owned`/`_mutate_conversation` (unsafe label → fail
+  closed; non-listable status → refused) and `_store_conversation` under a
+  distinct `kind` (`conversation.pinned|unpinned|tagged|untagged|foldered|unfoldered`).
+  `list_conversations`/`search_conversations` gain `pinned`/`tag`/`folder`
+  keyword filters applied AFTER actor scoping (a cross-actor filter matches
+  nothing; no existence oracle); pinned rows sort ahead of the rest. `_complete_deletion`
+  clears org metadata into the tombstone. All six added to the `ConversationStore`
+  Protocol and the `_synchronize` reentrant-lock list.
+- **`workbench/conversation_api.py` (+~90):** `conversation_json` now emits
+  `pinned`/`tags`/`folder`. New thin endpoints `POST /{id}/pin`, `/unpin`,
+  `/tags`, `/tags/remove`, `/folder`, `/folder/clear` (each idempotency-aware
+  like its siblings); `GET ""` and `GET /search` gain `pinned`/`tag`/`folder`
+  query filters. `TagInput`/`FolderInput` re-pin the safe token at the edge (422
+  on an unsafe label).
+- **Criteria → proving tests (`tests/test_conversation_organization.py`, +11):**
+  (1) org metadata absent from the assembled Serving request/turn content →
+  `test_organization_metadata_is_absent_from_the_assembled_serving_request`
+  (marker scan of `build_bounded_request`, which takes only route selection +
+  prompt — no conversation), `test_organization_metadata_is_absent_from_persisted_turn_content`;
+  (2) actor-scoped filters, cross-actor probe leaks nothing →
+  `test_filters_return_only_the_owning_actors_matching_conversations`,
+  `test_cross_actor_filter_probe_leaks_nothing_and_is_no_oracle`,
+  `test_api_filtered_list_is_actor_scoped_and_cross_actor_probes_return_nothing`;
+  (3) content-free lifecycle audit →
+  `test_organization_mutations_are_audited_content_free_with_lifecycle_kind`.
+  Plus bounding/idempotence/lock: unsafe+over-count fail closed, dedup/idempotent
+  remove, a `sys.setswitchinterval` concurrency test proving the reentrant lock
+  serializes concurrent tag adds with no lost update (set/restore in try/finally),
+  tombstone drop, and API mutation endpoints.
+- **Rail UI (pending T004.2):** the backend + API shape the rail needs
+  (`conversation.pinned|tags|folder`, filter query params, mutation endpoints)
+  is delivered here; rendering/editing the pin/tag/folder rail is T004.2 and not
+  merged. No `web/src` touched.
+- **Verification:** FULL Python suite green at 452 (441 baseline + 11 new), run
+  3x for the concurrency test — stable. No `web/src` touched, so `npm test` was
+  not required.
+
 ## 2026-07-20 chat-first-voice T009 — off-read-path retention enforcement, content-free preview, one-action ephemeral chat
 
 Retention expiry is batched-only (never triggered by a read), a content-free

@@ -117,11 +117,23 @@ class ConversationStore(Protocol):
     def create_conversation(self, actor: ConversationActor, retention: RetentionPolicy, title: str | None = None) -> Conversation: ...
     def create_ephemeral_conversation(self, actor: ConversationActor) -> Conversation: ...
     def get_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation: ...
-    def list_conversations(self, actor: ConversationActor, include_archived: bool = False) -> list[Conversation]: ...
-    def search_conversations(self, actor: ConversationActor, query: str, include_archived: bool = False) -> list[Conversation]: ...
+    def list_conversations(
+        self, actor: ConversationActor, include_archived: bool = False, *,
+        pinned: bool | None = None, tag: str | None = None, folder: str | None = None,
+    ) -> list[Conversation]: ...
+    def search_conversations(
+        self, actor: ConversationActor, query: str, include_archived: bool = False, *,
+        pinned: bool | None = None, tag: str | None = None, folder: str | None = None,
+    ) -> list[Conversation]: ...
     def rename_conversation(self, actor: ConversationActor, conversation_id: str, title: str) -> Conversation: ...
     def archive_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation: ...
     def unarchive_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation: ...
+    def pin_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation: ...
+    def unpin_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation: ...
+    def add_conversation_tag(self, actor: ConversationActor, conversation_id: str, tag: str) -> Conversation: ...
+    def remove_conversation_tag(self, actor: ConversationActor, conversation_id: str, tag: str) -> Conversation: ...
+    def set_conversation_folder(self, actor: ConversationActor, conversation_id: str, folder: str) -> Conversation: ...
+    def clear_conversation_folder(self, actor: ConversationActor, conversation_id: str) -> Conversation: ...
     def append_turn(
         self, actor: ConversationActor, conversation_id: str, *, role: str, status: str,
         lineage: TurnLineage, redaction: TurnRedaction, mode: str = "ordinary",
@@ -303,24 +315,62 @@ class MemoryConversationStore:
             raise UnknownConversationError("unknown conversation")
         return refreshed
 
-    def list_conversations(self, actor: ConversationActor, include_archived: bool = False) -> list[Conversation]:
+    def list_conversations(
+        self,
+        actor: ConversationActor,
+        include_archived: bool = False,
+        *,
+        pinned: bool | None = None,
+        tag: str | None = None,
+        folder: str | None = None,
+    ) -> list[Conversation]:
+        """List the acting actor's conversations, optionally filtered by organization.
+
+        The result is always scoped to ``actor`` first, so every organization
+        filter (``pinned``/``tag``/``folder``) narrows within the actor's own
+        rows only — a filter naming another actor's tag or folder simply matches
+        nothing here, and can never surface a foreign conversation or act as an
+        existence oracle.  Pinned conversations sort ahead of the rest; within
+        each group the newest-updated comes first.
+        """
         self._require_actor(actor)
         wanted = _LISTABLE_STATUSES if include_archived else frozenset({"active"})
         values = [
             record for record in self.rows.conversations.values()
-            if record.actor == actor and record.status in wanted
+            if record.actor == actor
+            and record.status in wanted
+            and (pinned is None or record.pinned == pinned)
+            and (tag is None or tag in record.tags)
+            and (folder is None or record.folder == folder)
         ]
-        return sorted(values, key=lambda record: record.updated_at, reverse=True)
+        values.sort(key=lambda record: record.updated_at, reverse=True)
+        values.sort(key=lambda record: not record.pinned)  # stable: pinned first
+        return values
 
     def search_conversations(
-        self, actor: ConversationActor, query: str, include_archived: bool = False,
+        self,
+        actor: ConversationActor,
+        query: str,
+        include_archived: bool = False,
+        *,
+        pinned: bool | None = None,
+        tag: str | None = None,
+        folder: str | None = None,
     ) -> list[Conversation]:
-        """Title/metadata search only — turn content is never scanned here."""
+        """Title search plus the same actor-scoped organization filters.
+
+        Turn content is never scanned here; the query matches the title only,
+        and the ``pinned``/``tag``/``folder`` filters are applied on top through
+        :meth:`list_conversations`, so the search stays scoped to the acting
+        actor exactly like the plain list.
+        """
         needle = query.strip().lower() if isinstance(query, str) else ""
         if not needle:
             raise ConversationStoreError("search query must be a non-empty string")
         return [
-            record for record in self.list_conversations(actor, include_archived=include_archived)
+            record for record in self.list_conversations(
+                actor, include_archived=include_archived, pinned=pinned, tag=tag, folder=folder,
+            )
             if record.title is not None and needle in record.title.lower()
         ]
 
@@ -350,6 +400,46 @@ class MemoryConversationStore:
             raise ConversationStoreError("only an archived conversation can be unarchived")
         updated = self._mutate_conversation(actor, conversation_id, status="active")
         return self._store_conversation("conversation.unarchived", updated)
+
+    # -- organization metadata (pin / tags / folder) ----------------------
+    #
+    # Each mutation is actor-scoped (routed through ``_owned``/``_mutate_conversation``,
+    # so a cross-actor probe is the same ``unknown conversation`` a missing id
+    # raises), fails closed on an unsafe label (the ``Conversation`` model
+    # rejects it), and emits a content-free ``ConversationAudit`` under a
+    # distinct lifecycle ``kind``.  None of these values ever reaches turn
+    # content or a Serving request.
+
+    def pin_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation:
+        updated = self._mutate_conversation(actor, conversation_id, pinned=True)
+        return self._store_conversation("conversation.pinned", updated)
+
+    def unpin_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation:
+        updated = self._mutate_conversation(actor, conversation_id, pinned=False)
+        return self._store_conversation("conversation.unpinned", updated)
+
+    def add_conversation_tag(self, actor: ConversationActor, conversation_id: str, tag: str) -> Conversation:
+        """Add one safe tag; unsafe or over-count tags fail closed at the model."""
+        record = self._owned(actor, conversation_id)
+        new_tags = tuple(record.tags) + (tag,)
+        updated = self._mutate_conversation(actor, conversation_id, tags=new_tags)
+        return self._store_conversation("conversation.tagged", updated)
+
+    def remove_conversation_tag(self, actor: ConversationActor, conversation_id: str, tag: str) -> Conversation:
+        """Remove one tag if present (idempotent); the actor keeps the rest."""
+        record = self._owned(actor, conversation_id)
+        new_tags = tuple(existing for existing in record.tags if existing != tag)
+        updated = self._mutate_conversation(actor, conversation_id, tags=new_tags)
+        return self._store_conversation("conversation.untagged", updated)
+
+    def set_conversation_folder(self, actor: ConversationActor, conversation_id: str, folder: str) -> Conversation:
+        """Move the conversation into one safe folder label; unsafe labels fail closed."""
+        updated = self._mutate_conversation(actor, conversation_id, folder=folder)
+        return self._store_conversation("conversation.foldered", updated)
+
+    def clear_conversation_folder(self, actor: ConversationActor, conversation_id: str) -> Conversation:
+        updated = self._mutate_conversation(actor, conversation_id, folder=None)
+        return self._store_conversation("conversation.unfoldered", updated)
 
     # -- turn appends (all routed through validate_turn_append) ------------
 
@@ -554,6 +644,9 @@ class MemoryConversationStore:
                 pending,
                 status="deleted",
                 title=None,
+                pinned=False,
+                tags=(),
+                folder=None,
                 deletion=ConversationDeletion(deletion.requested_at, deletion.mode, completed_at),
                 updated_at=completed_at,
             )
@@ -677,6 +770,12 @@ def _synchronize_memory_store() -> None:
         "rename_conversation",
         "archive_conversation",
         "unarchive_conversation",
+        "pin_conversation",
+        "unpin_conversation",
+        "add_conversation_tag",
+        "remove_conversation_tag",
+        "set_conversation_folder",
+        "clear_conversation_folder",
         "append_turn",
         "retry_turn",
         "branch_turn",

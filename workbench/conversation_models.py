@@ -89,11 +89,24 @@ MAX_VOICE_EVENTS = 64
 MAX_SIBLING_INDEX = 4096
 MAX_TITLE_CHARS = 200
 
+#: Conversation-level ORGANIZATION metadata bounds (chat-first-voice T011).
+#: Pin/tags/folder are operator/actor-authored labels for organizing the
+#: conversation list — never turn content, never part of a Serving request.
+#: A tag or folder is a short safe token: no free-form prose, no punctuation
+#: that could smuggle a path/URL/marker, and each is length-bounded.
+MAX_TAGS = 32
+MAX_TAG_CHARS = 64
+MAX_FOLDER_CHARS = 64
+
 _CONVERSATION_ID = re.compile(r"^conv_[a-zA-Z0-9_-]{8,128}$")
 _TURN_ID = re.compile(r"^turn_[a-zA-Z0-9_-]{8,128}$")
 _ACTOR_ID = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
 _POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 _REDACTION_RULESET = re.compile(r"^[a-z][a-z0-9._-]{1,127}$")
+#: A safe organization token: lowercase alnum start, then a bounded run of
+#: ``[a-z0-9._-]`` — structurally cannot express a path, URL, or free-form
+#: message body, so a tag/folder is a label, not content.
+_ORG_TOKEN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 # Domain separation so a chat content fingerprint can never collide with a
 # contract digest computed over the same bytes (see docs/contracts/DIGESTING.md
@@ -194,15 +207,48 @@ class ConversationDeletion:
             _require(isinstance(self.completed_at, datetime), "deletion completed_at must be a datetime")
 
 
+def normalize_tags(tags: tuple[str, ...] | list[str] | frozenset[str]) -> tuple[str, ...]:
+    """Fail-closed normalize an organization tag set into a sorted, unique tuple.
+
+    Each tag must be a safe :data:`_ORG_TOKEN` label (no prose, path, or URL);
+    the set is bounded to :data:`MAX_TAGS` and deduplicated deterministically so
+    the stored value is order-independent and free of content.
+    """
+    _require(
+        isinstance(tags, (tuple, list, frozenset, set)) and not isinstance(tags, (str, bytes)),
+        "conversation tags must be a collection of safe tag tokens",
+    )
+    unique: set[str] = set()
+    for tag in tags:
+        _require(
+            isinstance(tag, str) and bool(_ORG_TOKEN.match(tag)),
+            f"conversation tag is not a safe organization token: {tag!r}",
+        )
+        unique.add(tag)
+    _require(len(unique) <= MAX_TAGS, f"conversation carries more than {MAX_TAGS} tags")
+    return tuple(sorted(unique))
+
+
 @dataclass(frozen=True)
 class Conversation:
-    """One durable, mode-agnostic conversation identity owned by an actor."""
+    """One durable, mode-agnostic conversation identity owned by an actor.
+
+    Beyond identity/lifecycle it carries the actor's ORGANIZATION metadata —
+    a ``pinned`` flag, a bounded set of safe ``tags``, and one optional
+    ``folder`` label.  These are operator/actor-authored organization labels,
+    never turn content and never part of a Serving request; they are bounded to
+    safe tokens here and kept out of the turn-content and Serving-request paths
+    everywhere else.
+    """
 
     id: str
     actor: ConversationActor
     retention: RetentionPolicy
     status: str = "active"
     title: str | None = None
+    pinned: bool = False
+    tags: tuple[str, ...] = ()
+    folder: str | None = None
     deletion: ConversationDeletion | None = None
     created_at: datetime = field(default_factory=now_utc)
     updated_at: datetime = field(default_factory=now_utc)
@@ -214,15 +260,29 @@ class Conversation:
         _require(self.status in CONVERSATION_STATUSES, f"conversation status is not allowlisted: {self.status!r}")
         if self.title is not None:
             _require(isinstance(self.title, str) and len(self.title) <= MAX_TITLE_CHARS, "conversation title is invalid")
+        # Organization metadata is bounded to safe labels and stored canonically
+        # (a sorted, unique tag tuple) so it is order-independent and content-free.
+        _require(isinstance(self.pinned, bool), "conversation pinned must be a bool")
+        object.__setattr__(self, "tags", normalize_tags(self.tags))
+        if self.folder is not None:
+            _require(
+                isinstance(self.folder, str) and bool(_ORG_TOKEN.match(self.folder)),
+                "conversation folder is not a safe organization token",
+            )
         if self.status in _DELETION_REQUIRED_STATUSES:
             _require(isinstance(self.deletion, ConversationDeletion), f"conversation status {self.status!r} requires a deletion record")
         else:
             _require(self.deletion is None, f"conversation status {self.status!r} must not carry a deletion record")
         # A ``deleted`` row is the post-purge tombstone: identity, lifecycle,
         # and counts only.  The title is untrusted prose content and must not
-        # survive the purge.
+        # survive the purge; the organization labels are dropped with it so the
+        # tombstone carries no actor-authored metadata at all.
         if self.status == "deleted":
             _require(self.title is None, "a deleted conversation tombstone must not retain a title")
+            _require(
+                not self.pinned and self.tags == () and self.folder is None,
+                "a deleted conversation tombstone must not retain organization metadata",
+            )
 
 
 @dataclass(frozen=True)
@@ -589,6 +649,12 @@ class ConversationAudit:
 
     This is also the tombstone shape ``purge_content_keep_tombstone`` leaves
     behind: identity plus turn counts, never retained message content.
+
+    An organization lifecycle change (pin/tag/folder — chat-first-voice T011)
+    is audited through the distinct store event ``kind`` over this same
+    content-free shape; the audit deliberately carries NO tag/folder label
+    value, mirroring the way even a title never appears here — the audit stays
+    scalar, lifecycle-only, and structurally incapable of smuggling content.
     """
 
     conversation_id: str
