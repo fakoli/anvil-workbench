@@ -97,16 +97,18 @@ def test_concurrent_same_key_requests_yield_exactly_one_record():
         response, _ = store.run(ALICE, "op", "race-key", request_hash, executor)
         results[name] = response
 
-    threads = [threading.Thread(target=race, args=(name,)) for name in ("a", "b")]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    try:
+        threads = [threading.Thread(target=race, args=(name,)) for name in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(previous_interval)
 
     assert len(executions) == 1  # exactly one record was created
     assert len(store.rows.records) == 1
     assert results["a"] == results["b"] == {"id": "the-one-record", "runs": 1}
-    sys.setswitchinterval(previous_interval)
 
 
 def test_a_failed_execution_stores_nothing_and_stays_retriable():
@@ -309,27 +311,50 @@ def test_requests_without_a_key_are_never_deduplicated():
         assert len(listing) == 2
 
 
-def test_concurrent_same_key_create_over_http_yields_one_conversation():
+def test_repeated_same_key_create_over_http_yields_one_conversation():
+    # The genuine concurrency proof is at the store layer (deterministic under
+    # the lock); at the HTTP layer we assert a retried key dedups to one record
+    # and an identical response, without sharing a TestClient across threads
+    # (httpx/TestClient is not documented as concurrent-safe).
     with client() as test_client:
-        previous_interval = sys.getswitchinterval()
-        sys.setswitchinterval(1e-6)
-        barrier = threading.Barrier(2)
-        responses: dict[str, object] = {}
-
-        def race(name: str) -> None:
-            barrier.wait()
-            responses[name] = test_client.post(
-                "/api/conversations", json={"title": "Raced"}, headers=keyed(OWNER, "race-http"),
-            )
-
-        threads = [threading.Thread(target=race, args=(name,)) for name in ("a", "b")]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        sys.setswitchinterval(previous_interval)
-
-        assert responses["a"].status_code == 201 and responses["b"].status_code == 201
-        assert responses["a"].json() == responses["b"].json()
+        first = test_client.post(
+            "/api/conversations", json={"title": "Raced"}, headers=keyed(OWNER, "race-http"),
+        )
+        second = test_client.post(
+            "/api/conversations", json={"title": "Raced"}, headers=keyed(OWNER, "race-http"),
+        )
+        assert first.status_code == 201 and second.status_code == 201
+        assert first.json() == second.json()
         listing = test_client.get("/api/conversations", headers=as_actor(OWNER)).json()["conversations"]
         assert len(listing) == 1
+
+
+def test_rename_and_delete_endpoints_dedup_a_reused_key():
+    # Breadth beyond create/append: two more wired endpoints (rename, delete)
+    # must each dedup a retried key to one effect with an identical response.
+    with client() as test_client:
+        cid = test_client.post(
+            "/api/conversations", json={"title": "chat"}, headers=as_actor(OWNER),
+        ).json()["id"]
+
+        r1 = test_client.post(
+            f"/api/conversations/{cid}/rename", json={"title": "renamed"}, headers=keyed(OWNER, "rename-1"),
+        )
+        r2 = test_client.post(
+            f"/api/conversations/{cid}/rename", json={"title": "renamed"}, headers=keyed(OWNER, "rename-1"),
+        )
+        assert r1.status_code == 200 and r2.status_code == 200
+        # Identical response and a single rename effect (both replays agree).
+        assert r1.json() == r2.json()
+        assert r1.json().get("title") == "renamed"
+
+        d1 = test_client.post(
+            f"/api/conversations/{cid}/delete", json={"mode": "purge_content_keep_tombstone"},
+            headers=keyed(OWNER, "delete-1"),
+        )
+        d2 = test_client.post(
+            f"/api/conversations/{cid}/delete", json={"mode": "purge_content_keep_tombstone"},
+            headers=keyed(OWNER, "delete-1"),
+        )
+        assert d1.status_code == d2.status_code
+        assert d1.json() == d2.json()

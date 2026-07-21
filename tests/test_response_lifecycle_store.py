@@ -172,14 +172,17 @@ def test_concurrent_advances_cannot_regress_a_terminal():
         except ResponseLifecycleError as exc:  # the loser sees an immutable terminal
             results[name] = exc
 
-    threads = [
-        threading.Thread(target=race, args=("a", "completed")),
-        threading.Thread(target=race, args=("b", "timed_out")),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    try:
+        threads = [
+            threading.Thread(target=race, args=("a", "completed")),
+            threading.Thread(target=race, args=("b", "timed_out")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(previous_interval)
 
     successes = [name for name, value in results.items() if not isinstance(value, Exception)]
     failures = [value for value in results.values() if isinstance(value, Exception)]
@@ -192,7 +195,6 @@ def test_concurrent_advances_cannot_regress_a_terminal():
     assert settled.is_terminal
     assert settled.state == results[successes[0]].state
     assert len(store.rows.responses) == 1
-    sys.setswitchinterval(previous_interval)
 
 
 def test_advance_rejects_an_unknown_state_and_an_unbegun_request():
