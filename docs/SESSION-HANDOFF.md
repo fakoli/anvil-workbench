@@ -56,6 +56,39 @@ Contract: `docs/CONTRACTS.md` → "System health and observational posture
 effect — and reads already-parsed Settings plus an optional injected
 bridge-health signal. Remaining T003.2 lane work (a browser view over this API)
 is unchanged by this fix round.
+## 2026-07-21 chat-first-voice T002 + T003 — integration qualification fixtures
+
+Integrated and qualified the two chat foundations end-to-end with hermetic
+fixtures. No production code changed; both remain deliberately OFF `create_app`'s
+live loop (the browser endpoint over these paths is a later slice).
+
+- **T002 — durable conversation storage** (`tests/test_chat_conversation_integration.py`,
+  +5 tests): one fixture drives the FULL lifecycle through the actor-scoped HTTP
+  API on an injected `MemoryConversationStore` — create → append → search →
+  rename → retry/branch → archive/unarchive → reload (fresh store over the same
+  rows, `recover_on_open`) → both deletion modes → operator-only retention
+  preview + enforce. Proves actor isolation (cross-actor reads/mutations are
+  byte-identical to a missing id), reload recovery (committed turns preserved,
+  in-flight streaming turn surfaced `interrupted`, append-only lineage intact),
+  and content-free audit (read via the hub-internal `list_audit` — the only
+  surface exposing the shape — asserting the server-keyed `hmac-sha256:`
+  fingerprint is retained where required while the transcript text, title, and a
+  raw unkeyed sha256 content digest are all absent).
+- **T003 — streaming Chat runtime** (`tests/test_chat_runtime_integration.py`,
+  +9 tests): one `run_chat_turn` driver composes the runtime path (route
+  validation → lifecycle `begin` → bounded relay over a scripted SSE transport →
+  per-frame sequence stamp/commit → truthful terminal persistence → browser-safe
+  projection) and every outcome test calls it. Covers all four terminal outcomes
+  (completed/cancelled/timed_out/serving_unavailable), each persisted truthfully
+  and never rendered complete despite relayed partial text; invalid-route and
+  undeclared-control refusal proven to happen before the transport is ever opened
+  (no lifecycle record begins); reconnect/snapshot via the sequence contract
+  (monotonic seqs, gap detection, stale-frame refusal, terminal immutability,
+  restart→`interrupted` recovery); browser projection carries only declared
+  controls + safe route/usage metadata; and a source scan over the four runtime
+  modules confirms no HTTP-client import, provider host, or URL scheme.
+- **Verification:** full `python -m pytest -q` green at 466 (452 baseline + 14).
+  No `web/` change, so the JS toolchain was not required.
 
 ## 2026-07-20 autonomous PR-delivery run summary (actor `claude`)
 

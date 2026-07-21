@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/plugin-request.v1.schema.json",
+  "title": "Anvil Workbench plugin request v1",
+  "description": "One typed, idempotent request against the reviewed plugin catalog: either a `tool_call` invoking an enabled tool, or a lifecycle action (`install`, `upgrade`, `downgrade`, `disable`, `remove`) executed by the plugin host (R003). It carries ids, digests, and typed tool inputs only — every object is closed (additionalProperties:false), so no local path, raw shell command, credential value, or generic executable body is representable; a browser or model cannot manufacture a new privilege by emitting one. It is digest-bearing: `request_digest` is the hub's idempotency key over the canonical content, so replaying an identical request is the same action rather than a second one. An `install`, `upgrade`, or `downgrade` always carries both a `preview_ref` and a hash-bound owner approval that binds its exact typed subject (the R003 floor: a preview AND a hash-bound approval; a catalog gate may be stricter but never weaker). Any approval attached to a request — for any kind, including `disable`/`remove` — must name the action that corresponds to that kind or it is refused fail-closed. The request grants nothing on its own — the plugin host still enforces catalog/profile authority, preview, approval binding, and reconciliation. All prose is untrusted task data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id", "request_digest", "kind", "actor", "plugin", "created_at"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,62}$"},
+    "pluginId": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,62}$"},
+    "toolId": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"},
+    "semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "rfc3339": {"type": "string", "format": "date-time", "maxLength": 40, "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "pluginRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plugin_id", "plugin_digest"],
+      "properties": {
+        "plugin_id": {"$ref": "#/$defs/pluginId"},
+        "plugin_digest": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-plugin-request/v1"},
+    "request_id": {"type": "string", "pattern": "^plugreq_[a-zA-Z0-9_-]{8,128}$"},
+    "request_digest": {"$ref": "#/$defs/sha256"},
+    "kind": {"enum": ["tool_call", "install", "upgrade", "downgrade", "disable", "remove"]},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_id", "kind"],
+      "properties": {
+        "actor_id": {"type": "string", "pattern": "^[a-zA-Z0-9._-]{1,128}$"},
+        "kind": {"enum": ["operator", "reviewer", "service"]}
+      }
+    },
+    "plugin": {"$ref": "#/$defs/pluginRef"},
+    "tool_call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_id", "inputs"],
+      "description": "Present when kind is tool_call. The tool is named by id at the pinned plugin digest; `inputs` is a typed object validated against that tool's reviewed input schema by the plugin host — never a command, path, or free body.",
+      "properties": {
+        "tool_id": {"$ref": "#/$defs/toolId"},
+        "inputs": {"type": "object"}
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Present for a lifecycle action. It names the version window only; the plugin host performs the effect. There is no source URL, path, or archive field: the target is resolved from the reviewed catalog, never fetched from a request-supplied location.",
+      "properties": {
+        "target_version": {"$ref": "#/$defs/semver"},
+        "from_version": {"$ref": "#/$defs/semver"}
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grant_id", "action", "payload_hash"],
+      "description": "The hash-bound one-time approval. `payload_hash` binds the exact typed subject of this request (the tool inputs for an effectful tool_call, or the plugin/kind/target-version selection for a lifecycle or management action), and `action` MUST correspond to the request `kind` (tool_call->invoke_effect_tool, install->install_plugin, upgrade->upgrade_plugin, downgrade->downgrade_plugin, disable->disable_plugin, remove->remove_plugin), enforced fail-closed on every kind by workbench.contracts.validate_plugin_request. disable_plugin/remove_plugin exist so a descriptor may declare a stricter approval gate on disable/remove per R003; an attached approval whose action does not match the kind is refused.",
+      "properties": {
+        "grant_id": {"type": "string", "pattern": "^approval_[a-zA-Z0-9_-]{4,128}$"},
+        "action": {"enum": ["invoke_effect_tool", "install_plugin", "upgrade_plugin", "downgrade_plugin", "disable_plugin", "remove_plugin"]},
+        "payload_hash": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "preview_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preview_id"],
+      "properties": {
+        "preview_id": {"type": "string", "pattern": "^plugprev_[a-zA-Z0-9_-]{8,128}$"}
+      }
+    },
+    "created_at": {"$ref": "#/$defs/rfc3339"}
+  },
+  "allOf": [
+    {"if": {"properties": {"kind": {"const": "tool_call"}}, "required": ["kind"]},
+     "then": {"required": ["tool_call"], "not": {"required": ["lifecycle"]}}},
+    {"if": {"properties": {"kind": {"enum": ["install", "upgrade", "downgrade", "disable", "remove"]}}, "required": ["kind"]},
+     "then": {"not": {"required": ["tool_call"]}}},
+    {"if": {"properties": {"kind": {"enum": ["install", "upgrade", "downgrade"]}}, "required": ["kind"]},
+     "then": {"required": ["lifecycle", "approval", "preview_ref"]}}
+  ]
+}
