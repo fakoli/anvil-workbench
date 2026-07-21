@@ -21,6 +21,11 @@ from .conversation_api import (
     register_conversation_handlers,
 )
 from .conversation_store import ConversationStore, MemoryConversationStore
+from .delivery_projection import (
+    DeliveryProjectionStore,
+    UnknownDeliveryRecordError,
+)
+from .directives import session_directive_view, submit_directive
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .plugin_host import PluginHostService
 from .project_context_store import ProjectContextStore, UnknownProjectionError
@@ -334,6 +339,149 @@ def build_run_context_router(
         context = context_store().get(project_id, run_id).as_dict()
         context["untrusted"] = scrub_config_payload(context["untrusted"])
         return {"context": context}
+
+    return router
+
+
+#: The single non-leaking body every unknown-or-foreign delivery-projection
+#: lookup gets, so a cross-project probe cannot distinguish "missing" from
+#: "belongs to another project".
+_UNKNOWN_DELIVERY_DETAIL = "unknown delivery record"
+
+#: The PRD / task / delivery-run / approval path grammars, mirrored from the
+#: contract patterns so a malformed scope is rejected at the edge (422) before it
+#: can reach the store as a distinguishable error.
+_PRD_ID_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,63}$"
+_TASK_ID_PATTERN = r"^T[0-9]{3}(\.[0-9]{1,3})?$"
+_DELIVERY_RUN_ID_PATTERN = r"^run_[a-zA-Z0-9_-]{8,128}$"
+_APPROVAL_ID_PATTERN = r"^approval_[a-zA-Z0-9_-]{4,128}$"
+
+
+def build_delivery_projection_router(
+    actor_dependency: Callable[..., str],
+    delivery_projection_store: DeliveryProjectionStore | None,
+) -> APIRouter:
+    """Build the read-only, project-scoped delivery display surface (T002 / T004).
+
+    Serves four display read-models, all authenticated by the hub's trusted
+    ``actor`` dependency and scoped by the ``project_id`` path segment: bounded
+    redacted PRD content, scoped task references, delivery-eligibility verdicts,
+    and the pinned operational run rows / approval bindings.  Task references and
+    eligibility are keyed by ``(prd_id, task_id)`` so a ``T001`` in two PRDs can
+    never collapse into one row (T002 criterion 1).  Eligibility reflects the
+    current snapshot: when the task reference's source advanced, the served
+    verdict is derived as ``stale.snapshot_superseded`` rather than replaying a
+    superseded ``eligible`` verdict (criterion 2).
+
+    Every response is scrubbed on this last hop with
+    :func:`~workbench.redaction.scrub_config_payload`, so the untrusted PRD body,
+    task title, or attempt label can never ferry a secret, endpoint, or path to
+    the UI (criterion 3 / recurring redaction gate).  Project scoping is a hard
+    boundary: a record owned by another project raises the same
+    ``UnknownDeliveryRecordError`` a genuinely missing record raises, so this
+    surface is never a cross-project existence oracle.  The surface is GET-only
+    and fail-closed (503) until a projection store is configured — it is
+    deliberately NOT wired into the live bridge poll loop.
+    """
+    router = APIRouter(prefix="/api/projects")
+
+    def projection() -> DeliveryProjectionStore:
+        if delivery_projection_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="delivery projection is not configured",
+            )
+        return delivery_projection_store
+
+    @router.get("/{project_id}/prds/{prd_id}/content")
+    def prd_content(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        prd_id: str = Path(pattern=_PRD_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One PRD's bounded, untrusted content, redacted for safe rendering."""
+        return scrub_config_payload({"content": projection().get_prd_content(project_id, prd_id)})
+
+    @router.get("/{project_id}/prds/{prd_id}/tasks")
+    def task_references(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        prd_id: str = Path(pattern=_PRD_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Every scoped task reference in the PRD's plan/feature hierarchy."""
+        return scrub_config_payload({"tasks": projection().list_task_references(project_id, prd_id)})
+
+    @router.get("/{project_id}/prds/{prd_id}/tasks/{task_id}")
+    def task_reference(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        prd_id: str = Path(pattern=_PRD_ID_PATTERN),
+        task_id: str = Path(pattern=_TASK_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One scoped task reference; a foreign/missing scope is the indistinct 404."""
+        return scrub_config_payload({"task": projection().get_task_reference(project_id, prd_id, task_id)})
+
+    @router.get("/{project_id}/prds/{prd_id}/tasks/{task_id}/eligibility")
+    def task_eligibility(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        prd_id: str = Path(pattern=_PRD_ID_PATTERN),
+        task_id: str = Path(pattern=_TASK_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The task's delivery-eligibility verdict, stale-checked against the source."""
+        return scrub_config_payload(
+            {"eligibility": projection().get_eligibility(project_id, prd_id, task_id)}
+        )
+
+    @router.get("/{project_id}/delivery/runs")
+    def delivery_runs(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        prd_id: str | None = None,
+        task_id: str | None = None,
+        run_status: str | None = None,
+        route_digest: str | None = None,
+        capability_profile_digest: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The project's pinned run rows, grouped/filtered by the query facets.
+
+        Every row's headline is the pinned task title (never a bare id when a
+        title exists), and repeated attempts for one task are distinguished by
+        their human attempt label and start time (T004 criteria 1 and 3).
+        """
+        rows = projection().list_run_rows(
+            project_id,
+            prd_id=prd_id,
+            task_id=task_id,
+            status=run_status,
+            route_digest=route_digest,
+            capability_profile_digest=capability_profile_digest,
+            since=since,
+            until=until,
+        )
+        return scrub_config_payload({"runs": [row.as_dict() for row in rows]})
+
+    @router.get("/{project_id}/delivery/runs/{run_id}")
+    def delivery_run(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        run_id: str = Path(pattern=_DELIVERY_RUN_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One pinned run row; a foreign/missing run is the indistinct 404."""
+        return scrub_config_payload({"run": projection().get_run_row(project_id, run_id).as_dict()})
+
+    @router.get("/{project_id}/delivery/approvals/{approval_id}")
+    def delivery_approval(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        approval_id: str = Path(pattern=_APPROVAL_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One approval binding, exposing every exact safe authorization binding."""
+        return scrub_config_payload(
+            {"approval": projection().get_approval_binding(project_id, approval_id).as_dict()}
+        )
 
     return router
 
@@ -714,6 +862,7 @@ def create_app(
     idempotency_store: IdempotencyStore | None = None,
     project_context_store: ProjectContextStore | None = None,
     run_context_store: RunContextStore | None = None,
+    delivery_projection_store: DeliveryProjectionStore | None = None,
     system_health: SystemHealthService | None = None,
     plugin_host_service: "PluginHostService | None" = None,
     preference_store: MemoryPreferenceStore | None = None,
@@ -749,6 +898,11 @@ def create_app(
     # read-model that is deliberately NOT wired into the live bridge poll loop;
     # it stays ``None`` unless injected, so the browser surface fails closed (503).
     app.state.run_context_store = run_context_store
+    # The delivery display projection (PRD/plan/task/eligibility + pinned run
+    # rows/approval bindings) is a hub-side supervision read-model that is
+    # deliberately NOT wired into the live bridge poll loop; it stays ``None``
+    # unless injected, so the browser surface fails closed (503).
+    app.state.delivery_projection_store = delivery_projection_store
     app.state.system_health = system_health
     # The reviewed-plugin discovery/receipt surface is a hub-side read-model that
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
@@ -821,6 +975,16 @@ def create_app(
             status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_INTEGRATION_DETAIL}
         )
 
+    # A missing delivery record and another project's delivery record raise the
+    # same ``UnknownDeliveryRecordError``; both render the identical fixed 404
+    # body so the delivery display surface is never a cross-project existence
+    # oracle. More specific than the ``StoreError`` handler, so it wins.
+    @app.exception_handler(UnknownDeliveryRecordError)
+    async def unknown_delivery_record_handler(_: Request, __: UnknownDeliveryRecordError):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_DELIVERY_DETAIL}
+        )
+
     # Actor-scoped chat surface (chat-first-voice T002.4): identity comes from
     # the same trusted ``actor`` dependency; the store enforces ownership.
     register_conversation_handlers(app)
@@ -842,6 +1006,13 @@ def create_app(
     # immutable queue-time snapshot with trusted policy and untrusted PRD/task
     # data separately labeled; never a secret, path, command, or provider payload.
     app.include_router(build_run_context_router(actor, run_context_store))
+    # Read-only, project-scoped delivery display surface (plan-task-delivery
+    # T002/T004): authenticated by the same trusted ``actor`` dependency, scoped
+    # by the path ``project_id``, GET-only, and fail-closed (503) until a
+    # projection store is configured. Serves bounded redacted PRD content, scoped
+    # task references, stale-checked eligibility verdicts, and the pinned run
+    # rows / approval bindings; never canonical State, a secret, path, or command.
+    app.include_router(build_delivery_projection_router(actor, delivery_projection_store))
     # Read-only system-health + observational posture surface (preferences-
     # configuration T003.2 / T008): authenticated by the same trusted ``actor``
     # dependency, GET-only, and serving only the closed descriptor/posture display
@@ -917,14 +1088,38 @@ def create_app(
 
     @app.post("/api/sessions/{session_id}/directives", status_code=status.HTTP_202_ACCEPTED)
     def add_directive(session_id: str, payload: DirectiveInput, current_actor: str = Depends(actor)) -> dict[str, Any]:
+        # Typed delivery semantics (plan-task-delivery T008): the directive is a
+        # scrubbed append-only session event queued for the next work packet. It
+        # cannot signal, interrupt, or retarget a running Codex process; the only
+        # effect is recording the event. The outcome is one stable typed code.
+        #
+        # Not-wired seam (reviewer-flagged, not a bug): the
+        # ``directive.rejected_unknown_session`` typed outcome is unreachable on
+        # THIS wired path — ``store.get_session`` below raises a 404 for an unknown
+        # session first, so the API never returns that typed code. It is reachable
+        # only by a direct ``submit_directive`` store-layer caller (covered by
+        # ``tests/test_harness_kernel.py::test_ptd_t008_directive_outcomes_are_typed_and_append_only``).
         session = store.get_session(session_id)
         workflow = next(iter(store.list_workflows(session_id)), None)
-        event = store.record_session_event(session.id, workflow.id if workflow else None, "operator.directive", {
-            "content": payload.content.strip(), "actor": current_actor,
-            "delivery": "included in the next bridge work packet for this session",
-        })
-        store.append_audit("session.directive_added", current_actor, session.project_id, {"session_id": session.id, "event_id": event.id})
-        return as_json(event)
+        result = submit_directive(
+            store, session.id, payload.content, current_actor, workflow.id if workflow else None,
+        )
+        event = result.get("event")
+        if event is not None:
+            store.append_audit(
+                "session.directive_added", current_actor, session.project_id,
+                {"session_id": session.id, "event_id": event.id, "outcome": result["outcome"]},
+            )
+        response = {"outcome": result["outcome"], "recorded": result["recorded"]}
+        if event is not None:
+            response["event"] = as_json(event)
+        return response
+
+    @app.get("/api/sessions/{session_id}/directives")
+    def list_directives(session_id: str, _: str = Depends(actor)) -> dict[str, Any]:
+        """The session's directives split into pending vs. packet-included (T008)."""
+        store.get_session(session_id)
+        return scrub_config_payload(session_directive_view(store, session_id))
 
     @app.get("/api/sessions/{session_id}/events")
     def session_events(session_id: str, after_sequence: int = 0, _: str = Depends(actor)) -> dict[str, Any]:

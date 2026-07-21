@@ -14,6 +14,60 @@ Use this file to resume work in a new Anvil Workbench coding session.
 - Immediate roadmap: [ROADMAP.md](ROADMAP.md)
 - Agent rules: [../AGENTS.md](../AGENTS.md)
 
+## 2026-07-21 delivery display projection + Deliver + typed directives (plan-task-delivery T002/T004/T005/T008)
+
+- **New browser-facing delivery API boundary (read-only, project-scoped, GET):**
+  `build_delivery_projection_router` in `workbench/api.py` serves redacted PRD
+  content, scoped `(prd_id, task_id)` task references, delivery-eligibility
+  verdicts, and pinned run-display rows / approval bindings. Every response is
+  re-scrubbed on the last hop with `scrub_config_payload`. Backed by
+  `workbench/delivery_projection.py` (`MemoryDeliveryProjectionStore`). It stays
+  `None` in `create_app` (503 until injected) — **not wired into the live bridge
+  poll loop**; it is a supervision DISPLAY projection, never canonical State.
+- **Deliver-from-a-task (T005):** `workbench/deliver.py`
+  (`MemoryDeliverStartStore`) is the atomic, idempotent start with a typed
+  accepted/denied receipt; the denied `safe_summary` is scrubbed with
+  `redact_config_text`. Preconditions are an injected callable (see the seam
+  note below).
+- **Typed operator directives (T008):** `workbench/directives.py` wraps the
+  append-only `operator.directive` session event with a closed set of typed
+  outcomes; text is scrubbed with `redact_config_text` before persist (the
+  pre-existing `add_directive` redaction fix). `POST /api/sessions/{id}/directives`
+  returns `{outcome, recorded, event?}` (202); `GET` returns the pending-vs-
+  included split.
+- **FIXED this run — T008 criterion 2 live falsification (packet marker wiring):**
+  the pending/included split is derived from an `operator.directive_packet`
+  high-water marker, but NOTHING wired recorded it — a directive already carried
+  in a queued packet reported `pending` forever. Every live packet-assembly point
+  now records the marker (highest included directive sequence): `MemoryStore`
+  `start_workflow_run` + `enqueue_run`, and the `PostgresStore` variants, all four
+  consistent. Wired proof:
+  `tests/test_api.py::test_ptd_t008_directive_reports_included_after_real_packet_assembly`
+  (POST directive → start workflow → GET shows INCLUDED, `included_up_to_sequence`
+  advanced; revert of the marker → the test fails).
+- **FIXED this run — capture-time eligibility TOCTOU (T002 criterion 2):**
+  `capture_eligibility` now fails closed (`StaleEligibilityError`) when the
+  verdict's own pinned `ref.prd_revision`/`scoped_id` no longer matches the
+  current task reference, so a verdict computed against a superseded source cannot
+  be captured against an advanced reference and served fresh.
+- **FIXED this run — systemic dotless host:port leak (shared redaction):**
+  `redact_config_text` gained a lowercase-anchored single-label endpoint pattern
+  `\b[a-z][a-z0-9-]*:\d{2,5}\b`, closing a `serving:8443`-style leak that slipped
+  every free-text channel across three lanes (RTP/AMP/PTD). Full-suite verified:
+  no over-redaction of timestamps, `sha256:` digests, or `scoped_id`s. The
+  RTP/AMP receipt backstops are now redundant-but-harmless (retained).
+- **FIXED this run — immutable-record aliasing:** `capture_prd_content` /
+  `capture_task_reference` (and reads) now deep-copy nested content so a caller
+  retaining the dict cannot mutate a stored "immutable" record.
+- **Not-wired seams (reviewer-flagged, documented in code, not bugs):**
+  `directive.rejected_unknown_session` is unreachable via the wired POST (a 404
+  precedes it); `eligibility_for_start` (fail-closed staleness gate) is not yet
+  JOINED to the Deliver coordinator (preconditions are injected); the run-row
+  `since`/`until` filter is a lexicographic RFC3339 compare assuming the Z-form
+  every wired producer emits.
+- **Verification:** full `python -m pytest -q` = 823 passed (twice); `web` vitest
+  51 passed; `npm run build` clean. Revert-detection demonstrated for the packet
+  marker and the shared redaction pattern.
 ## 2026-07-21 Advanced model playground runtime lane (advanced-model-playground T002/T003/T008)
 
 - **Implemented (three new hermetic modules, NOT wired into the live bridge loop):**

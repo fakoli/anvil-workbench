@@ -258,3 +258,54 @@ def test_a_failed_attempt_stays_retriable_and_never_fabricates_a_stored_success(
         idempotency_key="run:run_1:evidence:1", executor=failing,
     )
     assert executions["n"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# plan-task-delivery T005 — the atomic idempotent Deliver: a typed start receipt
+# is returned BEFORE any State claim / Codex launch, a precondition failure
+# leaves no claim, and a retried start replays one run.  Exercised through the
+# same MemoryDeliverStartStore the runtime uses.
+# --------------------------------------------------------------------------- #
+
+from _support import load_example as _ptd_rel_load_example
+from workbench.deliver import DeliverPreconditions as _PtdPreconditions, MemoryDeliverStartStore as _PtdRelStore
+
+
+def test_ptd_t005_precondition_failure_never_claims_or_launches():
+    store = _PtdRelStore()
+    effects: list[str] = []
+
+    def launch():
+        # Stand in for the State claim + Codex launch: it must never run when a
+        # precondition fails (a State acceptance never precedes a merge, and no
+        # claim precedes a passed preflight).
+        effects.append("claim+launch")
+        return store.default_run_block("run_rel_0001")
+
+    intent = _ptd_rel_load_example("deliver-intent.v1.json")
+    receipt, replayed = store.start(
+        intent, launch=launch, preconditions=_PtdPreconditions(prd_unapproved=True),
+    )
+    assert receipt["status"] == "denied" and replayed is False
+    assert receipt["error"]["code"] == "deliver.prd_unapproved"
+    assert effects == []  # nothing was claimed or launched
+    assert store.get_receipt(intent["intent_digest"]) is None
+
+
+def test_ptd_t005_accepted_start_claims_once_and_replays_the_same_run():
+    store = _PtdRelStore()
+    effects: list[str] = []
+
+    def launch():
+        effects.append("claim+launch")
+        return store.default_run_block("run_rel_0002")
+
+    intent = _ptd_rel_load_example("deliver-intent.v1.json")
+    accepted, replayed = store.start(intent, launch=launch, preconditions=_PtdPreconditions())
+    assert accepted["status"] == "accepted" and replayed is False
+    # A retried identical intent replays the stored receipt as a duplicate; the
+    # claim/launch effect never runs a second time.
+    duplicate, replayed2 = store.start(intent, launch=launch, preconditions=_PtdPreconditions())
+    assert duplicate["status"] == "duplicate" and replayed2 is True
+    assert duplicate["run"]["run_id"] == accepted["run"]["run_id"]
+    assert effects == ["claim+launch"]

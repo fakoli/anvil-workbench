@@ -1410,3 +1410,256 @@ def test_preference_write_rejects_unknown_body_fields():
             json={"scope": "personal", "value": "format_12h", "expected_version": 0, "scope_key": "victim"},
         )
         assert resp.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# plan-task-delivery T002/T004/T008 — delivery projection browser surface,
+# pinned operational rows/approval bindings, and typed directive semantics
+# through the ACTUAL wired API entrypoint.
+# --------------------------------------------------------------------------- #
+
+from _support import load_example as _ptd_load_example
+from workbench.contracts import contract_digest as _ptd_contract_digest
+from workbench.delivery_projection import (
+    ApprovalBinding as _PtdApprovalBinding,
+    MemoryDeliveryProjectionStore as _PtdProjectionStore,
+    RunDisplayRow as _PtdRunRow,
+)
+
+_PTD_ACTOR = {"X-Workbench-Actor": "operator"}
+_PTD_DIGEST_A = "sha256:5ddaacfaf8405e6e3f0d0a920e0f1f2b20afadded4f8d98748fb42868da0ad2e"
+_PTD_DIGEST_B = "sha256:" + "b" * 64
+
+
+def _ptd_client(projection_store):
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://100.87.34.66:8000/v1", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(),
+        delivery_projection_store=projection_store,
+    ))
+
+
+def _ptd_reference(prd_id="release-alpha", snapshot_digest=None):
+    ref = _ptd_load_example("task-reference.v1.json")
+    if prd_id != "release-alpha":
+        ref["ref"]["prd_id"] = prd_id
+        ref["scoped_id"] = f"{prd_id}:T001"
+        ref["run_label"] = f"{prd_id}:T001@r4"
+        ref["hierarchy"]["prd_id"] = prd_id
+    if snapshot_digest is not None:
+        ref["source"]["snapshot_digest"] = snapshot_digest
+    return ref
+
+
+def _ptd_eligible(prd_id="release-alpha"):
+    return {
+        "schema_version": "workbench-delivery-eligibility/v1",
+        "ref": {"prd_id": prd_id, "task_id": "T001", "prd_revision": 4},
+        "scoped_id": f"{prd_id}:T001", "eligible": True, "state": "eligible",
+        "reasons": [{"class": "info", "code": "info.ready", "content_trust": "untrusted_task_data",
+                     "explanation": "All dependencies are merged and the source is current."}],
+    }
+
+
+def _ptd_prd_content(body):
+    doc = {
+        "schema_version": "workbench-prd-content/v1",
+        "content_digest": "sha256:" + "0" * 64,
+        "provider": "anvil-state",
+        "generated_at": "2026-07-20T12:00:00Z",
+        "prd": {"prd_id": "release-alpha", "title": "Chat-first Workbench", "status": "approved", "revision": 4},
+        "content_trust": "untrusted_task_data",
+        "content": {"format": "markdown", "body": body, "truncated": False,
+                    "total_bytes": len(body.encode("utf-8"))},
+        "redaction": {"status": "redacted", "ruleset": "hub.default"},
+    }
+    doc["content_digest"] = _ptd_contract_digest("prd-content", doc)
+    return doc
+
+
+def test_ptd_t002_delivery_surface_fails_closed_when_unconfigured():
+    with _ptd_client(None) as client:
+        r = client.get("/api/projects/proj/prds/release-alpha/tasks", headers=_PTD_ACTOR)
+        assert r.status_code == 503
+
+
+def test_ptd_t002_task_and_eligibility_readable_and_scoped():
+    store = _PtdProjectionStore()
+    store.capture_task_reference("proj", _ptd_reference("release-alpha", _PTD_DIGEST_A))
+    store.capture_task_reference("proj", _ptd_reference("release-beta", _PTD_DIGEST_A))
+    store.capture_eligibility("proj", _ptd_eligible("release-alpha"))
+    with _ptd_client(store) as client:
+        tasks = client.get("/api/projects/proj/prds/release-alpha/tasks", headers=_PTD_ACTOR).json()["tasks"]
+        assert [t["scoped_id"] for t in tasks] == ["release-alpha:T001"]  # cross-PRD does not collapse
+        one = client.get("/api/projects/proj/prds/release-alpha/tasks/T001", headers=_PTD_ACTOR).json()["task"]
+        assert one["scoped_id"] == "release-alpha:T001"
+        elig = client.get("/api/projects/proj/prds/release-alpha/tasks/T001/eligibility", headers=_PTD_ACTOR).json()
+        assert elig["eligibility"]["state"] == "eligible"
+        # Cross-project read is the indistinct 404, never an existence oracle.
+        foreign = client.get("/api/projects/intruder/prds/release-alpha/tasks/T001", headers=_PTD_ACTOR)
+        assert foreign.status_code == 404 and foreign.json()["detail"] == "unknown delivery record"
+
+
+def test_ptd_t002_eligibility_becomes_stale_through_the_wired_get():
+    store = _PtdProjectionStore()
+    store.capture_task_reference("proj", _ptd_reference("release-alpha", _PTD_DIGEST_A))
+    store.capture_eligibility("proj", _ptd_eligible("release-alpha"))
+    with _ptd_client(store) as client:
+        before = client.get("/api/projects/proj/prds/release-alpha/tasks/T001/eligibility",
+                            headers=_PTD_ACTOR).json()["eligibility"]
+        assert before["state"] == "eligible"
+        # The source snapshot advances via a real recapture; the wired GET now
+        # returns a stale verdict rather than the superseded eligible one.
+        store.capture_task_reference("proj", _ptd_reference("release-alpha", _PTD_DIGEST_B))
+        after = client.get("/api/projects/proj/prds/release-alpha/tasks/T001/eligibility",
+                           headers=_PTD_ACTOR).json()["eligibility"]
+        assert after["state"] == "stale" and after["eligible"] is False
+        assert after["reasons"][0]["code"] == "stale.snapshot_superseded"
+
+
+def test_ptd_t002_served_prd_body_is_redacted():
+    leaky = (
+        "See AKIA1234567890ABCDEF and token=supersecretvalue.\n"
+        "Deploy from C:/Users/op/.anvil/state.db and /etc/anvil/prod.env.\n"
+        "JWT eyJhbGciOiJI.eyJzdWIiOiIx.sig ghp_abcdefghijklmnopqrstuvwxyz0123456789.\n"
+        "sk-proj-abcdefghijklmnopqrstuvwx reaches db.tail1234.ts.net:7687 at 100.64.0.5:8443.\n"
+        "Server=db.internal;User Id=admin;Password=hunter2"
+    )
+    store = _PtdProjectionStore()
+    store.capture_prd_content("proj", _ptd_prd_content(leaky))
+    with _ptd_client(store) as client:
+        body = client.get("/api/projects/proj/prds/release-alpha/content",
+                          headers=_PTD_ACTOR).json()["content"]["content"]["body"]
+    for secret in ("AKIA1234567890ABCDEF", "supersecretvalue", "state.db", "/etc/anvil",
+                   "eyJhbGciOiJI", "ghp_abcdefghijklmnop", "sk-proj-abcdef", "tail1234.ts.net",
+                   "100.64.0.5", "hunter2", "C:/Users"):
+        assert secret not in body, f"leak survived: {secret}"
+    assert "[REDACTED" in body  # the scrub actually fired
+
+
+def test_ptd_t004_run_list_headline_is_title_and_approval_binding_readable():
+    store = _PtdProjectionStore()
+    store.capture_run_row("proj", _PtdRunRow(
+        run_id="run_alpha_t001_0001", run_label="release-alpha:T001@r4", scoped_id="release-alpha:T001",
+        prd_id="release-alpha", task_id="T001", prd_revision=4, task_title="Add routed chat",
+        prd_title="Chat-first Workbench", status="running", attempt_label="attempt 1",
+        started_at="2026-07-20T12:00:01Z", workflow_digest="sha256:" + "0" * 64,
+        capability_profile_digest="sha256:" + "4" * 64,
+    ))
+    store.capture_approval_binding("proj", _PtdApprovalBinding(
+        approval_id="approval_alpha_0001", scoped_id="release-alpha:T001",
+        run_label="release-alpha:T001@r4", action="commit_pr", payload_hash="a" * 64,
+        bridge_id="bridge-1", expires_at="2026-07-20T13:00:01Z",
+        workflow_digest="sha256:" + "0" * 64, capability_profile_digest="sha256:" + "4" * 64,
+    ))
+    with _ptd_client(store) as client:
+        runs = client.get("/api/projects/proj/delivery/runs?run_status=running", headers=_PTD_ACTOR).json()["runs"]
+        assert len(runs) == 1 and runs[0]["headline"] == "Add routed chat"
+        assert runs[0]["headline"] != runs[0]["scoped_id"]  # not a bare id
+        binding = client.get("/api/projects/proj/delivery/approvals/approval_alpha_0001",
+                             headers=_PTD_ACTOR).json()["approval"]
+        assert binding["payload_hash"] == "a" * 64 and binding["action"] == "commit_pr"
+        assert binding["scoped_id"] == "release-alpha:T001" and binding["run_label"] == "release-alpha:T001@r4"
+
+
+def test_ptd_t008_directive_post_returns_typed_outcome_and_get_splits_pending():
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "demo", "state_root": ".anvil"}).json()
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "s", "worktree_id": "checkout-a",
+        }).json()["session"]
+        posted = test_client.post(
+            f"/api/sessions/{session['id']}/directives",
+            json={"content": "Run the independent evidence check."},
+        )
+        assert posted.status_code == 202
+        body = posted.json()
+        assert body["outcome"] == "directive.queued_pending" and body["recorded"] is True
+        view = test_client.get(f"/api/sessions/{session['id']}/directives", headers=_PTD_ACTOR).json()
+        assert [d["content"] for d in view["pending"]] == ["Run the independent evidence check."]
+        assert view["included"] == []
+
+
+def test_ptd_t008_directive_content_is_scrubbed_before_persist():
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "demo", "state_root": ".anvil"}).json()
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "s", "worktree_id": "checkout-a",
+        }).json()["session"]
+        test_client.post(
+            f"/api/sessions/{session['id']}/directives",
+            json={"content": "deploy from C:/secrets/state.db with token=supersecretvalue"},
+        )
+        view = test_client.get(f"/api/sessions/{session['id']}/directives", headers=_PTD_ACTOR).json()
+        content = view["pending"][0]["content"]
+        assert "state.db" not in content and "supersecretvalue" not in content
+        assert "[REDACTED" in content
+
+
+def test_ptd_t008_persisted_directive_scrubs_dotless_host_port():
+    # Finding 4 (persisted channel): a scheme-less single-label host:port
+    # (serving:8443) must be scrubbed before a directive is persisted/served. The
+    # shared redact_config_text now removes the dotless label:port; reverting that
+    # pattern lets serving:8443 ride out to the served directive view.
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "demo", "state_root": ".anvil"}).json()
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "s", "worktree_id": "checkout-a",
+        }).json()["session"]
+        test_client.post(
+            f"/api/sessions/{session['id']}/directives",
+            json={"content": "point the run at serving:8443 before the gate"},
+        )
+        view = test_client.get(f"/api/sessions/{session['id']}/directives", headers=_PTD_ACTOR).json()
+        content = view["pending"][0]["content"]
+        assert "serving:8443" not in content
+        assert "[REDACTED" in content
+
+
+def test_ptd_t008_directive_reports_included_after_real_packet_assembly():
+    # MUST-FIX 1 (wired, vacuum-proof): a directive already carried in a queued
+    # run_codex packet must report INCLUDED, not pending forever. The live packet
+    # assembler (workflow start -> start_workflow_run) now records the
+    # operator.directive_packet marker; session_directive_view derives the split
+    # from it. Reverting the marker recording makes this fail (still pending).
+    with client() as test_client:
+        project = test_client.post("/api/projects", json={"name": "wired", "state_root": ".anvil"}).json()
+        registered = test_client.post(f"/api/projects/{project['id']}/bridges", json={"name": "bridge"}).json()
+        bridge, token = registered["bridge"], registered["bootstrap_token"]
+        headers = {"X-Workbench-Bridge": bridge["id"], "Authorization": f"Bearer {token}"}
+        digest = "a" * 64
+        test_client.post(f"/api/bridge/{bridge['id']}/skills", headers=headers, json={"skills": [{
+            "skill_id": "anvil:review", "description": "Review state evidence.", "content_sha256": digest,
+        }]})
+        session = test_client.post("/api/sessions", json={
+            "project_id": project["id"], "title": "wired", "worktree_id": "default", "skills": ["anvil:review"],
+        }).json()
+        posted = test_client.post(
+            f"/api/sessions/{session['session']['id']}/directives",
+            json={"content": "Run the independent evidence check."},
+        ).json()
+        directive_sequence = posted["event"]["sequence"]
+
+        # Before packet assembly the directive is pending.
+        before = test_client.get(
+            f"/api/sessions/{session['session']['id']}/directives", headers=_PTD_ACTOR,
+        ).json()
+        assert [d["content"] for d in before["pending"]] == ["Run the independent evidence check."]
+        assert before["included"] == [] and before["included_up_to_sequence"] == 0
+
+        # Start the workflow: the real packet assembler snapshots the directive
+        # into the queued run_codex payload AND records the packet-inclusion marker.
+        started = test_client.post(f"/api/workflows/{session['workflow']['id']}/start", json={"task_id": "TASK-9"})
+        assert started.status_code == 201
+
+        after = test_client.get(
+            f"/api/sessions/{session['session']['id']}/directives", headers=_PTD_ACTOR,
+        ).json()
+        assert [d["content"] for d in after["included"]] == ["Run the independent evidence check."]
+        assert after["pending"] == []
+        assert after["included_up_to_sequence"] >= directive_sequence

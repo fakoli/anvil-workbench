@@ -267,17 +267,23 @@ class MemoryStore:
             session_id=session.id, workflow_id=workflow.id,
             workflow_step_id=entry, lease_epoch=lease.epoch,
         )
-        directives = [
-            str(event.data["content"])
+        directive_events = [
+            event
             for event in self.workflow_events.get(session.id, [])
             if event.kind == "operator.directive" and isinstance(event.data.get("content"), str)
         ]
+        # The packet carries only the trailing window of directives; the highest
+        # included sequence is the packet inclusion high-water mark recorded below
+        # so ``session_directive_view`` reports the truthful pending/included split.
+        included_directives = directive_events[-32:]
+        directives = [str(event.data["content"]) for event in included_directives]
+        directive_high_water = included_directives[-1].sequence if included_directives else 0
         command_payload = {
             "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
             "model": run.model, "session_id": run.session_id,
             "workflow_id": run.workflow_id, "workflow_step_id": run.workflow_step_id,
             "lease_epoch": run.lease_epoch, "worktree_id": session.worktree_id,
-            "skills": skills, "directives": directives[-32:],
+            "skills": skills, "directives": directives,
         }
         started = replace(workflow, status="running", cursor=(entry,), updated_at=now)
 
@@ -296,6 +302,13 @@ class MemoryStore:
         self._append_workflow_event(session.id, workflow.id, "workflow.started", {
             "step_id": entry, "actor": actor, "run_id": run.id,
         })
+        # Record the packet-inclusion marker (operator.directive_packet) naming the
+        # highest directive sequence carried in this queued run_codex payload, so a
+        # directive already in the packet is reported INCLUDED, not pending forever.
+        if directive_high_water > 0:
+            self._append_workflow_event(session.id, workflow.id, "operator.directive_packet", {
+                "included_up_to_sequence": directive_high_water,
+            })
         self.append_audit("run.created", actor, workflow.project_id, {
             "run_id": run.id, "task_id": task_id, "model": run.model,
             "session_id": session.id, "workflow_id": workflow.id,
@@ -745,10 +758,13 @@ class MemoryStore:
                     "description": skill.description,
                     "content_sha256": skill.content_sha256,
                 })
-        directives = [
-            str(event.data.get("content", "")) for event in self.workflow_events.get(run.session_id or "", [])
+        directive_events = [
+            event for event in self.workflow_events.get(run.session_id or "", [])
             if event.kind == "operator.directive" and isinstance(event.data.get("content"), str)
         ]
+        included_directives = directive_events[-32:]
+        directives = [str(event.data.get("content", "")) for event in included_directives]
+        directive_high_water = included_directives[-1].sequence if included_directives else 0
         payload = {
             "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
             "model": run.model, "session_id": run.session_id,
@@ -756,12 +772,18 @@ class MemoryStore:
             "lease_epoch": run.lease_epoch,
             "worktree_id": session.worktree_id if session else None,
             "skills": skills,
-            "directives": directives[-32:],
+            "directives": directives,
         }
         self.commands.setdefault(bridge_id, []).append({
             "id": new_id("command"), "approval_id": None, "action_type": "run_codex",
             "payload": payload, "payload_hash": payload_hash(payload),
         })
+        # Record the packet-inclusion marker so a directive carried in this queued
+        # packet reports INCLUDED via session_directive_view (T008 criterion 2).
+        if run.session_id and directive_high_water > 0:
+            self._append_workflow_event(run.session_id, run.workflow_id, "operator.directive_packet", {
+                "included_up_to_sequence": directive_high_water,
+            })
 
     def enqueue_skill_probe(self, bridge_id: str) -> None:
         bridge = self.bridges.get(bridge_id)
@@ -1250,20 +1272,20 @@ class PostgresStore:
                 if started_row is None:
                     raise StoreError("workflow is not a draft")
                 cur.execute(
-                    "SELECT data FROM workbench_workflow_events "
+                    "SELECT data, sequence FROM workbench_workflow_events "
                     "WHERE session_id = %s AND kind = 'operator.directive' ORDER BY sequence",
                     (workflow.session_id,),
                 )
-                directives = [
-                    str(row["data"].get("content", "")) for row in cur.fetchall()
-                    if isinstance(row["data"], dict)
-                ]
+                directive_rows = [row for row in cur.fetchall() if isinstance(row["data"], dict)]
+                included_rows = directive_rows[-32:]
+                directives = [str(row["data"].get("content", "")) for row in included_rows]
+                directive_high_water = int(included_rows[-1]["sequence"]) if included_rows else 0
                 command_payload = {
                     "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
                     "model": run.model, "session_id": run.session_id,
                     "workflow_id": run.workflow_id, "workflow_step_id": run.workflow_step_id,
                     "lease_epoch": run.lease_epoch, "worktree_id": str(session["worktree_id"]),
-                    "skills": skills, "directives": directives[-32:],
+                    "skills": skills, "directives": directives,
                 }
                 cur.execute(
                     "INSERT INTO workbench_commands "
@@ -1281,10 +1303,17 @@ class PostgresStore:
                     (workflow.session_id,),
                 )
                 sequence = int(cur.fetchone()["sequence"])
-                event_values = (
+                event_values = [
                     ("lease.acquired", {"resource_key": resource_key, "epoch": lease.epoch}),
                     ("workflow.started", {"step_id": entry, "actor": actor, "run_id": run.id}),
-                )
+                ]
+                # Packet-inclusion marker (operator.directive_packet): the highest
+                # directive sequence carried in the queued run_codex payload above,
+                # so session_directive_view reports it INCLUDED (T008 criterion 2).
+                if directive_high_water > 0:
+                    event_values.append(
+                        ("operator.directive_packet", {"included_up_to_sequence": directive_high_water})
+                    )
                 for offset, (kind, data) in enumerate(event_values):
                     cur.execute(
                         "INSERT INTO workbench_workflow_events "
@@ -2133,13 +2162,17 @@ class PostgresStore:
                         "content_sha256": skill.content_sha256,
                     })
         directives: list[str] = []
+        directive_high_water = 0
         if run.session_id:
             with self._connection().cursor() as cur:
                 cur.execute(
-                    "SELECT data FROM workbench_workflow_events WHERE session_id = %s AND kind = 'operator.directive' ORDER BY sequence",
+                    "SELECT data, sequence FROM workbench_workflow_events WHERE session_id = %s AND kind = 'operator.directive' ORDER BY sequence",
                     (run.session_id,),
                 )
-                directives = [str(row["data"].get("content", "")) for row in cur.fetchall() if isinstance(row["data"], dict)]
+                directive_rows = [row for row in cur.fetchall() if isinstance(row["data"], dict)]
+            included_rows = directive_rows[-32:]
+            directives = [str(row["data"].get("content", "")) for row in included_rows]
+            directive_high_water = int(included_rows[-1]["sequence"]) if included_rows else 0
         payload = {
             "run_id": run.id, "project_id": run.project_id, "task_id": run.task_id,
             "model": run.model, "session_id": run.session_id,
@@ -2147,7 +2180,7 @@ class PostgresStore:
             "lease_epoch": run.lease_epoch,
             "worktree_id": session.worktree_id if session else None,
             "skills": skills,
-            "directives": directives[-32:],
+            "directives": directives,
         }
         with self._connection().cursor() as cur:
             cur.execute("SELECT id FROM workbench_bridges WHERE id = %s", (bridge_id,))
@@ -2157,6 +2190,12 @@ class PostgresStore:
                 "INSERT INTO workbench_commands (id,bridge_id,approval_id,action_type,payload,payload_hash,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                 (new_id("command"), bridge_id, None, "run_codex", self._json(payload), payload_hash(payload), now_utc()),
             )
+        # Record the packet-inclusion marker so a directive carried in this queued
+        # packet reports INCLUDED via session_directive_view (T008 criterion 2).
+        if run.session_id and directive_high_water > 0:
+            self._append_workflow_event(run.session_id, run.workflow_id, "operator.directive_packet", {
+                "included_up_to_sequence": directive_high_water,
+            })
 
     def enqueue_skill_probe(self, bridge_id: str) -> None:
         with self._connection().cursor() as cur:

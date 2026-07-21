@@ -543,19 +543,20 @@ def test_redaction_accepted_output_summary_is_scrubbed() -> None:
 
 
 def test_redaction_scheme_less_host_port_is_caught_by_the_receipt_backstop() -> None:
-    # Finding 1 (unit revert-detection): the shared redact_config_text leaves a
-    # DOTLESS single-label serving:8443 intact (its host rule requires a dot), so
-    # the receipt safeText backstop is the ONLY boundary. _safe_receipt_summary
-    # therefore downgrades it to the fixed safe fallback. Reverting the backstop's
-    # lowercase-anchored host:port alternative makes both assertions fail.
-    from workbench.plugin_host import _SAFE_FALLBACK
+    # PTD shared-fix follow-through (unit revert-detection): the shared
+    # redact_config_text now removes a DOTLESS single-label serving:8443 via its
+    # lowercase-anchored label:port pattern, so this leak no longer depends solely
+    # on the receipt safeText backstop -- the backstop stays as defense-in-depth
+    # (redundant-but-harmless). Reverting the shared pattern lets serving:8443
+    # survive the scrub and reach the summary, failing the first assertion. (The
+    # backstop's fixed-fallback path is still proven by
+    # test_redaction_falls_back_when_a_residual_shape_would_trip_the_backstop.)
     from workbench.redaction import redact_config_text
 
     raw = "install pending at serving:8443"
-    assert "serving:8443" in redact_config_text(raw)  # shared scrub leaves it intact
+    assert "serving:8443" not in redact_config_text(raw)  # shared scrub now catches it
     summary = _safe_receipt_summary(raw)
-    assert "serving:8443" not in summary
-    assert summary == _SAFE_FALLBACK  # backstop tripped -> fixed safe fallback
+    assert "serving:8443" not in summary  # never leaks into a persisted/served receipt summary
 
 
 def test_redaction_scheme_less_host_port_scrubbed_in_served_and_persisted_receipt() -> None:

@@ -482,11 +482,17 @@ def test_served_trace_scrubs_the_adversarial_corpus():
 
 
 def test_served_trace_scrubs_dotless_host_port():
-    # The dotless single-label host:port class (serving:8443, redis:6379) that
-    # redact_config_text misses (it anchors on a dotted host / IPv4) must still be
-    # scrubbed by the advanced-trace safe_summary guard in the SERVED, schema-valid
-    # trace -- the RTP-lane class, closed here for the advanced trace too.
-    for dotless in ("upstream serving:8443 refused", "redis:6379 backend unreachable"):
+    # The dotless single-label host:port class (serving:8443, redis:6379) must be
+    # scrubbed in the SERVED, schema-valid trace. As of the shared-scrubber fix
+    # (plan-task-delivery lane) redact_config_text now catches this class centrally
+    # and replaces just the endpoint with its [REDACTED-URL] marker; the advanced
+    # safe_summary backstop remains as defense-in-depth (its full-fallback path is
+    # covered by test_served_trace_scrubs_the_adversarial_corpus). Either way the
+    # endpoint never reaches the served trace and the trace still schema-validates.
+    for dotless, host in (
+        ("upstream serving:8443 refused", "serving:8443"),
+        ("redis:6379 backend unreachable", "redis:6379"),
+    ):
         result, _ = _run(
             ScriptedTransport([_delta("x")], raise_at=1, error=ServingStreamUnavailable("boom")),
             summary=dotless,
@@ -496,9 +502,11 @@ def test_served_trace_scrubs_dotless_host_port():
         served = repr(trace).lower()
         assert "serving:8443" not in served
         assert "redis:6379" not in served
-        # The residual falls back to the fixed safe marker (fail-safe), so the whole
-        # served trace still schema-validates.
-        assert trace["events"][-1]["safe_summary"] == art._SAFE_SUMMARY_FALLBACK
+        summary = trace["events"][-1]["safe_summary"]
+        # The endpoint is gone from the summary; it is either surgically scrubbed
+        # by the shared redactor or collapsed to the fixed safe fallback.
+        assert host not in summary
+        assert "[REDACTED-URL]" in summary or summary == art._SAFE_SUMMARY_FALLBACK
 
 
 def test_trace_input_chars_tracks_the_prompt_not_the_output():

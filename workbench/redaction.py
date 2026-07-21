@@ -103,6 +103,15 @@ _CONFIG_URL_PATTERNS = (
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
     # A bare Tailscale tailnet host (``serving.tail1234.ts.net``).
     re.compile(r"(?i)\b(?:[a-z0-9-]+\.)+ts\.net\b"),
+    # A scheme-less SINGLE-LABEL host:port (``serving:8443``, ``neo4j:7687`` — a
+    # tailnet compose service name).  The dotted host:port pattern above requires
+    # a dot, so a dotless label:port slipped every free-text channel (proven by
+    # three lanes: RTP, AMP, PTD).  Lowercase-anchored on purpose: an uppercase-T
+    # ISO timestamp (``…T09:15``) and a scoped id (``release-alpha:T001``) start
+    # the fractional/id part with ``T``/a digit-less token, not ``[a-z]`` before a
+    # colon-then-digits, and a ``sha256:``+hex digest has no 2–5 digit run ending
+    # on a word boundary — so none of them is over-redacted.
+    re.compile(r"\b[a-z][a-z0-9-]*:\d{2,5}\b"),
 )
 
 # --- Local paths.
