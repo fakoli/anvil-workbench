@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from .config import Settings
 from .conversation_api import build_conversation_router, register_conversation_handlers
 from .conversation_store import ConversationStore, MemoryConversationStore
+from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
@@ -165,16 +166,19 @@ def create_app(
     store: WorkbenchStore | None = None,
     graph: EvidenceGraph | None = None,
     conversation_store: ConversationStore | None = None,
+    idempotency_store: IdempotencyStore | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
     graph = graph or _graph(settings)
     conversation_store = conversation_store or _conversation_store(settings)
+    idempotency_store = idempotency_store or MemoryIdempotencyStore()
     app = FastAPI(title="Anvil Workbench", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.settings = settings
     app.state.store = store
     app.state.graph = graph
     app.state.conversation_store = conversation_store
+    app.state.idempotency_store = idempotency_store
 
     def actor(request: Request) -> str:
         name = (request.headers.get(settings.identity_header) or "").strip()
@@ -212,7 +216,7 @@ def create_app(
     # Actor-scoped chat surface (chat-first-voice T002.4): identity comes from
     # the same trusted ``actor`` dependency; the store enforces ownership.
     register_conversation_handlers(app)
-    app.include_router(build_conversation_router(actor, conversation_store))
+    app.include_router(build_conversation_router(actor, conversation_store, idempotency_store))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:

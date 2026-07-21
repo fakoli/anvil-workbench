@@ -30,7 +30,7 @@ import hashlib
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -52,6 +52,7 @@ from .conversation_models import (
     VoiceEvent,
 )
 from .conversation_store import ConversationStore, UnknownConversationError
+from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore, request_hash_for
 
 #: The one non-leaking body every unknown-or-foreign conversation lookup gets.
 _UNKNOWN_DETAIL = "unknown conversation"
@@ -279,9 +280,16 @@ def register_conversation_handlers(app: FastAPI) -> None:
         return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
 
 
+#: The header carrying the caller-supplied idempotency key on a side-effecting
+#: chat request.  It is optional: a request without it executes normally (no
+#: dedup); one with it converges concurrent or retried requests on one record.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+
+
 def build_conversation_router(
     actor_dependency: Callable[..., str],
     conversation_store: ConversationStore | None,
+    idempotency_store: IdempotencyStore | None = None,
 ) -> APIRouter:
     """Build the actor-scoped chat router over an already-authenticated actor.
 
@@ -289,8 +297,17 @@ def build_conversation_router(
     allowlist); it is the only source of the acting identity.  When
     ``conversation_store`` is ``None`` the hub has no content-hash key and
     every endpoint refuses with 503.
+
+    Every side-effecting endpoint honours an optional ``Idempotency-Key``
+    header via ``idempotency_store``: a retried or concurrent request carrying
+    the same key and the same payload yields exactly one record and replays the
+    identical response, the key is scoped per actor and operation, and the same
+    key with a materially different payload is refused with a typed conflict.
+    A fresh :class:`~workbench.idempotency_store.MemoryIdempotencyStore` is
+    built when one is not injected.
     """
     router = APIRouter(prefix="/api/conversations")
+    idempotency = idempotency_store if idempotency_store is not None else MemoryIdempotencyStore()
 
     def chat_store() -> ConversationStore:
         if conversation_store is None:
@@ -303,10 +320,38 @@ def build_conversation_router(
     def chat_actor(current_actor: str = Depends(actor_dependency)) -> ConversationActor:
         return conversation_actor(current_actor)
 
+    def idempotent(
+        actor: ConversationActor,
+        operation: str,
+        key: str | None,
+        material: dict[str, Any],
+        executor: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Run a side-effecting endpoint under optional idempotency.
+
+        Without a key the operation executes normally (no dedup); with one it is
+        deduplicated per ``(actor, operation, key)`` and bound to the canonical
+        hash of ``material`` (the path identifiers plus the validated body), so
+        a retry with the same payload replays the stored response and a reused
+        key with a different payload is refused.
+        """
+        if key is None:
+            return executor()
+        request_hash = request_hash_for(operation, material)
+        response, _ = idempotency.run(actor, operation, key, request_hash, executor)
+        return response
+
     @router.post("", status_code=status.HTTP_201_CREATED)
-    def create_conversation(payload: ConversationInput, actor: ConversationActor = Depends(chat_actor)) -> dict[str, Any]:
-        record = chat_store().create_conversation(actor, _retention(payload.retention), title=payload.title)
-        return conversation_json(record)
+    def create_conversation(
+        payload: ConversationInput,
+        actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            record = chat_store().create_conversation(actor, _retention(payload.retention), title=payload.title)
+            return conversation_json(record)
+
+        return idempotent(actor, "conversations.create", idempotency_key, {"body": payload.model_dump(mode="json")}, _run)
 
     @router.get("")
     def list_conversations(
@@ -332,67 +377,125 @@ def build_conversation_router(
     @router.post("/{conversation_id}/rename")
     def rename_conversation(
         conversation_id: str, payload: RenameInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     ) -> dict[str, Any]:
-        return conversation_json(chat_store().rename_conversation(actor, conversation_id, payload.title))
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().rename_conversation(actor, conversation_id, payload.title))
+
+        return idempotent(
+            actor, "conversations.rename", idempotency_key,
+            {"conversation_id": conversation_id, "body": payload.model_dump(mode="json")}, _run,
+        )
 
     @router.post("/{conversation_id}/archive")
-    def archive_conversation(conversation_id: str, actor: ConversationActor = Depends(chat_actor)) -> dict[str, Any]:
-        return conversation_json(chat_store().archive_conversation(actor, conversation_id))
+    def archive_conversation(
+        conversation_id: str, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().archive_conversation(actor, conversation_id))
+
+        return idempotent(
+            actor, "conversations.archive", idempotency_key, {"conversation_id": conversation_id}, _run,
+        )
 
     @router.post("/{conversation_id}/unarchive")
-    def unarchive_conversation(conversation_id: str, actor: ConversationActor = Depends(chat_actor)) -> dict[str, Any]:
-        return conversation_json(chat_store().unarchive_conversation(actor, conversation_id))
+    def unarchive_conversation(
+        conversation_id: str, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().unarchive_conversation(actor, conversation_id))
+
+        return idempotent(
+            actor, "conversations.unarchive", idempotency_key, {"conversation_id": conversation_id}, _run,
+        )
 
     @router.post("/{conversation_id}/delete")
     def delete_conversation(
         conversation_id: str, payload: DeleteInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     ) -> dict[str, Any]:
-        return deletion_json(chat_store().delete_conversation(actor, conversation_id, payload.mode))
+        def _run() -> dict[str, Any]:
+            return deletion_json(chat_store().delete_conversation(actor, conversation_id, payload.mode))
+
+        return idempotent(
+            actor, "conversations.delete", idempotency_key,
+            {"conversation_id": conversation_id, "body": payload.model_dump(mode="json")}, _run,
+        )
 
     @router.post("/{conversation_id}/turns", status_code=status.HTTP_201_CREATED)
     def append_turn(
         conversation_id: str, payload: TurnAppendInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     ) -> dict[str, Any]:
-        turn = chat_store().append_turn(
-            actor, conversation_id,
-            role=payload.role, status=payload.status, mode=payload.mode,
-            lineage=TurnLineage(payload.lineage.parent_turn_id, payload.lineage.sibling_index, payload.lineage.kind),
-            redaction=_redaction(payload.redaction),
-            content=_content(payload.content),
-            voice_events=_voice_events(payload.voice_events),
+        def _run() -> dict[str, Any]:
+            turn = chat_store().append_turn(
+                actor, conversation_id,
+                role=payload.role, status=payload.status, mode=payload.mode,
+                lineage=TurnLineage(payload.lineage.parent_turn_id, payload.lineage.sibling_index, payload.lineage.kind),
+                redaction=_redaction(payload.redaction),
+                content=_content(payload.content),
+                voice_events=_voice_events(payload.voice_events),
+            )
+            return turn_json(turn)
+
+        return idempotent(
+            actor, "conversations.append_turn", idempotency_key,
+            {"conversation_id": conversation_id, "body": payload.model_dump(mode="json")}, _run,
         )
-        return turn_json(turn)
 
     @router.post("/{conversation_id}/turns/{turn_id}/retry", status_code=status.HTTP_201_CREATED)
     def retry_turn(
         conversation_id: str, turn_id: str, payload: TurnBodyInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     ) -> dict[str, Any]:
-        turn = chat_store().retry_turn(
-            actor, conversation_id, turn_id,
-            role=payload.role, status=payload.status, mode=payload.mode,
-            redaction=_redaction(payload.redaction),
-            content=_content(payload.content),
-            voice_events=_voice_events(payload.voice_events),
+        def _run() -> dict[str, Any]:
+            turn = chat_store().retry_turn(
+                actor, conversation_id, turn_id,
+                role=payload.role, status=payload.status, mode=payload.mode,
+                redaction=_redaction(payload.redaction),
+                content=_content(payload.content),
+                voice_events=_voice_events(payload.voice_events),
+            )
+            return turn_json(turn)
+
+        return idempotent(
+            actor, "conversations.retry_turn", idempotency_key,
+            {"conversation_id": conversation_id, "turn_id": turn_id, "body": payload.model_dump(mode="json")}, _run,
         )
-        return turn_json(turn)
 
     @router.post("/{conversation_id}/turns/{turn_id}/branch", status_code=status.HTTP_201_CREATED)
     def branch_turn(
         conversation_id: str, turn_id: str, payload: TurnBodyInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     ) -> dict[str, Any]:
-        turn = chat_store().branch_turn(
-            actor, conversation_id, turn_id,
-            role=payload.role, status=payload.status, mode=payload.mode,
-            redaction=_redaction(payload.redaction),
-            content=_content(payload.content),
-            voice_events=_voice_events(payload.voice_events),
+        def _run() -> dict[str, Any]:
+            turn = chat_store().branch_turn(
+                actor, conversation_id, turn_id,
+                role=payload.role, status=payload.status, mode=payload.mode,
+                redaction=_redaction(payload.redaction),
+                content=_content(payload.content),
+                voice_events=_voice_events(payload.voice_events),
+            )
+            return turn_json(turn)
+
+        return idempotent(
+            actor, "conversations.branch_turn", idempotency_key,
+            {"conversation_id": conversation_id, "turn_id": turn_id, "body": payload.model_dump(mode="json")}, _run,
         )
-        return turn_json(turn)
 
     @router.post("/{conversation_id}/turns/{turn_id}/status")
     def advance_turn_status(
         conversation_id: str, turn_id: str, payload: TurnStatusInput, actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
     ) -> dict[str, Any]:
-        return turn_json(chat_store().advance_turn_status(actor, conversation_id, turn_id, payload.status))
+        def _run() -> dict[str, Any]:
+            return turn_json(chat_store().advance_turn_status(actor, conversation_id, turn_id, payload.status))
+
+        return idempotent(
+            actor, "conversations.advance_turn_status", idempotency_key,
+            {"conversation_id": conversation_id, "turn_id": turn_id, "body": payload.model_dump(mode="json")}, _run,
+        )
 
     return router
