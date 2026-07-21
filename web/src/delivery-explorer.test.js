@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import {
+  deliverBlockReason,
   describeEligibility,
   describePrdContent,
   describeTaskReference,
   filterDescribedTasks,
   freshnessLabel,
+  nextDeliverCandidate,
   progressSummaryLabel,
   scopedTaskId,
   summarizeProgress,
+  workflowEntryModel,
 } from './delivery-explorer'
 
 // A task reference exactly as the router serves it (task-reference.v1), so these
@@ -134,6 +137,83 @@ describe('describeEligibility', () => {
   it('returns null when no verdict is present so the UI degrades truthfully', () => {
     expect(describeEligibility(null)).toBeNull()
     expect(describeEligibility(undefined)).toBeNull()
+  })
+})
+
+describe('nextDeliverCandidate (T006 criterion 2)', () => {
+  it('previews the FIRST State-ranked row as the single candidate', () => {
+    const cand = nextDeliverCandidate([
+      taskRef('release-alpha', 'T001', { title: 'Add routed chat' }),
+      taskRef('release-alpha', 'T002', { title: 'Persist retention' }),
+    ])
+    expect(cand.scopedId).toBe('release-alpha:T001')
+    expect(cand.title).toBe('Add routed chat')
+  })
+
+  it('never skips a blocked ranked head to reach a later ready task', () => {
+    // The head is blocked and a later row is ready; the candidate is still the
+    // blocked head — the flow must surface it blocked, not silently skip it.
+    const cand = nextDeliverCandidate([
+      taskRef('release-alpha', 'T001', { title: 'Blocked head', status: 'blocked' }),
+      taskRef('release-alpha', 'T002', { title: 'Ready later', status: 'ready' }),
+    ])
+    expect(cand.scopedId).toBe('release-alpha:T001')
+    expect(cand.status).toBe('blocked')
+  })
+
+  it('is truthfully null for an empty or absent list', () => {
+    expect(nextDeliverCandidate([])).toBeNull()
+    expect(nextDeliverCandidate(undefined)).toBeNull()
+  })
+})
+
+describe('deliverBlockReason (T006 criteria 2 + 4)', () => {
+  const candidate = describeTaskReference(taskRef('release-alpha', 'T001'))
+  // The ONLY contract-valid eligible verdict: state 'eligible' with an info.ready
+  // reason (delivery-eligibility.v1 enums + the derived-state cross-check). The
+  // old {state:'ready', class:'ready', code:'ready.all_clear'} shape is one the
+  // server can never serve, so it must not appear even in a fixture.
+  const ready = { status: 'loaded', value: describeEligibility({ eligible: true, state: 'eligible', reasons: [{ class: 'info', code: 'info.ready', explanation: 'All clear.' }] }), message: null }
+
+  it('requires a startable session first', () => {
+    expect(deliverBlockReason({ candidate, eligibility: ready, hasSession: false })).toMatchObject({ code: 'deliver.no_session' })
+  })
+
+  it('requires a loaded candidate', () => {
+    expect(deliverBlockReason({ candidate: null, eligibility: ready, hasSession: true })).toMatchObject({ code: 'deliver.no_candidate' })
+  })
+
+  it('blocks while eligibility is still loading or failed', () => {
+    expect(deliverBlockReason({ candidate, eligibility: { status: 'loading' }, hasSession: true })).toMatchObject({ code: 'deliver.eligibility_loading' })
+    expect(deliverBlockReason({ candidate, eligibility: { status: 'error', message: 'down' }, hasSession: true })).toMatchObject({ code: 'deliver.eligibility_unavailable', text: 'down' })
+  })
+
+  it('surfaces a blocked verdict’s own leading reason verbatim (no fabrication)', () => {
+    const eligibility = { status: 'loaded', value: describeEligibility({ eligible: false, state: 'blocked', reasons: [{ class: 'blocked', code: 'blocked.dependency_unmet', explanation: 'A dependency has not merged.' }] }), message: null }
+    expect(deliverBlockReason({ candidate, eligibility, hasSession: true })).toEqual({ code: 'blocked.dependency_unmet', text: 'A dependency has not merged.' })
+  })
+
+  it('returns null (deliverable) only when session, candidate, and an eligible verdict all hold', () => {
+    expect(deliverBlockReason({ candidate, eligibility: ready, hasSession: true })).toBeNull()
+  })
+})
+
+describe('workflowEntryModel (T006 SHOULD #2)', () => {
+  const withDefinition = (model) => ({
+    id: 'workflow_1', session_id: 'session_1', status: 'draft',
+    definition: { entry: 'implement', steps: [{ id: 'implement', kind: 'agent', model, skills: [], next: ['review'] }, { id: 'review', kind: 'approval_wait', next: [] }] },
+  })
+
+  it('reads the model off the entry agent step of the version-pinned definition', () => {
+    expect(workflowEntryModel(withDefinition('heavy-local'))).toBe('heavy-local')
+  })
+
+  it('is null (truthful default) when the definition, entry step, or model is missing', () => {
+    expect(workflowEntryModel({ id: 'workflow_1', status: 'draft' })).toBeNull() // the served shape with no definition
+    expect(workflowEntryModel(withDefinition(''))).toBeNull() // entry step pins no model
+    expect(workflowEntryModel(undefined)).toBeNull()
+    // A non-agent entry step never yields a route (v1 requires an agent entry).
+    expect(workflowEntryModel({ definition: { entry: 'x', steps: [{ id: 'x', kind: 'reconcile' }] } })).toBeNull()
   })
 })
 

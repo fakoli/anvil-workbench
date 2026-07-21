@@ -34,11 +34,16 @@ export async function createSession({ project_id, title, worktree_id, workflow_d
   return response.json()
 }
 
-export async function startWorkflow(workflowId, { task_id, model }) {
+// An optional caller-owned AbortSignal lets a dismissed Deliver abort a hung
+// start POST so the user is never trapped waiting on an unresponsive bridge
+// (T006 a11y #4). It is threaded only into the fetch options; the request body
+// is unchanged.
+export async function startWorkflow(workflowId, { task_id, model }, { signal } = {}) {
   const response = await fetch(`/api/workflows/${workflowId}/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ task_id, model }),
+    signal,
   })
   if (!response.ok) throw new Error('Workflow could not be started')
   return response.json()
