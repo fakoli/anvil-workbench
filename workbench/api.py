@@ -13,6 +13,8 @@ import uuid
 from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, WebSocket, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -720,6 +722,22 @@ def build_chat_tools_router(
 #: decoded, so an oversized blob never allocates its decoded form.
 _MAX_STT_B64_CHARS = ((MAX_STT_INPUT_BYTES + 2) // 3) * 4 + 16
 
+#: Every ``/api/chat/voice/*`` endpoint shares this path prefix.  It is the branch
+#: key the pre-endpoint request-validation handler uses to scrub a voice 422 while
+#: leaving all other endpoints' 422 bodies byte-identical to FastAPI's default.
+_VOICE_PATH_PREFIX = "/api/chat/voice/"
+
+#: The FIXED, non-leaking detail returned for ANY malformed voice request that
+#: fails pydantic validation BEFORE the endpoint runs (oversized ``audio_base64``,
+#: a wrong-type audio field, an over-length TTS ``text``, a missing/non-string
+#: field).  FastAPI's default ``RequestValidationError`` body echoes the offending
+#: ``input`` verbatim -- for these endpoints that ``input`` IS the raw audio/text,
+#: which a tailnet proxy that logs 4xx bodies would then persist.  This constant
+#: omits ``input``/``ctx`` entirely so raw audio/text can never leak through the
+#: pre-endpoint validation path (the in-endpoint ``VoiceRequestError`` path already
+#: scrubs to a fixed detail; this closes the uncovered edge before it).
+_VOICE_INVALID_REQUEST_DETAIL = "voice request is invalid"
+
 
 class VoiceTranscribeInput(BaseModel):
     """A bounded push-to-talk transcription request.  Closed field set.
@@ -1302,6 +1320,23 @@ def create_app(
     @app.exception_handler(StoreError)
     async def store_error_handler(_: Request, exc: StoreError):
         return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
+
+    # Pre-endpoint request-validation scrub for the voice lane ONLY. FastAPI's
+    # default ``RequestValidationError`` fires BEFORE the endpoint and echoes the
+    # offending ``input`` verbatim; for ``/api/chat/voice/*`` that ``input`` is the
+    # raw base64 audio (oversized/wrong-type) or the raw TTS text (over-length), so
+    # the default body would leak exactly the payload this slice promises never to
+    # persist. For a voice path we return a FIXED detail with no ``input``/``ctx``;
+    # for EVERY other path we delegate to FastAPI's default handler unchanged, so
+    # non-voice 422 bodies stay byte-identical (branch is on ``request.url.path``).
+    @app.exception_handler(RequestValidationError)
+    async def voice_scrubbed_validation_handler(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith(_VOICE_PATH_PREFIX):
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                content={"detail": _VOICE_INVALID_REQUEST_DETAIL},
+            )
+        return await request_validation_exception_handler(request, exc)
 
     # A missing projection and another project's projection raise the same
     # ``UnknownProjectionError``; both render the identical fixed 404 body so the

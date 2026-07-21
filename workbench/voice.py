@@ -198,6 +198,12 @@ VOICE_RELAY_TIMEOUT_S = 30.0
 #: work onto Serving.
 MAX_VOICE_CONCURRENCY_PER_ACTOR = 2
 
+#: How many fully-saturating actors the shared relay thread pool is sized to admit
+#: at once (pool size = per-actor limit * this).  It bounds the availability
+#: coupling documented at the executor: a small tailnet operator set stays
+#: isolated; a busier deployment should raise it.
+_POOL_ACTOR_HEADROOM = 2
+
 
 def _voice_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -441,6 +447,10 @@ class _ActorConcurrencyGuard:
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {}
 
+    @property
+    def limit(self) -> int:
+        return self._limit
+
     @contextmanager
     def hold(self, actor: str) -> Iterator[None]:
         with self._lock:
@@ -492,9 +502,21 @@ class VoiceRelayService:
         self._event_log = event_log
         self._guard = _ActorConcurrencyGuard(concurrency_limit)
         self._timeout_s = float(timeout_s)
-        # A tiny pool bounds one blocking Serving hop into a real wall-clock
-        # deadline without leaking threads across requests.
-        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="voice-relay")
+        # The pool bounds one blocking Serving hop into a real wall-clock deadline
+        # without leaking threads across requests.  AVAILABILITY-COUPLING NOTE: the
+        # pool is shared across actors while the concurrency GUARD is per-actor, so
+        # a pool smaller than ``expected_concurrent_actors * per_actor_limit`` lets
+        # a few saturating actors occupy every worker and delay a third actor's hop
+        # (that third hop still completes or times out — it is a fairness/latency
+        # coupling, never a slot leak or a correctness bug).  We size the pool to
+        # admit ``_POOL_ACTOR_HEADROOM`` fully-saturating actors at once so a small
+        # tailnet operator set is isolated; a deployment expecting more simultaneous
+        # voice actors should raise the headroom.  A fixed pool cannot fully isolate
+        # an unbounded actor set, hence this is documented rather than "solved".
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(4, self._guard.limit * _POOL_ACTOR_HEADROOM),
+            thread_name_prefix="voice-relay",
+        )
 
     # -- gate -----------------------------------------------------------------
 

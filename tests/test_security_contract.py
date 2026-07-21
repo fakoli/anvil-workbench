@@ -1665,6 +1665,103 @@ def test_voice_error_payload_carries_no_audio_and_no_leak_corpus():
     assert r.json()["detail"] == "voice relay is unavailable"
 
 
+def test_voice_pre_endpoint_validation_422_never_reflects_raw_audio_or_text():
+    # MUST-1: FastAPI's default RequestValidationError fires BEFORE the endpoint
+    # and echoes the offending ``input`` verbatim. For the voice lane that ``input``
+    # IS the raw base64 audio (oversized / wrong-type) or the raw TTS text
+    # (over-length), which a 4xx-body-logging tailnet proxy would then persist --
+    # exactly the forbidden sink this slice excludes. Every malformed shape must
+    # instead return the FIXED, ``input``-free detail, while NON-voice endpoints
+    # keep their default 422 (which reflects normally).
+    service = _marker_service(_VsEventLog())
+    client = _voice_sec_client(service)
+    headers = {"X-Workbench-Actor": "alice"}
+
+    # (a) An OVERSIZED audio_base64 (breaches the field max_length) carrying a
+    #     distinctive marker.
+    audio_marker = "OVERSIZED_AUDIO_LEAK_MARKER"
+    oversized = audio_marker + "A" * 11_000_000
+    ra = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": "c", "audio_base64": oversized, "audio_format": "pcm16", "is_final": True,
+    }, headers=headers)
+    assert ra.status_code == 422
+    assert audio_marker not in ra.text
+    assert ra.json() == {"detail": "voice request is invalid"}
+
+    # (b) A WRONG-TYPE audio_base64 (a nested object, not a string) carrying a
+    #     distinctive marker -- the default handler would echo the whole object.
+    wrongtype_marker = "WRONGTYPE_AUDIO_LEAK_MARKER"
+    rb = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": "c", "audio_base64": {"smuggled": wrongtype_marker}, "audio_format": "pcm16", "is_final": True,
+    }, headers=headers)
+    assert rb.status_code == 422
+    assert wrongtype_marker not in rb.text
+    assert rb.json() == {"detail": "voice request is invalid"}
+
+    # (c) An OVER-LENGTH TTS text carrying a distinctive marker.
+    text_marker = "OVERLENGTH_TTS_LEAK_MARKER"
+    rc = client.post("/api/chat/voice/speak", json={
+        "conversation_id": "c", "message_ref": "m", "text": text_marker + "x" * 21_000, "output_format": "mp3",
+    }, headers=headers)
+    assert rc.status_code == 422
+    assert text_marker not in rc.text
+    assert rc.json() == {"detail": "voice request is invalid"}
+
+    # A NON-voice endpoint's 422 is UNCHANGED: it still reflects the offending
+    # input in the default errors list (proving the scrub is voice-scoped, not a
+    # global change). Revert-detection: without the handler, (a)-(c) leak.
+    nonvoice_marker = "NONVOICE_REFLECTED_MARKER"
+    rn = client.post("/api/policy-operations/preview", json={"smuggled": nonvoice_marker}, headers=headers)
+    assert rn.status_code == 422
+    assert nonvoice_marker in rn.text  # non-voice still echoes input normally
+    assert isinstance(rn.json()["detail"], list)
+
+
+def test_voice_full_cycle_leaves_no_audio_or_draft_marker_in_the_wired_store_or_audit():
+    # Optional durable-surface proof: run a full STT+TTS cycle through the WIRED
+    # app and assert neither the store's audit/events nor the lifecycle log carry
+    # any audio/draft marker. The event log is the only durable voice sink; the
+    # store must stay entirely marker-free (voice writes nothing to it).
+    store = MemoryStore()
+    log = _VsEventLog()
+    service = _marker_service(log)
+    from fastapi.testclient import TestClient
+
+    from workbench.api import create_app
+    from workbench.config import Settings
+
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="alice", approvers=frozenset({"alice"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://serving", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+        chat_content_hash_key="voice-sec-test-content-hash-key",
+    )
+    client = TestClient(create_app(
+        settings=settings, store=store, graph=NullGraph(), voice_relay_service=service,
+    ))
+    headers = {"X-Workbench-Actor": "alice"}
+    rt = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": "conv_cycle", "audio_base64": _vs_base64.b64encode(_VOICE_AUDIO_MARKER).decode(),
+        "audio_format": "pcm16", "is_final": True,
+    }, headers=headers)
+    assert rt.status_code == 200
+    rs = client.post("/api/chat/voice/speak", json={
+        "conversation_id": "conv_cycle", "message_ref": "m1", "text": "please read this", "output_format": "mp3",
+    }, headers=headers)
+    assert rs.status_code == 200
+
+    # The wired store never saw any voice write at all: dump every audit row and
+    # assert both markers (and the audio base64) are absent.
+    store_blob = "".join(repr(record) for record in store.list_audit(limit=1000))
+    assert _VOICE_DRAFT_MARKER not in store_blob
+    assert _VOICE_AUDIO_MARKER.decode("latin-1") not in store_blob
+    assert _vs_base64.b64encode(_VOICE_AUDIO_MARKER).decode() not in store_blob
+    # And the only durable voice sink (the lifecycle log) is likewise clean.
+    log_blob = json.dumps([e.as_event_data() for e in log.events("conv_cycle")])
+    assert _VOICE_DRAFT_MARKER not in log_blob and _VOICE_AUDIO_MARKER.decode("latin-1") not in log_blob
+
+
 def test_voice_relay_sources_reach_no_raw_provider():
     # AGENTS.md boundary: STT/TTS relay only through Anvil Serving. The voice
     # relay and its Serving audio functions must never name a raw provider host or
