@@ -1227,6 +1227,30 @@ class Bridge:
                 })
                 self.hub.finalize_run(run_id, "reconciliation", str(command["id"]))
                 raise
+            except TypedOperationError as exc:
+                # T008 skill-adoption gate refusal (skill.unacknowledged /
+                # skill.digest_changed).  The gate is the first statement of
+                # CodexRunner.run, so it fires BEFORE the router/model/prompt --
+                # nothing executed.  TypedOperationError is a ValueError, NOT a
+                # BridgeError, so it is not caught by the clause above NOR by
+                # main()'s poll-loop ``except BridgeError``.  Without this clause
+                # it escapes dispatch and crashes the daemon with no receipt, and
+                # the still-unsettled command redelivers on restart -> a crash
+                # loop until the skill is acknowledged.  A gate refusal is a
+                # DETERMINISTIC, known refusal: the run did not proceed and
+                # produced no evidence.  Finalize it as the settled, non-evidenced
+                # terminal the finalize API actually models -- "reconciliation"
+                # (there is no "failed" status; "evidenced" would be a lie).
+                # finalize_run consumes the command in the store, so it does NOT
+                # redeliver.  We record the stable typed code as evidence and,
+                # unlike the BridgeError path, do NOT re-raise: poll_once returns
+                # normally and the loop advances to the next command.
+                self.hub.evidence("failure", f"{run_id}:reconciliation", self.settings.project_id, {
+                    "task_id": task_id, "fingerprint": "skill-adoption-gate",
+                    "reconciliation_required": True, "refusal_code": exc.code, "error": str(exc),
+                })
+                self.hub.finalize_run(run_id, "reconciliation", str(command["id"]))
+                return True
             else:
                 self.hub.finalize_run(run_id, "evidenced", str(command["id"]))
                 return True

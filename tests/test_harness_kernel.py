@@ -3801,6 +3801,7 @@ class _T008DispatchHub:
     def __init__(self, skill: "_T008_LocalSkill") -> None:
         self._skill = skill
         self.finalizations: list[tuple[str, str, str]] = []
+        self.evidences: list[tuple[str, str, dict]] = []
 
     def next_command(self):
         return {
@@ -3817,8 +3818,8 @@ class _T008DispatchHub:
     def acknowledge_command(self, _command_id):
         return None
 
-    def evidence(self, *_args):
-        return None
+    def evidence(self, source_kind, source_id, _project_id, payload):
+        self.evidences.append((source_kind, source_id, payload))
 
     def event(self, *_args):
         return None
@@ -3850,15 +3851,58 @@ def test_t008_bridge_dispatch_enforces_the_gate_when_a_store_is_configured(tmp_p
     bridge = _T008_Bridge(settings, skill_adoption_store=store)
     bridge.hub = _T008DispatchHub(skill)  # type: ignore[assignment]
     _t008_wire_bridge(bridge, skill, monkeypatch)
-    with pytest.raises(_T008_TypedError) as excinfo:
-        bridge.poll_once()
-    assert excinfo.value.code == "skill.unacknowledged"
+
+    # The deterministic gate refusal is now caught in dispatch and FINALIZED, not
+    # propagated: poll_once returns normally (the daemon does not crash) and the
+    # run is settled as the non-evidenced terminal ("reconciliation") with the
+    # stable typed code recorded as evidence.  (Before the catch, the
+    # TypedOperationError escaped dispatch AND main()'s ``except BridgeError`` ->
+    # crash + redeliver-crash-loop.)
+    assert bridge.poll_once() is True
+    assert ("run_1", "reconciliation", "cmd_1") in bridge.hub.finalizations
+    codes = [payload.get("refusal_code") for (_kind, _sid, payload) in bridge.hub.evidences]
+    assert "skill.unacknowledged" in codes
 
     # Acknowledge the exact reviewed digest -> the gate passes and the run proceeds
-    # far enough to hit the (unconfigured) router boundary instead.
+    # far enough to hit the (unconfigured) router boundary instead.  That is a
+    # BridgeError, which dispatch finalizes-and-re-raises as before.
     store.acknowledge(skill.skill_id, _t008_digest(skill), content_sha256=skill.content_sha256)
     with pytest.raises(_T008_BridgeError):
         bridge.poll_once()
+
+
+def test_t008_bridge_dispatch_finalizes_gate_refusal_without_crash_loop(tmp_path, monkeypatch) -> None:
+    # Revert-detection anchor for the crash-loop fix: a configured-gate refusal on
+    # an unacknowledged skill must be settled through the REAL Bridge.poll_once /
+    # dispatch path, NOT allowed to propagate.  If the ``except TypedOperationError``
+    # catch in dispatch is removed, the TypedOperationError (a ValueError, not a
+    # BridgeError) escapes poll_once and this test fails -- exactly the daemon crash
+    # + redeliver loop the fix removes.
+    settings = _t008_bridge_settings(tmp_path)
+    store = _T008_AckStore()  # empty ledger -> unacknowledged
+    skill = _t008_local_skill()
+    bridge = _T008_Bridge(settings, skill_adoption_store=store)
+    bridge.hub = _T008DispatchHub(skill)  # type: ignore[assignment]
+    _t008_wire_bridge(bridge, skill, monkeypatch)
+
+    # No unhandled exception propagates out of poll_once (in particular no
+    # TypedOperationError): the daemon poll loop would continue to the next command.
+    result = bridge.poll_once()
+    assert result is True
+
+    # The command is settled via terminal finalization (which consumes it in the
+    # store, so it would NOT redeliver-crash-loop), recorded as the non-evidenced
+    # "reconciliation" terminal -- never as "evidenced", since nothing executed.
+    assert bridge.hub.finalizations == [("run_1", "reconciliation", "cmd_1")]
+    assert all(status != "evidenced" for (_run, status, _cmd) in bridge.hub.finalizations)
+
+    # The stable typed refusal code is recorded as evidence for the operator.
+    reconciliation_evidence = [
+        payload for (kind, _sid, payload) in bridge.hub.evidences if kind == "failure"
+    ]
+    assert reconciliation_evidence
+    assert reconciliation_evidence[-1]["refusal_code"] == "skill.unacknowledged"
+    assert reconciliation_evidence[-1]["reconciliation_required"] is True
 
 
 def test_t008_bridge_dispatch_is_legacy_ungated_when_unconfigured(tmp_path, monkeypatch) -> None:
