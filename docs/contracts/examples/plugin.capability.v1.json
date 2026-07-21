@@ -1,0 +1,29 @@
+{
+  "schema_version": "workbench-plugin-capability/v1",
+  "profile_id": "release-alpha-chat",
+  "revision": "1.0.0",
+  "digest": "sha256:28ad95729819896dddecdbfc50175aacdcc551441076416187d1074a81d77f7f",
+  "scope": "chat",
+  "binding": "enable_only",
+  "plugins": [
+    {
+      "plugin_id": "anvil-tasks-viewer",
+      "plugin_digest": "sha256:4ae65e4cfc645dc1adf8a742e6485946c1961819b87039ffa0d93ea88253b4fd",
+      "enabled_tools": [
+        "tasks.list",
+        "issues.read"
+      ]
+    },
+    {
+      "plugin_id": "deploy-notifier",
+      "plugin_digest": "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb",
+      "enabled_tools": [
+        "notify.send"
+      ]
+    }
+  ],
+  "limits": {
+    "max_enabled_tools": 16,
+    "max_concurrent_tool_calls": 4
+  }
+}

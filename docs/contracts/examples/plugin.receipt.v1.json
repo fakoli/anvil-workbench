@@ -1,0 +1,27 @@
+{
+  "schema_version": "workbench-plugin-receipt/v1",
+  "receipt_id": "plugrcpt_taskslist000001",
+  "request_digest": "sha256:443c54c65fbc1a0d16831581506fde9495c069232c371293a7c093b118b6f01a",
+  "kind": "tool_call",
+  "plugin": {
+    "plugin_id": "anvil-tasks-viewer",
+    "plugin_digest": "sha256:4ae65e4cfc645dc1adf8a742e6485946c1961819b87039ffa0d93ea88253b4fd"
+  },
+  "tool_id": "tasks.list",
+  "status": "accepted",
+  "effect": "read",
+  "credential_use": {
+    "requirement": "none"
+  },
+  "result": {
+    "output_digest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "output_summary": "Returned 7 tasks in the ready state.",
+    "produced_receipts": [
+      "plugin.tasks.list"
+    ]
+  },
+  "redaction": {
+    "status": "redacted"
+  },
+  "completed_at": "2026-07-20T12:00:01Z"
+}

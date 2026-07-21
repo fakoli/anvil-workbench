@@ -1,0 +1,257 @@
+{
+  "schema_version": "workbench-plugin-catalog/v1",
+  "registry_id": "anvil-reviewed-plugins",
+  "revision": "1.0.0",
+  "catalog_digest": "sha256:1141993cd58f661b1ab6f9fa06d73ecdbc3fa19eabe6dceb86dedb2342ddcf2a",
+  "generated_at": "2026-07-19T00:00:00Z",
+  "provenance": {
+    "signer_kind": "operator_owner_key",
+    "key_id": "anvil-operator-key-01",
+    "reviewed_at": "2026-07-18T00:00:00Z"
+  },
+  "plugins": [
+    {
+      "id": "anvil-tasks-viewer",
+      "title": "Anvil task viewer",
+      "version": "1.2.0",
+      "plugin_digest": "sha256:4ae65e4cfc645dc1adf8a742e6485946c1961819b87039ffa0d93ea88253b4fd",
+      "publisher": {
+        "name": "Anvil Workbench",
+        "kind": "first_party"
+      },
+      "description": "Read-only views over the current project's task hierarchy and reviewed issue mirror. Grants no effect and holds no credential of its own.",
+      "runtime": {
+        "kind": "mcp_server",
+        "api_version": "1.0.0",
+        "min_host_version": "1.0.0"
+      },
+      "support_status": "supported",
+      "credential": {
+        "requirement": "none"
+      },
+      "data_access": [
+        "read_project_metadata",
+        "read_task_context"
+      ],
+      "host_access": [
+        {
+          "scope_id": "anvil-issues-mirror",
+          "egress": "host_mediated"
+        }
+      ],
+      "retention": "none",
+      "openapi_source": {
+        "document_digest": "sha256:abababababababababababababababababababababababababababababababab",
+        "compiled_at": "2026-07-18T00:00:00Z"
+      },
+      "tools": [
+        {
+          "tool_kind": "plugin_tool",
+          "tool_id": "tasks.list",
+          "title": "List project tasks",
+          "summary": "Return a bounded, redacted list of the project's tasks filtered by lifecycle status. Read-only display data.",
+          "effect": "read",
+          "gates": {
+            "preview": "not_supported",
+            "confirmation": "not_required",
+            "human_approval": "not_required",
+            "approval_action": null
+          },
+          "input_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ready",
+                  "claimed",
+                  "needs_review",
+                  "done"
+                ]
+              }
+            }
+          },
+          "output_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "count"
+            ],
+            "properties": {
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "data_access": [
+            "read_task_context"
+          ],
+          "host_access": [],
+          "receipts": [
+            "plugin.tasks.list"
+          ],
+          "idempotency": {
+            "key_scope": "tool_call",
+            "replay": "return_prior_receipt",
+            "max_attempts": 3
+          },
+          "docs": "docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed"
+        },
+        {
+          "tool_kind": "read_only_connector",
+          "tool_id": "issues.read",
+          "title": "Read one reviewed issue",
+          "summary": "Read one mirrored issue's redacted summary through the host-mediated connector. Compiled from a digest-pinned OpenAPI document at review time; read-only.",
+          "effect": "read",
+          "gates": {
+            "preview": "not_supported",
+            "confirmation": "not_required",
+            "human_approval": "not_required",
+            "approval_action": null
+          },
+          "input_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "issue_ref"
+            ],
+            "properties": {
+              "issue_ref": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,63}#[0-9]{1,6}$"
+              }
+            }
+          },
+          "output_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "title"
+            ],
+            "properties": {
+              "title": {
+                "type": "string",
+                "maxLength": 200
+              }
+            }
+          },
+          "data_access": [
+            "read_project_metadata"
+          ],
+          "host_access": [
+            {
+              "scope_id": "anvil-issues-mirror",
+              "egress": "host_mediated"
+            }
+          ],
+          "receipts": [
+            "plugin.issues.read"
+          ],
+          "idempotency": {
+            "key_scope": "tool_call",
+            "replay": "return_prior_receipt",
+            "max_attempts": 3
+          },
+          "docs": "docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed"
+        }
+      ],
+      "docs": "docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed"
+    },
+    {
+      "id": "deploy-notifier",
+      "title": "Deployment notifier",
+      "version": "1.0.0",
+      "plugin_digest": "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb",
+      "publisher": {
+        "name": "Reviewed Partner Co",
+        "kind": "reviewed_third_party"
+      },
+      "description": "Send one redacted deployment notification to a host-mediated channel. The connector host owns the channel credential reference; this plugin never receives credential material.",
+      "runtime": {
+        "kind": "connector",
+        "api_version": "1.0.0",
+        "min_host_version": "1.0.0"
+      },
+      "support_status": "supported",
+      "credential": {
+        "requirement": "host_owned",
+        "owner_host": "anvil-connector-host",
+        "credential_refs": [
+          "deploy-channel-ref"
+        ]
+      },
+      "data_access": [
+        "read_task_context"
+      ],
+      "host_access": [
+        {
+          "scope_id": "deploy-channel",
+          "egress": "host_mediated"
+        }
+      ],
+      "retention": "host_retained",
+      "tools": [
+        {
+          "tool_kind": "plugin_tool",
+          "tool_id": "notify.send",
+          "title": "Send a deployment notice",
+          "summary": "Send one bounded, redacted notification through the host-mediated channel. An external effect: previewed and owner-approved before every call.",
+          "effect": "external_effect",
+          "gates": {
+            "preview": "required",
+            "confirmation": "required",
+            "human_approval": "required",
+            "approval_action": "invoke_effect_tool"
+          },
+          "input_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "message_ref"
+            ],
+            "properties": {
+              "message_ref": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9._-]{1,62}$"
+              }
+            }
+          },
+          "output_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "delivered"
+            ],
+            "properties": {
+              "delivered": {
+                "type": "boolean"
+              }
+            }
+          },
+          "data_access": [
+            "read_task_context"
+          ],
+          "host_access": [
+            {
+              "scope_id": "deploy-channel",
+              "egress": "host_mediated"
+            }
+          ],
+          "cancellation": "unknown_outcome",
+          "receipts": [
+            "plugin.notify.send"
+          ],
+          "idempotency": {
+            "key_scope": "approval_payload",
+            "replay": "reconcile",
+            "max_attempts": 1
+          },
+          "docs": "docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed"
+        }
+      ],
+      "docs": "docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed"
+    }
+  ]
+}

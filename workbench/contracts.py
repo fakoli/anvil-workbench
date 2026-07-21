@@ -477,6 +477,273 @@ def _reset_deliver_start_receipt_contract_validator_cache() -> None:
     _deliver_start_receipt_contract_validator_cache = None
 
 
+_PLUGIN_CATALOG_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "plugin-catalog.v1.schema.json"
+)
+_plugin_catalog_contract_validator_cache: Draft202012Validator | None = None
+
+
+def plugin_catalog_contract_validator() -> Draft202012Validator:
+    """Load the plugin-catalog contract schema once; fail closed if absent.
+
+    Shared by every plugin-catalog consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root, closed-plugin,
+    closed-tool, and closed-gates guards refuse a schema edit that would reopen
+    the catalog, a plugin, a tool descriptor, or its gate set to unreviewed
+    extension fields: a plugin catalog must stay a closed, typed registry
+    through which a raw command, endpoint, path, or credential value can never
+    ride in, and every tool must keep its mandatory machine-checkable gate set.
+    The ``generated_at`` bound guard refuses an edit that would let a provider
+    smuggle unbounded content through the timestamp field.
+    """
+    global _plugin_catalog_contract_validator_cache
+    if _plugin_catalog_contract_validator_cache is None:
+        try:
+            schema = json.loads(_PLUGIN_CATALOG_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "plugin-catalog contract schema is unavailable; refusing to validate catalogs"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "plugin-catalog contract schema no longer closes its root object; "
+                "refusing to validate catalogs"
+            )
+        defs = schema.get("$defs", {})
+        for name in ("plugin", "tool", "gates", "credential", "hostAccess"):
+            node = defs.get(name)
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"plugin-catalog contract schema no longer closes its {name} object; "
+                    "refusing to validate catalogs"
+                )
+        # Extend the tripwire to the remaining closed objects nested inside the
+        # root/plugin/tool, so a schema edit that reopened any of them (letting an
+        # unreviewed field ride in) also fails closed.
+        _plugin_def = defs.get("plugin", {}).get("properties", {}) if isinstance(defs.get("plugin"), dict) else {}
+        _tool_def = defs.get("tool", {}).get("properties", {}) if isinstance(defs.get("tool"), dict) else {}
+        _nested_closed = (
+            ("provenance", schema.get("properties", {}).get("provenance")),
+            ("publisher", _plugin_def.get("publisher")),
+            ("runtime", _plugin_def.get("runtime")),
+            ("openapi_source", _plugin_def.get("openapi_source")),
+            ("idempotency", _tool_def.get("idempotency")),
+        )
+        for name, node in _nested_closed:
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"plugin-catalog contract schema no longer closes its {name} object; "
+                    "refusing to validate catalogs"
+                )
+        bound = defs.get("rfc3339", {})
+        if not isinstance(bound.get("maxLength"), int) or "pattern" not in bound:
+            raise ContractValidationError(
+                "plugin-catalog contract schema no longer bounds its timestamps; "
+                "refusing to validate catalogs"
+            )
+        _plugin_catalog_contract_validator_cache = Draft202012Validator(schema)
+    return _plugin_catalog_contract_validator_cache
+
+
+def _reset_plugin_catalog_contract_validator_cache() -> None:
+    """Test hook: force the next plugin-catalog validation to reload the on-disk schema."""
+    global _plugin_catalog_contract_validator_cache
+    _plugin_catalog_contract_validator_cache = None
+
+
+_PLUGIN_CAPABILITY_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "plugin-capability.v1.schema.json"
+)
+_plugin_capability_contract_validator_cache: Draft202012Validator | None = None
+
+
+def plugin_capability_contract_validator() -> Draft202012Validator:
+    """Load the plugin-capability contract schema once; fail closed if absent.
+
+    Shared by every plugin-capability consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root and closed-entry
+    guards refuse a schema edit that would reopen the profile or a plugin
+    allowlist entry to unreviewed extension fields: a plugin capability profile
+    must stay a closed enable-only allowlist of installed, digest-pinned
+    plugins, never an extensible envelope that could grant a new privilege.
+    """
+    global _plugin_capability_contract_validator_cache
+    if _plugin_capability_contract_validator_cache is None:
+        try:
+            schema = json.loads(_PLUGIN_CAPABILITY_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "plugin-capability contract schema is unavailable; refusing to validate profiles"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "plugin-capability contract schema no longer closes its root object; "
+                "refusing to validate profiles"
+            )
+        entry = schema.get("properties", {}).get("plugins", {}).get("items", {})
+        if not isinstance(entry, dict) or entry.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "plugin-capability contract schema no longer closes its plugin entry object; "
+                "refusing to validate profiles"
+            )
+        _plugin_capability_contract_validator_cache = Draft202012Validator(schema)
+    return _plugin_capability_contract_validator_cache
+
+
+def _reset_plugin_capability_contract_validator_cache() -> None:
+    """Test hook: force the next plugin-capability validation to reload the on-disk schema."""
+    global _plugin_capability_contract_validator_cache
+    _plugin_capability_contract_validator_cache = None
+
+
+_PLUGIN_REQUEST_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "plugin-request.v1.schema.json"
+)
+_plugin_request_contract_validator_cache: Draft202012Validator | None = None
+
+
+def plugin_request_contract_validator() -> Draft202012Validator:
+    """Load the plugin-request contract schema once; fail closed if absent.
+
+    Shared by every plugin-request consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root, closed-tool-call,
+    and closed-approval guards refuse a schema edit that would reopen the
+    request, its tool-call block, or its approval binding to unreviewed
+    extension fields: a plugin request must stay a closed ids/typed-inputs
+    record, never an extensible envelope through which a path, a raw command, a
+    credential value, or an executable body could ride in.
+    """
+    global _plugin_request_contract_validator_cache
+    if _plugin_request_contract_validator_cache is None:
+        try:
+            schema = json.loads(_PLUGIN_REQUEST_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "plugin-request contract schema is unavailable; refusing to validate requests"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "plugin-request contract schema no longer closes its root object; "
+                "refusing to validate requests"
+            )
+        props = schema.get("properties", {})
+        for name, node in (
+            ("tool_call", props.get("tool_call")),
+            ("approval", props.get("approval")),
+            ("lifecycle", props.get("lifecycle")),
+            ("actor", props.get("actor")),
+            ("pluginRef", schema.get("$defs", {}).get("pluginRef")),
+        ):
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"plugin-request contract schema no longer closes its {name} object; "
+                    "refusing to validate requests"
+                )
+        _plugin_request_contract_validator_cache = Draft202012Validator(schema)
+    return _plugin_request_contract_validator_cache
+
+
+def _reset_plugin_request_contract_validator_cache() -> None:
+    """Test hook: force the next plugin-request validation to reload the on-disk schema."""
+    global _plugin_request_contract_validator_cache
+    _plugin_request_contract_validator_cache = None
+
+
+_PLUGIN_PREVIEW_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "plugin-preview.v1.schema.json"
+)
+_plugin_preview_contract_validator_cache: Draft202012Validator | None = None
+
+
+def plugin_preview_contract_validator() -> Draft202012Validator:
+    """Load the plugin-preview contract schema once; fail closed if absent.
+
+    Shared by every plugin-preview consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root, closed-change, and
+    closed-approval guards refuse a schema edit that would reopen the preview, a
+    change item, or its approval binding to unreviewed extension fields: a
+    preview must stay a closed, redacted, hash-bound artifact, never an
+    extensible envelope through which a raw endpoint, path, or credential could
+    ride in.
+    """
+    global _plugin_preview_contract_validator_cache
+    if _plugin_preview_contract_validator_cache is None:
+        try:
+            schema = json.loads(_PLUGIN_PREVIEW_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "plugin-preview contract schema is unavailable; refusing to validate previews"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "plugin-preview contract schema no longer closes its root object; "
+                "refusing to validate previews"
+            )
+        change = schema.get("properties", {}).get("changes", {}).get("items", {})
+        approval = schema.get("properties", {}).get("approval")
+        for name, node in (("change", change), ("approval", approval)):
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"plugin-preview contract schema no longer closes its {name} object; "
+                    "refusing to validate previews"
+                )
+        _plugin_preview_contract_validator_cache = Draft202012Validator(schema)
+    return _plugin_preview_contract_validator_cache
+
+
+def _reset_plugin_preview_contract_validator_cache() -> None:
+    """Test hook: force the next plugin-preview validation to reload the on-disk schema."""
+    global _plugin_preview_contract_validator_cache
+    _plugin_preview_contract_validator_cache = None
+
+
+_PLUGIN_RECEIPT_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "plugin-receipt.v1.schema.json"
+)
+_plugin_receipt_contract_validator_cache: Draft202012Validator | None = None
+
+
+def plugin_receipt_contract_validator() -> Draft202012Validator:
+    """Load the plugin-receipt contract schema once; fail closed if absent.
+
+    Shared by every plugin-receipt consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root, closed-result, and
+    closed-credential guards refuse a schema edit that would reopen the receipt,
+    its result block, or its credential-use block to unreviewed extension
+    fields: a receipt must stay a closed, redacted audit record whose credential
+    use is reported by opaque reference only, never an extensible envelope that
+    could leak a raw payload or a credential value.
+    """
+    global _plugin_receipt_contract_validator_cache
+    if _plugin_receipt_contract_validator_cache is None:
+        try:
+            schema = json.loads(_PLUGIN_RECEIPT_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "plugin-receipt contract schema is unavailable; refusing to validate receipts"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "plugin-receipt contract schema no longer closes its root object; "
+                "refusing to validate receipts"
+            )
+        for name in ("result", "credential_use"):
+            node = schema.get("properties", {}).get(name)
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"plugin-receipt contract schema no longer closes its {name} object; "
+                    "refusing to validate receipts"
+                )
+        _plugin_receipt_contract_validator_cache = Draft202012Validator(schema)
+    return _plugin_receipt_contract_validator_cache
+
+
+def _reset_plugin_receipt_contract_validator_cache() -> None:
+    """Test hook: force the next plugin-receipt validation to reload the on-disk schema."""
+    global _plugin_receipt_contract_validator_cache
+    _plugin_receipt_contract_validator_cache = None
+
+
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -551,6 +818,105 @@ def check_operation_schema(schema: Any) -> None:
         _resolve_local_pointer(schema, keyword, target)
 
 
+_PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES = 64
+_PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH = 8
+
+# JSON Schema applicator keywords whose values are (or contain) subschemas. The
+# walk is confined to these so a data-bearing keyword (enum/const/default/
+# examples) can never be mistaken for a schema to close or count.
+_SCHEMA_SUBSCHEMA_KEYWORDS = (
+    "additionalProperties", "unevaluatedProperties", "propertyNames",
+    "items", "contains", "not", "if", "then", "else",
+)
+_SCHEMA_SUBSCHEMA_LIST_KEYWORDS = ("allOf", "anyOf", "oneOf", "prefixItems")
+_SCHEMA_SUBSCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "dependentSchemas")
+
+
+def _is_object_schema(node: Mapping[str, Any]) -> bool:
+    """True when a subschema constrains an object (by ``type`` or by properties)."""
+    declared = node.get("type")
+    if declared == "object" or (isinstance(declared, list) and "object" in declared):
+        return True
+    return isinstance(node.get("properties"), Mapping) or isinstance(node.get("patternProperties"), Mapping)
+
+
+def _check_plugin_schema_closed_and_bounded(node: Any, object_depth: int) -> None:
+    """Recursively enforce closed, size-bounded object schemas; fail closed.
+
+    Every object schema anywhere in the tree must declare
+    ``additionalProperties: false`` (an open nested object is the same smuggle
+    hole as an open root, one level down); no object may declare more than
+    :data:`_PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES` properties; and object schemas may
+    not nest deeper than :data:`_PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH` levels.
+    """
+    if not isinstance(node, Mapping):
+        return
+    depth = object_depth
+    if _is_object_schema(node):
+        if node.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "must close every object with additionalProperties:false "
+                "(an open nested object schema is a smuggle hole)"
+            )
+        if "patternProperties" in node:
+            # additionalProperties:false only governs keys NOT matched by
+            # patternProperties, so a pattern-keyed open string map still
+            # accepts arbitrary fields ({"command": "...| sh"}) through the
+            # "closed" boundary. A plugin tool's typed boundary must enumerate
+            # its fields via `properties` only.
+            raise ContractValidationError(
+                "must enumerate object fields via properties only; a plugin tool "
+                "schema may not use patternProperties (additionalProperties:false "
+                "does not close keys matched by patternProperties — a smuggle hole)"
+            )
+        depth += 1
+        if depth > _PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH:
+            raise ContractValidationError(
+                f"nests object schemas deeper than the {_PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH}-level bound"
+            )
+        properties = node.get("properties")
+        if isinstance(properties, Mapping) and len(properties) > _PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES:
+            raise ContractValidationError(
+                f"declares more than the {_PLUGIN_TOOL_SCHEMA_MAX_PROPERTIES}-property bound on one object"
+            )
+    for keyword in _SCHEMA_SUBSCHEMA_KEYWORDS:
+        _check_plugin_schema_closed_and_bounded(node.get(keyword), depth)
+    for keyword in _SCHEMA_SUBSCHEMA_LIST_KEYWORDS:
+        seq = node.get(keyword)
+        if isinstance(seq, (list, tuple)):
+            for item in seq:
+                _check_plugin_schema_closed_and_bounded(item, depth)
+    for keyword in _SCHEMA_SUBSCHEMA_MAP_KEYWORDS:
+        mapping = node.get(keyword)
+        if isinstance(mapping, Mapping):
+            for item in mapping.values():
+                _check_plugin_schema_closed_and_bounded(item, depth)
+
+
+def check_plugin_tool_schema(schema: Any) -> None:
+    """Fail closed unless a plugin tool I/O schema is a *closed, bounded* object schema.
+
+    Extends :func:`check_operation_schema` (well-formedness, draft-2020-12
+    dialect, object root, intra-document ``#``-pointer refs only) with the two
+    properties a plugin tool's typed I/O boundary needs that a provider operation
+    schema does not guarantee: the root object *and every locally-reachable
+    nested object schema* must declare ``additionalProperties: false``, and the
+    schema is size-bounded (at most 64 properties per object, object nesting no
+    deeper than 8).  Without recursive closure an open ``{"type":"object"}``
+    field would let ``{"command":"curl … | sh","cwd":"/etc"}`` ride through the
+    typed boundary a reviewer thought was closed.
+
+    Kept plugin-specific rather than folded into ``check_operation_schema``: the
+    provider operation contract applies that helper only to operation *inputs*
+    and deliberately leaves operation *outputs* open, so recursive closure and
+    the size bound are plugin criterion-1 properties, not shared ones.  Hardening
+    the shared helper would change the operation contract's guarantees and its
+    review boundary for no plugin benefit.
+    """
+    check_operation_schema(schema)
+    _check_plugin_schema_closed_and_bounded(schema, 0)
+
+
 class ApprovalConsumer(Protocol):
     """Bridge-side authority check for one approval-gated V2 operation."""
 
@@ -572,6 +938,10 @@ _PREFIXES = {
     "settings-descriptor": b"anvil-workbench/settings-descriptor/v1\0",
     "advanced-preset": b"anvil-workbench/advanced-preset/v1\0",
     "deliver-intent": b"anvil-workbench/deliver-intent/v1\0",
+    "plugin-catalog": b"anvil-workbench/plugin-catalog/v1\0",
+    "plugin": b"anvil-workbench/plugin/v1\0",
+    "plugin-capability": b"anvil-workbench/plugin-capability/v1\0",
+    "plugin-request": b"anvil-workbench/plugin-request/v1\0",
 }
 
 
@@ -727,6 +1097,46 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
                 selections["skills"] = sorted(
                     skills, key=lambda item: (str(item.get("id", "")), str(item.get("digest", "")))
                 )
+    elif kind == "plugin-catalog":
+        # Exclude the digest and the volatile generated_at; sort plugins by the
+        # full (id, plugin_digest) tuple so a reorder can never change the
+        # catalog digest.  A plugin's own tool order is part of its identity and
+        # is preserved: reordering tools is a content change to that plugin and
+        # legitimately changes its plugin_digest.
+        payload = _without(value, "catalog_digest", "generated_at")
+        plugins = payload.get("plugins")
+        if isinstance(plugins, list):
+            payload["plugins"] = sorted(
+                copy.deepcopy(plugins),
+                key=lambda item: (str(item.get("id", "")), str(item.get("plugin_digest", ""))),
+            )
+    elif kind == "plugin":
+        # Exclude only the plugin's own digest; the tool list order is preserved
+        # so the plugin_digest is tamper-evidence over the exact reviewed tools.
+        payload = _without(value, "plugin_digest")
+    elif kind == "plugin-capability":
+        # Exclude the digest; sort the plugin allowlist by the full
+        # (plugin_id, plugin_digest) tuple and each entry's enabled_tools
+        # lexicographically, so neither a reorder of entries nor of a tool list
+        # can change the profile digest.
+        payload = _without(value, "digest")
+        plugins = payload.get("plugins")
+        if isinstance(plugins, list):
+            sorted_plugins = sorted(
+                copy.deepcopy(plugins),
+                key=lambda item: (str(item.get("plugin_id", "")), str(item.get("plugin_digest", ""))),
+            )
+            for entry in sorted_plugins:
+                tools = entry.get("enabled_tools") if isinstance(entry, Mapping) else None
+                if isinstance(tools, list):
+                    entry["enabled_tools"] = sorted(tools, key=str)
+            payload["plugins"] = sorted_plugins
+    elif kind == "plugin-request":
+        # Exclude the digest so the same request content hashes identically and
+        # the idempotency key is stable; a mutated request recomputes to a
+        # different key.  The tool-call inputs are an object, so canonical JSON
+        # already sorts their keys — there is no list needing an explicit sort.
+        payload = _without(value, "request_digest")
     return payload
 
 
@@ -1421,3 +1831,401 @@ def validate_bridge_command_snapshot(
         raise
     except Exception as exc:
         raise ContractValidationError("approval grant is missing, expired, replayed, or not bound to this bridge/project") from exc
+
+
+_PLUGIN_EFFECTFUL = ("external_effect", "state_mutation")
+_PLUGIN_LIFECYCLE_ACTION = {
+    "install": "install_plugin",
+    "upgrade": "upgrade_plugin",
+    "downgrade": "downgrade_plugin",
+}
+# disable/remove are management actions: an approval is not mandatory (a
+# descriptor MAY require one to tighten the gate per R003), but when present its
+# action must correspond to the kind and its hash must bind the subject.
+_PLUGIN_MANAGEMENT_ACTION = {
+    "disable": "disable_plugin",
+    "remove": "remove_plugin",
+}
+# The single source of truth for kind->approval_action correspondence, so any
+# attached approval is validated fail-closed on EVERY kind, never only lifecycle.
+_PLUGIN_KIND_APPROVAL_ACTION = {
+    "tool_call": "invoke_effect_tool",
+    **_PLUGIN_LIFECYCLE_ACTION,
+    **_PLUGIN_MANAGEMENT_ACTION,
+}
+
+
+def _plugin_approval_subject(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the exact typed subject a plugin request's approval must bind.
+
+    For a ``tool_call`` the subject is the target tool plus its typed inputs; for
+    a lifecycle or management action it is the pinned plugin and (for a lifecycle
+    action) the selected version.  Hashing this subject (never the whole request,
+    never a raw command) is what binds a one-time approval to the precise effect
+    the owner reviewed.
+
+    The subject intentionally pins ``plugin_digest`` (the installed/target
+    entry's tamper-evident identity) and, for a lifecycle action, only the
+    ``target_version``; ``lifecycle.from_version`` is deliberately omitted because
+    the pinned ``plugin_digest`` already fixes the exact entry the effect acts on,
+    so a replayed or drifted ``from_version`` cannot change what was approved.
+    """
+    plugin = request.get("plugin") if isinstance(request.get("plugin"), Mapping) else {}
+    kind = request.get("kind")
+    if kind == "tool_call":
+        tool_call = request.get("tool_call") if isinstance(request.get("tool_call"), Mapping) else {}
+        return {
+            "plugin_id": plugin.get("plugin_id"),
+            "plugin_digest": plugin.get("plugin_digest"),
+            "tool_id": tool_call.get("tool_id"),
+            "inputs": tool_call.get("inputs"),
+        }
+    lifecycle = request.get("lifecycle") if isinstance(request.get("lifecycle"), Mapping) else {}
+    subject: dict[str, Any] = {
+        "kind": kind,
+        "plugin_id": plugin.get("plugin_id"),
+        "plugin_digest": plugin.get("plugin_digest"),
+    }
+    if "target_version" in lifecycle:
+        subject["target_version"] = lifecycle["target_version"]
+    return subject
+
+
+def validate_plugin_catalog(catalog: Mapping[str, Any]) -> None:
+    """Fail closed when a reviewed plugin catalog has drifted or is unsafe.
+
+    JSON Schema pins each shape and, because every object is closed, already
+    makes a raw shell command, arbitrary URL/endpoint, local path, generic code
+    body, or credential value unrepresentable, and makes the effect class and
+    gate set mandatory (criteria 1 and 2).  These are the cross-field rules it
+    cannot express:
+
+    * every ``plugin_digest`` and the enclosing ``catalog_digest`` must
+      recompute, so a tampered manifest or tool descriptor fails closed (R002);
+    * plugin ids are unique, and tool ids are unique within a plugin;
+    * each tool's ``input_schema``/``output_schema`` is a self-contained draft
+      2020-12 object schema — a typed I/O boundary, never a generic executable
+      input (criterion 1);
+    * an effect-capable (non-read) tool is preview/approval-shaped: it supports a
+      preview and requires a hash-bound approval (criterion 2);
+    * a ``read`` tool is ungated, so a read can never silently carry an effect;
+    * a ``read_only_connector`` tool is constrained to the read effect and its
+      plugin pins the reviewed OpenAPI document digest it was compiled from — it
+      is never ingested live or from a browser-supplied URL (R016).
+    """
+    try:
+        plugin_catalog_contract_validator().validate(dict(catalog))
+    except ValidationError as exc:
+        raise ContractValidationError(f"plugin catalog is not schema valid: {exc.message}") from exc
+
+    plugins = catalog.get("plugins")
+    if not isinstance(plugins, list):
+        raise ContractValidationError("plugin catalog has no plugins list")
+    seen_plugins: set[str] = set()
+    for plugin in plugins:
+        if not isinstance(plugin, Mapping):
+            raise ContractValidationError("plugin catalog entry is not an object")
+        plugin_id = str(plugin.get("id"))
+        if plugin_id in seen_plugins:
+            raise ContractValidationError(f"duplicate plugin id: {plugin_id}")
+        seen_plugins.add(plugin_id)
+        if plugin.get("plugin_digest") != contract_digest("plugin", plugin):
+            raise ContractValidationError(f"plugin digest mismatch: {plugin_id}")
+
+        tools = plugin.get("tools")
+        if not isinstance(tools, list):
+            raise ContractValidationError(f"plugin has no tools list: {plugin_id}")
+        seen_tools: set[str] = set()
+        for tool in tools:
+            if not isinstance(tool, Mapping):
+                raise ContractValidationError(f"plugin tool is not an object: {plugin_id}")
+            tool_id = str(tool.get("tool_id"))
+            if tool_id in seen_tools:
+                raise ContractValidationError(f"duplicate tool id in plugin {plugin_id}: {tool_id}")
+            seen_tools.add(tool_id)
+
+            for field in ("input_schema", "output_schema"):
+                try:
+                    check_plugin_tool_schema(tool.get(field))
+                except ContractValidationError as exc:
+                    raise ContractValidationError(
+                        f"plugin tool {plugin_id}:{tool_id} {field} {exc}"
+                    ) from exc
+
+            effect = tool.get("effect")
+            gates = tool.get("gates")
+            if not isinstance(gates, Mapping):
+                raise ContractValidationError(f"plugin tool has no gate set: {plugin_id}:{tool_id}")
+            if effect in _PLUGIN_EFFECTFUL:
+                if gates.get("preview") not in ("optional", "required"):
+                    raise ContractValidationError(
+                        f"effect-capable plugin tool must support a preview: {plugin_id}:{tool_id}"
+                    )
+                if gates.get("human_approval") != "required" or not gates.get("approval_action"):
+                    raise ContractValidationError(
+                        f"effect-capable plugin tool must require a hash-bound approval: {plugin_id}:{tool_id}"
+                    )
+                # A tool gate binds the tool-invocation action only. A catalog
+                # tool cannot declare a lifecycle approval_action (install/
+                # upgrade/downgrade_plugin): validate_plugin_request hardcodes
+                # invoke_effect_tool for a tool_call, so any other declared gate
+                # would be dead text a reviewer might trust. Refuse it here as
+                # defence-in-depth behind the schema enum.
+                if gates.get("approval_action") != "invoke_effect_tool":
+                    raise ContractValidationError(
+                        f"plugin tool approval gate must be invoke_effect_tool: {plugin_id}:{tool_id}"
+                    )
+            elif effect == "read":
+                if gates.get("human_approval") != "not_required":
+                    raise ContractValidationError(
+                        f"read plugin tool must be ungated: {plugin_id}:{tool_id}"
+                    )
+
+            if tool.get("tool_kind") == "read_only_connector":
+                if effect != "read":
+                    raise ContractValidationError(
+                        f"read-only connector tool must declare the read effect: {plugin_id}:{tool_id}"
+                    )
+                if not isinstance(plugin.get("openapi_source"), Mapping):
+                    raise ContractValidationError(
+                        f"plugin with a read-only connector tool must pin its openapi_source: {plugin_id}"
+                    )
+
+    if catalog.get("catalog_digest") != contract_digest("plugin-catalog", catalog):
+        raise ContractValidationError("plugin catalog digest mismatch")
+
+
+def _resolve_catalog_plugin(
+    catalog: Mapping[str, Any], plugin_ref: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Return the catalog plugin at the reference's exact id and pinned digest."""
+    for plugin in catalog.get("plugins", []):
+        if (
+            isinstance(plugin, Mapping)
+            and plugin.get("id") == plugin_ref.get("plugin_id")
+            and plugin.get("plugin_digest") == plugin_ref.get("plugin_digest")
+        ):
+            return plugin
+    return None
+
+
+def validate_plugin_capability(profile: Mapping[str, Any]) -> None:
+    """Fail closed when a plugin capability profile has drifted or over-enables.
+
+    JSON Schema pins the enable-only allowlist shape.  These are the cross-field
+    rules it cannot express:
+
+    * the advertised ``digest`` must recompute, so a tampered allowlist fails
+      closed;
+    * a plugin appears at most once, so its enabled-tool set is unambiguous;
+    * the total enabled-tool count never exceeds a declared ``max_enabled_tools``
+      limit.
+    """
+    try:
+        plugin_capability_contract_validator().validate(dict(profile))
+    except ValidationError as exc:
+        raise ContractValidationError(f"plugin capability profile is not schema valid: {exc.message}") from exc
+
+    if profile.get("digest") != contract_digest("plugin-capability", profile):
+        raise ContractValidationError("plugin capability profile digest mismatch")
+
+    plugins = profile.get("plugins")
+    if not isinstance(plugins, list):
+        raise ContractValidationError("plugin capability profile has no plugins list")
+    seen: set[str] = set()
+    total_tools = 0
+    for entry in plugins:
+        if not isinstance(entry, Mapping):
+            raise ContractValidationError("plugin capability entry is not an object")
+        plugin_id = str(entry.get("plugin_id"))
+        if plugin_id in seen:
+            raise ContractValidationError(f"duplicate plugin in capability profile: {plugin_id}")
+        seen.add(plugin_id)
+        tools = entry.get("enabled_tools")
+        total_tools += len(tools) if isinstance(tools, list) else 0
+
+    limits = profile.get("limits")
+    if isinstance(limits, Mapping) and isinstance(limits.get("max_enabled_tools"), int):
+        if total_tools > limits["max_enabled_tools"]:
+            raise ContractValidationError(
+                "plugin capability profile enables more tools than its declared limit"
+            )
+
+
+def validate_plugin_request(
+    request: Mapping[str, Any], catalog: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail closed when a plugin request is tampered with, unauthorized, or unsafe.
+
+    JSON Schema pins the ids/typed-inputs shape and, because every object is
+    closed, already makes a path, raw command, credential value, or executable
+    body unrepresentable (criterion 1).  These are the cross-field rules it
+    cannot express:
+
+    * the advertised ``request_digest`` must recompute over the canonical
+      content, so it is a tamper-evident idempotency key — replaying an
+      identical request is the same action, and a mutated request fails closed
+      (R003 idempotency);
+    * an ``install``/``upgrade``/``downgrade`` carries both a ``preview_ref`` and
+      a hash-bound approval whose action matches the kind and whose
+      ``payload_hash`` binds the exact plugin/version subject (the R003 floor: a
+      preview AND an approval);
+    * an attached approval is validated fail-closed on EVERY kind — including
+      ``disable``/``remove`` and a ``tool_call`` — so a bogus or mismatched
+      action (e.g. ``install_plugin`` on a ``disable``) is refused, never
+      silently ignored; when present its ``payload_hash`` binds the exact typed
+      subject, never a raw command;
+    * when a trusted ``catalog`` is supplied for a ``tool_call``, the plugin
+      must be present at its pinned digest, the tool must exist, the typed
+      inputs must validate against that tool's reviewed input schema, and an
+      effect-capable tool call must carry an approval.
+    """
+    try:
+        plugin_request_contract_validator().validate(dict(request))
+    except ValidationError as exc:
+        raise ContractValidationError(f"plugin request is not schema valid: {exc.message}") from exc
+
+    if request.get("request_digest") != contract_digest("plugin-request", request):
+        raise ContractValidationError("plugin request digest mismatch")
+
+    kind = request.get("kind")
+    approval = request.get("approval")
+
+    # R003 floor: an install/upgrade/downgrade always carries BOTH a preview_ref
+    # and a hash-bound approval. The schema already requires both, but the
+    # validator enforces it independently so a request never reaches an effect
+    # path on schema drift alone.
+    if kind in _PLUGIN_LIFECYCLE_ACTION:
+        if not isinstance(approval, Mapping):
+            raise ContractValidationError(f"lifecycle {kind} requires a hash-bound approval")
+        if not isinstance(request.get("preview_ref"), Mapping):
+            raise ContractValidationError(f"lifecycle {kind} requires a preview_ref (R003: a preview AND an approval)")
+
+    # Fail-closed on EVERY kind: an attached approval must name the action that
+    # corresponds to the request kind and its payload_hash must bind the exact
+    # typed subject. A bogus {action: install_plugin} on a disable, or an
+    # unexpected approval on a read tool_call, is refused rather than ignored.
+    if isinstance(approval, Mapping):
+        expected_action = _PLUGIN_KIND_APPROVAL_ACTION.get(kind)
+        if approval.get("action") != expected_action:
+            if kind in _PLUGIN_LIFECYCLE_ACTION:
+                raise ContractValidationError(f"approval action does not match the lifecycle kind: {kind}")
+            if kind == "tool_call":
+                raise ContractValidationError("tool-call approval action must be invoke_effect_tool")
+            raise ContractValidationError(f"approval action does not match the request kind: {kind}")
+        subject_hash = approval_payload_digest(_plugin_approval_subject(request))
+        if approval.get("payload_hash") != subject_hash:
+            if kind == "tool_call":
+                raise ContractValidationError("approval hash does not bind the exact tool inputs")
+            if kind in _PLUGIN_LIFECYCLE_ACTION:
+                raise ContractValidationError("approval hash does not bind the exact plugin/version subject")
+            raise ContractValidationError("approval hash does not bind the exact plugin subject")
+
+    if kind == "tool_call":
+        if catalog is not None:
+            validate_plugin_catalog(catalog)
+            plugin_ref = request.get("plugin")
+            if not isinstance(plugin_ref, Mapping):
+                raise ContractValidationError("plugin request has no typed plugin reference")
+            plugin = _resolve_catalog_plugin(catalog, plugin_ref)
+            if plugin is None:
+                raise ContractValidationError("plugin is not present at the pinned catalog digest")
+            tool_call = request.get("tool_call")
+            if not isinstance(tool_call, Mapping):
+                raise ContractValidationError("tool-call request has no tool_call block")
+            tool = next(
+                (item for item in plugin.get("tools", [])
+                 if isinstance(item, Mapping) and item.get("tool_id") == tool_call.get("tool_id")),
+                None,
+            )
+            if tool is None:
+                raise ContractValidationError("tool is not present in the pinned plugin")
+            inputs = tool_call.get("inputs")
+            if not isinstance(inputs, Mapping):
+                raise ContractValidationError("tool-call inputs must be an object")
+            input_schema = tool.get("input_schema")
+            try:
+                check_plugin_tool_schema(input_schema)
+            except ContractValidationError as exc:
+                raise ContractValidationError(f"selected tool input schema {exc}") from exc
+            try:
+                Draft202012Validator(input_schema).validate(dict(inputs))
+            except ValidationError as exc:
+                raise ContractValidationError(
+                    f"tool-call inputs do not match the selected tool schema: {exc.message}"
+                ) from exc
+            except Exception as exc:
+                raise ContractValidationError(f"tool input schema cannot be evaluated: {exc}") from exc
+            if tool.get("effect") in _PLUGIN_EFFECTFUL and not isinstance(approval, Mapping):
+                raise ContractValidationError("effect-capable tool call requires an approval")
+
+
+def validate_plugin_preview(
+    preview: Mapping[str, Any], request: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail closed when a plugin preview is unsafe or inconsistent with its request.
+
+    JSON Schema pins the redacted, hash-bound preview shape.  These are the
+    cross-field rules it cannot express:
+
+    * an ``install``/``upgrade``/``downgrade`` preview must declare approval
+      required with a bound ``payload_hash`` — the R003 floor is never waived by
+      a preview;
+    * when the originating request is supplied, the preview echoes its
+      ``request_digest``, scopes to the same plugin and kind, and — when approval
+      is required — its ``payload_hash`` binds the exact request subject.
+    """
+    try:
+        plugin_preview_contract_validator().validate(dict(preview))
+    except ValidationError as exc:
+        raise ContractValidationError(f"plugin preview is not schema valid: {exc.message}") from exc
+
+    kind = preview.get("kind")
+    approval = preview.get("approval") if isinstance(preview.get("approval"), Mapping) else {}
+    if kind in _PLUGIN_LIFECYCLE_ACTION and approval.get("required") is not True:
+        raise ContractValidationError(f"lifecycle {kind} preview must require a hash-bound approval")
+
+    if request is not None:
+        if preview.get("request_digest") != request.get("request_digest"):
+            raise ContractValidationError("plugin preview does not echo the previewed request digest")
+        if preview.get("kind") != request.get("kind"):
+            raise ContractValidationError("plugin preview kind differs from the request")
+        if preview.get("plugin") != request.get("plugin"):
+            raise ContractValidationError("plugin preview scopes to a different plugin than the request")
+        if approval.get("required") is True:
+            if approval.get("payload_hash") != approval_payload_digest(_plugin_approval_subject(request)):
+                raise ContractValidationError("plugin preview approval hash does not bind the exact request subject")
+
+
+def validate_plugin_receipt(
+    receipt: Mapping[str, Any], request: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail closed when a plugin receipt is unsafe or inconsistent with its request.
+
+    JSON Schema pins the accepted/duplicate/denied/reconcile shapes and, because
+    every object is closed and credential use is reference-only, already makes a
+    credential value or raw tool payload unrepresentable (R004).  These are the
+    cross-field rules it cannot express:
+
+    * when the originating request is supplied, the receipt echoes its
+      ``request_digest``, scopes to the same plugin and kind, and — for a
+      ``tool_call`` — names the same tool, so a receipt can never be attributed
+      to a different request, plugin, or tool than the one presented.
+    """
+    try:
+        plugin_receipt_contract_validator().validate(dict(receipt))
+    except ValidationError as exc:
+        raise ContractValidationError(f"plugin receipt is not schema valid: {exc.message}") from exc
+
+    if request is not None:
+        if receipt.get("request_digest") != request.get("request_digest"):
+            raise ContractValidationError("plugin receipt does not echo the request digest")
+        if receipt.get("kind") != request.get("kind"):
+            raise ContractValidationError("plugin receipt kind differs from the request")
+        if receipt.get("plugin") != request.get("plugin"):
+            raise ContractValidationError("plugin receipt scopes to a different plugin than the request")
+        if request.get("kind") == "tool_call":
+            requested_tool = request.get("tool_call", {})
+            requested_tool = requested_tool.get("tool_id") if isinstance(requested_tool, Mapping) else None
+            if receipt.get("tool_id") != requested_tool:
+                raise ContractValidationError("plugin receipt names a different tool than the request")

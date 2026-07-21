@@ -1,10 +1,17 @@
-"""Shared hermetic builders for the run-context lane (T005.x).
+"""Shared hermetic builders and constants for the test suite.
 
 These fixtures compile the reviewed delivery workflow snapshot from the
 checked-in contract examples and assemble a complete, valid
 :class:`~workbench.models.RunContext` from it, so the run-context tests do not
 each re-implement the discovery -> profile -> snapshot -> capture pipeline.
 Everything is hermetic: only checked-in example JSON is read, no CLI or network.
+
+De-duplicated test constants also live here so two test modules can never drift
+out of sync.  ``SYSTEM_HEALTH_DESCRIPTOR_FIELDS`` is the single source of truth
+for the closed field set an
+:class:`~workbench.system_health.IntegrationDescriptor` may serialize;
+``tests/test_api.py`` and ``tests/test_security_contract.py`` both import it, so
+the descriptor's leak-by-addition guard is stated once.
 """
 from __future__ import annotations
 
@@ -119,3 +126,14 @@ def run_context_snapshot() -> WorkflowSnapshot:
 def make_run_context() -> Callable[..., RunContext]:
     """A factory the tests call with overrides to build a run context."""
     return build_run_context
+
+
+#: The exact closed field set a system-health descriptor may serialize.  A field
+#: added outside this set (a leak-by-addition) must fail the response/descriptor
+#: tests, so the assertion is not a tautology.  Kept here, imported by both the
+#: API surface test and the security-contract test, so the two can never drift.
+SYSTEM_HEALTH_DESCRIPTOR_FIELDS = frozenset({
+    "configured", "dependencies", "digest", "integration_id", "non_canonical",
+    "owner", "remediation", "schema_version", "state", "title",
+    "version", "detail", "last_checked_at",
+})

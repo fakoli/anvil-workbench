@@ -701,3 +701,292 @@ def test_malformed_run_id_is_rejected_before_the_store():
         assert client_.get(
             "/api/projects/project_a/runs/has%20space/context", headers=CTX_ACTOR,
         ).status_code == 422
+
+# Read-only system-health + observational posture surface (preferences-
+# configuration T003.2 / T008): every declared integration's descriptor,
+# truthful disabled/degraded states, a closed leak-proof response, GET-only (no
+# mutation/execution/approval), and CLI/API finding parity.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime as _datetime, timezone as _timezone
+
+from conftest import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+
+from workbench.cli import main as _cli_main
+from workbench.system_health import (
+    INTEGRATION_IDS as _SH_IDS,
+    IntegrationDescriptor as _SHDescriptor,
+    PostureCheck as _SHPostureCheck,
+    PostureReport as _SHPostureReport,
+    SystemHealthService as _SHService,
+    run_posture_audit as _sh_run_audit,
+)
+
+SYS_ACTOR = {"X-Workbench-Actor": "operator"}
+
+#: The only fields a descriptor response object may carry. A field added outside
+#: this set must fail the response test (leak-by-addition), so it is not a
+#: tautology. Imported from ``conftest`` so this list and its twin in
+#: ``test_security_contract.py`` are one source of truth and cannot drift.
+_SYS_ALLOWED_FIELDS = SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+_FIXED_CLOCK = lambda: _datetime(2026, 7, 21, tzinfo=_timezone.utc)
+
+
+def _sys_settings(**overrides) -> Settings:
+    base = dict(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def _sys_client(settings: Settings, *, bridge_health=None, service=None) -> TestClient:
+    service = service or _SHService(settings, clock=_FIXED_CLOCK, bridge_health=bridge_health)
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), system_health=service,
+    ))
+
+
+def test_system_health_returns_a_descriptor_for_every_declared_integration():
+    # T003.2 criterion 1: the endpoint returns descriptors for every declared
+    # integration, each with a closed field set and an explicit non-canonical mark.
+    with _sys_client(_sys_settings()) as client_:
+        response = client_.get("/api/system/health", headers=SYS_ACTOR)
+        assert response.status_code == 200, response.text
+        integrations = response.json()["integrations"]
+        assert {i["integration_id"] for i in integrations} == set(_SH_IDS)
+        for descriptor in integrations:
+            assert set(descriptor) - _SYS_ALLOWED_FIELDS == set(), descriptor
+            assert descriptor["non_canonical"] is True
+            assert descriptor["digest"].startswith("sha256:")
+            assert descriptor["last_checked_at"] == "2026-07-21T00:00:00Z"
+
+
+def test_system_health_reports_unavailable_integrations_as_disabled_or_degraded():
+    # T003.2 criterion 2: unavailable integrations return disabled or degraded
+    # states with remediation and no raw internals. Serving/graph are unset
+    # (disabled); the bridge observation is degraded (passed through, criterion 4).
+    with _sys_client(_sys_settings(), bridge_health="degraded") as client_:
+        integrations = {
+            i["integration_id"]: i
+            for i in client_.get("/api/system/health", headers=SYS_ACTOR).json()["integrations"]
+        }
+        assert integrations["anvil_serving"]["state"] == "disabled"
+        assert integrations["anvil_serving"]["configured"] is False
+        assert integrations["anvil_serving"]["remediation"]
+        # Bridge health passes through the SAME descriptor + redaction contract.
+        assert integrations["project_bridge"]["state"] == "degraded"
+        assert integrations["project_bridge"]["configured"] is True
+
+
+def test_system_health_reports_configured_integrations_as_ready():
+    # A configured plane is reported truthfully as ready (never a false disabled).
+    settings = _sys_settings(anvil_router_base_url="http://serving", anvil_router_token="t")
+    with _sys_client(settings) as client_:
+        integrations = {
+            i["integration_id"]: i
+            for i in client_.get("/api/system/health", headers=SYS_ACTOR).json()["integrations"]
+        }
+        assert integrations["anvil_serving"]["state"] == "ready"
+        assert integrations["anvil_serving"]["configured"] is True
+
+
+def test_system_health_response_carries_no_credential_url_or_path_marker():
+    # T003.2 criterion 2 ("no raw internals"): even with secret-shaped config
+    # VALUES, the rendered response leaks no credential, endpoint URL, or path.
+    settings = _sys_settings(
+        anvil_router_base_url="https://100.87.34.66:8000/v1",
+        anvil_router_token="sk-live-supersecretDEADBEEF",
+        neo4j_password="/var/secrets/neo4j",
+    )
+    with _sys_client(settings) as client_:
+        raw = client_.get("/api/system/health", headers=SYS_ACTOR).text.lower()
+        for marker in ("supersecret", "deadbeef", "100.87.34.66", "://", "/var/secrets", "sk-live"):
+            assert marker not in raw, f"system-health response leaked {marker!r}"
+
+
+_BS = chr(92)
+
+#: The full adversarial redaction corpus (finding 1), mirrored at the API last
+#: hop: ``(fragment, [tokens that must be gone])``. Each proven-leak shape spans
+#: the response body as a negative assertion.
+_SYS_REDACTION_CORPUS = (
+    ("AKIAIOSFODNN7EXAMPLE", ["AKIAIOSFODNN7EXAMPLE"]),
+    ("aws_secret_access_key=wJalrXUtnFEMIK7bPxRfiCYEXAMPLEKEY", ["wJalrXUtnFEMI"]),
+    ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dozjgNryP4", ["eyJhbGci", "eyJzdWIi"]),
+    ("-----BEGIN RSA PRIVATE KEY-----MIIEpQ-----END RSA PRIVATE KEY-----", ["MIIEpQ"]),
+    ("100.64.0.5:8443", ["100.64.0.5"]),
+    ("db.tail1234.ts.net:7687", ["tail1234", "ts.net"]),
+    ("serving.tail1234.ts.net", ["serving.tail1234"]),
+    ("//internalhost/admin", ["//internalhost"]),
+    ("Server=db.internal;Password=hunter2;", ["db.internal", "hunter2"]),
+    ("path=/etc/anvil/secret.conf", ["/etc/anvil"]),
+    ("file:/var/lib/secrets/key", ["/var/lib/secrets"]),
+    (_BS + _BS + "fileserver" + _BS + "secrets", ["fileserver"]),
+    ("~/.ssh/id_rsa", ["id_rsa"]),
+    ("deploy/.env", ["deploy/.env"]),
+    ("certs/server.pem", ["certs/server.pem"]),
+    ("prod.env", ["prod.env"]),
+)
+
+
+def _seeded_service(remediation: str, *, use_descriptor: bool = True):
+    """A system-health service seeded with adversarial prose.
+
+    With ``use_descriptor`` it returns a real (construction-scrubbed)
+    ``IntegrationDescriptor``; with it False it returns a ROGUE, duck-typed
+    object whose ``as_dict()`` emits raw, unscrubbed prose -- proving the API
+    last hop is the guarantee, not descriptor construction (finding 2, option b).
+    """
+    class _RogueDescriptor:
+        def as_dict(self):
+            return {
+                "integration_id": "anvil_serving", "state": "disabled",
+                "configured": False, "owner": "anvil-serving",
+                "remediation": remediation, "title": "Anvil Serving model plane",
+                "dependencies": [], "non_canonical": True,
+                "schema_version": "workbench-system-health/v1",
+                "digest": "sha256:" + "a" * 64,
+                "last_checked_at": "2026-07-21T00:00:00Z",
+            }
+
+    real = _SHDescriptor(
+        integration_id="anvil_serving", title="Anvil Serving model plane",
+        state="disabled", configured=False, owner="anvil-serving",
+        remediation=remediation, last_checked_at="2026-07-21T00:00:00Z",
+    )
+    descriptor = real if use_descriptor else _RogueDescriptor()
+
+    class _SeededService:
+        def descriptors(self):
+            return (descriptor,)
+        def get(self, integration_id):
+            return descriptor
+        def posture(self):
+            return _SHPostureReport(checks=(
+                _SHPostureCheck(
+                    check_id="posture.integration.anvil_serving", title="x",
+                    status="disabled", severity="info", remediation=remediation,
+                ),
+            ))
+
+    return _SeededService()
+
+
+def test_system_health_last_hop_scrubs_an_adversarially_seeded_descriptor():
+    # Redaction is enforced at the API boundary, so even a service that splices a
+    # secret/URL/path into descriptor prose cannot make the API emit it. Every
+    # proven-leak shape (finding 1) is checked across /health and /posture.
+    for fragment, gone in _SYS_REDACTION_CORPUS:
+        remediation = f"remediation {fragment} tail"
+        with _sys_client(_sys_settings(), service=_seeded_service(remediation)) as client_:
+            health_raw = client_.get("/api/system/health", headers=SYS_ACTOR).text
+            detail_raw = client_.get("/api/system/health/anvil_serving", headers=SYS_ACTOR).text
+            posture_raw = client_.get("/api/system/posture", headers=SYS_ACTOR).text
+            for token in gone:
+                for surface, raw in (("health", health_raw), ("detail", detail_raw), ("posture", posture_raw)):
+                    assert token not in raw, f"{surface} leaked {token!r} from {fragment!r}"
+            assert "remediation" in health_raw and "tail" in health_raw  # prose survives
+
+
+def test_system_health_last_hop_scrubs_a_rogue_duck_typed_service_that_bypassed_construction():
+    # Finding 2 (security lens, option b): the guarantee is the serialized API
+    # boundary, not descriptor construction. A rogue, duck-typed service whose
+    # as_dict() returns RAW unscrubbed prose (never went through _prose) must
+    # still be scrubbed by the router's last-hop scrub before it reaches the
+    # browser -- otherwise secrets ride straight through.
+    remediation = (
+        "token=leakedsecret at https://10.0.0.9/admin path /root/.ssh/id_rsa "
+        "and AKIAIOSFODNN7EXAMPLE"
+    )
+    service = _seeded_service(remediation, use_descriptor=False)
+    # Sanity: the rogue as_dict() really does emit the raw secret (so the test is
+    # not vacuous -- construction-time scrubbing did NOT run here).
+    assert "leakedsecret" in _json.dumps(service.get("anvil_serving").as_dict())
+    with _sys_client(_sys_settings(), service=service) as client_:
+        for path in ("/api/system/health", "/api/system/health/anvil_serving", "/api/system/posture"):
+            raw = client_.get(path, headers=SYS_ACTOR).text
+            for token in ("leakedsecret", "10.0.0.9", "/root/.ssh", "AKIAIOSFODNN7EXAMPLE", "://"):
+                assert token not in raw, f"{path} leaked {token!r} from a rogue service"
+            assert "[REDACTED" in raw  # a class marker proves the scrub ran
+
+
+def test_system_health_surface_is_get_only_with_no_mutation_execution_or_approval_route():
+    # T003.2 criterion 3 / T008: the surface exposes no mutation, execution, or
+    # approval path. Every declared /api/system operation is GET-only (checked in
+    # the OpenAPI schema), and every write verb is refused, never served.
+    with _sys_client(_sys_settings()) as client_:
+        paths = client_.app.openapi()["paths"]
+        system_paths = {path: ops for path, ops in paths.items() if path.startswith("/api/system")}
+        assert set(system_paths) == {
+            "/api/system/health", "/api/system/health/{integration_id}", "/api/system/posture",
+        }
+        for path, operations in system_paths.items():
+            assert set(operations) <= {"get"}, f"{path} declares non-GET operations: {sorted(operations)}"
+        # Behavioral proof: a write verb against EVERY declared route -- the
+        # collection, the per-integration detail, and the posture audit -- is
+        # refused with 405, never served.
+        for verb in (client_.post, client_.put, client_.patch, client_.delete):
+            assert verb("/api/system/health", headers=SYS_ACTOR).status_code == 405
+            assert verb("/api/system/health/anvil_serving", headers=SYS_ACTOR).status_code == 405
+            assert verb("/api/system/posture", headers=SYS_ACTOR).status_code == 405
+
+
+def test_system_health_one_integration_detail_and_unknown_and_malformed_ids():
+    with _sys_client(_sys_settings()) as client_:
+        # A known integration resolves to its own descriptor.
+        one = client_.get("/api/system/health/anvil_serving", headers=SYS_ACTOR)
+        assert one.status_code == 200
+        assert one.json()["integration"]["integration_id"] == "anvil_serving"
+        # An unknown (but well-formed) id is a plain 404 -- the catalog is public.
+        unknown = client_.get("/api/system/health/not_a_real_one", headers=SYS_ACTOR)
+        assert unknown.status_code == 404
+        assert unknown.json()["detail"] == "unknown integration"
+        # A malformed id is rejected at the edge (422) before the service.
+        assert client_.get("/api/system/health/Bad-ID", headers=SYS_ACTOR).status_code == 422
+
+
+def test_system_health_requires_a_trusted_allowlisted_actor():
+    # Behind the same trusted actor dependency as the rest of the hub.
+    settings = _sys_settings(approvers=frozenset({"operator"}), allow_insecure_dev_actor=False)
+    with _sys_client(settings) as client_:
+        for path in ("/api/system/health", "/api/system/health/anvil_serving", "/api/system/posture"):
+            assert client_.get(path).status_code == 401  # no identity header
+            assert client_.get(path, headers={"X-Workbench-Actor": "intruder"}).status_code == 403
+
+
+def test_system_posture_endpoint_returns_deterministic_stable_id_findings():
+    # T008: the posture endpoint returns stable, deterministic findings.
+    with _sys_client(_sys_settings(allow_insecure_dev_actor=True)) as client_:
+        body = client_.get("/api/system/posture", headers=SYS_ACTOR).json()
+        ids = [c["check_id"] for c in body["checks"]]
+        assert ids == sorted(ids) and len(ids) == len(set(ids))
+        assert "posture.security.insecure_dev_actor" in ids
+        # Re-fetching yields identical findings (timestamp is not part of them).
+        again = client_.get("/api/system/posture", headers=SYS_ACTOR).json()
+        assert again["checks"] == body["checks"]
+
+
+def test_cli_and_system_health_api_render_identical_posture_findings(monkeypatch, capsys):
+    # T008 criterion 3: CLI and System Health render identical findings for the
+    # same configuration, because both call the one run_posture_audit runner.
+    monkeypatch.setenv("WORKBENCH_ALLOW_INSECURE_DEV_ACTOR", "1")
+    monkeypatch.setenv("ANVIL_ROUTER_BASE_URL", "http://serving")
+    monkeypatch.setenv("ANVIL_ROUTER_TOKEN", "server-held")
+    monkeypatch.setenv("WORKBENCH_IDENTITY_HEADER", "X-Workbench-Actor")
+    settings = Settings.from_env()
+
+    # CLI surface: emit JSON findings and parse them.
+    assert _cli_main(["posture", "--json"]) == 0
+    cli_findings = _json.loads(capsys.readouterr().out)
+
+    # API surface: the same settings drive the mounted service.
+    with _sys_client(settings) as client_:
+        api_findings = client_.get("/api/system/posture", headers=SYS_ACTOR).json()["checks"]
+
+    assert cli_findings == api_findings
+    # And both agree with a direct run of the shared runner -- no surface drift.
+    assert cli_findings == _sh_run_audit(settings).findings()

@@ -1,0 +1,21 @@
+{
+  "schema_version": "workbench-plugin-request/v1",
+  "request_id": "plugreq_taskslist000001",
+  "request_digest": "sha256:443c54c65fbc1a0d16831581506fde9495c069232c371293a7c093b118b6f01a",
+  "kind": "tool_call",
+  "actor": {
+    "actor_id": "operator-01",
+    "kind": "operator"
+  },
+  "plugin": {
+    "plugin_id": "anvil-tasks-viewer",
+    "plugin_digest": "sha256:4ae65e4cfc645dc1adf8a742e6485946c1961819b87039ffa0d93ea88253b4fd"
+  },
+  "tool_call": {
+    "tool_id": "tasks.list",
+    "inputs": {
+      "status": "ready"
+    }
+  },
+  "created_at": "2026-07-20T12:00:00Z"
+}
