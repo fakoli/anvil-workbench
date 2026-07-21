@@ -6,6 +6,8 @@ reimplements State transitions.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -1379,3 +1381,602 @@ def _rfc3339(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Preference configuration: typed policy operations, durable records, schema
+# migration, and the shared effective-value resolver
+# (preferences-configuration: T004.1 / T002.1 / T002.3)
+# ---------------------------------------------------------------------------
+#
+# These values back the preference store slice.  They deliberately mirror the
+# typed-operation spine above: a mutable setting is changed only by naming one
+# closed, versioned :class:`PolicyOperation` (never a generic command), whose
+# canonical payload digest binds the exact effect (:func:`preference_operation
+# _digest`).  A durable :class:`PreferenceRecord` carries the monotonic write
+# and schema-version fields optimistic concurrency and migration depend on, and
+# a single shared resolver (:func:`resolve_effective_settings`) gives every
+# consumer one deterministic precedence + policy-ceiling + capability-fallback
+# interpretation.  Nothing here is wired into the live loop; it is exercised
+# only through the injectable store, mirroring the run-context read-model.
+
+_PREF_SCOPES = ("personal", "project", "deployment", "policy")
+_PREF_ACTOR_SCOPES = ("personal", "project")
+_PREF_AUTHORITY_SCOPES = ("deployment", "policy")
+_PREF_SETTING_ID = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
+_PREF_ID_REF = re.compile(r"^[a-z][a-z0-9._:-]{1,127}$")
+_PREF_DIGEST_REF = re.compile(r"^sha256:[a-f0-9]{64}$")
+_PREF_SCOPE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
+
+#: Sentinel distinguishing "no stored value" from a legitimately stored ``None``
+#: in the resolver, so a caller can never confuse an unset setting with one set
+#: to a falsy value.
+_PREF_MISSING: Any = object()
+
+#: Domain separation + minimum key length for the KEYED scope-key audit
+#: fingerprint, mirroring the chat-content fingerprint idiom
+#: (:func:`workbench.conversation_models.turn_content_hash`).  The scope key is
+#: an actor/project identity (often a guessable email or slug); an UNSALTED
+#: ``sha256(scope:scope_key)`` of it is dictionary-recoverable, so the audit
+#: fingerprint is a keyed HMAC-SHA256 whose server-held key never sits beside
+#: the fingerprints it protects.  Without the key a holder of audit metadata
+#: cannot run a dictionary of candidate actors against the tag.
+_PREF_AUDIT_FINGERPRINT_PREFIX = b"anvil-workbench/preference-scope-key/v1\0"
+MIN_PREF_AUDIT_KEY_BYTES = 16
+
+
+def require_pref_audit_key(key: bytes) -> bytes:
+    """Fail closed unless ``key`` is a usable server-held audit-fingerprint key."""
+    if not isinstance(key, (bytes, bytearray)) or len(key) < MIN_PREF_AUDIT_KEY_BYTES:
+        raise PreferenceValidationError(
+            f"preference audit fingerprint key must be bytes of at least {MIN_PREF_AUDIT_KEY_BYTES} octets"
+        )
+    return bytes(key)
+
+
+class PreferenceValidationError(ValueError):
+    """A preference value is malformed or out of range for its descriptor.
+
+    Raised BEFORE persistence (T002.1 criterion 4) so a wrong-type or
+    out-of-bounds value never reaches the durable store, and mapped to a typed
+    422 by the API — deliberately distinct from the stale-write reload-required
+    conflict.
+    """
+
+
+def validate_setting_value(descriptor: Mapping[str, Any], value: Any) -> Any:
+    """Return ``value`` when it satisfies its descriptor; else raise a typed error.
+
+    Enforces the descriptor's declared ``type`` and (for ints) ``bounds``, (for
+    enums) ``allowed_values``, and (for references) the id/digest grammar.  This
+    is the single typed-validation entry point shared by the operation builder
+    and the durable store, so a malformed value is refused identically wherever
+    it enters.
+    """
+    if not isinstance(descriptor, Mapping):
+        raise PreferenceValidationError("a setting value requires a typed descriptor")
+    setting_type = descriptor.get("type")
+    setting_id = descriptor.get("id", "<unknown>")
+    if setting_type == "bool":
+        if not isinstance(value, bool):
+            raise PreferenceValidationError(f"{setting_id} requires a boolean value")
+    elif setting_type == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PreferenceValidationError(f"{setting_id} requires an integer value")
+        bounds = descriptor.get("bounds")
+        if isinstance(bounds, Mapping):
+            low = bounds.get("min")
+            high = bounds.get("max")
+            if (isinstance(low, int) and value < low) or (isinstance(high, int) and value > high):
+                raise PreferenceValidationError(
+                    f"{setting_id} value {value} is outside its declared bounds "
+                    f"[{bounds.get('min')}, {bounds.get('max')}]"
+                )
+    elif setting_type == "enum":
+        allowed = descriptor.get("allowed_values") or ()
+        if value not in allowed:
+            raise PreferenceValidationError(f"{setting_id} value is not one of its allowed values")
+    elif setting_type == "string":
+        if not isinstance(value, str) or len(value) > 200:
+            raise PreferenceValidationError(f"{setting_id} requires a string of at most 200 characters")
+    elif setting_type == "id_ref":
+        if not isinstance(value, str) or not _PREF_ID_REF.match(value):
+            raise PreferenceValidationError(f"{setting_id} requires a valid id reference")
+    elif setting_type == "digest_ref":
+        if not isinstance(value, str) or not _PREF_DIGEST_REF.match(value):
+            raise PreferenceValidationError(f"{setting_id} requires a sha256 digest reference")
+    else:
+        raise PreferenceValidationError(f"{setting_id} declares an unsupported type: {setting_type!r}")
+    return value
+
+
+# --- T004.1 typed, versioned policy operations + canonical payload hashing ---
+
+PREFERENCE_OPERATION_SCHEMA_VERSION = "workbench-preference-operation/v1"
+
+#: The closed set of typed policy-operation kinds.  A mutable setting is changed
+#: only by naming one of these; a model or browser can never mint a new
+#: privilege by emitting a fresh command name or arbitrary JSON.
+PREFERENCE_OPERATION_KINDS = frozenset({"preference.set", "preference.reset"})
+
+
+class PolicyOperationError(ValueError):
+    """A typed policy operation would carry an unsafe or undeclared payload."""
+
+
+@dataclass(frozen=True)
+class PolicyOperation:
+    """One typed, versioned, owner-specific mutation of a single policy/setting.
+
+    Every mutable policy maps to one of these — bound to exactly one setting
+    descriptor id and its owning scope, and carrying a monotonic ``op_version``
+    — rather than a generic bridge command.  :attr:`digest` binds the full
+    canonical payload, so an approval commits to the precise effect and a
+    :class:`PolicyOperationPreview` sharing the payload shares the digest.
+    """
+
+    operation: str
+    setting_id: str
+    scope: str
+    op_version: int
+    value: Any = None
+    expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.operation not in PREFERENCE_OPERATION_KINDS:
+            raise PolicyOperationError(f"unknown policy operation: {self.operation!r}")
+        if not isinstance(self.setting_id, str) or not _PREF_SETTING_ID.match(self.setting_id):
+            raise PolicyOperationError(f"policy operation names an invalid setting id: {self.setting_id!r}")
+        if self.scope not in _PREF_SCOPES:
+            raise PolicyOperationError(f"policy operation names an unknown scope: {self.scope!r}")
+        # Fail closed on the frozen value itself, not only in the builder: a
+        # ``deployment`` scope is owner/environment-managed and can never be
+        # represented as an actor/model-proposable policy operation.  A direct
+        # construction that names it is refused here so no code path (test,
+        # deserialization, or a future caller) can mint a deployment-scoped
+        # operation that bypasses :func:`build_policy_operation`.
+        if self.scope == "deployment":
+            raise PolicyOperationError(
+                "a deployment-owned setting is owner-managed and cannot be a policy operation"
+            )
+        if not isinstance(self.op_version, int) or isinstance(self.op_version, bool) or self.op_version < 1:
+            raise PolicyOperationError("policy operation op_version must be an integer >= 1")
+        if self.operation == "preference.reset" and self.value is not None:
+            raise PolicyOperationError("a reset operation carries no value")
+        if self.expires_at is not None and not isinstance(self.expires_at, datetime):
+            raise PolicyOperationError("policy operation expires_at must be a datetime")
+
+    def payload(self) -> dict[str, Any]:
+        """The closed, canonical payload the digest binds.
+
+        Deliberately closed: only the declared fields appear, so no undeclared
+        JSON can ride into the hashed payload.  A ``preference.set`` carries its
+        value; a ``preference.reset`` never does.
+        """
+        data: dict[str, Any] = {
+            "schema_version": PREFERENCE_OPERATION_SCHEMA_VERSION,
+            "operation": self.operation,
+            "setting_id": self.setting_id,
+            "scope": self.scope,
+            "op_version": self.op_version,
+        }
+        if self.operation == "preference.set":
+            data["value"] = self.value
+        if self.expires_at is not None:
+            data["expires_at"] = _rfc3339(self.expires_at)
+        return data
+
+    @property
+    def digest(self) -> str:
+        # Function-local import purely to defer loading the heavier ``contracts``
+        # module (jsonschema + schema files) until a digest is actually taken.
+        # It is NOT breaking an import cycle: ``contracts`` imports nothing from
+        # ``models``, so a module-level import here would be acyclic — the
+        # laziness is a load-cost choice, not a correctness one.
+        from .contracts import preference_operation_digest
+
+        return preference_operation_digest(self.payload())
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize the operation with its bound digest, scrubbing free text."""
+        payload = self.payload()
+        if isinstance(payload.get("value"), str):
+            payload["value"] = redact_config_text(payload["value"])
+        return {"digest": self.digest, "payload": payload}
+
+
+@dataclass(frozen=True)
+class PolicyOperationPreview:
+    """A read-only preview of a typed policy operation.
+
+    Constructing or storing a preview is a pure function of the operation
+    payload: it exposes the same canonical :attr:`digest` the applied operation
+    binds and a redacted human-readable effect summary, but NO path that writes
+    a stored value.  A preview and its operation share a digest, so an approval
+    bound to the preview commits to exactly the effect that applies — and a
+    preview can never change the effective setting.
+    """
+
+    operation: PolicyOperation
+    effect_summary: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, PolicyOperation):
+            raise PolicyOperationError("a preview requires a PolicyOperation")
+        object.__setattr__(self, "effect_summary", redact_config_text(str(self.effect_summary)))
+
+    @property
+    def digest(self) -> str:
+        return self.operation.digest
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "digest": self.digest,
+            "operation": self.operation.as_dict()["payload"],
+            "effect_summary": self.effect_summary,
+        }
+
+
+def build_policy_operation(
+    descriptor: Mapping[str, Any],
+    *,
+    operation: str,
+    op_version: int,
+    value: Any = None,
+    expires_at: datetime | None = None,
+) -> PolicyOperation:
+    """Build a typed operation for one setting descriptor, or fail closed.
+
+    Criterion 4: a ``secret`` / path-like descriptor and a deployment-only
+    (``deployment`` scope or ``env_only`` mutability) descriptor are
+    authority-owned; their values cannot enter an operation payload, so the
+    build is refused before anything is hashed or applied.  A ``preference.set``
+    value is typed-validated against the descriptor first, so an out-of-range or
+    wrong-type value never enters the payload either.
+    """
+    if not isinstance(descriptor, Mapping):
+        raise PolicyOperationError("a policy operation requires a typed descriptor")
+    setting_id = str(descriptor.get("id"))
+    scope = descriptor.get("scope")
+    if descriptor.get("sensitivity") == "secret" or descriptor.get("path_like") is True:
+        raise PolicyOperationError(
+            f"a secret or path-like setting cannot enter an operation payload: {setting_id}"
+        )
+    if scope == "deployment" or descriptor.get("mutability") == "env_only":
+        raise PolicyOperationError(
+            f"a deployment-only setting is owner-managed and cannot enter an operation payload: {setting_id}"
+        )
+    if operation == "preference.set":
+        validate_setting_value(descriptor, value)
+    return PolicyOperation(
+        operation=operation,
+        setting_id=setting_id,
+        scope=str(scope),
+        op_version=op_version,
+        value=value if operation == "preference.set" else None,
+        expires_at=expires_at,
+    )
+
+
+# --- T002.1 durable preference record + optimistic versioning + migration ---
+
+#: The current durable record schema version.  A stored row at any supported
+#: prior version migrates up to this shape (:func:`migrate_preference_record`).
+PREFERENCE_RECORD_SCHEMA_VERSION = 2
+_SUPPORTED_PREFERENCE_SCHEMA_VERSIONS = frozenset({1, 2})
+
+
+class PreferenceMigrationError(ValueError):
+    """A stored preference row is at an unsupported or malformed schema version."""
+
+
+def _pref_parse_dt(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PreferenceMigrationError(f"unparseable updated_at: {value!r}") from exc
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return now_utc()
+
+
+@dataclass(frozen=True)
+class PreferenceRecord:
+    """One durable, scoped preference value with optimistic-concurrency metadata.
+
+    ``write_version`` is the monotonically increasing optimistic-concurrency
+    counter (a valid write increments it by one); ``schema_version`` is the
+    record shape version a migration upgrades.  The record is frozen: a stored
+    value is replaced, never mutated in place.
+    """
+
+    setting_id: str
+    scope: str
+    scope_key: str
+    value: Any
+    write_version: int
+    updated_by: str
+    schema_version: int = PREFERENCE_RECORD_SCHEMA_VERSION
+    updated_at: datetime = field(default_factory=now_utc)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.setting_id, str) or not _PREF_SETTING_ID.match(self.setting_id):
+            raise PreferenceValidationError(f"preference record has an invalid setting id: {self.setting_id!r}")
+        if self.scope not in _PREF_SCOPES:
+            raise PreferenceValidationError(f"preference record names an unknown scope: {self.scope!r}")
+        if not isinstance(self.scope_key, str) or not _PREF_SCOPE_KEY.match(self.scope_key):
+            raise PreferenceValidationError("preference record has an invalid scope key")
+        if not isinstance(self.write_version, int) or isinstance(self.write_version, bool) or self.write_version < 1:
+            raise PreferenceValidationError("preference record write_version must be an integer >= 1")
+        if self.schema_version != PREFERENCE_RECORD_SCHEMA_VERSION:
+            raise PreferenceValidationError(
+                f"preference record is not at the current schema version {PREFERENCE_RECORD_SCHEMA_VERSION}"
+            )
+        if not isinstance(self.updated_by, str) or not self.updated_by:
+            raise PreferenceValidationError("preference record requires an updater identity")
+
+    def audit_metadata(self, *, key: bytes) -> dict[str, Any]:
+        """Non-identifying audit metadata (T002.1 criterion 3).
+
+        Excludes the raw ``value`` (which may be personally identifying) and the
+        raw updater/scope-key identity; the scope key is reduced to a short,
+        one-way fingerprint so a record can be correlated in an audit log without
+        exposing who owns it.
+
+        The fingerprint is a KEYED HMAC-SHA256 over ``scope:scope_key`` (the
+        server-held ``key`` is required and never stored beside the tag), so a
+        guessable actor identity cannot be recovered by hashing a dictionary of
+        candidates — the same protection the chat-content fingerprint uses.  An
+        unsalted digest of a known email/slug would be trivially reversible; this
+        is not.
+        """
+        material = _PREF_AUDIT_FINGERPRINT_PREFIX + f"{self.scope}:{self.scope_key}".encode("utf-8")
+        fingerprint = hmac.new(require_pref_audit_key(key), material, hashlib.sha256).hexdigest()[:12]
+        return {
+            "setting_id": self.setting_id,
+            "scope": self.scope,
+            "scope_key_fingerprint": fingerprint,
+            "write_version": self.write_version,
+            "schema_version": self.schema_version,
+            "updated_at": _rfc3339(self.updated_at),
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize the record, scrubbing a free-text value on the last hop."""
+        value = redact_config_text(self.value) if isinstance(self.value, str) else self.value
+        return {
+            "setting_id": self.setting_id,
+            "scope": self.scope,
+            "value": value,
+            "write_version": self.write_version,
+            "schema_version": self.schema_version,
+            "updated_at": _rfc3339(self.updated_at),
+        }
+
+
+def migrate_preference_record(raw: Mapping[str, Any]) -> PreferenceRecord:
+    """Upgrade a stored preference row at any supported prior version to current.
+
+    * v1 shape ``{setting_id, scope, actor, value, version, updated_at}`` is
+      upgraded by renaming ``actor`` -> ``scope_key``/``updated_by`` and
+      ``version`` -> ``write_version`` and stamping the current schema version.
+    * v2 is already the current shape and round-trips unchanged.
+
+    An unknown/malformed version fails closed with :class:`PreferenceMigration
+    Error`, so a corrupt row never silently loads as the current shape.
+    """
+    if not isinstance(raw, Mapping):
+        raise PreferenceMigrationError("a preference row must be a mapping")
+    version = raw.get("schema_version", 1)
+    if version not in _SUPPORTED_PREFERENCE_SCHEMA_VERSIONS:
+        raise PreferenceMigrationError(f"unsupported preference schema version: {version!r}")
+    if version == 1:
+        actor = raw.get("actor")
+        upgraded = {
+            "setting_id": raw.get("setting_id"),
+            "scope": raw.get("scope"),
+            "scope_key": actor,
+            "value": raw.get("value"),
+            "write_version": raw.get("version"),
+            "updated_by": actor,
+            "updated_at": raw.get("updated_at"),
+        }
+    else:  # version == 2
+        upgraded = dict(raw)
+    write_version = upgraded.get("write_version")
+    if not isinstance(write_version, int) or isinstance(write_version, bool):
+        raise PreferenceMigrationError("a preference row must carry an integer write version")
+    return PreferenceRecord(
+        setting_id=str(upgraded.get("setting_id")),
+        scope=str(upgraded.get("scope")),
+        scope_key=str(upgraded.get("scope_key")),
+        value=upgraded.get("value"),
+        write_version=write_version,
+        updated_by=str(upgraded.get("updated_by")),
+        schema_version=PREFERENCE_RECORD_SCHEMA_VERSION,
+        updated_at=_pref_parse_dt(upgraded.get("updated_at")),
+    )
+
+
+# --- T002.3 shared effective-value resolver (precedence + ceiling + fallback) ---
+
+
+@dataclass(frozen=True)
+class EffectiveValue:
+    """One resolved effective setting value and how it was derived.
+
+    ``source`` is one of ``stored`` (an actor/project/authority value was set),
+    ``default`` (the reviewed descriptor default), ``clamped`` (a value bounded
+    down to a policy ceiling), ``repaired`` (an invalidated capability reference
+    fell back to a safe state), or ``unset`` (no stored value and no default).
+    """
+
+    setting_id: str
+    scope: str
+    value: Any
+    source: str
+    repair: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        value = redact_config_text(self.value) if isinstance(self.value, str) else self.value
+        data: dict[str, Any] = {
+            "setting_id": self.setting_id,
+            "scope": self.scope,
+            "value": value,
+            "source": self.source,
+        }
+        if self.repair is not None:
+            data["repair"] = self.repair
+        return data
+
+
+def resolve_effective_value(
+    descriptor: Mapping[str, Any],
+    stored_value: Any = _PREF_MISSING,
+    *,
+    ceiling_value: Any = _PREF_MISSING,
+    live_valid_refs: Mapping[str, Any] | None = None,
+) -> EffectiveValue:
+    """Resolve one descriptor's effective value deterministically.
+
+    Order: take the stored value if present else the descriptor default; if the
+    setting is a capability reference and its value is not in the current live
+    valid set, fall back to a safe state (the default when it is itself valid,
+    otherwise unset) with a repair notice — never a hard failure; finally, if the
+    setting declares a policy ceiling and the value exceeds the (higher-authority)
+    ceiling, clamp it down.
+
+    The numeric ceiling clamp below is INT-ONLY BY DESIGN: it bounds a scalar
+    value against a scalar ceiling (e.g. a retention day count against the
+    operator maximum).  A ``policy_ceiling`` whose values are non-scalar
+    references — such as ``personal.default_chat_route`` bounded by the
+    ``policy.route_allowlist_profile`` capability digest — is NOT numerically
+    clamped here; its membership is enforced through ``live_valid_refs``.  The
+    live consumer scopes the reference-validity set for the setting's
+    ``ref_kind`` to exactly the routes/ids the approved profile admits, so an
+    out-of-profile reference falls out of that set and is repaired to the safe
+    default above — the same fail-safe path an invalidated reference takes.  A
+    ref-kind setting therefore stays within its profile via the ref-validity
+    path, never via a silent no-op numeric clamp.
+    """
+    setting_id = str(descriptor.get("id"))
+    scope = str(descriptor.get("scope"))
+    setting_type = descriptor.get("type")
+
+    if stored_value is not _PREF_MISSING:
+        value: Any = stored_value
+        source = "stored"
+    elif "default" in descriptor:
+        value = descriptor["default"]
+        source = "default"
+    else:
+        return EffectiveValue(setting_id, scope, None, "unset")
+
+    ref_kind = descriptor.get("ref_kind")
+    if setting_type in ("id_ref", "digest_ref") and ref_kind and live_valid_refs is not None:
+        valid = live_valid_refs.get(str(ref_kind))
+        if valid is not None and value not in valid:
+            default = descriptor.get("default")
+            if default is not None and default in valid:
+                return EffectiveValue(
+                    setting_id, scope, default, "repaired",
+                    repair=f"{setting_id} referenced an unavailable {ref_kind}; reset to the reviewed default",
+                )
+            return EffectiveValue(
+                setting_id, scope, None, "repaired",
+                repair=f"{setting_id} referenced an unavailable {ref_kind}; unset to a safe state",
+            )
+
+    # Int-only clamp: a ref/non-scalar ceiling (e.g. a route bounded by a
+    # capability-profile digest) is intentionally NOT handled here — its
+    # enforcement is the ref-validity path above, not this scalar bound.
+    if (
+        isinstance(descriptor.get("policy_ceiling"), Mapping)
+        and ceiling_value is not _PREF_MISSING
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and isinstance(ceiling_value, int)
+        and not isinstance(ceiling_value, bool)
+        and value > ceiling_value
+    ):
+        return EffectiveValue(
+            setting_id, scope, ceiling_value, "clamped",
+            repair=f"{setting_id} exceeded the policy ceiling and was clamped to {ceiling_value}",
+        )
+
+    return EffectiveValue(setting_id, scope, value, source)
+
+
+def resolve_effective_settings(
+    catalog: Mapping[str, Any],
+    stored: Mapping[str, Any],
+    *,
+    live_valid_refs: Mapping[str, Any] | None = None,
+) -> dict[str, EffectiveValue]:
+    """The single shared effective-value resolver every consumer calls.
+
+    ``stored`` maps ``setting_id -> value`` and is already scope/actor-scoped by
+    the caller from the durable store, so this function never crosses a scope
+    boundary itself.  Resolution is deterministic: a policy ceiling owned by a
+    strictly higher-authority scope clamps a lower-scope value, and an
+    invalidated capability reference falls back to a safe state with a repair
+    notice.  Because the result is a pure function of ``(catalog, stored,
+    live_valid_refs)``, every consumer that passes identical inputs resolves
+    identical effective values.
+    """
+    by_id = {
+        str(setting.get("id")): setting
+        for setting in catalog.get("settings", [])
+        if isinstance(setting, Mapping)
+    }
+    result: dict[str, EffectiveValue] = {}
+    for setting_id, descriptor in sorted(by_id.items()):
+        stored_value = stored[setting_id] if setting_id in stored else _PREF_MISSING
+        ceiling_value: Any = _PREF_MISSING
+        ceiling = descriptor.get("policy_ceiling")
+        if isinstance(ceiling, Mapping):
+            ceiling_desc = by_id.get(str(ceiling.get("ceiling_setting")))
+            if ceiling_desc is not None:
+                ceiling_stored = (
+                    stored[ceiling_desc["id"]] if ceiling_desc["id"] in stored else _PREF_MISSING
+                )
+                ceiling_value = resolve_effective_value(
+                    ceiling_desc, ceiling_stored, live_valid_refs=live_valid_refs
+                ).value
+        result[setting_id] = resolve_effective_value(
+            descriptor, stored_value, ceiling_value=ceiling_value, live_valid_refs=live_valid_refs
+        )
+    return result
+
+
+def reviewed_catalog_valid_refs(catalog: Mapping[str, Any]) -> dict[str, set[Any]]:
+    """The conservative reference-validity baseline derived from the catalog.
+
+    Every reference-kind setting in the reviewed descriptor catalog declares a
+    reviewed default reference (a route id, a capability digest, …).  Those
+    declared defaults are, by construction, the references the reviewer vouched
+    for; nothing else is known-valid without a live source.  This returns
+    ``{ref_kind -> {reviewed default reference values}}`` so a resolver given
+    this baseline serves an unset (default) reference normally while REPAIRING a
+    stored reference that is not among the reviewed defaults — i.e. a stale or
+    since-removed reference falls back to the safe default instead of being
+    served verbatim.
+
+    It is the documented default source :func:`resolve_effective_settings`
+    consumers use when no richer LIVE validity source (e.g. the chat-first-voice
+    route discovery / the profile-scoped route allowlist) is injected.  A live
+    provider, when supplied, replaces this baseline with the actual live set so
+    the enforcement tracks the operator's current profile exactly.
+    """
+    valid: dict[str, set[Any]] = {}
+    for setting in catalog.get("settings", []):
+        if not isinstance(setting, Mapping):
+            continue
+        ref_kind = setting.get("ref_kind")
+        if ref_kind is None or setting.get("type") not in ("id_ref", "digest_ref"):
+            continue
+        if "default" in setting:
+            valid.setdefault(str(ref_kind), set()).add(setting["default"])
+    return valid

@@ -1132,3 +1132,549 @@ def test_operation_approval_grant_is_one_time_and_hash_bound():
     approvals.grant("approval_g2", "commit_pr", payload_hash, "bridge_1", "project_1")
     with pytest.raises(OperationReceiptStoreError, match="payload hash"):
         approvals.consume("approval_g2", "commit_pr", "sha256:" + "b" * 64, "bridge_1", "project_1")
+
+
+# ---------------------------------------------------------------------------
+# Preference configuration slice (preferences-configuration:
+# T004.1 / T002.1 / T002.2 / T002.3 / T002)
+# ---------------------------------------------------------------------------
+
+from workbench.contracts import preference_operation_digest
+from workbench.models import (
+    PREFERENCE_OPERATION_KINDS,
+    PREFERENCE_RECORD_SCHEMA_VERSION,
+    EffectiveValue,
+    PolicyOperation,
+    PolicyOperationError,
+    PolicyOperationPreview,
+    PreferenceMigrationError,
+    PreferenceRecord,
+    PreferenceValidationError,
+    build_policy_operation,
+    migrate_preference_record,
+    resolve_effective_settings,
+    validate_setting_value,
+)
+from workbench.store import (
+    MemoryPreferenceStore,
+    PreferenceRows,
+    PreferenceStoreError,
+    StalePreferenceWriteError,
+    UnknownPreferenceError,
+)
+
+from _support import load_example
+
+
+def _settings_catalog() -> dict:
+    return load_example("settings-descriptor.v1.json")
+
+
+def _descriptor(catalog: dict, setting_id: str) -> dict:
+    return next(s for s in catalog["settings"] if s["id"] == setting_id)
+
+
+#: A server-held key standing in for the hub's audit-fingerprint key (>= 16 octets).
+_PREF_AUDIT_KEY = b"pref-audit-key-0123456789"
+
+
+def _pref_api_client(store, live_valid_refs_provider=None):
+    """A real create_app TestClient over the injected preference store.
+
+    Used so the effective/repair/reset assertions run through the ACTUAL wired
+    GET/POST /api/preferences path (not a hand-passed-refs vacuum), and thus fail
+    if the endpoint stops threading the ceiling / ref-validity into the shared
+    resolver.
+    """
+    from fastapi.testclient import TestClient
+
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.graph import NullGraph
+    from workbench.store import MemoryStore
+
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="alice", approvers=frozenset({"alice"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://serving", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(),
+        preference_store=store, live_valid_refs_provider=live_valid_refs_provider,
+    ))
+
+
+_PREF_API_ACTOR = {"X-Workbench-Actor": "alice"}
+
+
+# --- T004.1: typed policy operations + canonical payload hashing -------------
+
+
+def test_every_mutable_policy_maps_to_one_typed_versioned_operation():
+    # Criterion 1: each mutable, non-secret, non-deployment-only setting maps to
+    # one typed, versioned operation from the CLOSED kind set -- never a generic
+    # command name.
+    catalog = _settings_catalog()
+    built = 0
+    for descriptor in catalog["settings"]:
+        if descriptor.get("sensitivity") == "secret" or descriptor.get("path_like"):
+            continue
+        if descriptor.get("scope") == "deployment" or descriptor.get("mutability") == "env_only":
+            continue
+        op = build_policy_operation(descriptor, operation="preference.reset", op_version=1)
+        assert isinstance(op, PolicyOperation)
+        assert op.operation in PREFERENCE_OPERATION_KINDS
+        assert op.setting_id == descriptor["id"]
+        assert op.scope == descriptor["scope"]
+        assert op.op_version == 1
+        built += 1
+    assert built >= 1
+
+
+def test_policy_operation_hashes_equivalent_payloads_identically_and_detects_changes():
+    # Criterion 2: equivalent payloads hash identically; any material scope,
+    # value, version, or expiry change produces a different digest.
+    catalog = _settings_catalog()
+    descriptor = _descriptor(catalog, "personal.chat_transcript_retention_days")
+    a = build_policy_operation(descriptor, operation="preference.set", op_version=1, value=30)
+    b = build_policy_operation(descriptor, operation="preference.set", op_version=1, value=30)
+    assert a.digest == b.digest == preference_operation_digest(a.payload())
+
+    # A changed value, version, or scope each changes the digest (no field escapes).
+    assert a.digest != build_policy_operation(descriptor, operation="preference.set", op_version=1, value=31).digest
+    assert a.digest != build_policy_operation(descriptor, operation="preference.set", op_version=2, value=30).digest
+    when = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    assert a.digest != PolicyOperation("preference.set", descriptor["id"], "personal", 1, 30, when).digest
+    assert a.digest != PolicyOperation("preference.set", descriptor["id"], "project", 1, 30).digest
+
+
+def test_policy_operation_refuses_secret_and_deployment_only_values():
+    # Criterion 4: a secret/path-like or deployment-only value can never enter an
+    # operation payload -- refused before it is hashed or applied.
+    catalog = _settings_catalog()
+    for setting_id in ("deployment.identity_header_name", "deployment.state_read_location"):
+        with pytest.raises(PolicyOperationError):
+            build_policy_operation(
+                _descriptor(catalog, setting_id), operation="preference.set", op_version=1, value="x",
+            )
+    # A public, approval-gated policy setting is NOT deployment-only, so it builds.
+    policy_op = build_policy_operation(
+        _descriptor(catalog, "policy.transcript_retention_max_days"),
+        operation="preference.set", op_version=1, value=120,
+    )
+    assert policy_op.scope == "policy"
+
+
+def test_policy_operation_dataclass_refuses_a_deployment_scope_on_construction():
+    # Finding 9: the frozen dataclass itself fails closed on a deployment scope,
+    # not only the builder -- so no direct construction/deserialization can mint a
+    # deployment-owned operation that bypasses build_policy_operation.
+    with pytest.raises(PolicyOperationError):
+        PolicyOperation("preference.set", "deployment.state_read_location", "deployment", 1, "x")
+    # Actor/policy scopes still construct (regression guard for the digest tests).
+    assert PolicyOperation("preference.reset", "personal.time_format", "personal", 1).scope == "personal"
+    assert PolicyOperation("preference.set", "policy.route_allowlist_profile", "policy", 1,
+                           "sha256:" + "b" * 64).scope == "policy"
+
+
+def test_policy_operation_preview_shares_digest_and_cannot_mutate_a_store():
+    # Criterion 3: creating/storing a preview is pure -- it shares the applied
+    # operation's digest (so an approval binds the exact effect) and exposes no
+    # write path, so a store's committed value is untouched by building a preview.
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 30, 0, "alice")
+    op = build_policy_operation(
+        _descriptor(catalog, "personal.chat_transcript_retention_days"),
+        operation="preference.set", op_version=2, value=45,
+    )
+    preview = PolicyOperationPreview(op, "raise retention to 45 days")
+    assert preview.digest == op.digest
+    assert not hasattr(preview, "commit") and not hasattr(preview, "apply")
+    # The store's committed value is unchanged by constructing/serializing a preview.
+    preview.as_dict()
+    assert store.get("personal", "alice", "personal.chat_transcript_retention_days").value == 30
+
+
+# --- T002.1: preference record, versioning, migration, typed validation ------
+
+
+def test_preference_record_carries_monotonic_write_and_schema_versions():
+    record = PreferenceRecord(
+        setting_id="personal.time_format", scope="personal", scope_key="alice",
+        value="format_12h", write_version=1, updated_by="alice",
+    )
+    assert record.write_version == 1
+    assert record.schema_version == PREFERENCE_RECORD_SCHEMA_VERSION
+    # Frozen: a stored value is replaced, never mutated in place.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        record.value = "format_24h"  # type: ignore[misc]
+
+
+def test_preference_migration_upgrades_every_supported_prior_version():
+    # v1 shape (actor/version) upgrades to the current (scope_key/write_version).
+    v1 = {
+        "setting_id": "personal.time_format", "scope": "personal", "actor": "alice",
+        "value": "format_12h", "version": 3, "updated_at": "2026-07-20T00:00:00Z",
+    }
+    upgraded = migrate_preference_record(v1)
+    assert upgraded.schema_version == PREFERENCE_RECORD_SCHEMA_VERSION
+    assert upgraded.write_version == 3
+    assert upgraded.scope_key == "alice" and upgraded.updated_by == "alice"
+
+    # v2 is already current and round-trips unchanged.
+    v2 = {
+        "setting_id": "personal.time_format", "scope": "personal", "scope_key": "bob",
+        "value": "format_24h", "write_version": 5, "updated_by": "bob",
+        "schema_version": 2, "updated_at": "2026-07-20T00:00:00Z",
+    }
+    assert migrate_preference_record(v2).write_version == 5
+
+    # An unknown/malformed version fails closed rather than loading as current.
+    with pytest.raises(PreferenceMigrationError):
+        migrate_preference_record({"schema_version": 99, "setting_id": "x.y"})
+
+
+def test_preference_audit_metadata_excludes_secret_and_pii():
+    record = PreferenceRecord(
+        setting_id="personal.default_chat_route", scope="personal",
+        scope_key="alice@example.com", value="route.private-abc",
+        write_version=2, updated_by="alice@example.com",
+    )
+    meta = record.audit_metadata(key=_PREF_AUDIT_KEY)
+    assert meta["setting_id"] == "personal.default_chat_route"
+    assert meta["write_version"] == 2 and meta["schema_version"] == PREFERENCE_RECORD_SCHEMA_VERSION
+    # No value and no identifying fields (raw scope key / updater) leak.
+    for forbidden in ("value", "scope_key", "updated_by"):
+        assert forbidden not in meta
+    assert "alice@example.com" not in json.dumps(meta)
+    assert "route.private-abc" not in json.dumps(meta)
+    assert meta["scope_key_fingerprint"] != "alice@example.com"
+    # The fingerprint is KEYED: the same scope key under a different server key
+    # yields a different tag, so a holder of the tag without the key cannot run a
+    # dictionary of candidate actors against it. An unsalted sha256 could not do
+    # this. A too-short key fails closed.
+    other = record.audit_metadata(key=b"a-different-key-0123456789")
+    assert other["scope_key_fingerprint"] != meta["scope_key_fingerprint"]
+    with pytest.raises(PreferenceValidationError):
+        record.audit_metadata(key=b"too-short")
+
+
+def test_malformed_or_out_of_range_value_raises_typed_error_before_persistence():
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    # Out of bounds (max is 90), wrong type, and non-member enum each raise the
+    # typed validation error and leave nothing persisted.
+    with pytest.raises(PreferenceValidationError):
+        store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 500, 0, "alice")
+    with pytest.raises(PreferenceValidationError):
+        store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", "lots", 0, "alice")
+    with pytest.raises(PreferenceValidationError):
+        store.set_preference("personal", "alice", "personal.landing_surface", "spaceship", 0, "alice")
+    with pytest.raises(UnknownPreferenceError):
+        store.get("personal", "alice", "personal.chat_transcript_retention_days")
+
+
+# --- T002.2: scoped durable storage + stale-write rejection ------------------
+
+
+def test_valid_preference_write_commits_atomically_and_increments_version():
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    first = store.set_preference("personal", "alice", "personal.time_format", "format_12h", 0, "alice")
+    assert first.write_version == 1
+    second = store.set_preference("personal", "alice", "personal.time_format", "format_24h", 1, "alice")
+    assert second.write_version == 2
+    assert store.get("personal", "alice", "personal.time_format").value == "format_24h"
+
+
+def test_stale_preference_write_is_reload_required_and_leaves_value_unchanged():
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    store.set_preference("personal", "alice", "personal.time_format", "format_12h", 0, "alice")
+    with pytest.raises(StalePreferenceWriteError) as excinfo:
+        # Expected version 0 is stale: the stored version is already 1.
+        store.set_preference("personal", "alice", "personal.time_format", "format_24h", 0, "alice")
+    assert excinfo.value.reload_required is True
+    assert excinfo.value.current_version == 1
+    # The stored value is exactly as it was; the stale write did not overwrite it.
+    assert store.get("personal", "alice", "personal.time_format").value == "format_12h"
+    # A stale write is NOT a validation failure -- distinct typed exceptions.
+    assert not isinstance(excinfo.value, PreferenceValidationError)
+
+
+def test_preference_store_isolates_cross_actor_and_cross_project_scopes():
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    store.set_preference("personal", "alice", "personal.time_format", "format_12h", 0, "alice")
+    store.set_preference("project", "proj_1", "project.delivery_route", "route.delivery-heavy", 0, "alice")
+
+    # A cross-actor and a cross-project read raise the SAME indistinct not-found a
+    # genuinely missing record raises -- byte-identical, so neither is an oracle.
+    def _err_bytes(fn) -> bytes:
+        try:
+            fn()
+        except UnknownPreferenceError as exc:
+            return str(exc).encode("utf-8")
+        raise AssertionError("expected UnknownPreferenceError")
+
+    foreign_actor = _err_bytes(lambda: store.get("personal", "bob", "personal.time_format"))
+    foreign_project = _err_bytes(lambda: store.get("project", "proj_2", "project.delivery_route"))
+    genuinely_missing = _err_bytes(lambda: store.get("personal", "carol", "personal.landing_surface"))
+    assert foreign_actor == foreign_project == genuinely_missing
+
+    # A personal actor cannot write a project/policy-owned setting from personal scope.
+    with pytest.raises(PreferenceStoreError):
+        store.set_preference("personal", "alice", "project.delivery_route", "route.delivery-heavy", 0, "alice")
+    # No cross-scope value crossed over: bob has no personal.time_format.
+    with pytest.raises(UnknownPreferenceError):
+        store.get("personal", "bob", "personal.time_format")
+
+
+def test_preference_reset_returns_the_inherited_default_state():
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    store.set_preference("personal", "alice", "personal.landing_surface", "delivery", 0, "alice")
+    effective = store.reset_preference("personal", "alice", "personal.landing_surface", 1, "alice")
+    # Reset falls back to the reviewed descriptor default ("chat").
+    assert isinstance(effective, EffectiveValue)
+    assert effective.value == "chat" and effective.source == "default"
+    with pytest.raises(UnknownPreferenceError):
+        store.get("personal", "alice", "personal.landing_surface")
+
+
+def test_concurrent_same_version_preference_writes_commit_exactly_one():
+    """A contended optimistic write on one setting must commit EXACTLY once; the
+    loser is rejected as a stale, reload-required write, never a second commit.
+
+    The check->act gap (read current version, then write) is made real by an
+    inner namespace whose ``get`` sleeps, and by two barrier-synchronized workers
+    at a 1e-6 switch interval.  Disabling the store lock locally is what proves
+    the assertion is not a tautology: without serialization both workers pass the
+    version-0 check and double-commit; the store's lock is what forces the loser
+    to observe the winner's version and fail stale.  The lock is restored in a
+    ``finally`` and never committed disabled.
+    """
+    import sys
+    import threading
+    import time
+
+    class YieldingDict(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            time.sleep(0.002)  # force a preemption point inside the critical section
+            return value
+
+    class _NullLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    catalog = _settings_catalog()
+
+    def run_round(disable_lock: bool) -> tuple[int, int]:
+        rows = PreferenceRows(records={("personal", "alice"): YieldingDict()})
+        store = MemoryPreferenceStore(catalog, rows)
+        if disable_lock:
+            store._lock = _NullLock()
+        start = threading.Barrier(2)
+        results: list[str] = []
+        results_lock = threading.Lock()
+
+        def worker(value: str) -> None:
+            start.wait()
+            try:
+                store.set_preference("personal", "alice", "personal.time_format", value, 0, "alice")
+                outcome = "ok"
+            except StalePreferenceWriteError:
+                outcome = "stale"
+            with results_lock:
+                results.append(outcome)
+
+        threads = [
+            threading.Thread(target=worker, args=("format_12h",)),
+            threading.Thread(target=worker, args=("format_24h",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return results.count("ok"), results.count("stale")
+
+    old_interval = sys.getswitchinterval()
+    try:
+        sys.setswitchinterval(1e-6)
+        # With the store lock, every contended round commits exactly one write and
+        # rejects the other as stale.
+        for _ in range(15):
+            oks, stales = run_round(disable_lock=False)
+            assert (oks, stales) == (1, 1), "the write must be serialized: one commit, one stale"
+        # Detection check: with the lock disabled the invariant BREAKS (both pass
+        # the version-0 check and double-commit), proving the locked assertion is
+        # load-bearing rather than a tautology.
+        broke = any(run_round(disable_lock=True)[0] == 2 for _ in range(15))
+        assert broke, "disabling the lock must expose the check->act race"
+    finally:
+        sys.setswitchinterval(old_interval)
+
+
+# --- T002.3: shared effective-value resolver ---------------------------------
+
+
+def test_shared_resolver_gives_real_consumer_surfaces_identical_effective_values():
+    # Criterion 3: the REAL consumer surfaces resolve identical effective values
+    # for identical state. This diffs two genuine call sites -- the API GET
+    # effective value and the store reset effective value -- rather than calling
+    # one pure function four times (a tautology). It FAILS if the two surfaces
+    # diverge, mirroring the CLI/System-Health identical-posture precedent.
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    # A tightened operator ceiling (7) BELOW even the reviewed default (30): so
+    # the clamp is observable post-reset. Before reset the personal 60 clamps to
+    # 7; after reset the override is gone but the default 30 STILL clamps to 7.
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 7)
+    store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 60, 0, "alice")
+
+    setting = "personal.chat_transcript_retention_days"
+    with _pref_api_client(store) as client:
+        api_before = {item["setting_id"]: item for item in
+                      client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}[setting]
+        # The store reset surface (via POST): removes the override and reports
+        # the effective value it resolves.
+        reset_effective = client.post(
+            f"/api/preferences/{setting}/reset", headers=_PREF_API_ACTOR,
+            json={"scope": "personal", "expected_version": 1},
+        ).json()["effective"]
+        api_after = {item["setting_id"]: item for item in
+                     client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}[setting]
+
+    # Reset (store surface) and GET (api surface) agree on the SAME effective
+    # value for the SAME post-reset state -- both the clamped ceiling 7, not a
+    # bare default 30. If reset ignored the ceiling (the old bug: value=30
+    # source=default) these two real surfaces diverge and the test fails.
+    assert reset_effective == api_after
+    assert reset_effective["value"] == 7 and reset_effective["source"] == "clamped"
+    assert api_before["value"] == 7 and api_before["source"] == "clamped"
+
+
+def test_policy_ceiling_clamps_a_personal_value_that_exceeds_the_bound():
+    # Criterion 1 / PRD non-goal: a personal value can never exceed a policy bound.
+    catalog = _settings_catalog()
+    stored = {
+        "personal.chat_transcript_retention_days": 200,  # exceeds the 90 ceiling
+        "policy.transcript_retention_max_days": 90,
+    }
+    resolved = resolve_effective_settings(catalog, stored)
+    clamped = resolved["personal.chat_transcript_retention_days"]
+    assert clamped.value == 90 and clamped.source == "clamped"
+    assert clamped.repair is not None
+
+
+def test_route_ceiling_is_enforced_via_ref_validity_not_a_silent_numeric_noop():
+    # Finding 5: personal.default_chat_route carries a policy_ceiling that names
+    # the route_allowlist_profile capability digest. That ref/non-scalar ceiling
+    # is NOT a numeric clamp (which would be a silent no-op for a route string);
+    # enforcement is the ref-validity path -- the live route set is scoped to the
+    # approved profile, so an out-of-profile route falls back to the safe default.
+    catalog = _settings_catalog()
+    # The profile admits route.chat-fast only. An out-of-profile stored route
+    # repairs to the reviewed default (which is in-profile), NOT served verbatim.
+    out_of_profile = resolve_effective_settings(
+        catalog, {"personal.default_chat_route": "route.premium-unapproved"},
+        live_valid_refs={"route": {"route.chat-fast"}},
+    )["personal.default_chat_route"]
+    assert out_of_profile.source == "repaired" and out_of_profile.value == "route.chat-fast"
+    assert out_of_profile.repair is not None
+    # An in-profile route is served unchanged -- no false clamp/repair.
+    in_profile = resolve_effective_settings(
+        catalog, {"personal.default_chat_route": "route.chat-fast"},
+        live_valid_refs={"route": {"route.chat-fast", "route.premium-unapproved"}},
+    )["personal.default_chat_route"]
+    assert in_profile.source == "stored" and in_profile.value == "route.chat-fast"
+
+
+def test_invalidated_capability_resolves_to_safe_state_with_repair_notice():
+    # Criterion 4 (T002 crit 3 / T002.3 crit 4): an invalidated capability/route
+    # reference served by the WIRED GET /api/preferences endpoint falls back to a
+    # safe state with a repair notice -- never the stale value. This goes through
+    # the real API path so it FAILS if the endpoint stops threading ref-validity
+    # into the shared resolver (the fallback-never-fires regression).
+    catalog = _settings_catalog()
+    store = MemoryPreferenceStore(catalog)
+    # A stored route that the live valid set no longer admits (deleted long ago).
+    store.set_preference("personal", "alice", "personal.default_chat_route", "route.deleted-long-ago", 0, "alice")
+
+    # The live valid set contains the reviewed default but NOT the stale route.
+    with _pref_api_client(store, live_valid_refs_provider=lambda: {"route": {"route.chat-fast"}}) as client:
+        effective = {item["setting_id"]: item for item in
+                     client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    repaired = effective["personal.default_chat_route"]
+    # The stale value is NOT served; it is repaired to the reviewed default with a
+    # notice (the default IS in the live valid set).
+    assert repaired["source"] == "repaired" and repaired["value"] == "route.chat-fast"
+    assert repaired.get("repair") is not None
+    assert repaired["value"] != "route.deleted-long-ago"
+
+    # With the reviewed-catalog baseline (NO injected provider), a stale stored
+    # route is STILL repaired out of the box rather than served verbatim -- the
+    # default source fires in the wired endpoint, not only when refs are injected.
+    with _pref_api_client(store) as client:
+        effective2 = {item["setting_id"]: item for item in
+                      client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    repaired2 = effective2["personal.default_chat_route"]
+    assert repaired2["source"] == "repaired" and repaired2["value"] == "route.chat-fast"
+
+    # When the live set DOES admit the stored route, it is served unchanged (no
+    # false repair): proves the fallback keys off validity, not blanket repair.
+    with _pref_api_client(
+        store, live_valid_refs_provider=lambda: {"route": {"route.deleted-long-ago", "route.chat-fast"}},
+    ) as client:
+        effective3 = {item["setting_id"]: item for item in
+                      client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    served = effective3["personal.default_chat_route"]
+    assert served["source"] == "stored" and served["value"] == "route.deleted-long-ago"
+
+
+# --- T002: whole-slice integration -------------------------------------------
+
+
+def test_preferences_slice_integration_scope_stale_migration_and_fallback():
+    catalog = _settings_catalog()
+    rows = PreferenceRows()
+    store = MemoryPreferenceStore(catalog, rows)
+
+    # 1) Scope resolution through the one shared resolver, with a policy ceiling
+    #    clamping a personal value. The policy ceiling is seeded via the authority
+    #    path (an approval-gated policy write is refused for an actor).
+    store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 90, 0, "alice")
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 60)
+    stored = {}
+    stored.update(store.owned_values("policy", "policy"))
+    stored.update(store.owned_values("personal", "alice"))
+    resolved = resolve_effective_settings(catalog, stored)
+    assert resolved["personal.chat_transcript_retention_days"].value == 60  # clamped to the tightened ceiling
+
+    # 2) Stale write is reload-required and leaves the value intact.
+    with pytest.raises(StalePreferenceWriteError):
+        store.set_preference("personal", "alice", "personal.chat_transcript_retention_days", 10, 0, "alice")
+    assert store.get("personal", "alice", "personal.chat_transcript_retention_days").value == 90
+
+    # 3) Migration: a persisted v1 row loads as the current shape.
+    migrated = migrate_preference_record({
+        "setting_id": "personal.time_format", "scope": "personal", "actor": "alice",
+        "value": "format_12h", "version": 4, "updated_at": "2026-07-20T00:00:00Z",
+    })
+    assert migrated.schema_version == PREFERENCE_RECORD_SCHEMA_VERSION and migrated.write_version == 4
+
+    # 4) Capability invalidation through the WIRED endpoint falls back to a safe
+    #    state, not a hard failure and not the stale value. Exercised via the real
+    #    GET /api/preferences so a regression that drops ref-validity is caught.
+    store.set_preference("personal", "alice", "personal.default_chat_route", "route.gone", 0, "alice")
+    with _pref_api_client(store, live_valid_refs_provider=lambda: {"route": set()}) as client:
+        effective = {item["setting_id"]: item for item in
+                     client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
+    fallback = effective["personal.default_chat_route"]
+    assert fallback["source"] == "repaired" and fallback["value"] != "route.gone"
