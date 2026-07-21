@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .contracts import settings_actor_view
 from .conversation_api import (
     build_conversation_router,
     build_hub_retention_router,
@@ -24,11 +25,14 @@ from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .project_context_store import ProjectContextStore, UnknownProjectionError
 from .run_context_store import RunContextStore, UnknownRunContextError
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
-from .models import as_json
+from .models import PreferenceValidationError, as_json, resolve_effective_settings
 from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
 from .redaction import scrub_config_payload
-from .store import PostgresStore, StoreError, WorkbenchStore
+from .store import (
+    MemoryPreferenceStore, PostgresStore, PreferenceStoreError, StalePreferenceWriteError,
+    StoreError, UnknownPreferenceError, WorkbenchStore,
+)
 from .system_health import SystemHealthService, UnknownIntegrationError
 from .voice import relay_realtime
 
@@ -377,6 +381,194 @@ def build_system_health_router(
     return router
 
 
+#: The setting-id path grammar, mirrored from the settings-descriptor
+#: ``settingId`` definition, so a malformed id is rejected at the edge (422)
+#: before it reaches the store as a distinguishable lookup.
+_SETTING_ID_PATTERN = r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$"
+
+#: The single fixed body an unknown/cross-scope preference lookup returns. A
+#: missing preference and another actor's/project's preference render the same
+#: 404 so the read surface is never a cross-scope existence oracle.
+_UNKNOWN_PREFERENCE_DETAIL = "unknown preference"
+
+
+class PreferenceWriteInput(BaseModel):
+    scope: str = Field(pattern=r"^(personal|project)$")
+    value: Any
+    expected_version: int = Field(ge=0)
+    project_id: str | None = Field(default=None, max_length=128)
+
+
+class PreferenceResetInput(BaseModel):
+    scope: str = Field(pattern=r"^(personal|project)$")
+    expected_version: int = Field(ge=0)
+    project_id: str | None = Field(default=None, max_length=128)
+
+
+def build_preferences_router(
+    actor_dependency: Callable[..., str],
+    preference_store: MemoryPreferenceStore | None,
+) -> APIRouter:
+    """Build the actor-scoped preference read/write browser surface (T002.3).
+
+    Every endpoint is authenticated by the hub's trusted ``actor`` dependency.
+    The personal namespace is ALWAYS keyed by the authenticated actor — a client
+    can never name another actor — so a cross-actor read is structurally
+    impossible; a project namespace is keyed by the path/body ``project_id``. A
+    read for a setting not set in the actor's namespace, or for a foreign
+    namespace, returns the same indistinct 404, so the surface is never a
+    cross-scope existence oracle.
+
+    Only the settings actor-view and actor-scope effective values are serialized
+    (never an authority-owned, secret, or path-like descriptor or value), and
+    every response is scrubbed on the last hop with
+    :func:`~workbench.redaction.scrub_config_payload`. A stale write returns a
+    reload-required 409 distinct from the 422 a malformed value raises. When
+    ``preference_store`` is ``None`` the surface is not configured and refuses
+    with 503, mirroring the other injectable read-models.
+    """
+    router = APIRouter(prefix="/api/preferences")
+
+    def pref_store() -> MemoryPreferenceStore:
+        if preference_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="preference store is not configured",
+            )
+        return preference_store
+
+    def _scope_key(scope: str, actor: str, project_id: str | None) -> str:
+        # The personal namespace is bound to the authenticated actor and can
+        # never be addressed for another actor. A project namespace needs an
+        # explicit project id.
+        if scope == "personal":
+            return actor
+        if not project_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="a project-scope preference requires a project_id",
+            )
+        return project_id
+
+    @router.get("")
+    def effective_preferences(
+        project_id: str | None = None,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The actor's resolved effective values plus the settings actor-view.
+
+        Merges the actor's own personal namespace, the named project namespace,
+        and the public authority (deployment/policy) values needed for ceilings,
+        resolves them through the single shared resolver, and serializes only
+        actor-scope effective values and the actor-view descriptor projection.
+        """
+        store = pref_store()
+        catalog = store.catalog
+        stored: dict[str, Any] = {}
+        stored.update(store.stored_values("deployment", "deployment"))
+        stored.update(store.stored_values("policy", "policy"))
+        if project_id:
+            stored.update(store.stored_values("project", project_id))
+        stored.update(store.stored_values("personal", actor))
+        resolved = resolve_effective_settings(catalog, stored)
+        actor_view = settings_actor_view(catalog)
+        actor_setting_ids = {setting["id"] for setting in actor_view["settings"]}
+        effective = [
+            value.as_dict()
+            for setting_id, value in sorted(resolved.items())
+            if setting_id in actor_setting_ids
+        ]
+        return scrub_config_payload({"catalog": actor_view, "effective": effective})
+
+    @router.get("/{setting_id}")
+    def read_preference(
+        setting_id: str = Path(pattern=_SETTING_ID_PATTERN),
+        scope: str = "personal",
+        project_id: str | None = None,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One stored preference record in the actor's own namespace."""
+        store = pref_store()
+        if scope not in ("personal", "project"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="scope must be personal or project"
+            )
+        scope_key = _scope_key(scope, actor, project_id)
+        try:
+            record = store.get(scope, scope_key, setting_id)
+        except UnknownPreferenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PREFERENCE_DETAIL
+            ) from exc
+        return scrub_config_payload({"preference": record.as_dict()})
+
+    @router.put("/{setting_id}")
+    def write_preference(
+        payload: PreferenceWriteInput,
+        setting_id: str = Path(pattern=_SETTING_ID_PATTERN),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Commit one scoped preference write under optimistic concurrency."""
+        store = pref_store()
+        scope_key = _scope_key(payload.scope, actor, payload.project_id)
+        try:
+            record = store.set_preference(
+                payload.scope, scope_key, setting_id, payload.value, payload.expected_version, actor,
+            )
+        except PreferenceValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        except StalePreferenceWriteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "detail": "reload required before writing",
+                    "reload_required": True,
+                    "current_version": exc.current_version,
+                },
+            ) from exc
+        except UnknownPreferenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PREFERENCE_DETAIL
+            ) from exc
+        except PreferenceStoreError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return scrub_config_payload({"preference": record.as_dict()})
+
+    @router.post("/{setting_id}/reset")
+    def reset_preference(
+        payload: PreferenceResetInput,
+        setting_id: str = Path(pattern=_SETTING_ID_PATTERN),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Reset one preference to its declared inherited/default state."""
+        store = pref_store()
+        scope_key = _scope_key(payload.scope, actor, payload.project_id)
+        try:
+            effective = store.reset_preference(
+                payload.scope, scope_key, setting_id, payload.expected_version, actor,
+            )
+        except StalePreferenceWriteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "detail": "reload required before writing",
+                    "reload_required": True,
+                    "current_version": exc.current_version,
+                },
+            ) from exc
+        except UnknownPreferenceError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PREFERENCE_DETAIL
+            ) from exc
+        except PreferenceStoreError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return scrub_config_payload({"effective": effective.as_dict()})
+
+    return router
+
+
 def create_app(
     settings: Settings | None = None,
     store: WorkbenchStore | None = None,
@@ -386,6 +578,7 @@ def create_app(
     project_context_store: ProjectContextStore | None = None,
     run_context_store: RunContextStore | None = None,
     system_health: SystemHealthService | None = None,
+    preference_store: MemoryPreferenceStore | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
@@ -412,6 +605,10 @@ def create_app(
     # it stays ``None`` unless injected, so the browser surface fails closed (503).
     app.state.run_context_store = run_context_store
     app.state.system_health = system_health
+    # The scoped preference store is a hub-side supervision read/write model that
+    # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
+    # unless injected, so the browser surface fails closed (503).
+    app.state.preference_store = preference_store
 
     def actor(request: Request) -> str:
         name = (request.headers.get(settings.identity_header) or "").strip()
@@ -502,6 +699,13 @@ def create_app(
     # shapes. It never fails closed on an unconfigured integration -- a disabled
     # descriptor with safe remediation is the truthful answer.
     app.include_router(build_system_health_router(actor, system_health))
+    # Actor-scoped preference read/write surface (preferences-configuration
+    # T002.3): authenticated by the same trusted ``actor`` dependency, personal
+    # namespace bound to the authenticated actor, and fail-closed (503) until a
+    # preference store is configured. Serves only the settings actor-view and
+    # actor-scope effective values; a stale write is a reload-required 409
+    # distinct from the 422 a malformed value raises.
+    app.include_router(build_preferences_router(actor, preference_store))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:
