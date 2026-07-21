@@ -14,6 +14,48 @@ Use this file to resume work in a new Anvil Workbench coding session.
 - Immediate roadmap: [ROADMAP.md](ROADMAP.md)
 - Agent rules: [../AGENTS.md](../AGENTS.md)
 
+## 2026-07-21 system-health descriptors + observational posture (preferences-configuration T003.1/T003.2/T008)
+
+Landed the read-only **system-health and observational-posture** surface on the
+`preferences-configuration` lane (branch `agent/preferences-configuration-t003.1-…`),
+then applied a three-lens adversarial fix round. What is implemented and green:
+
+- `workbench/system_health.py` — frozen `IntegrationDescriptor` (closed field
+  set: state/digest/last-check/owner/dependencies/remediation and structurally
+  nothing that names a credential, endpoint, path, approval, or command),
+  `PostureCheck`/`PostureReport`, and the shared `run_posture_audit` runner. A
+  `configured` predicate reads only Settings booleans; an all-unset deployment
+  yields truthful `disabled` descriptors with safe env-var-name remediation.
+- `workbench/api.py` `build_system_health_router` — GET-only
+  `/api/system/health`, `/api/system/health/{integration_id}` (unknown id → 404,
+  malformed → 422), `/api/system/posture`, behind the trusted `actor` dependency.
+- `workbench/cli.py` `posture` command — renders the SAME findings as the API
+  from the one runner (CLI/API parity is proven byte-for-byte).
+- **Fix round (this session):** `workbench/redaction.py` `redact_config_text`
+  was hardened from a narrow scrub to cover all four declared classes — the
+  earlier version leaked bare `AKIA` keys, compound-named secret assignments,
+  JWTs, PEM blocks, scheme-less `ip:port`/`host:port`, `*.ts.net` hosts,
+  protocol-relative `//host`, connection-string hosts, `=`/`:`/`(`-adjacent and
+  UNC/`~`/relative-sensitive-extension paths (24 proven token-leaks across 20
+  shapes). The redaction guarantee is now enforced structurally at the
+  **serialized API boundary** via the new `scrub_config_payload` (finding 2,
+  option **b** + kept construction-time scrub for the CLI/digest = both): a
+  rogue, duck-typed service whose `as_dict()` bypassed construction is still
+  scrubbed by the router. The posture `check_id` grammar was tightened to the
+  dotted `posture.<segment>` form (a bare `run_codex` is now refused). The two
+  descriptor field-allowlist frozensets were de-duplicated into
+  `tests/conftest.py::SYSTEM_HEALTH_DESCRIPTOR_FIELDS`. The proving tests were
+  extended with the full adversarial corpus (each proven-leak shape is a
+  negative assertion; a revert to the old patterns fails them), a rogue-service
+  last-hop test was added, and a 405 assertion added on the detail route.
+
+Contract: `docs/CONTRACTS.md` → "System health and observational posture
+(implemented, read-only)" under the Hub and browser contract. **Full suite is
+543 green** (542 baseline + 1 new rogue-service test), verified deterministic
+×2. This surface is observational only — no claim, lease, approval, evidence, or
+effect — and reads already-parsed Settings plus an optional injected
+bridge-health signal. Remaining T003.2 lane work (a browser view over this API)
+is unchanged by this fix round.
 ## 2026-07-21 chat-first-voice T002 + T003 — integration qualification fixtures
 
 Integrated and qualified the two chat foundations end-to-end with hermetic
