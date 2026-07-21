@@ -339,3 +339,161 @@ export async function fetchTaskEligibility(projectId, prdId, taskId) {
     'Task eligibility is unavailable',
   )
 }
+
+// --- Settings / preferences API client (preferences-configuration T005.1) -----
+//
+// The browser half of the actor-scoped preference surface
+// (workbench/api.py `build_preferences_router` at /api/preferences) plus the
+// typed policy-operation spine (`build_policy_operations_router` at
+// /api/policy-operations) that an approval-gated change routes through. Every
+// endpoint is actor-scoped server-side from the trusted tailnet identity, so
+// this client assembles NO actor, token, endpoint, provider key, or credential —
+// only the safe path, method, and a CLOSED body of declared fields. It can never
+// smuggle a deployment credential or raw provider key: the write/reset/preview
+// bodies are built field-by-field from the declared closed set (mirroring the
+// server's `extra="forbid"` models), and this module holds no state, so nothing
+// is cached between calls.
+//
+// The distinct server outcomes stay DISTINGUISHABLE to the UI as typed results
+// rather than a single collapsed error (T005.1): a value that is rejected (422),
+// a stale optimistic write (409, keep the draft + reload), an unknown setting
+// (404), and an unavailable/unconfigured surface (503 / network) each map to a
+// separate `status`. Reads throw a distinct non-leaking Error so the view can
+// render a loading/empty/error state.
+
+const PREFERENCES = '/api/preferences'
+const POLICY_OPERATIONS = '/api/policy-operations'
+
+async function preferencesReadJson(response, failure) {
+  if (response.status === 503) throw new Error('The settings service is not configured for this hub')
+  if (!response.ok) throw new Error(failure)
+  return response.json()
+}
+
+// The settings actor-view catalog + the resolved effective actor-scope values:
+// `{catalog: {schema_version, catalog_id, revision, settings:[descriptor…]}, effective:[value…]}`.
+// `project_id` is optional; it is only needed to resolve project-scope values.
+export async function fetchPreferences(projectId) {
+  const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''
+  return preferencesReadJson(await fetch(`${PREFERENCES}${qs}`), 'Settings are unavailable')
+}
+
+// One stored preference record in the actor's own namespace. A missing record or
+// a foreign namespace is the same indistinct 404 upstream; surfaced here as a
+// distinct 'unknown' Error the caller can show without leaking existence.
+export async function fetchPreference(settingId, { scope = 'personal', projectId } = {}) {
+  const params = new URLSearchParams({ scope })
+  if (projectId) params.set('project_id', projectId)
+  const response = await fetch(`${PREFERENCES}/${encodeURIComponent(settingId)}?${params.toString()}`)
+  if (response.status === 404) throw new Error('This preference is not set in your namespace')
+  return preferencesReadJson(response, 'This preference is unavailable')
+}
+
+// Classify a preference write/reset response into a typed result the UI keeps
+// distinguishable. NEVER collapses stale/invalid/unknown/unavailable together.
+async function classifyPreferenceWrite(response) {
+  if (response.ok) return { status: 'saved', preference: (await response.json()).preference }
+  let body = {}
+  try { body = await response.json() } catch { /* non-JSON error body */ }
+  const detail = body?.detail
+  if (response.status === 409) {
+    // Stale optimistic write: the local draft must be preserved and the actor
+    // prompted to reload/compare, never silently overwritten.
+    const info = detail && typeof detail === 'object' ? detail : {}
+    return {
+      status: 'stale',
+      reloadRequired: info.reload_required === true,
+      currentVersion: Number.isInteger(info.current_version) ? info.current_version : null,
+      message: 'This setting changed elsewhere. Reload to compare before saving.',
+    }
+  }
+  if (response.status === 422) {
+    return { status: 'invalid', message: typeof detail === 'string' ? detail : 'That value is not allowed for this setting.' }
+  }
+  if (response.status === 404) return { status: 'unknown', message: 'This setting is not available.' }
+  if (response.status === 503) return { status: 'unavailable', message: 'The settings service is not configured for this hub.' }
+  return { status: 'unavailable', message: 'The setting could not be saved.' }
+}
+
+// Commit one scoped preference write under optimistic concurrency. The body is a
+// CLOSED set — `{scope, value, expected_version, project_id?}` — so a caller can
+// never smuggle an actor, credential, provider key, or any other field past this
+// edge. Returns a typed result; only a genuine network failure yields
+// 'unavailable' via the catch.
+export async function writePreference(settingId, { scope, value, expectedVersion, projectId } = {}) {
+  const body = { scope, value, expected_version: expectedVersion }
+  if (projectId) body.project_id = projectId
+  try {
+    const response = await jsonPut(`${PREFERENCES}/${encodeURIComponent(settingId)}`, body)
+    return classifyPreferenceWrite(response)
+  } catch {
+    return { status: 'unavailable', message: 'The settings service could not be reached.' }
+  }
+}
+
+// Reset one preference to its inherited/default state at ONLY the named scope.
+// Same closed body (no value) and the same typed-result contract as a write.
+export async function resetPreference(settingId, { scope, expectedVersion, projectId } = {}) {
+  const body = { scope, expected_version: expectedVersion }
+  if (projectId) body.project_id = projectId
+  try {
+    const response = await jsonPost(`${PREFERENCES}/${encodeURIComponent(settingId)}/reset`, body)
+    if (response.ok) return { status: 'reset', effective: (await response.json()).effective }
+    return classifyPreferenceWrite(response)
+  } catch {
+    return { status: 'unavailable', message: 'The settings service could not be reached.' }
+  }
+}
+
+function jsonPut(path, body) {
+  return fetch(path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+// The typed policy-operation body an approval-gated change routes through. It is
+// CLOSED — only the declared operation fields — mirroring the server's
+// `extra="forbid"` `PolicyOperationBody`; there is no provider-credential field.
+function policyOperationBody({ settingId, scope, operation, opVersion, value, projectId, provider }) {
+  const body = { setting_id: settingId, scope, operation, op_version: opVersion }
+  if (operation === 'preference.set') body.value = value
+  if (projectId) body.project_id = projectId
+  if (provider) body.provider = provider
+  return body
+}
+
+async function classifyPolicyBuild(response, okStatus, okKey) {
+  if (response.ok) return { status: okStatus, [okKey]: await response.json() }
+  let body = {}
+  try { body = await response.json() } catch { /* non-JSON */ }
+  const detail = body?.detail
+  if (response.status === 422) return { status: 'invalid', message: typeof detail === 'string' ? detail : 'That change is not allowed.' }
+  if (response.status === 404) return { status: 'unknown', message: 'This setting is not available.' }
+  if (response.status === 503) return { status: 'unavailable', message: 'The approval surface is not configured for this hub.' }
+  return { status: 'unavailable', message: 'The change could not be previewed.' }
+}
+
+// Preview an approval-gated change WITHOUT mutating anything. Returns the served
+// preview envelope (operation type, effect summary, target scope, and the
+// payload-hash fingerprint the approval will bind) as a typed result.
+export async function previewPolicyOperation(request) {
+  try {
+    const response = await jsonPost(`${POLICY_OPERATIONS}/preview`, policyOperationBody(request))
+    return classifyPolicyBuild(response, 'previewed', 'preview')
+  } catch {
+    return { status: 'unavailable', message: 'The approval surface could not be reached.' }
+  }
+}
+
+// The exact (action, payload_hash, actor, scope_key) an out-of-band approval
+// grant must bind to. No secret; the payload_hash is a digest.
+export async function policyApprovalBinding(request) {
+  try {
+    const response = await jsonPost(`${POLICY_OPERATIONS}/approval-binding`, policyOperationBody(request))
+    return classifyPolicyBuild(response, 'bound', 'binding')
+  } catch {
+    return { status: 'unavailable', message: 'The approval surface could not be reached.' }
+  }
+}

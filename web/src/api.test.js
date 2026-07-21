@@ -18,6 +18,10 @@ import {
   sendMessage,
   unarchiveConversation,
 } from './api'
+import {
+  fetchPreferences, fetchPreference, writePreference, resetPreference,
+  previewPolicyOperation, policyApprovalBinding,
+} from './api'
 import { describeConversation, selectChatRoute, successorTurnBody, toTurnContent } from './chat-api'
 
 describe('Workbench browser API', () => {
@@ -277,6 +281,99 @@ describe('delivery-projection explorer client (T003)', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 404, json: async () => ({}) })
     await expect(fetchPrdTasks('project_1', 'release-alpha')).rejects.toThrow('PRD tasks are unavailable')
     await expect(fetchTaskReference('project_1', 'release-alpha', 'T001')).rejects.toThrow('Task reference is unavailable')
+  })
+})
+
+// A non-2xx JSON response the fetch spy can return.
+function err(statusCode, json = {}) {
+  return { ok: false, status: statusCode, json: async () => json }
+}
+
+// The parsed JSON body of the most recent fetch call (POST/PUT).
+function lastBody(fetch) {
+  return JSON.parse(fetch.mock.calls.at(-1)[1].body)
+}
+
+describe('settings / preferences API client (T005.1)', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('reads the settings actor-view + effective values from the scoped GET path', async () => {
+    const served = { catalog: { schema_version: 'v1', settings: [] }, effective: [] }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(served))
+    await expect(fetchPreferences('project_1')).resolves.toEqual(served)
+    expect(fetch).toHaveBeenLastCalledWith('/api/preferences?project_id=project_1')
+    await fetchPreferences()
+    expect(fetch).toHaveBeenLastCalledWith('/api/preferences')
+  })
+
+  it('surfaces an unconfigured settings service (503) as a distinct not-configured error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(503))
+    await expect(fetchPreferences('project_1')).rejects.toThrow('not configured')
+  })
+
+  it('reads one preference record with scope + project id, and 404 stays a distinct not-set error', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ preference: { setting_id: 'personal.time_format', value: 'format_24h', write_version: 2 } }))
+    await fetchPreference('personal.time_format', { scope: 'personal' })
+    expect(fetch).toHaveBeenLastCalledWith('/api/preferences/personal.time_format?scope=personal')
+    await fetchPreference('project.delivery_route', { scope: 'project', projectId: 'project_1' })
+    expect(fetch).toHaveBeenLastCalledWith('/api/preferences/project.delivery_route?scope=project&project_id=project_1')
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(404, { detail: 'unknown preference' }))
+    await expect(fetchPreference('personal.time_format', { scope: 'personal' })).rejects.toThrow('not set')
+  })
+
+  it('writes a preference with a CLOSED body — no actor, credential, or provider key can ride along', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ preference: { setting_id: 'personal.time_format', value: 'format_12h', write_version: 3 } }))
+    const result = await writePreference('personal.time_format', { scope: 'personal', value: 'format_12h', expectedVersion: 2 })
+    expect(fetch).toHaveBeenLastCalledWith('/api/preferences/personal.time_format', expect.objectContaining({ method: 'PUT' }))
+    // Exactly the declared field set the server's extra="forbid" model accepts.
+    expect(Object.keys(lastBody(fetch)).sort()).toEqual(['expected_version', 'scope', 'value'])
+    expect(result).toEqual({ status: 'saved', preference: { setting_id: 'personal.time_format', value: 'format_12h', write_version: 3 } })
+  })
+
+  it('keeps stale (409), invalid (422), unknown (404), and unavailable (503/network) write results DISTINGUISHABLE', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(409, { detail: { detail: 'reload required before writing', reload_required: true, current_version: 7 } }))
+    expect(await writePreference('personal.time_format', { scope: 'personal', value: 'x', expectedVersion: 2 }))
+      .toEqual({ status: 'stale', reloadRequired: true, currentVersion: 7, message: expect.any(String) })
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(422, { detail: 'value not allowed' }))
+    expect((await writePreference('personal.time_format', { scope: 'personal', value: 'x', expectedVersion: 2 })).status).toBe('invalid')
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(404, { detail: 'unknown preference' }))
+    expect((await writePreference('nope', { scope: 'personal', value: 'x', expectedVersion: 0 })).status).toBe('unknown')
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(503))
+    expect((await writePreference('personal.time_format', { scope: 'personal', value: 'x', expectedVersion: 2 })).status).toBe('unavailable')
+
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'))
+    expect((await writePreference('personal.time_format', { scope: 'personal', value: 'x', expectedVersion: 2 })).status).toBe('unavailable')
+  })
+
+  it('resets ONLY the named scope with a valueless closed body', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ effective: { setting_id: 'project.delivery_route', scope: 'project', value: 'route.delivery-heavy', source: 'default' } }))
+    const result = await resetPreference('project.delivery_route', { scope: 'project', expectedVersion: 4, projectId: 'project_1' })
+    expect(fetch).toHaveBeenLastCalledWith('/api/preferences/project.delivery_route/reset', expect.objectContaining({ method: 'POST' }))
+    expect(Object.keys(lastBody(fetch)).sort()).toEqual(['expected_version', 'project_id', 'scope'])
+    expect(lastBody(fetch)).not.toHaveProperty('value')
+    expect(result.status).toBe('reset')
+  })
+
+  it('previews an approval-gated change through the typed policy-operation spine with a closed body', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ preview: { digest: 'sha256:' + 'a'.repeat(64), operation: { operation: 'preference.set', setting_id: 'project.delivery_route', scope: 'project', value: 'route.delivery-heavy' }, effect_summary: 'set project.delivery_route' }, target: 'anvil-preferences', hub_local: true, requires_approval: true }))
+    const result = await previewPolicyOperation({ settingId: 'project.delivery_route', scope: 'project', operation: 'preference.set', opVersion: 1, value: 'route.delivery-heavy', projectId: 'project_1' })
+    expect(fetch).toHaveBeenLastCalledWith('/api/policy-operations/preview', expect.objectContaining({ method: 'POST' }))
+    expect(Object.keys(lastBody(fetch)).sort()).toEqual(['op_version', 'operation', 'project_id', 'scope', 'setting_id', 'value'])
+    expect(result.status).toBe('previewed')
+    // 422 stays distinct from a preview.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(422, { detail: 'bad value' }))
+    expect((await previewPolicyOperation({ settingId: 'x', scope: 'project', operation: 'preference.set', opVersion: 1, value: 'y' })).status).toBe('invalid')
+  })
+
+  it('exposes the approval binding (action, payload_hash) with no secret field', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ action: 'preference.set', payload_hash: 'sha256:' + 'b'.repeat(64), actor: 'operator', scope_key: 'project_1' }))
+    const result = await policyApprovalBinding({ settingId: 'project.delivery_route', scope: 'project', operation: 'preference.set', opVersion: 1, value: 'route.delivery-heavy', projectId: 'project_1' })
+    expect(result.status).toBe('bound')
+    expect(result.binding).not.toHaveProperty('token')
+    expect(result.binding.payload_hash).toMatch(/^sha256:/)
   })
 })
 
