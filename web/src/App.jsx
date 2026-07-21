@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   addDirective, approve, bootstrap, createProject, createSession, fetchRoutes, probeSkills,
   runSandbox, searchEvidence, startWorkflow, taskLineage, voiceSocketUrl,
+  archiveConversation, branchTurn, createConversation, deleteConversation, fetchChatRoutes,
+  getConversation, listConversations, renameConversation, retryTurn, searchConversations,
+  sendMessage, unarchiveConversation,
 } from './api'
+import { describeConversation, selectChatRoute, terminalToStatus } from './chat-api'
 
 const emptyData = {
   projects: [], runs: [], sessions: [], workflows: [], approvals: [], skills: [], directives: [], audit: [],
@@ -10,8 +14,10 @@ const emptyData = {
   voice: { available: false, transport: 'not_configured', retains_transcripts: false },
 }
 
+// Chat is first and selected by default; Delivery stays reachable directly below
+// it (chat-first-voice T004.4). The order here IS the rendered nav order.
 const nav = [
-  ['Delivery', '⌘'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'],
+  ['Chat', '◇'], ['Delivery', '⌘'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'],
   ['Evidence', '◈'], ['Skills', '✦'], ['Sandbox', '□'],
 ]
 
@@ -22,7 +28,7 @@ function tone(status) { return ['reconciliation', 'pending', 'not_configured', '
 function Rail({ active, setActive, onNewDelivery, onProfile }) {
   return <aside className="rail">
     <div className="brand"><Mark /><span>Anvil<br /><em>Workbench</em></span></div>
-    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => setActive(label)}><b aria-hidden="true">{glyph}</b>{label}</button>)}</nav>
+    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} aria-current={active === label ? 'page' : undefined} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => setActive(label)}><b aria-hidden="true">{glyph}</b>{label}</button>)}</nav>
     <div className="rail-footer"><button className="new-run" onClick={onNewDelivery}><span aria-hidden="true">+</span> New delivery</button><button className="profile" aria-label="Operator menu" onClick={onProfile}><span>AW</span><div><strong>Operator</strong><small>tailnet owner</small></div><b aria-hidden="true">···</b></button></div>
   </aside>
 }
@@ -134,8 +140,283 @@ function Onboarding({ data, onClose, setActive, onNewDelivery, onNewSession }) {
 function Notifications({ audit, read, onRead }) { return <section className="notifications" aria-label="Notifications"><header><b>Recent hub activity</b><button onClick={onRead}>Mark viewed</button></header>{read ? <p>All current activity is marked viewed in this browser.</p> : audit.length ? audit.slice(0, 4).map((event) => <p key={event.id}><b>{event.kind}</b><br />{event.actor}</p>) : <p>No Workbench audit events yet.</p>}</section> }
 function ProfileMenu({ data, onClose }) { return <section className="profile-menu" aria-label="Operator menu"><b>{data.actor || 'Allowlisted operator'}</b><span>Tailnet identity verified by the hub</span><small>Project creation and approvals are server-checked. The browser has no bridge, GitHub, or model credential.</small><button onClick={onClose}>Close menu</button></section> }
 
+// --- Chat surface (chat-first-voice T004.2 / T004.3 / T004.4) ----------------
+//
+// The default surface. A conversation rail (management + search + active/archived
+// distinction), a transcript with distinct empty/streaming/interrupted/error
+// states, a multiline composer with documented keyboard submission, incremental
+// cancellable streaming, retry/branch as visible successors, an Advanced mode
+// that opens within Chat, and an allowlisted route selector.
+
+const LIFECYCLE = {
+  streaming: 'Streaming response…',
+  complete: 'Response complete',
+  cancelled: 'Response cancelled',
+  interrupted: 'Response interrupted',
+  failed: 'Response failed',
+}
+
+function turnText(turn) {
+  return (turn.content || []).map((block) => block.text || '').join('')
+}
+
+function ConversationRow({ record, selected, onSelect, onRename, onArchive, onUnarchive, onDelete, renaming, onStartRename, onCancelRename }) {
+  const info = describeConversation(record)
+  const [draft, setDraft] = useState(info.title)
+  useEffect(() => { setDraft(info.title) }, [renaming, info.title])
+  if (renaming) {
+    return <li className={`conv-row ${info.archived ? 'is-archived' : 'is-active'}`}>
+      <form className="conv-rename" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) onRename(record.id, draft.trim()) }}>
+        <input aria-label={`Rename ${info.title}`} value={draft} onChange={(event) => setDraft(event.target.value)} />
+        <button type="submit" disabled={!draft.trim()}>Save</button>
+        <button type="button" onClick={onCancelRename}>Cancel</button>
+      </form>
+    </li>
+  }
+  return <li className={`conv-row ${info.archived ? 'is-archived' : 'is-active'} ${selected ? 'selected' : ''}`}>
+    <button className="conv-open" aria-current={selected ? 'true' : undefined} aria-label={`Open ${info.title}`} onClick={() => onSelect(record.id)}>
+      <span className="conv-title">{info.title}</span>
+      <span className="conv-meta">
+        <span className={`conv-state conv-state-${info.state}`}>{info.state}</span>
+        {info.ephemeral && <span className="conv-badge">ephemeral</span>}
+        {info.tags.map((tag) => <span key={tag} className="conv-tag">{tag}</span>)}
+      </span>
+      <small className="conv-id">{record.id}</small>
+    </button>
+    <div className="conv-actions">
+      <button aria-label={`Rename ${info.title}`} onClick={() => onStartRename(record.id)}>Rename</button>
+      {info.archived
+        ? <button aria-label={`Unarchive ${info.title}`} onClick={() => onUnarchive(record.id)}>Unarchive</button>
+        : <button aria-label={`Archive ${info.title}`} onClick={() => onArchive(record.id)}>Archive</button>}
+      <button aria-label={`Delete ${info.title}`} onClick={() => onDelete(record.id)}>Delete</button>
+    </div>
+  </li>
+}
+
+function ConversationRail({ conversations, selectedId, includeArchived, query, renamingId, onSelect, onNew, onQueryChange, onToggleArchived, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename }) {
+  const active = conversations.filter((record) => record.status !== 'archived')
+  const archived = conversations.filter((record) => record.status === 'archived')
+  const rowProps = { selected: false, onSelect, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename }
+  const row = (record) => <ConversationRow key={record.id} record={record} {...rowProps} selected={selectedId === record.id} renaming={renamingId === record.id} />
+  return <nav className="conv-rail" aria-label="Conversations">
+    <div className="conv-rail-head"><h2>Conversations</h2><button className="conv-new" aria-label="Start a new conversation" onClick={onNew}>+ New</button></div>
+    <form className="conv-search" role="search" onSubmit={(event) => event.preventDefault()}>
+      <input type="search" aria-label="Search conversations" placeholder="Search titles and messages" value={query} onChange={(event) => onQueryChange(event.target.value)} />
+    </form>
+    <label className="conv-filter"><input type="checkbox" checked={includeArchived} onChange={onToggleArchived} aria-label="Show archived conversations" /> Show archived</label>
+    {conversations.length === 0
+      ? <p className="conv-empty">{query.trim() ? 'No conversations match that search.' : 'No conversations yet. Start one to begin.'}</p>
+      : <>
+          <section aria-label="Active conversations"><h3>Active</h3><ul className="conv-list">{active.length ? active.map(row) : <li className="conv-none">No active conversations.</li>}</ul></section>
+          {includeArchived && <section aria-label="Archived conversations"><h3>Archived</h3><ul className="conv-list">{archived.length ? archived.map(row) : <li className="conv-none">No archived conversations.</li>}</ul></section>}
+        </>}
+  </nav>
+}
+
+// Project / PRD / task titles as readable context when the conversation is bound
+// to a delivery, with the canonical ids available only as secondary disclosure.
+// The merged conversation projection does not yet emit this binding, so the panel
+// renders defensively from an optional `context` block and shows a truthful
+// unlinked state otherwise.
+function DeliveryContext({ context }) {
+  const rows = context ? [['Project', context.project], ['PRD', context.prd], ['Task', context.task]].filter(([, value]) => value) : []
+  if (!rows.length) return <p className="chat-context none">No linked delivery context.</p>
+  return <section className="chat-context" aria-label="Linked delivery context">
+    {rows.map(([label, value]) => <div key={label} className="context-row">
+      <span className="context-label">{label}</span>
+      <b className="context-title">{value.title}</b>
+      {value.id && <details className="context-id"><summary aria-label={`${label} id`}>id</summary><code>{value.id}</code></details>}
+    </div>)}
+  </section>
+}
+
+function AdvancedPanel() {
+  return <section className="advanced-panel" aria-label="Advanced controls">
+    <p>Advanced controls are not configured in this build. The transcript and its route are unchanged.</p>
+    <label>Reasoning effort<select aria-label="Reasoning effort" disabled><option>not configured</option></select></label>
+    <label>Temperature<input aria-label="Temperature" type="range" min="0" max="2" step="0.1" disabled /></label>
+  </section>
+}
+
+function TurnView({ turn, onRetry, onBranch }) {
+  const text = turnText(turn)
+  const streaming = turn.status === 'streaming'
+  const distinct = !streaming && turn.status !== 'complete'
+  const lineage = turn.lineage?.kind && turn.lineage.kind !== 'initial' ? turn.lineage.kind : null
+  return <li className={`turn turn-${turn.role} turn-${turn.status}`}>
+    <div className="turn-head">
+      <span className="turn-role">{turn.role === 'user' ? 'You' : 'Assistant'}</span>
+      {lineage && <span className="turn-lineage">{lineage}</span>}
+      {streaming && <span className="turn-status streaming">streaming…</span>}
+      {distinct && <span className={`turn-status turn-status-${turn.status}`}>{turn.status}</span>}
+    </div>
+    <p className="turn-text">{text || (streaming ? '…' : '')}</p>
+    {turn.role === 'assistant' && !streaming && <div className="turn-actions">
+      <button aria-label="Retry this response" onClick={() => onRetry(turn)}>Retry</button>
+      <button aria-label="Branch from this response" onClick={() => onBranch(turn)}>Branch</button>
+    </div>}
+  </li>
+}
+
+function Transcript({ selected, turns, streamingTurn, onRetry, onBranch }) {
+  if (!selected) return <div className="chat-empty" aria-label="No conversation selected"><h2>Select or start a conversation</h2><p>Your conversations are private to you and stay on the tailnet.</p></div>
+  const rendered = streamingTurn ? [...turns, streamingTurn] : turns
+  if (rendered.length === 0) return <div className="chat-empty" aria-label="Empty conversation"><h2>No messages yet</h2><p>Send the first message to start this conversation.</p></div>
+  return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} />)}</ol>
+}
+
+function Composer({ draft, setDraft, onSend, onCancel, streaming, disabled, canSend }) {
+  const onKeyDown = (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (canSend) onSend() }
+  }
+  return <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); if (canSend) onSend() }}>
+    <textarea aria-label="Message composer" aria-describedby="composer-hint" rows="3" value={draft} disabled={disabled}
+      onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown}
+      placeholder={disabled ? 'Select or start a conversation to send a message…' : 'Message…  (Enter to send, Shift+Enter for a new line)'} />
+    <div className="composer-bar">
+      <small id="composer-hint">Enter sends. Shift+Enter inserts a new line.</small>
+      {streaming
+        ? <button type="button" className="composer-cancel" aria-label="Cancel streaming response" onClick={onCancel}>Cancel</button>
+        : <button type="submit" aria-label="Send message" disabled={!canSend}>Send <span aria-hidden="true">↵</span></button>}
+    </div>
+  </form>
+}
+
+function RouteSelect({ routes, routeId, onChange }) {
+  return <label className="chat-route"><span>Route</span>
+    <select aria-label="Chat route" value={routeId || ''} onChange={(event) => onChange(event.target.value)} disabled={routes.length === 0}>
+      {routes.length === 0 && <option value="">No routes configured</option>}
+      {routes.map((route) => <option key={route.route_id} value={route.route_id}>{route.display_name || route.route_id}</option>)}
+    </select>
+  </label>
+}
+
+function ChatView({ append }) {
+  const [conversations, setConversations] = useState([])
+  const [includeArchived, setIncludeArchived] = useState(false)
+  const [query, setQuery] = useState('')
+  const [selectedId, setSelectedId] = useState(null)
+  const [turns, setTurns] = useState([])
+  const [routes, setRoutes] = useState([])
+  const [routeId, setRouteId] = useState('')
+  const [advanced, setAdvanced] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [streamingTurn, setStreamingTurn] = useState(null)
+  const [lifecycle, setLifecycle] = useState('')
+  const [renamingId, setRenamingId] = useState(null)
+  const abortRef = useRef(null)
+  const seqRef = useRef(0)
+
+  const selected = conversations.find((record) => record.id === selectedId) || null
+
+  const refreshList = async (nextQuery, nextArchived) => {
+    try {
+      const value = nextQuery && nextQuery.trim()
+        ? await searchConversations(nextQuery.trim(), { includeArchived: nextArchived })
+        : await listConversations({ includeArchived: nextArchived })
+      setConversations(value.conversations || [])
+    } catch { append('Conversations are unavailable. No conversation content left the tailnet.') }
+  }
+  useEffect(() => { refreshList(query, includeArchived) }, [query, includeArchived])
+  useEffect(() => {
+    fetchChatRoutes()
+      .then((value) => { const list = value.routes || []; setRoutes(list); setRouteId((current) => current || list[0]?.route_id || '') })
+      .catch(() => setRoutes([]))
+  }, [])
+
+  const select = async (id) => {
+    setSelectedId(id); setStreamingTurn(null); setLifecycle(''); setRenamingId(null)
+    try { const value = await getConversation(id); setTurns(value.turns || []) }
+    catch { setTurns([]); append('That conversation could not be opened.') }
+  }
+  const newConversation = async () => {
+    try { const record = await createConversation({}); setConversations((current) => [record, ...current]); await select(record.id) }
+    catch { append('A new conversation could not be created.') }
+  }
+  const rename = async (id, title) => {
+    setRenamingId(null)
+    try { const record = await renameConversation(id, title); setConversations((current) => current.map((item) => (item.id === id ? record : item))) }
+    catch { append('The conversation could not be renamed.') }
+  }
+  const archive = async (id) => { try { await archiveConversation(id); await refreshList(query, includeArchived) } catch { append('The conversation could not be archived.') } }
+  const unarchive = async (id) => { try { await unarchiveConversation(id); await refreshList(query, includeArchived) } catch { append('The conversation could not be unarchived.') } }
+  const remove = async (id) => {
+    try { await deleteConversation(id); if (selectedId === id) { setSelectedId(null); setTurns([]) } await refreshList(query, includeArchived) }
+    catch { append('The conversation could not be deleted.') }
+  }
+
+  const send = async () => {
+    const prompt = draft.trim()
+    if (!prompt || !selectedId || !routeId || streamingTurn) return
+    try { selectChatRoute(routes, routeId) } catch { append('That route is not in the reviewed allowlist.'); return }
+    const ordinal = (seqRef.current += 1)
+    const userTurn = { id: `local-user-${ordinal}`, role: 'user', status: 'complete', content: [{ text: prompt }], lineage: { kind: 'initial' } }
+    setTurns((current) => [...current, userTurn]); setDraft('')
+    const assistant = { id: `local-assistant-${ordinal}`, role: 'assistant', status: 'streaming', content: [{ text: '' }], lineage: { kind: 'initial' } }
+    setStreamingTurn(assistant); setLifecycle(LIFECYCLE.streaming)
+    const controller = new AbortController(); abortRef.current = controller
+    try {
+      const state = await sendMessage({
+        conversationId: selectedId, routeId, prompt, signal: controller.signal,
+        onState: (streamState) => setStreamingTurn((current) => (current ? {
+          ...current, content: [{ text: streamState.text }],
+          status: streamState.terminal ? terminalToStatus(streamState.terminal) : 'streaming',
+        } : current)),
+      })
+      const status = terminalToStatus(state.terminal)
+      setTurns((current) => [...current, { ...assistant, content: [{ text: state.text }], status }])
+      setStreamingTurn(null)
+      setLifecycle(LIFECYCLE[status] || LIFECYCLE.complete)
+      if (state.needsRefresh) {
+        try { const value = await getConversation(selectedId); setTurns(value.turns || []) }
+        catch { append('The reconnected transcript could not be refreshed.') }
+      }
+    } catch {
+      setStreamingTurn(null)
+      setTurns((current) => [...current, { ...assistant, status: 'failed', content: [{ text: '' }] }])
+      setLifecycle(LIFECYCLE.failed)
+      append('The response failed. No partial answer was recorded as complete.')
+    } finally { abortRef.current = null }
+  }
+  const cancel = () => { abortRef.current?.abort() }
+
+  const addSuccessor = async (call, turn, fallbackKind, failure) => {
+    try {
+      const created = await call(selectedId, turn.id, { role: 'assistant', status: 'complete', content: turn.content || [], mode: advanced ? 'advanced' : 'ordinary' })
+      setTurns((current) => [...current, { ...created, lineage: created.lineage || { kind: fallbackKind } }])
+      setLifecycle(fallbackKind === 'retry' ? 'Added a retry response' : 'Added a branch response')
+    } catch { append(failure) }
+  }
+  const retry = (turn) => addSuccessor(retryTurn, turn, 'retry', 'Retry could not be recorded.')
+  const branch = (turn) => addSuccessor(branchTurn, turn, 'branch', 'Branch could not be recorded.')
+
+  const streaming = Boolean(streamingTurn)
+  const canSend = Boolean(!streaming && draft.trim() && selectedId && routeId)
+  return <main className="chat">
+    <ConversationRail
+      conversations={conversations} selectedId={selectedId} includeArchived={includeArchived} query={query} renamingId={renamingId}
+      onSelect={select} onNew={newConversation} onQueryChange={setQuery} onToggleArchived={() => setIncludeArchived((value) => !value)}
+      onRename={rename} onArchive={archive} onUnarchive={unarchive} onDelete={remove}
+      onStartRename={setRenamingId} onCancelRename={() => setRenamingId(null)} />
+    <section className="chat-main" aria-label="Conversation">
+      <header className="chat-header">
+        <div><span className="crumb">Chat / private</span><h1>{selected ? describeConversation(selected).title : 'Chat'}</h1></div>
+        <div className="chat-controls">
+          <RouteSelect routes={routes} routeId={routeId} onChange={setRouteId} />
+          <button className={`advanced-toggle ${advanced ? 'on' : ''}`} aria-pressed={advanced} aria-label="Toggle Advanced mode" onClick={() => setAdvanced((value) => !value)}>Advanced</button>
+        </div>
+      </header>
+      <DeliveryContext context={selected?.context} />
+      {advanced && <AdvancedPanel />}
+      <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} /></div>
+      <div className="chat-live" role="status" aria-live="polite">{lifecycle}</div>
+      <Composer draft={draft} setDraft={setDraft} onSend={send} onCancel={cancel} streaming={streaming} disabled={!selectedId} canSend={canSend} />
+    </section>
+  </main>
+}
+
 function App() {
-  const [active, setActive] = useState('Delivery'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false)
+  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false)
   const load = async () => { const value = await bootstrap(); setData({ ...emptyData, ...value, sandbox: { ...emptyData.sandbox, ...(value.sandbox || {}) }, voice: { ...emptyData.voice, ...(value.voice || {}) } }); return value }
   useEffect(() => { load().catch(() => setNotice('Workbench hub is unavailable; no local mock delivery is shown.')) }, [])
   const createDelivery = async (payload) => { try { const project = await createProject(payload); setData((current) => ({ ...current, projects: [project, ...current.projects] })); setNewDeliveryOpen(false); setNotice(`Created ${project.name}. Register its bridge locally before starting a run.`); await load() } catch { setNotice('Project could not be created. No bridge or run was started.') } }
@@ -149,10 +430,12 @@ function App() {
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
     <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
       {notificationsOpen && <Notifications audit={data.audit || []} read={notificationsRead} onRead={() => setNotificationsRead(true)} />}
-      <div className="main-grid">
-        {active === 'Delivery' ? <Delivery data={data} append={setNotice} onDirective={addDirection} onGuide={() => setGuideOpen(true)} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} append={setNotice} refresh={load} selectApproval={selectApproval} />}
-        <Trace data={data} setActive={setActive} append={setNotice} refresh={load} selectedApprovalId={selectedApprovalId} clearApproval={() => setSelectedApprovalId(null)} />
-      </div>
+      {active === 'Chat'
+        ? <div className="chat-grid"><ChatView append={setNotice} /></div>
+        : <div className="main-grid">
+            {active === 'Delivery' ? <Delivery data={data} append={setNotice} onDirective={addDirection} onGuide={() => setGuideOpen(true)} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} append={setNotice} refresh={load} selectApproval={selectApproval} />}
+            <Trace data={data} setActive={setActive} append={setNotice} refresh={load} selectedApprovalId={selectedApprovalId} clearApproval={() => setSelectedApprovalId(null)} />
+          </div>}
       {notice && <div className="toast" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button></div>}
     </div>
     {newDeliveryOpen && <NewDelivery onClose={() => setNewDeliveryOpen(false)} onCreate={createDelivery} />}
