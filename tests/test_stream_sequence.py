@@ -325,3 +325,13 @@ def test_seq_source_is_not_a_cross_actor_oracle():
         store.next_seq(other, REQ)
     with pytest.raises(UnknownResponseError, match="unknown response"):
         store.snapshot(other, REQ)
+
+
+def test_committed_seq_raises_the_high_water_so_next_seq_never_allocates_below():
+    # The allocator invariant is self-enforced: a committed seq (even one not
+    # drawn from next_seq) raises the per-conversation high-water, so a fresh
+    # store over the same rows allocates strictly ABOVE it — never a stale seq.
+    store = _begun()
+    store.advance(ALICE, REQ, "in_progress", usage=SafeUsage(input_tokens=1), seq=500)
+    reopened = MemoryResponseLifecycleStore(store.rows)
+    assert reopened.next_seq(ALICE, REQ) == 501

@@ -153,8 +153,10 @@ class ResponseLifecycle:
     state: str
     usage: SafeUsage = field(default_factory=SafeUsage)
     #: Monotonic version that bumps on every committed *state change* (T008).  A
-    #: reconnecting client compares versions to detect an out-of-order lower
-    #: state-version and refuse to regress a terminal.
+    #: reconnecting client reads it to render a stable, monotonically-versioned
+    #: view; ordering and terminal-regression protection are enforced by ``seq``
+    #: (stale frames refused at/below ``last_committed_seq``) and terminal
+    #: immutability, not by a version comparison in this slice.
     state_version: int = 1
     #: The highest per-conversation sequence number committed for this response
     #: (T008).  A reconnecting client resyncs to this seq and refuses any stale
@@ -426,6 +428,14 @@ class MemoryResponseLifecycleStore:
             last_committed_seq=seq if seq is not None else record.last_committed_seq,
             updated_at=now_utc(),
         )
+        if seq is not None:
+            # Self-enforce the allocator invariant: a committed seq raises the
+            # conversation high-water, so next_seq always allocates strictly
+            # above any committed value — even across a restart and regardless
+            # of whether the seq came from next_seq or a caller.
+            current_hw = self.rows.conversation_seq.get(advanced.conversation_id, 0)
+            if seq > current_hw:
+                self.rows.conversation_seq[advanced.conversation_id] = seq
         kind = "response.terminated" if advanced.is_terminal else "response.progressed"
         return self._store(kind, advanced)
 

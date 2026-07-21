@@ -59,10 +59,14 @@ export function reduceStreamState(state, frame) {
 // jumps `lastSeq` to the committed position and adopts the committed state
 // WITHOUT re-applying the dropped frames, so the response is not duplicated.
 export function applySnapshot(state, snapshot) {
+  // `terminal` mirrors reduceStreamState's outcome vocabulary: it is set only
+  // when the committed snapshot is actually terminal. A non-terminal (e.g.
+  // in_progress) snapshot must NOT populate `terminal`, or a UI reading
+  // `if (state.terminal)` would treat a live stream as finished.
   return {
     ...state,
     lastSeq: snapshot.last_committed_seq,
-    terminal: snapshot.state,
+    terminal: snapshot.is_terminal ? snapshot.state : null,
     needsRefresh: false,
   }
 }

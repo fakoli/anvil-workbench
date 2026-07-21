@@ -53,6 +53,7 @@ describe('sequenced stream gap detection (T008)', () => {
     // Refresh from the snapshot: adopt last-committed state + seq, no frame replay.
     const resynced = applySnapshot(gapped, {
       state: 'completed',
+      is_terminal: true,
       last_committed_seq: 4,
       state_version: 2,
     })
@@ -61,5 +62,21 @@ describe('sequenced stream gap detection (T008)', () => {
     expect(resynced.needsRefresh).toBe(false)
     // The response text was never duplicated by the resync.
     expect(resynced.text).toBe('A')
+  })
+
+  it('does not mark an in-progress snapshot as terminal', () => {
+    // The realistic mid-stream drop: the last committed state is in_progress,
+    // so applySnapshot must leave `terminal` null (a UI reading `if (terminal)`
+    // must not treat a live stream as finished).
+    const state = { lastSeq: 1, text: 'A', terminal: null, needsRefresh: true }
+    const resynced = applySnapshot(state, {
+      state: 'in_progress',
+      is_terminal: false,
+      last_committed_seq: 3,
+      state_version: 1,
+    })
+    expect(resynced.lastSeq).toBe(3)
+    expect(resynced.terminal).toBe(null)
+    expect(resynced.needsRefresh).toBe(false)
   })
 })
