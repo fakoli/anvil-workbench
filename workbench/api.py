@@ -22,11 +22,14 @@ from .conversation_api import (
 from .conversation_store import ConversationStore, MemoryConversationStore
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .project_context_store import ProjectContextStore, UnknownProjectionError
+from .run_context_store import RunContextStore, UnknownRunContextError
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
+from .redaction import scrub_config_payload
 from .store import PostgresStore, StoreError, WorkbenchStore
+from .system_health import SystemHealthService, UnknownIntegrationError
 from .voice import relay_realtime
 
 
@@ -177,6 +180,16 @@ _UNKNOWN_PROJECTION_DETAIL = "unknown project context"
 _PROJECT_ID_PATTERN = r"^[a-zA-Z0-9._-]{1,128}$"
 _SOURCE_DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
 
+#: The single non-leaking body every unknown-or-foreign run-context lookup gets,
+#: so a cross-project probe cannot distinguish "missing" from "belongs to
+#: another project".
+_UNKNOWN_RUN_CONTEXT_DETAIL = "unknown run context"
+
+#: The run-id path grammar, mirrored from the run context's identity grammar so a
+#: malformed run id is rejected at the edge (422) before it can reach the store
+#: as a distinguishable error.
+_RUN_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+
 
 def build_project_context_router(
     actor_dependency: Callable[..., str],
@@ -236,6 +249,134 @@ def build_project_context_router(
     return router
 
 
+def build_run_context_router(
+    actor_dependency: Callable[..., str],
+    run_context_store: RunContextStore | None,
+) -> APIRouter:
+    """Build the read-only, project-scoped historical run-context surface.
+
+    A single endpoint returns the immutable queue-time run context captured for
+    one run (state-context-operations:T005.3).  It reads ONLY the persisted
+    snapshot, so a later task/PRD rename or catalog/route/skill refresh cannot
+    change the titles, revisions, or digests it returns.  The serialized
+    :meth:`RunContext.as_dict` keeps trusted execution policy and untrusted
+    PRD/task data in two separately labeled structures whose closed field set
+    structurally cannot carry a secret, host path, raw command, or provider
+    payload.
+
+    Project scoping is a hard boundary: a run that belongs to another project is
+    not in this project's namespace, so a cross-project read is refused with the
+    same indistinct not-found a genuinely missing run raises
+    (``UnknownRunContextError`` -> the fixed 404 body).  When
+    ``run_context_store`` is ``None`` the surface is not configured and refuses
+    with 503, mirroring the project-context and chat stores.
+    """
+    router = APIRouter(prefix="/api/projects")
+
+    def context_store() -> RunContextStore:
+        if run_context_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="run-context history is not configured",
+            )
+        return run_context_store
+
+    @router.get("/{project_id}/runs/{run_id}/context")
+    def historical_run_context(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        run_id: str = Path(pattern=_RUN_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The project's captured queue-time run context, read as stored.
+
+        A run owned by another project resolves to the indistinct 404, so this
+        endpoint is not an existence oracle for foreign runs.
+
+        Last-hop redaction (security lens, mirroring
+        :func:`build_system_health_router`): the ``untrusted`` PRD/task channel
+        carries whatever prose a PRD title/criterion/scope/evidence happened to
+        contain, so it is re-scrubbed here with
+        :func:`~workbench.redaction.scrub_config_payload`.  Construction-time
+        scrubbing already ran (so the store never held the secret), but this
+        closes a rogue or duck-typed record whose ``as_dict()`` bypassed it. The
+        ``trusted`` policy structure is left untouched -- it is a closed set of
+        typed identifiers/digests/enums with no free-form host/secret field, and
+        the config scrubber's path/URL patterns would otherwise mangle safe
+        ``sha256:`` digests and ``.../v1`` versions.
+        """
+        context = context_store().get(project_id, run_id).as_dict()
+        context["untrusted"] = scrub_config_payload(context["untrusted"])
+        return {"context": context}
+
+    return router
+
+
+#: The integration-id path grammar, mirrored from
+#: :data:`workbench.system_health.INTEGRATION_IDS`, so a malformed id is rejected
+#: at the edge (422) before it reaches the service as a distinguishable lookup.
+_INTEGRATION_ID_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
+
+#: The single fixed body an unknown-integration lookup returns.  The set of
+#: declared integrations is a public, deployment-invariant catalog (never a
+#: per-tenant secret), so this 404 is a plain not-found, not an existence oracle.
+_UNKNOWN_INTEGRATION_DETAIL = "unknown integration"
+
+
+def build_system_health_router(
+    actor_dependency: Callable[..., str],
+    health_service: SystemHealthService,
+) -> APIRouter:
+    """Build the read-only system-health and observational-posture browser surface.
+
+    Every endpoint is authenticated by the hub's trusted ``actor`` dependency
+    (tailnet identity + allowlist) and serializes only the closed
+    :class:`~workbench.system_health.IntegrationDescriptor` /
+    :class:`~workbench.system_health.PostureReport` display shapes, whose field
+    sets structurally cannot carry a credential, a raw endpoint URL, a local
+    path, an approval, or an execution surface.
+
+    Redaction guarantee (T003.1 criterion 2, security lens): the browser-facing
+    scrub is enforced here, at the serialized API boundary, by
+    :func:`~workbench.redaction.scrub_config_payload` over every response body --
+    not only field-by-field at descriptor construction.  Construction-time
+    scrubbing still runs (so the digest commits to safe content and the CLI is
+    protected), but a rogue or duck-typed ``health_service`` whose ``as_dict()``
+    bypassed it cannot make this router emit a secret/endpoint/path: the last hop
+    scrubs whatever it returns.  Delimiter-anchored patterns leave the content
+    digest, schema version, and timestamp intact.
+
+    This router is deliberately read-only: it registers only ``GET`` routes and
+    exposes no mutation, execution, or approval path (T003.2 criterion 3 /
+    T008).  Unlike the project-context projection it has no unconfigured-503
+    state -- reporting an *unconfigured integration as a truthful disabled
+    descriptor* is precisely its job, so an all-unset deployment still answers
+    200 with disabled descriptors rather than failing closed.
+    """
+    router = APIRouter(prefix="/api/system")
+
+    @router.get("/health")
+    def system_health(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """Every declared integration's observational descriptor."""
+        return scrub_config_payload(
+            {"integrations": [descriptor.as_dict() for descriptor in health_service.descriptors()]}
+        )
+
+    @router.get("/health/{integration_id}")
+    def system_health_integration(
+        integration_id: str = Path(pattern=_INTEGRATION_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One declared integration's descriptor; an unknown id is a plain 404."""
+        return scrub_config_payload({"integration": health_service.get(integration_id).as_dict()})
+
+    @router.get("/posture")
+    def system_posture(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """The deterministic observational posture audit (same runner as the CLI)."""
+        return scrub_config_payload(health_service.posture().as_dict())
+
+    return router
+
+
 def create_app(
     settings: Settings | None = None,
     store: WorkbenchStore | None = None,
@@ -243,12 +384,19 @@ def create_app(
     conversation_store: ConversationStore | None = None,
     idempotency_store: IdempotencyStore | None = None,
     project_context_store: ProjectContextStore | None = None,
+    run_context_store: RunContextStore | None = None,
+    system_health: SystemHealthService | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
     graph = graph or _graph(settings)
     conversation_store = conversation_store or _conversation_store(settings)
     idempotency_store = idempotency_store or MemoryIdempotencyStore()
+    # System health is always available: it is a read-only projection of the
+    # already-parsed settings, so it defaults to a live service rather than
+    # failing closed. An injected service lets tests exercise mock bridge health
+    # or seeded prose without env plumbing.
+    system_health = system_health or SystemHealthService(settings)
     app = FastAPI(title="Anvil Workbench", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.settings = settings
     app.state.store = store
@@ -259,6 +407,11 @@ def create_app(
     # deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless an instance is injected, so the browser surface fails closed (503).
     app.state.project_context_store = project_context_store
+    # The historical run-context store is likewise a hub-side supervision
+    # read-model that is deliberately NOT wired into the live bridge poll loop;
+    # it stays ``None`` unless injected, so the browser surface fails closed (503).
+    app.state.run_context_store = run_context_store
+    app.state.system_health = system_health
 
     def actor(request: Request) -> str:
         name = (request.headers.get(settings.identity_header) or "").strip()
@@ -303,6 +456,25 @@ def create_app(
             status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_PROJECTION_DETAIL}
         )
 
+    # A missing run context and another project's run context raise the same
+    # ``UnknownRunContextError``; both render the identical fixed 404 body so the
+    # historical run-context surface is never an existence oracle. More specific
+    # than the ``StoreError`` handler, so it wins for that subclass.
+    @app.exception_handler(UnknownRunContextError)
+    async def unknown_run_context_handler(_: Request, __: UnknownRunContextError):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_RUN_CONTEXT_DETAIL}
+        )
+
+    # An unknown system-health integration id renders a plain fixed 404. The
+    # declared-integration set is a public, deployment-invariant catalog, so this
+    # is a genuine not-found, not a cross-tenant existence oracle.
+    @app.exception_handler(UnknownIntegrationError)
+    async def unknown_integration_handler(_: Request, __: UnknownIntegrationError):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_INTEGRATION_DETAIL}
+        )
+
     # Actor-scoped chat surface (chat-first-voice T002.4): identity comes from
     # the same trusted ``actor`` dependency; the store enforces ownership.
     register_conversation_handlers(app)
@@ -317,6 +489,19 @@ def create_app(
     # (503) until a projection store is configured. Serves only the explicitly
     # non-canonical display read-model; never canonical State.
     app.include_router(build_project_context_router(actor, project_context_store))
+    # Read-only, project-scoped historical run-context surface
+    # (state-context-operations T005.3): authenticated by the same trusted
+    # ``actor`` dependency, scoped by the path ``project_id``/``run_id``, and
+    # fail-closed (503) until a run-context store is configured. Serves only the
+    # immutable queue-time snapshot with trusted policy and untrusted PRD/task
+    # data separately labeled; never a secret, path, command, or provider payload.
+    app.include_router(build_run_context_router(actor, run_context_store))
+    # Read-only system-health + observational posture surface (preferences-
+    # configuration T003.2 / T008): authenticated by the same trusted ``actor``
+    # dependency, GET-only, and serving only the closed descriptor/posture display
+    # shapes. It never fails closed on an unconfigured integration -- a disabled
+    # descriptor with safe remediation is the truthful answer.
+    app.include_router(build_system_health_router(actor, system_health))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:

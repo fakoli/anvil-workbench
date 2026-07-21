@@ -248,3 +248,402 @@ def test_project_context_browser_response_exposes_no_state_path_credential_or_pa
         lowered = value.lower()
         for marker in ("state.db", ".anvil", "-wal", "-shm", "://"):
             assert marker not in lowered, f"response value {value!r} leaked {marker!r}"
+
+
+# --- historical run-context response safety (state-context-operations T005.3 /
+# T005.4): the rendered queue-time run context keeps trusted policy and
+# untrusted PRD/task data in two separately labeled structures, exposes no
+# State-internal FIELD (storage path, credential, execution surface), and scrubs
+# credential-shaped strings seeded into the untrusted prose on the last hop. ----
+
+
+def _seeded_run_context_response() -> dict:
+    """Render a historical run-context response from secret-seeded task prose."""
+    from fastapi.testclient import TestClient
+
+    from _support import build_run_context
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.models import UntrustedEvidence, UntrustedTask, UntrustedTaskRef
+    from workbench.run_context_store import MemoryRunContextStore
+
+    context = build_run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=5),
+            title="Fix token=supersecretvalue in api_key=leak",
+            acceptance_criteria=("Rotate Bearer sk-live-abc123DEADBEEF now",),
+            work_packet_digest="sha256:" + "8" * 64,
+        ),
+        evidence=(UntrustedEvidence(citation="state-event:1", summary="secret=zzz seen"),),
+    )
+    store = MemoryRunContextStore()
+    store.capture("project_a", context)
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    app = create_app(settings=settings, store=MemoryStore(), graph=NullGraph(), run_context_store=store)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/projects/project_a/runs/{context.run_id}/context",
+            headers={"X-Workbench-Actor": "operator"},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["context"]
+
+
+def test_run_context_browser_response_separates_trust_and_exposes_no_leak():
+    context = _seeded_run_context_response()
+
+    # Two separately labeled trust structures.
+    assert context["trusted"]["trust"] == "trusted_execution_policy"
+    assert context["untrusted"]["content_trust"] == "untrusted_task_data"
+
+    keys: list[str] = []
+    strings: list[str] = []
+    _walk_ctx(context, keys, strings)
+
+    # No serialized FIELD NAME names a State-storage, credential, or raw
+    # execution surface. (Effect/gate enums are safe policy words; the closed
+    # run-context field set has no execution/adapter/command field at all.)
+    forbidden_key_markers = (
+        "state_db", "sqlite", "journal", "wal", "shm", "mount",
+        "token", "secret", "api_key", "apikey", "password", "credential", "bearer",
+        "adapter", "argv", "command", "input_schema", "output_schema",
+    )
+    for key in keys:
+        lowered = key.lower()
+        for marker in forbidden_key_markers:
+            assert marker not in lowered, f"run-context field {key!r} looks like a {marker!r} surface"
+
+    # The adversarial secrets seeded into the untrusted prose are scrubbed.
+    blob = json.dumps(context)
+    for leaked in ("supersecretvalue", "sk-live-abc123DEADBEEF", "zzz"):
+        assert leaked not in blob
+    assert "[REDACTED]" in blob
+
+    # No serialized VALUE carries a State-storage path or URL.
+    for value in strings:
+        lowered = value.lower()
+        for marker in ("state.db", ".anvil", "-wal", "-shm", "://"):
+            assert marker not in lowered, f"run-context value {value!r} leaked {marker!r}"
+
+
+#: The proven-leak corpus (state-context-operations security lens): every one of
+#: these classes was demonstrated to ride UNSCRUBBED through the run-context
+#: response before the untrusted channel was routed through the hardened
+#: config-class scrubber.  Each is a shape the transcript credential scrub
+#: (``redact_text``) misses -- so a revert of the untrusted-prose scrub or the
+#: API last-hop back to ``redact_text`` MUST make the assertions below fail.
+_RUN_CONTEXT_LEAK_CORPUS = {
+    "AKIA-no-separator": "AKIAIOSFODNN7EXAMPLE",
+    "JWT": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    "PEM-private-key": "-----BEGIN RSA PRIVATE KEY-----MIIBdeadbeefCAFE-----END RSA PRIVATE KEY-----",
+    "ip:port": "100.64.0.5:8443",
+    "postgres-url": "postgres://svc:pw@db.internal:5432/anvil",
+    "state.db-path": "/var/anvil/state.db",
+}
+
+
+def _corpus_field(prefix: str) -> str:
+    """Readable prose carrying every proven-leak class in one untrusted field."""
+    return prefix + " " + " ".join(_RUN_CONTEXT_LEAK_CORPUS.values())
+
+
+def _seeded_run_context_response_full_corpus() -> dict:
+    """Render a run-context response with the full corpus in EVERY untrusted field."""
+    from fastapi.testclient import TestClient
+
+    from _support import build_run_context
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.models import UntrustedEvidence, UntrustedTask, UntrustedTaskRef
+    from workbench.run_context_store import MemoryRunContextStore
+
+    context = build_run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=5),
+            title=_corpus_field("title"),
+            acceptance_criteria=(_corpus_field("criterion"),),
+            work_packet_digest="sha256:" + "8" * 64,
+            scope=(_corpus_field("scope"),),
+            verification_plan=(_corpus_field("verify"),),
+        ),
+        evidence=(
+            UntrustedEvidence(
+                citation=_corpus_field("cite"),
+                summary=_corpus_field("summary"),
+            ),
+        ),
+    )
+    store = MemoryRunContextStore()
+    store.capture("project_a", context)
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    app = create_app(settings=settings, store=MemoryStore(), graph=NullGraph(), run_context_store=store)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/projects/project_a/runs/{context.run_id}/context",
+            headers={"X-Workbench-Actor": "operator"},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["context"]
+
+
+def test_run_context_untrusted_prose_scrubs_full_proven_leak_corpus():
+    # Security lens (proven end-to-end): a secret/host-path/DB-URL/PEM/JWT/AKIA
+    # seeded into ANY untrusted PRD/task/acceptance/scope/evidence prose field
+    # must NOT render through GET .../runs/{run_id}/context. Each class is a
+    # separate negative assertion with its class marker, so a revert of the
+    # untrusted-channel scrub back to the transcript scrub fails this test.
+    context = _seeded_run_context_response_full_corpus()
+
+    # The trusted structure is left byte-for-byte as captured (no over-redaction).
+    assert context["trusted"]["trust"] == "trusted_execution_policy"
+    assert context["untrusted"]["content_trust"] == "untrusted_task_data"
+
+    blob = json.dumps(context)
+    for marker, literal in _RUN_CONTEXT_LEAK_CORPUS.items():
+        assert literal not in blob, f"untrusted run-context prose leaked a {marker!r} value: {literal!r}"
+
+    # Distinctive fragments (a partial leak is still a leak) are gone too.
+    for fragment in ("AKIAIOSFODNN7", "eyJhbGci", "BEGIN RSA PRIVATE KEY", "100.64.0.5", "db.internal", "state.db"):
+        assert fragment not in blob, f"untrusted run-context prose leaked fragment {fragment!r}"
+
+    # And the untrusted channel actually carried a redaction marker (proof the
+    # scrub ran rather than the corpus silently vanishing).
+    untrusted_blob = json.dumps(context["untrusted"])
+    assert "[REDACTED" in untrusted_blob
+
+
+# --- system-health integration descriptors + observational posture audit
+# (preferences-configuration T003.1 / T008): every descriptor and posture check
+# is an observational display record whose closed field set structurally cannot
+# carry a secret, a raw endpoint URL, a local path, an approval, or an execution
+# surface; readable prose is scrubbed on construction; and the audit is
+# deterministic with stable check IDs. These are the shared fixtures that guard
+# BOTH the descriptor safety (T003.1) and the audit's no-mutation claim (T008
+# criterion 2, "proven by the same fixtures that guard T003"). --------------
+
+from _support import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+
+from workbench.config import Settings as _SHSettings
+from workbench.system_health import (
+    INTEGRATION_IDS as _SH_INTEGRATION_IDS,
+    IntegrationDescriptor as _SHDescriptor,
+    PostureCheck as _SHCheck,
+    build_integration_descriptors as _sh_build,
+    run_posture_audit as _sh_audit,
+)
+
+#: A field NAME here would betray a credential, endpoint, local path, or an
+#: approval/execution surface. The closed display shapes must expose none of
+#: them -- an observational descriptor can never become an actuator.
+_SH_FORBIDDEN_FIELD_MARKERS = (
+    "token", "secret", "password", "credential", "api_key", "apikey", "bearer",
+    "url", "uri", "endpoint", "host", "argv", "command", "cmd",
+    "approve", "approval", "execute", "exec", "mutate", "action",
+)
+
+#: The exact closed field set a descriptor may serialize. A field added outside
+#: this set (leak-by-addition) must fail, so the assertion is not a tautology.
+#: Imported from ``conftest`` so this list and its twin in ``test_api.py`` cannot
+#: drift apart (a single source of truth for the closed shape).
+_SH_ALLOWED_DESCRIPTOR_FIELDS = SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+#: The six things T003.1 requires every descriptor to expose, always present.
+_SH_REQUIRED_DESCRIPTOR_FIELDS = frozenset({
+    "state", "configured", "digest", "last_checked_at", "owner",
+    "dependencies", "remediation",
+})
+
+
+def _sh_settings(**overrides) -> _SHSettings:
+    base = dict(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=False,
+    )
+    base.update(overrides)
+    return _SHSettings(**base)
+
+
+def test_system_health_descriptor_exposes_the_required_closed_field_set():
+    # T003.1 criterion 1: each descriptor exposes configured state, version/
+    # digest, last check, safe owner, dependencies, and remediation -- and, by
+    # the closed allowlist, structurally nothing that names a credential, an
+    # endpoint, a local path, or an approval/execution surface.
+    descriptors = _sh_build(_sh_settings(), checked_at="2026-07-21T00:00:00Z", bridge_health="degraded")
+    seen_ids = {descriptor.integration_id for descriptor in descriptors}
+    # Every declared integration is described (T003.2 criterion 1 relies on this).
+    assert seen_ids == set(_SH_INTEGRATION_IDS)
+    for descriptor in descriptors:
+        data = descriptor.as_dict()
+        extra = set(data) - _SH_ALLOWED_DESCRIPTOR_FIELDS
+        assert not extra, f"descriptor leaked field(s) by addition: {sorted(extra)}"
+        missing = _SH_REQUIRED_DESCRIPTOR_FIELDS - set(data)
+        assert not missing, f"descriptor omits required field(s): {sorted(missing)}"
+        # version/digest: the digest is always present and content-addressed.
+        assert data["digest"].startswith("sha256:")
+        for key in data:
+            lowered = key.lower()
+            for marker in _SH_FORBIDDEN_FIELD_MARKERS:
+                assert marker not in lowered, f"descriptor field {key!r} looks like a {marker!r} surface"
+
+
+_BS = chr(92)  # a single backslash, kept out of the f-strings below.
+
+#: The full adversarial redaction corpus (three-lens finding 1): one probe per
+#: proven-leaking shape across all four declared classes. Each entry is
+#: ``(fragment, [tokens that must be gone], expected marker)``. Every fragment is
+#: a shape a NARROWED scrub returned unchanged, so each is an independent
+#: negative assertion -- reverting ``redact_config_text`` to the old patterns
+#: must make at least one of these fail.
+_SH_REDACTION_CORPUS = (
+    # --- credentials / secrets ---
+    ("AKIAIOSFODNN7EXAMPLE", ["AKIAIOSFODNN7EXAMPLE"], "[REDACTED]"),
+    ("aws_secret_access_key=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+     ["wJalrXUtnFEMI", "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"], "[REDACTED]"),
+    ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dozjgNryP4J3jVmNHl0w",
+     ["eyJhbGci", "eyJzdWIi"], "[REDACTED]"),
+    ("-----BEGIN RSA PRIVATE KEY-----MIIEpQIBAAKCAQ-----END RSA PRIVATE KEY-----",
+     ["MIIEpQIBAAKCAQ", "BEGIN RSA PRIVATE KEY"], "[REDACTED]"),
+    # --- sensitive raw URLs / endpoints ---
+    ("reach it at 100.64.0.5:8443 today", ["100.64.0.5"], "[REDACTED-URL]"),
+    ("bolt db.tail1234.ts.net:7687", ["tail1234", "7687", "ts.net"], "[REDACTED-URL]"),
+    ("serving.tail1234.ts.net", ["serving.tail1234", "ts.net"], "[REDACTED-URL]"),
+    ("jump to //internalhost/admin now", ["//internalhost"], "[REDACTED-URL]"),
+    ("Server=db.internal;Password=hunter2;", ["db.internal", "hunter2"], "[REDACTED-URL]"),
+    ("https://100.87.34.66:8000/v1", ["100.87.34.66", "://"], "[REDACTED-URL]"),
+    # --- local paths ---
+    ("path=/etc/anvil/secret.conf", ["/etc/anvil"], "[REDACTED-PATH]"),
+    ("file:/var/lib/secrets/key", ["/var/lib/secrets"], "[REDACTED-PATH]"),
+    ("see (/opt/anvil/private) here", ["/opt/anvil"], "[REDACTED-PATH]"),
+    (_BS + _BS + "fileserver" + _BS + "secrets", ["fileserver"], "[REDACTED-PATH]"),
+    ("C:" + _BS + "Users" + _BS + "me" + _BS + "creds.json", ["Users" + _BS + "me"], "[REDACTED-PATH]"),
+    ("key at ~/.ssh/id_rsa here", ["~/.ssh", "id_rsa"], "[REDACTED-PATH]"),
+    ("load deploy/.env please", ["deploy/.env"], "[REDACTED-PATH]"),
+    ("certs/server.pem", ["certs/server.pem"], "[REDACTED-PATH]"),
+    ("prod.env", ["prod.env"], "[REDACTED-PATH]"),
+    ("backup.pem", ["backup.pem"], "[REDACTED-PATH]"),
+    ("/home/operator/private/key", ["/home/operator"], "[REDACTED-PATH]"),
+)
+
+
+def test_system_health_descriptor_scrubs_seeded_credential_url_and_path_on_construction():
+    # T003.1 criterion 2: the redaction layer removes ENTIRE declared classes --
+    # secrets/credentials, sensitive raw URLs/endpoints, AND local paths. Seed
+    # every proven-leaking shape (finding 1 corpus) into descriptor prose, one at
+    # a time, and prove each specific token is gone and its class marker present.
+    for fragment, gone_tokens, marker in _SH_REDACTION_CORPUS:
+        seeded = f"remediation prose {fragment} tail text"
+        descriptor = _SHDescriptor(
+            integration_id="anvil_serving", title="Anvil Serving model plane",
+            state="disabled", configured=False, owner="anvil-serving", remediation=seeded,
+        )
+        blob = json.dumps(descriptor.as_dict())
+        for token in gone_tokens:
+            assert token not in blob, f"{fragment!r}: leaked {token!r} -> {descriptor.remediation!r}"
+        assert marker in blob, f"{fragment!r}: expected {marker} -> {descriptor.remediation!r}"
+        # The digest commits to the scrubbed content, so it too is leak-free.
+        for token in gone_tokens:
+            assert token not in descriptor.digest
+        # Readable prose survives around the scrubbed shape.
+        assert "remediation prose" in descriptor.remediation and "tail text" in descriptor.remediation
+
+    # A single descriptor carrying one of every class at once is fully scrubbed.
+    seeded = (
+        "token=supersecretvalue reach it at https://100.87.34.66:8000/v1 "
+        "win C:" + _BS + "Users" + _BS + "me" + _BS + "creds.json "
+        "posix /home/operator/private/key"
+    )
+    descriptor = _SHDescriptor(
+        integration_id="anvil_serving", title="Anvil Serving model plane",
+        state="disabled", configured=False, owner="anvil-serving", remediation=seeded,
+    )
+    blob = json.dumps(descriptor.as_dict())
+    assert "supersecretvalue" not in blob and "[REDACTED]" in blob
+    assert "100.87.34.66" not in blob and "://" not in blob and "[REDACTED-URL]" in blob
+    assert "Users" + _BS + "me" not in blob and "/home/operator" not in blob and "[REDACTED-PATH]" in blob
+    assert "supersecretvalue" not in descriptor.digest
+
+
+def test_unconfigured_integrations_report_truthful_disabled_states_with_safe_remediation():
+    # T003.1 criterion 4: an all-unset deployment yields truthful disabled
+    # descriptors (never a false "ready"), each with non-empty remediation that
+    # carries no secret, URL, or path -- only safe public env-var names.
+    descriptors = _sh_build(_sh_settings(), checked_at="2026-07-21T00:00:00Z", bridge_health=None)
+    for descriptor in descriptors:
+        assert descriptor.state == "disabled"
+        assert descriptor.configured is False
+        assert descriptor.remediation
+        lowered = descriptor.remediation.lower()
+        for marker in ("[redacted]", "://", "supersecret"):
+            assert marker not in lowered, f"remediation leaked {marker!r}: {descriptor.remediation!r}"
+
+
+def test_system_health_descriptor_construction_is_read_only_and_has_no_effect_surface():
+    # T003.1 criterion 3: descriptor construction can neither trigger nor approve
+    # a change. The frozen value has no mutator and no effect field; the type
+    # rejects an unknown integration and a self-dependency (an id can never carry
+    # a smuggled edge), so it is purely observational.
+    descriptor = _sh_build(_sh_settings(), checked_at="2026-07-21T00:00:00Z")[0]
+    with pytest.raises(Exception):
+        descriptor.state = "ready"  # frozen: cannot mutate observed state
+    with pytest.raises(ValueError, match="unknown integration_id"):
+        _SHDescriptor(
+            integration_id="run_codex", title="x", state="ready", configured=True,
+            owner="operator", remediation="x",
+        )
+    with pytest.raises(ValueError, match="depend on itself"):
+        _SHDescriptor(
+            integration_id="anvil_serving", title="x", state="ready", configured=True,
+            owner="anvil-serving", remediation="x", dependencies=("anvil_serving",),
+        )
+
+
+def test_posture_audit_is_deterministic_with_stable_ids_and_no_secret_or_path():
+    # T008 criterion 1: every check has a stable id and a deterministic result
+    # for identical configuration, with remediation free of secrets and paths.
+    # Configure the plane with secret-shaped VALUES; the audit reads only
+    # booleans, so no value can reach a finding.
+    settings = _sh_settings(
+        anvil_router_base_url="https://100.87.34.66:8000/v1",
+        anvil_router_token="sk-live-DEADBEEFsupersecret",
+        neo4j_password="/var/secrets/neo4j.pass",
+        allow_insecure_dev_actor=True,
+    )
+    first = _sh_audit(settings, checked_at="2026-07-21T00:00:00Z", bridge_health="degraded")
+    # Determinism: a different observation time yields byte-identical findings.
+    second = _sh_audit(settings, checked_at="2099-12-31T23:59:59Z", bridge_health="degraded")
+    assert first.findings() == second.findings()
+    ids = [check.check_id for check in first.checks]
+    assert ids == sorted(ids) and len(ids) == len(set(ids))  # stable, unique, ordered
+    assert "posture.security.insecure_dev_actor" in ids
+    blob = json.dumps(first.findings())
+    for leaked in ("supersecret", "DEADBEEF", "100.87.34.66", "/var/secrets", "://"):
+        assert leaked not in blob, f"posture finding leaked {leaked!r}"
+    # Each finding's status is a bounded enum -- never a raw internal string.
+    for check in first.checks:
+        assert check.status in {"ok", "attention", "disabled"}
+
+
+def test_posture_check_rejects_a_smuggled_execution_shaped_id():
+    # T008: a check id is a stable observational label, not a command name; the
+    # grammar requires the dotted ``posture.<segment>`` form, so a finding can
+    # never smuggle an executable/approval token through its identifier. A
+    # command with an argument, AND a bare command-shaped id with no dotted
+    # ``posture.`` prefix, are both refused (the grammar is genuinely dotted-only,
+    # not merely space-free).
+    for smuggled in ("run_codex --now", "run_codex", "merge_and_accept", "posture"):
+        with pytest.raises(ValueError, match="check_id is invalid"):
+            _SHCheck(check_id=smuggled, title="x", status="ok", severity="info", remediation="x")
+    # The real dotted ids the audit emits stay valid.
+    for good in ("posture.integration.anvil_serving", "posture.security.insecure_dev_actor"):
+        assert _SHCheck(check_id=good, title="x", status="ok", severity="info", remediation="x").check_id == good
