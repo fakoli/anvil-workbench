@@ -378,42 +378,172 @@ def test_deliver_intent_digest_domain_rejects_floats() -> None:
 
 def test_task_reference_validator_trust_root_fails_closed(monkeypatch, tmp_path) -> None:
     contracts_module._reset_task_reference_contract_validator_cache()
-    monkeypatch.setattr(
-        contracts_module, "_TASK_REFERENCE_CONTRACT_SCHEMA_PATH", tmp_path / "absent.schema.json"
-    )
-    with pytest.raises(ContractValidationError, match="schema is unavailable"):
-        contracts_module.task_reference_contract_validator()
+    try:
+        monkeypatch.setattr(
+            contracts_module, "_TASK_REFERENCE_CONTRACT_SCHEMA_PATH", tmp_path / "absent.schema.json"
+        )
+        with pytest.raises(ContractValidationError, match="schema is unavailable"):
+            contracts_module.task_reference_contract_validator()
 
-    base = _load(SCHEMAS / "task-reference.v1.schema.json")
-    del base["$defs"]["source"]["additionalProperties"]
-    drifted = tmp_path / "drifted-reference.schema.json"
-    drifted.write_text(json.dumps(base), encoding="utf-8")
-    contracts_module._reset_task_reference_contract_validator_cache()
-    monkeypatch.setattr(contracts_module, "_TASK_REFERENCE_CONTRACT_SCHEMA_PATH", drifted)
-    with pytest.raises(ContractValidationError, match="no longer closes its source object"):
-        contracts_module.task_reference_contract_validator()
-    contracts_module._reset_task_reference_contract_validator_cache()
+        base = _load(SCHEMAS / "task-reference.v1.schema.json")
+        del base["$defs"]["source"]["additionalProperties"]
+        drifted = tmp_path / "drifted-reference.schema.json"
+        drifted.write_text(json.dumps(base), encoding="utf-8")
+        contracts_module._reset_task_reference_contract_validator_cache()
+        monkeypatch.setattr(contracts_module, "_TASK_REFERENCE_CONTRACT_SCHEMA_PATH", drifted)
+        with pytest.raises(ContractValidationError, match="no longer closes its source object"):
+            contracts_module.task_reference_contract_validator()
+    finally:
+        # Fail closed even if an assertion above raises: never leave a drifted
+        # validator cached to cascade into unrelated tests.
+        contracts_module._reset_task_reference_contract_validator_cache()
 
 
 def test_deliver_intent_validator_trust_root_fails_closed(monkeypatch, tmp_path) -> None:
     contracts_module._reset_deliver_intent_contract_validator_cache()
-    base = _load(SCHEMAS / "deliver-intent.v1.schema.json")
-    del base["properties"]["selections"]["additionalProperties"]
-    drifted = tmp_path / "drifted-intent.schema.json"
-    drifted.write_text(json.dumps(base), encoding="utf-8")
-    monkeypatch.setattr(contracts_module, "_DELIVER_INTENT_CONTRACT_SCHEMA_PATH", drifted)
-    with pytest.raises(ContractValidationError, match="no longer closes its selections object"):
-        contracts_module.deliver_intent_contract_validator()
-    contracts_module._reset_deliver_intent_contract_validator_cache()
+    try:
+        base = _load(SCHEMAS / "deliver-intent.v1.schema.json")
+        del base["properties"]["selections"]["additionalProperties"]
+        drifted = tmp_path / "drifted-intent.schema.json"
+        drifted.write_text(json.dumps(base), encoding="utf-8")
+        monkeypatch.setattr(contracts_module, "_DELIVER_INTENT_CONTRACT_SCHEMA_PATH", drifted)
+        with pytest.raises(ContractValidationError, match="no longer closes its selections object"):
+            contracts_module.deliver_intent_contract_validator()
+    finally:
+        contracts_module._reset_deliver_intent_contract_validator_cache()
 
 
 def test_delivery_eligibility_validator_trust_root_fails_closed(monkeypatch, tmp_path) -> None:
     contracts_module._reset_delivery_eligibility_contract_validator_cache()
-    base = _load(SCHEMAS / "delivery-eligibility.v1.schema.json")
-    del base["properties"]["reasons"]["items"]["additionalProperties"]
-    drifted = tmp_path / "drifted-eligibility.schema.json"
-    drifted.write_text(json.dumps(base), encoding="utf-8")
-    monkeypatch.setattr(contracts_module, "_DELIVERY_ELIGIBILITY_CONTRACT_SCHEMA_PATH", drifted)
-    with pytest.raises(ContractValidationError, match="no longer closes its reason object"):
-        contracts_module.delivery_eligibility_contract_validator()
-    contracts_module._reset_delivery_eligibility_contract_validator_cache()
+    try:
+        base = _load(SCHEMAS / "delivery-eligibility.v1.schema.json")
+        del base["properties"]["reasons"]["items"]["additionalProperties"]
+        drifted = tmp_path / "drifted-eligibility.schema.json"
+        drifted.write_text(json.dumps(base), encoding="utf-8")
+        monkeypatch.setattr(contracts_module, "_DELIVERY_ELIGIBILITY_CONTRACT_SCHEMA_PATH", drifted)
+        with pytest.raises(ContractValidationError, match="no longer closes its reason object"):
+            contracts_module.delivery_eligibility_contract_validator()
+    finally:
+        contracts_module._reset_delivery_eligibility_contract_validator_cache()
+
+
+# --------------------------------------------------------------------------- #
+# Digest-bearing timestamps and identifier fields must be pinned, not free
+# text: the production validators install no FormatChecker, so `format` alone
+# enforces nothing and maxLength+pattern must carry the whole load.
+# --------------------------------------------------------------------------- #
+
+
+def _errors_targeting(validator: Draft202012Validator, instance: dict, prop: str) -> list[ValidationError]:
+    return [err for err in validator.iter_errors(instance) if prop in list(err.absolute_path)]
+
+
+def test_intent_created_at_pattern_refuses_token_and_overlong_without_formatchecker() -> None:
+    # The reviewer validated an intent whose `created_at` smuggled a bearer
+    # token + shell command and a 5,073-char string, because `format:date-time`
+    # is inert without a FormatChecker (which the production validator omits).
+    # The pinned maxLength+pattern must refuse each, on the production path.
+    prod = contracts_module.deliver_intent_contract_validator()
+    assert prod.format_checker is None  # the hole the fix closes: no FormatChecker
+
+    for bad in (
+        "2026-07-20T12:00:00Z Bearer sk-ant-api03-REALKEY; git push --force",  # token + command
+        "2026-07-20T12:00:00" + "0" * 5073 + "Z",                              # 5,073-char string
+        "not-a-timestamp",                                                     # non-RFC3339 shape
+    ):
+        intent = _intent()
+        intent["created_at"] = bad
+        # Recompute the idempotency key so the ONLY remaining defect is the
+        # created_at value: the refusal is FOR this reason, not incidental.
+        intent["intent_digest"] = contract_digest("deliver-intent", intent)
+        errors = _errors_targeting(prod, intent, "created_at")
+        assert errors, f"created_at {bad!r} was not refused"
+        assert all(err.validator in {"pattern", "maxLength"} for err in errors)
+        with pytest.raises(ContractValidationError, match="not schema valid"):
+            validate_deliver_intent(intent)
+
+    # A well-formed RFC3339 created_at still validates end to end.
+    validate_deliver_intent(_intent())
+
+
+def test_receipt_run_timestamps_are_pinned_without_formatchecker() -> None:
+    # started_at and deadline are the receipt's equivalent digest-adjacent
+    # timestamp fields; they must be pinned identically to created_at.
+    prod = contracts_module.deliver_start_receipt_contract_validator()
+    assert prod.format_checker is None
+
+    bad_started = _start_receipt()
+    bad_started["run"]["started_at"] = "2026-07-20T12:00:01Z Bearer sk-ant-api03-REALKEY"
+    started_errors = _errors_targeting(prod, bad_started, "started_at")
+    assert started_errors and all(e.validator in {"pattern", "maxLength"} for e in started_errors)
+    with pytest.raises(ContractValidationError, match="not schema valid"):
+        validate_deliver_start_receipt(bad_started)
+
+    bad_deadline = _start_receipt()
+    bad_deadline["run"]["deadline"] = "2026-07-20T13:00:01" + "0" * 5073 + "Z"
+    deadline_errors = _errors_targeting(prod, bad_deadline, "deadline")
+    assert deadline_errors and all(e.validator in {"pattern", "maxLength"} for e in deadline_errors)
+    with pytest.raises(ContractValidationError, match="not schema valid"):
+        validate_deliver_start_receipt(bad_deadline)
+
+
+def test_workflow_revision_refuses_credential_shaped_free_text() -> None:
+    # `revision` was free text (maxLength only); the pinned charset pattern
+    # refuses a header/URL/whitespace-bearing credential shape and an overlong
+    # value.  (A bare identifier-charset token would still pass on charset
+    # alone — the revision is matched against the pinned workflow catalog
+    # downstream; the pattern's job here is to bar structured credential text.)
+    prod = contracts_module.deliver_intent_contract_validator()
+    for bad in (
+        "Bearer sk-ant-api03-REALKEY",   # header shape: space is refused
+        "https://serving.internal/tok",  # URL shape: ':' and '/' are refused
+        "x" * 65,                        # over the pinned length
+    ):
+        intent = _intent()
+        intent["selections"]["workflow"]["revision"] = bad
+        intent["intent_digest"] = contract_digest("deliver-intent", intent)
+        errors = _errors_targeting(prod, intent, "revision")
+        assert errors, f"revision {bad!r} was not refused"
+        assert all(e.validator in {"pattern", "maxLength"} for e in errors)
+
+    # A legitimate revision label still validates.
+    ok = _intent()
+    ok["selections"]["workflow"]["revision"] = "v1.2.3-rc_4"
+    ok["intent_digest"] = contract_digest("deliver-intent", ok)
+    validate_deliver_intent(ok)
+
+
+def test_intent_digest_is_stable_under_same_provider_catalog_reorder() -> None:
+    # Two same-provider catalog entries are schema-legal; sorting on provider
+    # alone left their order to decide the digest and broke the idempotency
+    # key.  Sorting on the full (provider, digest) tuple makes it stable.
+    intent = _intent()
+    intent["selections"]["catalogs"] = [
+        {"provider": "project-bridge", "digest": "sha256:" + "a" * 64},
+        {"provider": "project-bridge", "digest": "sha256:" + "b" * 64},
+    ]
+    intent["intent_digest"] = contract_digest("deliver-intent", intent)
+    validate_deliver_intent(intent)
+
+    reordered = copy.deepcopy(intent)
+    reordered["selections"]["catalogs"] = list(reversed(reordered["selections"]["catalogs"]))
+    assert contract_digest("deliver-intent", reordered) == intent["intent_digest"]
+    reordered["intent_digest"] = intent["intent_digest"]
+    validate_deliver_intent(reordered)  # the reversed intent is the same idempotent request
+
+
+def test_receipt_run_must_match_intent_workflow_and_profile_digests() -> None:
+    # A receipt claiming a run under a different workflow/profile than the
+    # intent selected must fail closed when the originating intent is supplied.
+    intent = _intent()
+    validate_deliver_start_receipt(_start_receipt(), intent)  # baseline agrees
+
+    wrong_workflow = _start_receipt()
+    wrong_workflow["run"]["workflow_digest"] = "sha256:" + "1" * 64
+    with pytest.raises(ContractValidationError, match="different workflow digest"):
+        validate_deliver_start_receipt(wrong_workflow, intent)
+
+    wrong_profile = _start_receipt()
+    wrong_profile["run"]["capability_profile_digest"] = "sha256:" + "2" * 64
+    with pytest.raises(ContractValidationError, match="different capability-profile digest"):
+        validate_deliver_start_receipt(wrong_profile, intent)

@@ -63,7 +63,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["content_trust", "title", "status"],
-      "description": "The redacted display projection for a task row or detail view (R003). Titles, statuses, and counts only; no raw command, path, token, or transcript is representable.",
+      "description": "The redacted display projection for a task row or detail view (R003). Titles, statuses, and counts only: it carries no structured path, command, token, or executable-workflow field. The free-text fields (`title`, `prd_title` on the hierarchy, `verification_summary`) are bounded, untrusted State-sourced display strings; per repo convention their safety is governed by redaction at bridge ingress, not by a pattern on this display record.",
       "properties": {
         "content_trust": {"const": "untrusted_task_data"},
         "title": {"type": "string", "maxLength": 500},

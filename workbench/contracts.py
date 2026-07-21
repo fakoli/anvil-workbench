@@ -714,7 +714,14 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
             payload["selections"] = selections
             catalogs = selections.get("catalogs")
             if isinstance(catalogs, list):
-                selections["catalogs"] = sorted(catalogs, key=lambda item: str(item.get("provider", "")))
+                # Sort by the full (provider, digest) tuple, mirroring skills'
+                # (id, digest) key.  Two same-provider catalog entries are
+                # schema-legal, so sorting on provider alone would leave their
+                # relative order to decide the digest and break the idempotency
+                # key; the full tuple makes the key order-independent.
+                selections["catalogs"] = sorted(
+                    catalogs, key=lambda item: (str(item.get("provider", "")), str(item.get("digest", "")))
+                )
             skills = selections.get("skills")
             if isinstance(skills, list):
                 selections["skills"] = sorted(
@@ -1275,7 +1282,9 @@ def validate_deliver_start_receipt(
     * a start receipt echoes the intent's ``intent_digest`` idempotency key, so a
       receipt can never be bound to a different intent than the one presented;
     * when the originating intent is supplied, the receipt's ``task_ref`` scopes
-      to the same task.
+      to the same task, and any run block must report the workflow and
+      capability-profile digests the intent actually selected — a run cannot
+      claim to have started under a different workflow or profile than approved.
     """
     try:
         deliver_start_receipt_contract_validator().validate(dict(receipt))
@@ -1296,6 +1305,20 @@ def validate_deliver_start_receipt(
         intent_ref = intent.get("task_ref")
         if isinstance(intent_ref, Mapping) and task_ref.get("scoped_id") != intent_ref.get("scoped_id"):
             raise ContractValidationError("deliver start receipt scopes to a different task than the intent")
+        run = receipt.get("run")
+        if isinstance(run, Mapping):
+            selections = intent.get("selections")
+            selections = selections if isinstance(selections, Mapping) else {}
+            workflow = selections.get("workflow")
+            expected_workflow_digest = workflow.get("digest") if isinstance(workflow, Mapping) else None
+            if run.get("workflow_digest") != expected_workflow_digest:
+                raise ContractValidationError(
+                    "deliver start receipt run claims a different workflow digest than the intent selected"
+                )
+            if run.get("capability_profile_digest") != selections.get("capability_profile_digest"):
+                raise ContractValidationError(
+                    "deliver start receipt run claims a different capability-profile digest than the intent selected"
+                )
 
 
 def validate_bridge_command_snapshot(
