@@ -8,6 +8,7 @@ import {
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
 } from './api'
 import { describeConversation, selectChatRoute, successorTurnBody, terminalToStatus } from './chat-api'
+import SettingsView from './settings-view'
 import {
   deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
   filterDescribedTasks, freshnessLabel, nextDeliverCandidate, progressSummaryLabel,
@@ -23,7 +24,7 @@ const emptyData = {
 // Chat is first and selected by default; Delivery stays reachable directly below
 // it (chat-first-voice T004.4). The order here IS the rendered nav order.
 const nav = [
-  ['Chat', '◇'], ['Delivery', '⌘'], ['Explorer', '▦'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'],
+  ['Chat', '◇'], ['Delivery', '⌘'], ['Explorer', '▦'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'], ['Settings', '⚙'],
   ['Evidence', '◈'], ['Skills', '✦'], ['Sandbox', '□'],
 ]
 
@@ -1100,13 +1101,15 @@ function App() {
   const addDirection = async (sessionId, text) => { const result = await addDirective(sessionId, text); if (result.recorded && result.event) { setData((current) => ({ ...current, directives: [...current.directives, result.event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.') } else { setNotice(`Direction was not recorded (${result.outcome}). No future work packet was changed.`) } await load() }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
   const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
-  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}`}>
+  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}`}>
     <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
     <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
       {notificationsOpen && <Notifications audit={data.audit || []} read={notificationsRead} onRead={() => setNotificationsRead(true)} />}
       {active === 'Chat'
         ? <div className="chat-grid"><ChatView append={setNotice} /></div>
+        : active === 'Settings'
+        ? <div className="settings-grid"><SettingsView data={data} append={setNotice} /></div>
         : active === 'Explorer'
         ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} /></div>
         : <div className="main-grid">
