@@ -4145,6 +4145,24 @@ def test_t006_apply_batch_rejects_a_malformed_value_before_any_commit():
     assert store.stored_values("personal", "alice")["personal.landing_surface"] == "dashboard"
 
 
+def test_t006_apply_batch_rejects_a_duplicate_key_within_one_batch():
+    # A duplicate (scope, scope_key, setting_id) in one batch would pass the SAME
+    # phase-1 version check twice and then double-commit; the store rejects it up
+    # front with a typed error and commits nothing (it is a public method even
+    # though the transfer service's classifier dedups before reaching it).
+    _, store = _cfg_seeded_store()
+    ops = [
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.landing_surface",
+         "op": "set", "value": "delivery", "expected_version": 1},
+        {"scope": "personal", "scope_key": "alice", "setting_id": "personal.landing_surface",
+         "op": "set", "value": "chat", "expected_version": 1},  # duplicate key
+    ]
+    with pytest.raises(PreferenceStoreError):
+        store.apply_batch(ops, "alice")
+    # Nothing committed — the original stored value is untouched.
+    assert store.stored_values("personal", "alice")["personal.landing_surface"] == "dashboard"
+
+
 def test_t006_closed_envelope_rejects_unknown_extension_and_bad_schema():
     validate_configuration_envelope({"schema_version": CONFIGURATION_EXPORT_SCHEMA_VERSION, "settings": []})
     for bad in (

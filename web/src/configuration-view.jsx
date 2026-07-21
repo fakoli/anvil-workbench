@@ -310,7 +310,10 @@ export default function ConfigurationView({ data, append }) {
   const notify = (message) => { setAnnounce(message); if (message) append?.(message) }
 
   return (
-    <main className="configuration" aria-label="Backup and transfer">
+    // A labeled region, NOT a second <main>: ConfigurationView renders alongside
+    // SettingsView (which owns the page's single <main>) in the Settings tab, so a
+    // <main> here would create two main landmarks on one page (acceptance N7).
+    <section className="configuration" aria-label="Backup and transfer">
       <div className="configuration-inner">
         <header className="configuration-header">
           <span className="crumb">Settings / backup &amp; transfer</span>
@@ -327,6 +330,6 @@ export default function ConfigurationView({ data, append }) {
         </div>
       </div>
       <div className="configuration-live" role="status" aria-live="polite">{announce}</div>
-    </main>
+    </section>
   )
 }

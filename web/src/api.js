@@ -713,7 +713,9 @@ async function classifyConfigurationApply(response, okStatus) {
   if (response.ok) {
     const body = await response.json()
     const applied = Array.isArray(body.applied) ? body.applied : []
-    return { status: okStatus, result: body, applied, appliedCount: applied.length, scope: body.scope }
+    // `scope` is the reset's single affected scope; `scopes` is the import's set of
+    // affected scope(s) so the applied result can report scope (T006.4 #3).
+    return { status: okStatus, result: body, applied, appliedCount: applied.length, scope: body.scope, scopes: body.scopes }
   }
   let body = {}
   try { body = await response.json() } catch { /* non-JSON error body */ }

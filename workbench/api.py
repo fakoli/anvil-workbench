@@ -1548,8 +1548,8 @@ def create_app(
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
-    configuration_transfer_service: ConfigurationTransferService | None = None,
     voice_relay_service: VoiceRelayService | None = None,
+    configuration_transfer_service: ConfigurationTransferService | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)

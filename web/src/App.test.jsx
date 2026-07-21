@@ -1710,9 +1710,19 @@ describe('Configuration backup & transfer workflows', () => {
     render(<App />)
     await screen.findByRole('button', { name: 'Settings' })
     await user.click(screen.getByRole('button', { name: 'Settings' }))
-    await screen.findByRole('main', { name: 'Backup and transfer' })
+    // A single <main> landmark per page: SettingsView owns it; the backup & transfer
+    // surface is a labeled region alongside it (acceptance N7), not a second <main>.
+    await screen.findByRole('region', { name: 'Backup and transfer' })
     return user
   }
+
+  it('renders a single main landmark in the Settings tab (backup & transfer is a region)', async () => {
+    await openSettings()
+    // SettingsView + the backup & transfer surface share one page; only ONE may be
+    // a <main> landmark (acceptance N7). The backup & transfer surface is a region.
+    expect(screen.getAllByRole('main')).toHaveLength(1)
+    expect(screen.getByRole('region', { name: 'Backup and transfer' })).toBeTruthy()
+  })
 
   it('states what is excluded from exports before any download control is shown', async () => {
     await openSettings()

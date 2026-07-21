@@ -52,18 +52,46 @@ export function summarizeExport(envelope) {
   }
 }
 
-// A defensive guard used in tests + before render: a serialized export must
-// expose NO secret / path / host:port / raw-actor identity. The actor_ref must be
-// the opaque `actorref:` token, never an email/slug. Returns true when clean.
+// The leak-shape detector applied ONLY to STRING values (never to a number, a
+// boolean, or JSON punctuation): a URL, a Windows/Unix path, a dotless host:port
+// (`serving:8443`), a password/secret/token/api-key marker, an AWS access-key id,
+// a PEM header, or an embedded `@` identity. A numeric setting value can never
+// trip this — it is not a string, so it is never scanned.
+const SUSPECT_STRING_VALUE = /(https?:\/\/|[a-z]:\\|\/(etc|var|home|opt|usr)\/|:\d{2,5}\b|password|secret|token|api[_-]?key|akia|-----BEGIN|@)/i
+
+// The opaque scope references are format-checked (below), not value-scanned: their
+// keyed hex is intentional and must not be walked by the string detector.
+const REDACTION_EXEMPT_KEYS = new Set(['actor_ref', 'project_ref'])
+
+// Walk the export structure and report whether any STRING value looks like a leak.
+// Numbers, booleans, and null never match; the opaque-ref keys are skipped.
+function hasSuspectStringValue(node) {
+  if (typeof node === 'string') return SUSPECT_STRING_VALUE.test(node)
+  if (Array.isArray(node)) return node.some(hasSuspectStringValue)
+  if (node && typeof node === 'object') {
+    return Object.entries(node).some(([key, value]) =>
+      REDACTION_EXEMPT_KEYS.has(key) ? false : hasSuspectStringValue(value))
+  }
+  return false
+}
+
+// A defensive guard used in tests + before render: an export must expose NO secret
+// / path / host:port / raw-actor / raw-project identity. It scans VALUES, not the
+// serialized JSON blob — so a portable INTEGER setting value (e.g.
+// `personal.chat_transcript_retention_days: 20`) can never be mistaken for a
+// `host:port` leak and wrongly withhold a legitimate export. The `actor_ref` and
+// `project_ref` are the opaque keyed tokens (`actorref:` / `projectref:`),
+// format-checked here rather than exempted, so a regression to a raw identity is
+// caught. Returns true when clean.
 export function exportIsRedacted(envelope) {
-  const suspect = /(https?:\/\/|[a-z]:\\|\/(etc|var|home|opt|usr)\/|:\d{2,5}\b|password|secret|token|api[_-]?key|akia|-----BEGIN|@)/i
-  const source = envelope?.source || {}
-  const actorRef = source.actor_ref || ''
-  if (actorRef && !/^actorref:[0-9a-f]{8,}$/.test(actorRef)) return false
-  // The whole serialized body must be free of leak shapes (the actor_ref hex is
-  // matched above and is safe; scan the rest).
-  const blob = JSON.stringify({ ...envelope, source: { ...source, actor_ref: undefined, project_ref: undefined } })
-  return !suspect.test(blob)
+  const source = (envelope && typeof envelope === 'object' && envelope.source) || {}
+  const actorRef = source.actor_ref
+  if (actorRef != null && !/^actorref:[0-9a-f]{8,}$/.test(String(actorRef))) return false
+  const projectRef = source.project_ref
+  if (projectRef != null && !/^projectref:[0-9a-f]{8,}$/.test(String(projectRef))) return false
+  // Scan only string values; a numeric/boolean value and JSON punctuation never
+  // trip the guard, and the opaque refs are format-checked above.
+  return !hasSuspectStringValue(envelope)
 }
 
 // Parse a pasted import envelope. Never trusts a filesystem path: the actor pastes
@@ -146,7 +174,11 @@ export function remediationFor(result) {
   const scope = result?.scope || 'selected'
   if (status === 'applied') {
     const n = Number.isInteger(result.appliedCount) ? result.appliedCount : (result.applied?.length ?? 0)
-    return `${n} preference${n === 1 ? '' : 's'} updated. Reopen Settings to see the resolved values.`
+    // Report the affected scope(s) (T006.4 #3: an import reports scope, result, and
+    // remediation, as a reset does). The scopes are carried from the apply result.
+    const scopes = Array.isArray(result.scopes) ? result.scopes.filter(Boolean) : []
+    const scopeLabel = scopes.length ? scopes.join(' and ') : scope
+    return `${n} preference${n === 1 ? '' : 's'} updated in your ${scopeLabel} scope${scopes.length > 1 ? 's' : ''}. Reopen Settings to see the resolved values.`
   }
   if (status === 'reset') {
     const n = Number.isInteger(result.appliedCount) ? result.appliedCount : (result.applied?.length ?? 0)

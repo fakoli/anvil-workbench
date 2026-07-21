@@ -100,6 +100,32 @@ describe('ConfigurationView backup & transfer workflows (T006.4)', () => {
     )
   })
 
+  it('reports the affected scope(s) in the import apply result (T006.4 #3)', async () => {
+    previewConfigurationImport.mockResolvedValue({ status: 'previewed', preview: {
+      valid: true,
+      creates: [{ setting_id: 'personal.time_format', scope: 'personal', value: 'format_12h' }],
+      changes: [{ setting_id: 'project.delivery_route', scope: 'project', from: 'route.delivery-heavy', to: 'route.chat-fast' }],
+      resets: [], skipped_read_only: [], unavailable_references: [], repairable: [], no_ops: [],
+      base_versions: { 'personal.time_format': 0, 'project.delivery_route': 1 },
+    } })
+    // The apply result carries the affected scope(s) so the result line can report scope.
+    applyConfigurationImport.mockResolvedValue({
+      status: 'applied',
+      result: { applied: [{ setting_id: 'personal.time_format', scope: 'personal' }, { setting_id: 'project.delivery_route', scope: 'project' }], scopes: ['personal', 'project'] },
+      applied: [{ setting_id: 'personal.time_format' }, { setting_id: 'project.delivery_route' }],
+      appliedCount: 2, scopes: ['personal', 'project'],
+    })
+    const user = userEvent.setup()
+    renderView()
+    const panel = screen.getByRole('region', { name: 'Import configuration' })
+    pasteImport(ENVELOPE_JSON)
+    await user.click(within(panel).getByRole('button', { name: 'Preview import' }))
+    await screen.findByRole('group', { name: 'Import preview' })
+    await user.click(within(panel).getByRole('button', { name: 'Apply import' }))
+    // The result line names both affected scopes and the next remediation.
+    expect(await within(panel).findByText(/updated in your personal and project scopes/i)).toBeTruthy()
+  })
+
   it('cannot apply an invalid import and names every repairable field', async () => {
     previewConfigurationImport.mockResolvedValue({ status: 'previewed', preview: {
       valid: false, creates: [], changes: [], resets: [], skipped_read_only: [], unavailable_references: [],

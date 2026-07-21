@@ -1481,9 +1481,13 @@ def test_configuration_export_is_closed_redacted_and_opaque_actor_ref():
     # The opaque actor ref is a keyed token, never the raw actor identity.
     assert body["source"]["actor_ref"].startswith("actorref:")
     assert "operator" not in body["source"]["actor_ref"]
-    # NO secret/path/host marker survives to the serialized export.
+    # S3: a project-scoped export references the project by the OPAQUE keyed token,
+    # never the raw project id — so a regression to a raw id is caught here.
+    assert body["source"]["project_ref"].startswith("projectref:")
+    assert "project_1" not in body["source"]["project_ref"]
+    # NO secret/path/host marker — and no raw project id — survives to the export.
     blob = resp.text
-    for marker in ("prod.pem", "deploy", "secrets", ":8443", "X-Api-Key"):
+    for marker in ("prod.pem", "deploy", "secrets", ":8443", "X-Api-Key", "project_1"):
         assert marker not in blob, marker
 
 
@@ -1627,6 +1631,47 @@ def test_configuration_scoped_reset_previews_applies_and_isolates_scopes():
     assert store.stored_values("deployment", "deployment") == before_deploy
     assert store.stored_values("policy", "policy") == before_policy
     assert any(a["action"] == "configuration.reset" for a in audit)
+
+
+def test_configuration_reset_preview_reports_exact_from_and_to_default_values():
+    # T006.3 #1: the reset preview reports the EXACT current value and the exact
+    # inherited default each setting falls back to — not merely the ids.
+    store = _seeded_store()
+    with _cfg_client(_cfg_service(store)) as test_client:
+        preview = test_client.post(
+            "/api/configuration/reset/preview", headers=_PREF_ACTOR, json={"scope": "personal"},
+        ).json()
+    by_id = {c["setting_id"]: c for c in preview["changes"]}
+    # personal.landing_surface: stored "dashboard" → its declared default "chat".
+    assert by_id["personal.landing_surface"]["from"] == "dashboard"
+    assert by_id["personal.landing_surface"]["to_default"] == "chat"
+    # personal.chat_transcript_retention_days: stored int 20 → its default int 30.
+    assert by_id["personal.chat_transcript_retention_days"]["from"] == 20
+    assert by_id["personal.chat_transcript_retention_days"]["to_default"] == 30
+
+
+def test_configuration_import_apply_result_reports_affected_scopes():
+    # T006.4 #3: an import apply reports the affected scope(s) (as a reset does), so
+    # the browser result line can state scope + result + remediation.
+    store = _seeded_store()
+    service = _cfg_service(store)
+    envelope = {"schema_version": _CFG_SCHEMA, "settings": [
+        {"setting_id": "personal.landing_surface", "value": "delivery"},        # personal change
+        {"setting_id": "project.delivery_route", "value": "route.chat-fast"},    # project change
+    ]}
+    with _cfg_client(service) as test_client:
+        preview = test_client.post(
+            "/api/configuration/import/preview", headers=_PREF_ACTOR,
+            json={"envelope": envelope, "project_id": "project_1"},
+        ).json()
+        applied = test_client.post(
+            "/api/configuration/import/apply", headers=_PREF_ACTOR,
+            json={"envelope": envelope, "project_id": "project_1", "base_versions": preview["base_versions"]},
+        )
+    assert applied.status_code == 200
+    body = applied.json()
+    # Both affected scopes are surfaced, sorted and de-duplicated.
+    assert body["scopes"] == ["personal", "project"]
 
 
 # --------------------------------------------------------------------------- #

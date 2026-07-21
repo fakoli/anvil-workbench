@@ -351,8 +351,12 @@ class ConfigurationTransferService:
         )
         results = self.preferences.apply_batch(operations, actor)
         self._record_audit("configuration.import", results)
+        applied = self._summarize(results)
         return {
-            "applied": self._summarize(results),
+            "applied": applied,
+            # The affected scope(s), carried from the applied ops so the result can
+            # report scope, result, and remediation (T006.4 #3), as a reset does.
+            "scopes": sorted({str(entry["scope"]) for entry in applied}),
             "creates": len(plan["creates"]),
             "changes": len(plan["changes"]),
             "resets": len(plan["resets"]),

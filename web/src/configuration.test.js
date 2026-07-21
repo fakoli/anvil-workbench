@@ -33,6 +33,42 @@ describe('configuration pure module (T006.4)', () => {
     expect(exportIsRedacted({ source: { actor_ref: 'actorref:0123456789ab' }, settings: [{ setting_id: 'x', value: 'https://serving:8443/secret' }] })).toBe(false)
   })
 
+  it('shows a clean export whose values include a portable INTEGER, and withholds a real leaked string', () => {
+    // MIRRORS the real served shape: the export carries a numeric setting value
+    // (`personal.chat_transcript_retention_days`, an int 1–90) ALONGSIDE a string
+    // value. Scanning VALUES (not the serialized blob) means `:20` is a number and
+    // can NEVER masquerade as a host:port — the export is shown, not withheld.
+    const served = {
+      schema_version: 'workbench-configuration-export/v1',
+      source: { scope: 'personal', actor_ref: 'actorref:0123456789abcdef', catalog_id: 'workbench.settings.initial' },
+      settings: [
+        { setting_id: 'personal.chat_transcript_retention_days', scope: 'personal', value: 20 },
+        { setting_id: 'personal.landing_surface', scope: 'personal', value: 'dashboard' },
+      ],
+    }
+    expect(exportIsRedacted(served)).toBe(true)
+    // A genuinely leaked dotless host:port inside a STRING value is still caught.
+    const leaked = { ...served, settings: [
+      { setting_id: 'personal.chat_transcript_retention_days', scope: 'personal', value: 20 },
+      { setting_id: 'x', scope: 'personal', value: 'serving:8443' },
+    ] }
+    expect(exportIsRedacted(leaked)).toBe(false)
+  })
+
+  it('format-checks the opaque project_ref so a regression to a raw project id is caught', () => {
+    // A project-scoped export carries an OPAQUE `projectref:` token; the clean case
+    // passes.
+    expect(exportIsRedacted({
+      source: { scope: 'personal+project', actor_ref: 'actorref:0123456789ab', project_ref: 'projectref:abcdef0123456789' },
+      settings: [{ setting_id: 'project.delivery_route', scope: 'project', value: 'route.delivery-heavy' }],
+    })).toBe(true)
+    // A raw project id leaked into project_ref is NOT the opaque shape → withheld.
+    expect(exportIsRedacted({
+      source: { scope: 'personal+project', actor_ref: 'actorref:0123456789ab', project_ref: 'project_1' },
+      settings: [],
+    })).toBe(false)
+  })
+
   it('parses a pasted envelope and rejects non-JSON / non-object input', () => {
     expect(parseImportEnvelope('   ').ok).toBe(false)
     expect(parseImportEnvelope('not json').ok).toBe(false)
@@ -81,6 +117,9 @@ describe('configuration pure module (T006.4)', () => {
 
   it('reports scope + result + next remediation, distinctly per status', () => {
     expect(remediationFor({ status: 'applied', appliedCount: 2 })).toMatch(/2 preferences updated/)
+    // An applied import reports its affected scope(s), as a reset does (T006.4 #3).
+    expect(remediationFor({ status: 'applied', appliedCount: 1, scopes: ['personal'] })).toMatch(/updated in your personal scope\b/)
+    expect(remediationFor({ status: 'applied', appliedCount: 3, scopes: ['personal', 'project'] })).toMatch(/updated in your personal and project scopes/)
     expect(remediationFor({ status: 'reset', scope: 'personal', appliedCount: 1 })).toMatch(/personal preferences were reset/)
     expect(remediationFor({ status: 'stale' })).toMatch(/changed since you previewed/)
     expect(remediationFor({ status: 'invalid', message: 'fix it' })).toBe('fix it')

@@ -3003,11 +3003,21 @@ class MemoryPreferenceStore:
         record (a ``set``) or ``None`` (a ``reset``) for the caller's audit trail.
         """
         prepared: list[tuple[str, str, str, str, Any, int]] = []
+        seen_keys: set[tuple[str, str, str]] = set()
         with self._lock:
             # Phase 1 -- validate everything and check every version. NO mutation.
             for op in operations:
                 scope, scope_key = self._require_scope(op["scope"], op["scope_key"])
                 setting_id = op["setting_id"]
+                # A duplicate (scope, scope_key, setting_id) in one batch would pass
+                # the SAME phase-1 version check twice and then double-commit; reject
+                # it up front so the batch stays a single, unambiguous atomic apply.
+                batch_key = (scope, scope_key, setting_id)
+                if batch_key in seen_keys:
+                    raise PreferenceStoreError(
+                        f"duplicate operation for {setting_id!r} in scope {scope!r} within one batch"
+                    )
+                seen_keys.add(batch_key)
                 # Ownership/writability gate (cross-scope -> indistinct not-found,
                 # authority/env_only -> fail closed) exactly like a single write.
                 descriptor = self._writable_descriptor(scope, setting_id)
