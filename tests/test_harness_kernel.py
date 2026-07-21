@@ -1678,3 +1678,347 @@ def test_preferences_slice_integration_scope_stale_migration_and_fallback():
                      client.get("/api/preferences", headers=_PREF_API_ACTOR).json()["effective"]}
     fallback = effective["personal.default_chat_route"]
     assert fallback["source"] == "repaired" and fallback["value"] != "route.gone"
+
+
+# --------------------------------------------------------------------------- #
+# plan-task-delivery T002/T004/T005/T008 — delivery projection, atomic Deliver,
+# typed directive semantics.  These bind the store/logic layer; the router,
+# redaction, and release-ordering proofs live in test_api / test_security_contract
+# / test_release_workflow.
+# --------------------------------------------------------------------------- #
+
+import sys as _sys
+import threading as _threading
+
+from _support import load_example as _load_example
+from workbench.deliver import (
+    DeliverError,
+    DeliverPreconditions,
+    MemoryDeliverStartStore,
+)
+from workbench.delivery_projection import (
+    ApprovalBinding,
+    DeliveryImmutableError,
+    MemoryDeliveryProjectionStore,
+    NotEligibleError,
+    RunDisplayRow,
+    StaleEligibilityError,
+    UnknownDeliveryRecordError,
+)
+from workbench.directives import (
+    DIRECTIVE_OUTCOMES,
+    record_packet_inclusion,
+    session_directive_view,
+    submit_directive,
+)
+
+
+def _reference(prd_id: str = "release-alpha", snapshot_digest: str | None = None) -> dict:
+    ref = _load_example("task-reference.v1.json")
+    if prd_id != "release-alpha":
+        ref["ref"]["prd_id"] = prd_id
+        ref["scoped_id"] = f"{prd_id}:T001"
+        ref["run_label"] = f"{prd_id}:T001@r4"
+        ref["hierarchy"]["prd_id"] = prd_id
+        ref["summary"]["title"] = f"{prd_id} task"
+    if snapshot_digest is not None:
+        ref["source"]["snapshot_digest"] = snapshot_digest
+    return ref
+
+
+def _eligible_verdict(prd_id: str = "release-alpha") -> dict:
+    return {
+        "schema_version": "workbench-delivery-eligibility/v1",
+        "ref": {"prd_id": prd_id, "task_id": "T001", "prd_revision": 4},
+        "scoped_id": f"{prd_id}:T001",
+        "eligible": True,
+        "state": "eligible",
+        "reasons": [
+            {"class": "info", "code": "info.ready", "content_trust": "untrusted_task_data",
+             "explanation": "All dependencies are merged and the source is current."}
+        ],
+    }
+
+
+def _blocked_verdict(prd_id: str = "release-alpha") -> dict:
+    verdict = _load_example("delivery-eligibility.v1.json")
+    verdict["ref"]["prd_id"] = prd_id
+    verdict["scoped_id"] = f"{prd_id}:T001"
+    return verdict
+
+
+_DIGEST_A = "sha256:5ddaacfaf8405e6e3f0d0a920e0f1f2b20afadded4f8d98748fb42868da0ad2e"
+_DIGEST_B = "sha256:" + "b" * 64
+
+
+def test_ptd_t002_two_prds_same_task_id_never_collapse():
+    store = MemoryDeliveryProjectionStore()
+    store.capture_task_reference("proj", _reference("release-alpha"))
+    store.capture_task_reference("proj", _reference("release-beta"))
+    alpha = store.get_task_reference("proj", "release-alpha", "T001")
+    beta = store.get_task_reference("proj", "release-beta", "T001")
+    assert alpha["scoped_id"] == "release-alpha:T001"
+    assert beta["scoped_id"] == "release-beta:T001"
+    assert alpha["summary"]["title"] != beta["summary"]["title"]
+    assert [r["scoped_id"] for r in store.list_task_references("proj", "release-alpha")] == ["release-alpha:T001"]
+    assert [r["scoped_id"] for r in store.list_task_references("proj", "release-beta")] == ["release-beta:T001"]
+
+
+def test_ptd_t002_cross_project_lookup_is_indistinct_not_found():
+    store = MemoryDeliveryProjectionStore()
+    store.capture_task_reference("owner", _reference("release-alpha"))
+    with pytest.raises(UnknownDeliveryRecordError):
+        store.get_task_reference("intruder", "release-alpha", "T001")
+    with pytest.raises(UnknownDeliveryRecordError):
+        store.get_task_reference("owner", "release-alpha", "T099")
+
+
+def test_ptd_t002_eligibility_goes_stale_when_source_snapshot_advances():
+    store = MemoryDeliveryProjectionStore()
+    store.capture_task_reference("proj", _reference("release-alpha", _DIGEST_A))
+    store.capture_eligibility("proj", _eligible_verdict("release-alpha"))
+    fresh = store.get_eligibility("proj", "release-alpha", "T001")
+    assert fresh["state"] == "eligible" and fresh["eligible"] is True
+    assert store.eligibility_for_start("proj", "release-alpha", "T001", _DIGEST_A)["state"] == "eligible"
+
+    store.capture_task_reference("proj", _reference("release-alpha", _DIGEST_B))
+    stale = store.get_eligibility("proj", "release-alpha", "T001")
+    assert stale["state"] == "stale" and stale["eligible"] is False
+    assert stale["reasons"][0]["code"] == "stale.snapshot_superseded"
+    with pytest.raises(StaleEligibilityError):
+        store.eligibility_for_start("proj", "release-alpha", "T001", _DIGEST_B)
+
+    store.capture_task_reference("proj", _reference("release-alpha", _DIGEST_A))
+    store.capture_eligibility("proj", _eligible_verdict("release-alpha"))
+    with pytest.raises(StaleEligibilityError):
+        store.eligibility_for_start("proj", "release-alpha", "T001", _DIGEST_B)
+
+
+def test_ptd_t002_eligibility_for_start_fails_closed_when_not_eligible():
+    store = MemoryDeliveryProjectionStore()
+    store.capture_task_reference("proj", _reference("release-alpha", _DIGEST_A))
+    store.capture_eligibility("proj", _blocked_verdict("release-alpha"))
+    with pytest.raises(NotEligibleError):
+        store.eligibility_for_start("proj", "release-alpha", "T001", _DIGEST_A)
+
+
+def _run_row(run_id: str = "run_alpha_t001_0001", **overrides) -> RunDisplayRow:
+    defaults = dict(
+        run_id=run_id, run_label="release-alpha:T001@r4", scoped_id="release-alpha:T001",
+        prd_id="release-alpha", task_id="T001", prd_revision=4,
+        task_title="Add routed chat", prd_title="Chat-first Workbench",
+        status="running", attempt_label="attempt 1", started_at="2026-07-20T12:00:01Z",
+        workflow_digest="sha256:" + "0" * 64, capability_profile_digest="sha256:" + "4" * 64,
+    )
+    defaults.update(overrides)
+    return RunDisplayRow(**defaults)
+
+
+def test_ptd_t004_run_row_headline_is_pinned_title_and_immutable():
+    store = MemoryDeliveryProjectionStore()
+    row = store.capture_run_row("proj", _run_row())
+    assert row.headline == "Add routed chat"
+    assert row.as_dict()["headline"] == "Add routed chat"
+    store.capture_run_row("proj", _run_row())
+    with pytest.raises(DeliveryImmutableError):
+        store.capture_run_row("proj", _run_row(task_title="Renamed later"))
+    assert store.get_run_row("proj", "run_alpha_t001_0001").task_title == "Add routed chat"
+
+
+def test_ptd_t004_run_list_groups_filters_and_orders_attempts():
+    store = MemoryDeliveryProjectionStore()
+    store.capture_run_row("proj", _run_row("run_alpha_t001_0001", attempt_label="attempt 1",
+                                           started_at="2026-07-20T12:00:01Z", status="evidenced"))
+    store.capture_run_row("proj", _run_row("run_alpha_t001_0002", attempt_label="attempt 2",
+                                           started_at="2026-07-20T13:00:01Z", status="running"))
+    store.capture_run_row("proj", _run_row("run_beta_t001_0001", run_label="release-beta:T001@r4",
+                                           scoped_id="release-beta:T001", prd_id="release-beta",
+                                           task_title="beta task", status="queued",
+                                           started_at="2026-07-20T14:00:01Z"))
+    alpha = store.list_run_rows("proj", prd_id="release-alpha")
+    assert [r.run_id for r in alpha] == ["run_alpha_t001_0001", "run_alpha_t001_0002"]
+    assert [r.attempt_label for r in alpha] == ["attempt 1", "attempt 2"]
+    assert alpha[0].started_at != alpha[1].started_at
+    assert [r.run_id for r in store.list_run_rows("proj", status="running")] == ["run_alpha_t001_0002"]
+    assert len(store.list_run_rows("proj", capability_profile_digest="sha256:" + "4" * 64)) == 3
+    windowed = store.list_run_rows("proj", since="2026-07-20T12:30:00Z", until="2026-07-20T13:30:00Z")
+    assert [r.run_id for r in windowed] == ["run_alpha_t001_0002"]
+
+
+def test_ptd_t004_approval_binding_exposes_every_safe_binding():
+    store = MemoryDeliveryProjectionStore()
+    binding = ApprovalBinding(
+        approval_id="approval_alpha_0001", scoped_id="release-alpha:T001",
+        run_label="release-alpha:T001@r4", action="commit_pr", payload_hash="a" * 64,
+        bridge_id="bridge-1", expires_at="2026-07-20T13:00:01Z",
+        workflow_digest="sha256:" + "0" * 64, capability_profile_digest="sha256:" + "4" * 64,
+    )
+    store.capture_approval_binding("proj", binding)
+    served = store.get_approval_binding("proj", "approval_alpha_0001").as_dict()
+    assert set(served) == {
+        "approval_id", "scoped_id", "run_label", "action", "payload_hash",
+        "bridge_id", "expires_at", "workflow_digest", "capability_profile_digest",
+    }
+    with pytest.raises(DeliveryImmutableError):
+        store.capture_approval_binding("proj", dataclasses.replace(binding, action="force_push"))
+
+
+def _intent() -> dict:
+    return _load_example("deliver-intent.v1.json")
+
+
+def test_ptd_t005_start_is_idempotent_and_replays_without_relaunch():
+    store = MemoryDeliverStartStore()
+    launches: list[str] = []
+
+    def launch():
+        launches.append("x")
+        return store.default_run_block("run_release_alpha_t001_0001")
+
+    intent = _intent()
+    receipt, replayed = store.start(intent, launch=launch, preconditions=DeliverPreconditions())
+    assert receipt["status"] == "accepted" and replayed is False
+    run_id = receipt["run"]["run_id"]
+    again, replayed2 = store.start(intent, launch=launch, preconditions=DeliverPreconditions())
+    assert replayed2 is True and again["status"] == "duplicate"
+    assert again["run"]["run_id"] == run_id
+    assert len(launches) == 1
+    assert receipt["run"]["workflow_digest"] == intent["selections"]["workflow"]["digest"]
+    assert receipt["run"]["capability_profile_digest"] == intent["selections"]["capability_profile_digest"]
+
+
+def test_ptd_t005_precondition_failure_leaves_no_effect_and_is_ordered():
+    cases = [
+        (DeliverPreconditions(stale_snapshot=True), "deliver.stale_snapshot"),
+        (DeliverPreconditions(dependency_changed=True), "deliver.dependency_changed"),
+        (DeliverPreconditions(active_run=True), "deliver.active_run"),
+        (DeliverPreconditions(invalid_worktree=True), "deliver.invalid_worktree"),
+        (DeliverPreconditions(lease_lost=True), "deliver.lease_unavailable"),
+        (DeliverPreconditions(capability_missing=True), "deliver.capability_missing"),
+        (DeliverPreconditions(prd_unapproved=True), "deliver.prd_unapproved"),
+    ]
+    for preconditions, code in cases:
+        store = MemoryDeliverStartStore()
+        launched = []
+        receipt, replayed = store.start(
+            _intent(), launch=lambda: launched.append("x") or store.default_run_block("run_x_00001"),
+            preconditions=preconditions,
+        )
+        assert receipt["status"] == "denied" and replayed is False
+        assert receipt["error"]["code"] == code
+        assert launched == []
+        assert store.get_receipt(_intent()["intent_digest"]) is None
+
+    store = MemoryDeliverStartStore()
+    receipt, _ = store.start(
+        _intent(), launch=lambda: store.default_run_block("run_x_00001"),
+        preconditions=DeliverPreconditions(stale_snapshot=True, active_run=True, prd_unapproved=True),
+    )
+    assert receipt["error"]["code"] == "deliver.stale_snapshot"
+
+
+def test_ptd_t005_launch_failure_stays_retriable_no_fabricated_success():
+    store = MemoryDeliverStartStore()
+
+    def boom():
+        raise RuntimeError("codex launch failed")
+
+    with pytest.raises(RuntimeError):
+        store.start(_intent(), launch=boom, preconditions=DeliverPreconditions())
+    assert store.get_receipt(_intent()["intent_digest"]) is None
+
+    ok, replayed = store.start(
+        _intent(), launch=lambda: store.default_run_block("run_retry_0001"),
+        preconditions=DeliverPreconditions(),
+    )
+    assert ok["status"] == "accepted" and replayed is False
+
+
+def test_ptd_t005_concurrent_starts_launch_exactly_once():
+    store = MemoryDeliverStartStore()
+    launches: list[str] = []
+    barrier = _threading.Barrier(8)
+    results: list[tuple[dict, bool]] = []
+    lock = _threading.Lock()
+
+    def launch():
+        with lock:
+            launches.append("x")
+        return store.default_run_block("run_race_0001")
+
+    def worker():
+        barrier.wait()
+        outcome = store.start(_intent(), launch=launch, preconditions=DeliverPreconditions())
+        with lock:
+            results.append(outcome)
+
+    old = _sys.getswitchinterval()
+    _sys.setswitchinterval(1e-6)
+    try:
+        threads = [_threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        _sys.setswitchinterval(old)
+
+    assert len(launches) == 1
+    accepted = [r for r, replayed in results if not replayed]
+    duplicates = [r for r, replayed in results if replayed]
+    assert len(accepted) == 1 and len(duplicates) == 7
+    run_ids = {r["run"]["run_id"] for r, _ in results}
+    assert run_ids == {"run_race_0001"}
+
+
+def test_ptd_t005_tampered_intent_fails_closed_before_any_effect():
+    store = MemoryDeliverStartStore()
+    tampered = _intent()
+    tampered["selections"]["workflow"]["revision"] = "2"
+    with pytest.raises(DeliverError):
+        store.start(tampered, launch=lambda: store.default_run_block("run_x_00001"),
+                    preconditions=DeliverPreconditions())
+
+
+def _session_store():
+    store = MemoryStore()
+    project = store.create_project("demo", ".anvil")
+    session, workflow = store.create_session(project.id, "s", "checkout-a", delivery_workflow())
+    return store, session, workflow
+
+
+def test_ptd_t008_directive_outcomes_are_typed_and_append_only():
+    store, session, _ = _session_store()
+    ok = submit_directive(store, session.id, "Run the independent evidence check.", "operator")
+    assert ok["outcome"] == "directive.queued_pending" and ok["recorded"] is True
+    assert ok["event"].kind == "operator.directive"
+    empty = submit_directive(store, session.id, "   ", "operator")
+    assert empty["outcome"] == "directive.rejected_empty" and empty["recorded"] is False
+    toolong = submit_directive(store, session.id, "x" * 8001, "operator")
+    assert toolong["outcome"] == "directive.rejected_too_long" and toolong["recorded"] is False
+    unknown = submit_directive(store, "sess_missing", "hi", "operator")
+    assert unknown["outcome"] == "directive.rejected_unknown_session"
+    for result in (ok, empty, toolong, unknown):
+        assert result["outcome"] in DIRECTIVE_OUTCOMES
+    events = [e for e in store.list_workflow_events(session.id) if e.kind == "operator.directive"]
+    assert len(events) == 1
+
+
+def test_ptd_t008_pending_vs_packet_included_distinction():
+    store, session, _ = _session_store()
+    first = submit_directive(store, session.id, "first steer", "operator")["event"]
+    submit_directive(store, session.id, "second steer", "operator")
+    view = session_directive_view(store, session.id)
+    assert [d["content"] for d in view["pending"]] == ["first steer", "second steer"]
+    assert view["included"] == []
+    record_packet_inclusion(store, session.id, first.sequence)
+    view2 = session_directive_view(store, session.id)
+    assert [d["content"] for d in view2["included"]] == ["first steer"]
+    assert [d["content"] for d in view2["pending"]] == ["second steer"]
+
+
+def test_ptd_t008_directive_never_signals_a_bridge_effect():
+    store, session, _ = _session_store()
+    submit_directive(store, session.id, "please steer", "operator")
+    assert store.commands == {} or all(len(q) == 0 for q in store.commands.values())
+    assert store.list_runs() == []

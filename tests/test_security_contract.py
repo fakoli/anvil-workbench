@@ -1291,3 +1291,82 @@ def test_preference_store_refuses_approval_gated_write_without_an_approval():
     seeded = store.seed_authority_value("policy", "policy.transcript_retention_max_days", 120)
     assert seeded.value == 120
     assert store.get("policy", "policy", "policy.transcript_retention_max_days").value == 120
+
+
+# --------------------------------------------------------------------------- #
+# plan-task-delivery T002/T005 — no served delivery display record (redacted PRD
+# body, task title) and no Deliver start receipt (denied summary) can carry a
+# secret, endpoint, or local path.  The adversarial corpus mirrors the recurring
+# free-text redaction gate.
+# --------------------------------------------------------------------------- #
+
+from _support import load_example as _ptd_sec_load_example
+from workbench.contracts import contract_digest as _ptd_sec_contract_digest
+from workbench.deliver import DeliverRefusal as _PtdDeliverRefusal, MemoryDeliverStartStore as _PtdDeliverStore
+from workbench.delivery_projection import MemoryDeliveryProjectionStore as _PtdSecProjection
+from workbench.redaction import scrub_config_payload as _ptd_scrub
+
+_PTD_CORPUS = (
+    "AKIA1234567890ABCDEF", "token=supersecretvalue", "C:/Users/op/.anvil/state.db",
+    "/etc/anvil/prod.env", "eyJhbGciOiJI", "ghp_abcdefghijklmnopqrstuvwxyz012345",
+    "sk-proj-abcdefghijklmnop", "db.tail1234.ts.net:7687", "100.64.0.5", "hunter2",
+)
+
+
+def _ptd_leaky_text():
+    return (
+        "See AKIA1234567890ABCDEF and token=supersecretvalue at C:/Users/op/.anvil/state.db "
+        "and /etc/anvil/prod.env. JWT eyJhbGciOiJI.eyJzdWIi.sig ghp_abcdefghijklmnopqrstuvwxyz012345 "
+        "sk-proj-abcdefghijklmnop reaches db.tail1234.ts.net:7687 at 100.64.0.5:8443 Password=hunter2"
+    )
+
+
+def test_ptd_t002_served_prd_and_task_title_are_scrubbed_on_last_hop():
+    leaky = _ptd_leaky_text()
+    doc = {
+        "schema_version": "workbench-prd-content/v1", "content_digest": "sha256:" + "0" * 64,
+        "provider": "anvil-state", "generated_at": "2026-07-20T12:00:00Z",
+        "prd": {"prd_id": "release-alpha", "title": "Chat-first Workbench", "status": "approved", "revision": 4},
+        "content_trust": "untrusted_task_data",
+        "content": {"format": "markdown", "body": leaky, "truncated": False,
+                    "total_bytes": len(leaky.encode("utf-8"))},
+        "redaction": {"status": "redacted", "ruleset": "hub.default"},
+    }
+    doc["content_digest"] = _ptd_sec_contract_digest("prd-content", doc)
+    store = _PtdSecProjection()
+    store.capture_prd_content("proj", doc)
+    # Mirror the router's last hop: whatever the store returns is scrubbed.
+    served = _ptd_scrub({"content": store.get_prd_content("proj", "release-alpha")})
+    body = served["content"]["content"]["body"]
+    for secret in _PTD_CORPUS:
+        assert secret not in body, f"leak survived in served PRD body: {secret}"
+
+    ref = _ptd_sec_load_example("task-reference.v1.json")
+    ref["summary"]["title"] = "steal " + leaky
+    store.capture_task_reference("proj", ref)
+    served_ref = _ptd_scrub({"task": store.get_task_reference("proj", "release-alpha", "T001")})
+    title = served_ref["task"]["summary"]["title"]
+    for secret in _PTD_CORPUS:
+        assert secret not in title, f"leak survived in served task title: {secret}"
+
+
+def test_ptd_t005_denied_receipt_summary_never_leaks():
+    store = _PtdDeliverStore()
+    intent = _ptd_sec_load_example("deliver-intent.v1.json")
+    leaky_refusal = _PtdDeliverRefusal(
+        code="deliver.invalid_worktree",
+        safe_summary="blocked at C:/Users/op/.anvil/state.db token=supersecretvalue",
+        retryable=False,
+    )
+    receipt, _ = store.start(intent, launch=lambda: store.default_run_block("run_x_00001"),
+                             preconditions=lambda: leaky_refusal)
+    assert receipt["status"] == "denied"
+    summary = receipt["error"]["safe_summary"]
+    for secret in ("state.db", "supersecretvalue", "C:/Users"):
+        assert secret not in summary, f"leak survived in denied receipt: {secret}"
+    # And the accepted receipt carries only ids/digests/timestamps — the closed
+    # schema structurally admits no path/command/token field.
+    ok, _ = store.start(intent, launch=lambda: store.default_run_block("run_ok_000001"),
+                        preconditions=None)
+    assert set(ok["run"]) <= {"run_id", "workflow_digest", "capability_profile_digest",
+                              "started_at", "deadline", "traceparent"}
