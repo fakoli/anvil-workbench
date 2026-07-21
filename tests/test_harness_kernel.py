@@ -746,3 +746,389 @@ def test_concurrent_captures_for_one_run_admit_exactly_one_snapshot():
             assert len(errors) == 1, "exactly one contender must be refused as immutable"
     finally:
         sys.setswitchinterval(old_interval)
+
+
+# ---------------------------------------------------------------------------
+# Immediate bridge authority preflight (state-context-operations:T006.2)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone
+
+from workbench.bridge import (
+    OperationLeaseState,
+    PreflightedOperation,
+    preflight_operation_command,
+)
+from workbench.contracts import approval_payload_digest
+from workbench.models import OperationRef, OperationRefusal, TypedOperationError
+from workbench.store import (
+    MemoryOperationApprovalStore,
+    MemoryOperationReceiptStore,
+    OperationApprovalGrant,
+    OperationOutcome,
+    OperationReceiptRows,
+    OperationReceiptStoreError,
+    UnknownOutcomeError,
+)
+
+from _support import (
+    capability_profile_document,
+    invoke_operation_command,
+    local_catalogs,
+    operation_ref_for,
+    published_catalog_set,
+)
+
+_PREFLIGHT_NOW = datetime(2026, 7, 19, 0, 0, 0, tzinfo=timezone.utc)
+_SUBMIT_INPUTS = {"task_ref": "release-beta:T001", "verification_receipt_ids": ["rcpt_v"]}
+_COMMIT_INPUTS = {"diff_hash": "a" * 64, "branch": "codex/x", "title": "Anvil Workbench delivery", "base": "main"}
+
+
+def _lease_authority(epoch: int = 3, minutes: int = 5):
+    def authority(worktree_name: str) -> OperationLeaseState:
+        return OperationLeaseState(worktree_name, epoch, _PREFLIGHT_NOW + timedelta(minutes=minutes))
+
+    return authority
+
+
+def _non_gated_command(snapshot):
+    return invoke_operation_command(
+        snapshot, operation_id="state.evidence.submit", inputs=_SUBMIT_INPUTS,
+    )
+
+
+def _gated_command(snapshot, *, grant_id: str = "approval_typedop_00000001", inputs=None):
+    inputs = inputs if inputs is not None else _COMMIT_INPUTS
+    return invoke_operation_command(
+        snapshot, operation_id="bridge.github.commit_pr", inputs=inputs,
+        grant_id=grant_id, action="commit_pr", payload_hash=approval_payload_digest(inputs),
+    )
+
+
+def test_preflight_passes_for_a_valid_non_gated_operation():
+    snapshot = compile_delivery_snapshot()
+    result = preflight_operation_command(
+        _non_gated_command(snapshot), catalogs=local_catalogs(), profile=capability_profile_document(),
+        lease_authority=_lease_authority(), now=_PREFLIGHT_NOW,
+    )
+    assert isinstance(result, PreflightedOperation)
+    assert result.bridge_adapter == "state.cli.submit_evidence"
+    assert result.effect == "state_mutation"
+    assert result.lease_epoch == 3
+    assert result.approval_grant_id is None
+
+
+def test_preflight_refuses_an_expired_command():
+    snapshot = compile_delivery_snapshot()
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            _non_gated_command(snapshot), catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), now=_PREFLIGHT_NOW + timedelta(hours=1),
+        )
+    assert excinfo.value.code == "command.expired"
+
+
+def test_preflight_refuses_a_missing_lease():
+    snapshot = compile_delivery_snapshot()
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            _non_gated_command(snapshot), catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=lambda name: None, now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "lease.missing"
+
+
+def test_preflight_rechecks_the_lease_expiry_immediately_before_the_effect():
+    # The lease was valid when the command issued but the live authority now
+    # reports it expired -- the immediate recheck stops the effect.
+    snapshot = compile_delivery_snapshot()
+    expired = lambda name: OperationLeaseState(name, 3, _PREFLIGHT_NOW - timedelta(seconds=1))
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            _non_gated_command(snapshot), catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=expired, now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "lease.expired"
+
+
+def test_preflight_refuses_a_fenced_out_lease_epoch():
+    snapshot = compile_delivery_snapshot()
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            _non_gated_command(snapshot), catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(epoch=9), now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "lease.epoch_mismatch"
+
+
+def test_preflight_refuses_a_drifted_local_catalog_digest():
+    snapshot = compile_delivery_snapshot()
+    command = _non_gated_command(snapshot)
+    for entry in command["workflow_snapshot"]["catalogs"]:
+        if entry["provider"] == "anvil-state":
+            entry["digest"] = "sha256:" + "0" * 64
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "operation.digest_drift"
+
+
+def test_preflight_refuses_a_changed_work_packet():
+    snapshot = compile_delivery_snapshot()
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            _non_gated_command(snapshot), catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), now=_PREFLIGHT_NOW,
+            pinned_work_packet_digest="sha256:" + "8" * 64,
+            current_work_packet_digest="sha256:" + "9" * 64,
+        )
+    assert excinfo.value.code == "work_packet.digest_changed"
+
+
+def test_preflight_refuses_an_undeclared_input_field():
+    snapshot = compile_delivery_snapshot()
+    command = _non_gated_command(snapshot)
+    command["payload"]["inputs"]["command"] = "rm -rf /"
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "operation.input_invalid"
+
+
+def test_preflight_gated_operation_consumes_a_one_time_hash_bound_approval():
+    snapshot = compile_delivery_snapshot()
+    command = _gated_command(snapshot)
+    approvals = MemoryOperationApprovalStore()
+    approvals.grant(
+        "approval_typedop_00000001", "commit_pr", approval_payload_digest(_COMMIT_INPUTS),
+        "bridge_example", "project_example",
+    )
+    result = preflight_operation_command(
+        command, catalogs=local_catalogs(), profile=capability_profile_document(),
+        lease_authority=_lease_authority(), approval_consumer=approvals, now=_PREFLIGHT_NOW,
+    )
+    assert result.bridge_adapter == "bridge.github.commit_pr"
+    assert result.approval_grant_id == "approval_typedop_00000001"
+    # The grant is one-time: a replay of the identical command fails closed.
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), approval_consumer=approvals, now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "approval.invalid"
+
+
+def test_preflight_gated_operation_refuses_a_missing_grant():
+    snapshot = compile_delivery_snapshot()
+    command = _gated_command(snapshot)
+    del command["payload"]["approval"]
+    del command["approval_grant_id"]
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), approval_consumer=MemoryOperationApprovalStore(),
+            now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "approval.missing"
+
+
+def test_preflight_gated_operation_refuses_a_hash_that_does_not_bind_the_inputs():
+    snapshot = compile_delivery_snapshot()
+    command = _gated_command(snapshot)
+    # Tamper the inputs after the approval hash was computed over the originals.
+    command["payload"]["inputs"]["branch"] = "codex/evil"
+    approvals = MemoryOperationApprovalStore()
+    approvals.grant(
+        "approval_typedop_00000001", "commit_pr", approval_payload_digest(_COMMIT_INPUTS),
+        "bridge_example", "project_example",
+    )
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), approval_consumer=approvals, now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "approval.hash_mismatch"
+
+
+def test_preflight_gated_operation_refuses_an_approval_action_that_differs_from_the_gate():
+    # bridge.py preflight step 6 binds the descriptor's gates.approval_action: an
+    # approval carrying a DIFFERENT action (e.g. a merge_and_accept grant replayed
+    # onto a commit_pr operation) is refused with the stable
+    # approval.action_mismatch code, BEFORE the hash bind or the one-time consume.
+    snapshot = compile_delivery_snapshot()
+    command = invoke_operation_command(
+        snapshot, operation_id="bridge.github.commit_pr", inputs=_COMMIT_INPUTS,
+        grant_id="approval_typedop_00000001", action="merge_and_accept",
+        payload_hash=approval_payload_digest(_COMMIT_INPUTS),
+    )
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), approval_consumer=MemoryOperationApprovalStore(),
+            now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "approval.action_mismatch"
+
+
+def test_preflight_gated_operation_refuses_a_cross_bridge_grant():
+    snapshot = compile_delivery_snapshot()
+    command = _gated_command(snapshot)
+    approvals = MemoryOperationApprovalStore()
+    # Grant bound to a DIFFERENT bridge/project than the command carries.
+    approvals.grant(
+        "approval_typedop_00000001", "commit_pr", approval_payload_digest(_COMMIT_INPUTS),
+        "other_bridge", "other_project",
+    )
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), approval_consumer=approvals, now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "approval.invalid"
+
+
+# ---------------------------------------------------------------------------
+# Idempotent typed receipts + reconciliation records (state-context-operations:T006.3)
+# ---------------------------------------------------------------------------
+
+
+def _submit_operation() -> OperationRef:
+    return OperationRef(**operation_ref_for("state.evidence.submit"))
+
+
+def test_unknown_outcome_files_exactly_one_reconciliation_and_is_never_retried():
+    store = MemoryOperationReceiptStore()
+    operation = _submit_operation()
+    executions = {"n": 0}
+
+    def interrupted() -> OperationOutcome:
+        executions["n"] += 1
+        raise UnknownOutcomeError(
+            "the external merge outcome is unknown", external_ref={"pr": "gh:1"}, reason="interrupted",
+        )
+
+    receipt, replayed = store.record_attempt(
+        run_id="run_1", command_id="cmd_1", operation=operation,
+        idempotency_key="run:run_1:merge:1", executor=interrupted,
+    )
+    assert receipt["status"] == "reconciliation_required"
+    assert replayed is False
+    items = store.list_reconciliations()
+    assert len(items) == 1
+    assert items[0]["reason"] == "interrupted"
+
+    # A replay must NOT re-run the unknown external effect; it returns the stored
+    # reconciliation receipt and files no second reconciliation item.
+    receipt2, replayed2 = store.record_attempt(
+        run_id="run_1", command_id="cmd_1", operation=operation,
+        idempotency_key="run:run_1:merge:1", executor=interrupted,
+    )
+    assert executions["n"] == 1
+    assert replayed2 is True
+    assert receipt2["receipt_id"] == receipt["receipt_id"]
+    assert len(store.list_reconciliations()) == 1
+
+
+def test_every_attempt_reaches_a_typed_terminal_receipt_or_reconciliation():
+    store = MemoryOperationReceiptStore()
+    operation = _submit_operation()
+
+    ok, _ = store.record_attempt(
+        run_id="r", command_id="c", operation=operation, idempotency_key="k-ok",
+        executor=lambda: OperationOutcome("succeeded", evidence_refs=("state_event_x",)),
+    )
+    denied, _ = store.record_attempt(
+        run_id="r", command_id="c", operation=operation, idempotency_key="k-denied",
+        executor=lambda: OperationOutcome("denied", error=OperationRefusal("operation.digest_drift", "stale")),
+    )
+    unknown, _ = store.record_attempt(
+        run_id="r", command_id="c", operation=operation, idempotency_key="k-unknown",
+        executor=lambda: OperationOutcome("unknown", external_ref={"pr": "gh:2"}),
+    )
+    assert ok["status"] == "succeeded"
+    assert denied["status"] == "denied"
+    assert denied["redaction"]["status"] == "metadata_only"
+    assert unknown["status"] == "reconciliation_required"
+
+
+def test_concurrent_same_key_attempts_execute_the_effect_exactly_once():
+    """A contended check-then-act on one idempotency key must execute the effect
+    exactly ONCE; the loser replays the committed receipt, never re-runs it.
+
+    The check->act gap is made real (not just asserted) by a ``receipts`` dict
+    whose ``get`` sleeps between the existence check and the write, and by driving
+    two barrier-synchronized workers at a 1e-6 thread switch interval across 15
+    rounds.  Without the store's synchronization both workers would pass the
+    ``None`` existence check and run the executor, so the committed
+    ``executions == 1`` assertion is what proves the effect is serialized; the
+    paired assertions prove both attempts resolve to the one receipt with exactly
+    one first-runner and one replayer.
+    """
+    import sys
+    import threading
+    import time
+
+    class YieldingDict(dict):
+        def get(self, key, default=None):  # noqa: D401
+            value = super().get(key, default)
+            time.sleep(0.002)  # force a preemption point inside the critical section
+            return value
+
+    operation = _submit_operation()
+    old_interval = sys.getswitchinterval()
+    try:
+        sys.setswitchinterval(1e-6)
+        for _ in range(15):
+            store = MemoryOperationReceiptStore(OperationReceiptRows(receipts=YieldingDict()))
+            executions = {"n": 0}
+            exec_lock = threading.Lock()
+            start = threading.Barrier(2)
+            outcomes: list[tuple[str, bool]] = []
+            outcomes_lock = threading.Lock()
+
+            def executor() -> OperationOutcome:
+                with exec_lock:
+                    executions["n"] += 1
+                time.sleep(0.001)
+                return OperationOutcome("succeeded", external_ref={"state_event_id": "evt_1"})
+
+            def worker() -> None:
+                start.wait()
+                receipt, replayed = store.record_attempt(
+                    run_id="run_1", command_id="cmd_1", operation=operation,
+                    idempotency_key="k-race", executor=executor,
+                )
+                with outcomes_lock:
+                    outcomes.append((receipt["receipt_id"], replayed))
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            assert executions["n"] == 1, "the effect must execute exactly once under contention"
+            assert len({rid for rid, _ in outcomes}) == 1, "both attempts resolve to one receipt"
+            assert sorted(replayed for _, replayed in outcomes) == [False, True]
+    finally:
+        sys.setswitchinterval(old_interval)
+
+
+def test_operation_approval_grant_is_one_time_and_hash_bound():
+    approvals = MemoryOperationApprovalStore()
+    payload_hash = approval_payload_digest(_COMMIT_INPUTS)
+    approvals.grant("approval_g1", "commit_pr", payload_hash, "bridge_1", "project_1")
+
+    approvals.consume("approval_g1", "commit_pr", payload_hash, "bridge_1", "project_1")
+    # Replay of the consumed grant fails closed.
+    with pytest.raises(OperationReceiptStoreError, match="already consumed"):
+        approvals.consume("approval_g1", "commit_pr", payload_hash, "bridge_1", "project_1")
+
+    # A different-payload consume on a fresh grant fails closed (hash binding).
+    approvals.grant("approval_g2", "commit_pr", payload_hash, "bridge_1", "project_1")
+    with pytest.raises(OperationReceiptStoreError, match="payload hash"):
+        approvals.consume("approval_g2", "commit_pr", "sha256:" + "b" * 64, "bridge_1", "project_1")

@@ -25,6 +25,9 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from datetime import datetime, timezone
+
+from .models import OperationRef, OperationRefusal, TypedOperationError, now_utc
 from .redaction import redact_value
 from .skills import LocalSkill, SkillError, SkillRegistry
 
@@ -698,6 +701,254 @@ class ApprovedActionRunner:
         self._run("gh", "pr", "merge", pr, "--merge", "--delete-branch", "--match-head-commit", expected_head_sha)
         acceptance = state.apply_acceptance(task_id, self.worktree_root)
         return {"pr": pr, "task_id": task_id, "head_sha": expected_head_sha, "state_acceptance": acceptance}
+
+
+# ---------------------------------------------------------------------------
+# Immediate bridge authority preflight for a typed operation
+# (state-context-operations:T006.2)
+# ---------------------------------------------------------------------------
+#
+# Before ANY adapter touches an effect, the bridge re-derives every authority
+# fact from its OWN locally configured catalogs/profile and the live lease --
+# it never trusts the hub's validation.  This preflight rechecks, in order and
+# fail-closed with a stable typed :class:`OperationRefusal` code:
+#
+# 1. the command envelope and its expiry (a stale command never runs);
+# 2. the worktree lease, re-read IMMEDIATELY before the effect (fenced+expiring:
+#    a missing/expired/epoch-changed lease stops the run);
+# 3. the pinned work-packet digest (a changed packet stops and reconciles);
+# 4. the descriptor pin: the local catalog digest is recomputed, matched to the
+#    run snapshot, and the operation resolved at its exact pinned digest, then
+#    checked against the local profile allowlist;
+# 5. the typed input against the pinned local input schema;
+# 6. for an approval-gated effect, a matching, unexpired, hash-bound, one-time
+#    approval consumed atomically -- a replayed or mismatched grant fails closed.
+#
+# Every refusal names the failed fact via its code and a redacted summary; no
+# credential, raw payload, adapter, or path is exposed.  This is the bridge-side
+# counterpart to the hub's :func:`workbench.workflows.resolve_operation` and
+# :func:`workbench.contracts.validate_bridge_command_snapshot`.  It is a
+# hermetic, in-memory validator: it is deliberately NOT wired into
+# :meth:`Bridge.poll_once`, so the live poll loop still dispatches only the
+# v1 ``run_codex``/``skill_probe``/``commit_pr``/``merge_and_accept`` commands
+# until an ``invoke_operation`` adapter path is separately reviewed and enabled.
+
+
+def _op_refuse(code: str, summary: str) -> TypedOperationError:
+    return TypedOperationError(OperationRefusal(code, summary))
+
+
+@dataclass(frozen=True)
+class OperationLeaseState:
+    """The live fenced worktree lease the bridge re-reads before an effect."""
+
+    worktree_name: str
+    epoch: int
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class PreflightedOperation:
+    """The bridge-private result of a passing preflight, ready for dispatch.
+
+    ``bridge_adapter`` is the local adapter the bridge would invoke; it is
+    resolved from the bridge's OWN configured catalog and never leaves the host.
+    """
+
+    operation: OperationRef
+    effect: str
+    bridge_adapter: str
+    inputs: Mapping[str, Any]
+    lease_epoch: int
+    approval_grant_id: str | None
+
+
+def _parse_rfc3339(value: Any, code: str, label: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise _op_refuse(code, f"{label} timestamp is missing")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise _op_refuse(code, f"{label} timestamp is not a valid RFC 3339 value") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _local_operation(catalog: Mapping[str, Any], ref: OperationRef) -> Mapping[str, Any]:
+    """Resolve one operation in the bridge's local catalog at its exact digest."""
+    candidates = [
+        operation for operation in catalog.get("operations", [])
+        if isinstance(operation, Mapping)
+        and operation.get("id") == ref.id
+        and operation.get("contract_version") == ref.contract_version
+    ]
+    if not candidates:
+        raise _op_refuse(
+            "operation.unknown",
+            f"the operation is not present in the local {ref.provider} catalog: {ref.id} {ref.contract_version}",
+        )
+    for operation in candidates:
+        if operation.get("operation_digest") == ref.operation_digest:
+            return operation
+    raise _op_refuse(
+        "operation.digest_drift",
+        f"the pinned operation digest no longer matches the local {ref.provider} catalog: {ref.id}",
+    )
+
+
+def preflight_operation_command(
+    command: Mapping[str, Any],
+    *,
+    catalogs: Mapping[str, Mapping[str, Any]],
+    profile: Mapping[str, Any],
+    lease_authority: Callable[[str], OperationLeaseState | None],
+    approval_consumer: Any | None = None,
+    pinned_work_packet_digest: str | None = None,
+    current_work_packet_digest: str | None = None,
+    now: datetime | None = None,
+) -> PreflightedOperation:
+    """Fail-closed re-derive every authority fact before a typed operation effect.
+
+    ``catalogs`` is the bridge's OWN ``{provider: catalog_dict}`` local
+    configuration (full descriptors with execution/gate blocks), ``profile`` its
+    local pinned profile dict, and ``lease_authority`` a callback that returns
+    the LIVE lease for a worktree name (re-read at call time) or ``None``.  On
+    success returns a bridge-private :class:`PreflightedOperation`; on any failed
+    fact raises :class:`TypedOperationError` with a stable code and a redacted
+    summary.  Reuses the reviewed digest/schema/approval primitives in
+    :mod:`workbench.contracts`.
+    """
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import ValidationError
+
+    from .contracts import (
+        ContractValidationError,
+        approval_payload_digest,
+        check_operation_input_schema,
+        validate_catalog,
+    )
+
+    now = now or now_utc()
+    if not isinstance(command, Mapping):
+        raise _op_refuse("command.malformed", "bridge command is not an object")
+    if command.get("kind") != "invoke_operation":
+        raise _op_refuse("command.malformed", "bridge command is not an invoke_operation command")
+    payload = command.get("payload")
+    snapshot = command.get("workflow_snapshot")
+    lease_block = command.get("lease")
+    if not isinstance(payload, Mapping) or not isinstance(snapshot, Mapping):
+        raise _op_refuse("command.malformed", "invoke_operation command has no payload or workflow snapshot")
+    if not isinstance(lease_block, Mapping):
+        raise _op_refuse("command.malformed", "invoke_operation command has no lease block")
+
+    # 1. Command expiry -- a stale command never reaches an effect.
+    expires_at = _parse_rfc3339(command.get("expires_at"), "command.expired", "command expiry")
+    if now >= expires_at:
+        raise _op_refuse("command.expired", "the bridge command expired before preflight completed")
+
+    # 2. Lease recheck, IMMEDIATELY before the effect (fenced + expiring).
+    worktree_name = lease_block.get("worktree_name")
+    epoch = lease_block.get("epoch")
+    if not isinstance(worktree_name, str) or not worktree_name or not isinstance(epoch, int) or isinstance(epoch, bool):
+        raise _op_refuse("command.malformed", "invoke_operation lease block is invalid")
+    live = lease_authority(worktree_name)
+    if live is None:
+        raise _op_refuse("lease.missing", "the worktree lease is no longer held by this run")
+    if live.expires_at <= now:
+        raise _op_refuse("lease.expired", "the worktree lease expired before the effect")
+    if live.epoch != epoch:
+        raise _op_refuse("lease.epoch_mismatch", "the worktree lease epoch changed; the run was fenced out")
+
+    # 3. Work-packet digest -- a changed packet stops and reconciles.
+    if pinned_work_packet_digest is not None and current_work_packet_digest != pinned_work_packet_digest:
+        raise _op_refuse("work_packet.digest_changed", "the work packet changed since the run snapshot was pinned")
+
+    # 4. Descriptor pin against the LOCAL catalog (recomputed digest).
+    ref = OperationRef.from_mapping(payload.get("operation"), "command operation")
+    catalog = catalogs.get(ref.provider)
+    if not isinstance(catalog, Mapping):
+        raise _op_refuse("operation.provider_unknown", f"the operation provider is not locally configured: {ref.provider}")
+    try:
+        validate_catalog(catalog)
+    except ContractValidationError as exc:
+        raise _op_refuse("operation.digest_drift", f"the local {ref.provider} catalog failed its digest recompute: {exc}") from exc
+    snapshot_catalogs = snapshot.get("catalogs")
+    if not isinstance(snapshot_catalogs, list):
+        raise _op_refuse("command.malformed", "workflow snapshot catalogs are invalid")
+    pinned = next(
+        (entry.get("digest") for entry in snapshot_catalogs
+         if isinstance(entry, Mapping) and entry.get("provider") == ref.provider),
+        None,
+    )
+    if pinned != catalog.get("catalog_digest"):
+        raise _op_refuse("operation.digest_drift", f"the local {ref.provider} catalog digest differs from the pinned run snapshot")
+    if snapshot.get("capability_profile_digest") != profile.get("digest"):
+        raise _op_refuse("operation.unprofiled", "the run snapshot capability-profile digest differs from the local profile")
+    operation = _local_operation(catalog, ref)
+
+    # 5. Profile allowlist + typed input against the pinned LOCAL input schema.
+    profile_keys = {
+        (str(item.get("provider")), str(item.get("id")), str(item.get("contract_version")), str(item.get("operation_digest")))
+        for item in profile.get("operations", []) if isinstance(item, Mapping)
+    }
+    if ref.key not in profile_keys:
+        raise _op_refuse("operation.unprofiled", f"the operation is not allowlisted by the local profile: {ref.provider} {ref.id}")
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise _op_refuse("operation.input_not_object", "the operation input must be an object")
+    input_schema = operation.get("input_schema")
+    try:
+        check_operation_input_schema(input_schema)
+    except ContractValidationError as exc:
+        raise _op_refuse("operation.schema_unresolvable", f"the local operation input schema {exc}") from exc
+    try:
+        Draft202012Validator(dict(input_schema)).validate(dict(inputs))
+    except ValidationError as exc:
+        raise _op_refuse("operation.input_invalid", f"the operation input does not match the pinned schema: {exc.message}") from exc
+    except Exception as exc:
+        raise _op_refuse("operation.schema_unresolvable", f"the local operation input schema cannot be evaluated: {exc}") from exc
+
+    # 6. Approval binding + atomic one-time consumption for a gated effect.
+    gates = operation.get("gates")
+    grant_id: str | None = None
+    if isinstance(gates, Mapping) and gates.get("human_approval") == "required":
+        approval = payload.get("approval")
+        if not isinstance(approval, Mapping):
+            raise _op_refuse("approval.missing", "the approval-gated operation requires a typed approval grant")
+        grant_id = approval.get("grant_id")
+        if not grant_id or command.get("approval_grant_id") != grant_id:
+            raise _op_refuse("approval.missing", "the approval-gated operation has no matching approval grant id")
+        if approval.get("action") != gates.get("approval_action"):
+            raise _op_refuse("approval.action_mismatch", "the approval action does not match the operation gate")
+        if approval.get("payload_hash") != approval_payload_digest(dict(inputs)):
+            raise _op_refuse("approval.hash_mismatch", "the approval hash does not bind the exact operation inputs")
+        if approval_consumer is None:
+            raise _op_refuse("approval.missing", "the approval-gated operation requires an atomic approval consumer")
+        try:
+            approval_consumer.consume(
+                str(approval["grant_id"]), str(approval["action"]), str(approval["payload_hash"]),
+                str(command.get("bridge_id", "")), str(command.get("project_id", "")),
+            )
+        except TypedOperationError:
+            raise
+        except Exception as exc:
+            raise _op_refuse(
+                "approval.invalid",
+                "the approval grant is missing, expired, replayed, or not bound to this bridge and project",
+            ) from exc
+
+    execution = operation.get("execution")
+    bridge_adapter = str(execution.get("bridge_adapter")) if isinstance(execution, Mapping) else ""
+    return PreflightedOperation(
+        operation=ref,
+        effect=str(operation.get("effect")),
+        bridge_adapter=bridge_adapter,
+        inputs=dict(inputs),
+        lease_epoch=epoch,
+        approval_grant_id=grant_id,
+    )
 
 
 class Bridge:

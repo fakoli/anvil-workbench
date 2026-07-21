@@ -43,6 +43,7 @@ from jsonschema.exceptions import ValidationError
 from .contracts import (
     ContractValidationError,
     catalog_contract_validator,
+    check_operation_input_schema,
     check_operation_schema,
     validate_catalog,
 )
@@ -179,8 +180,11 @@ def _compatible_contract_version(operation_id: str, version: Any) -> str:
 def _schema_json(operation_id: str, name: str, schema: Any) -> str:
     if not isinstance(schema, Mapping):
         raise StateManifestError(f"State operation {operation_id} has no {name} object")
+    # Input schemas must be closed (no undeclared field into a dispatch); output
+    # schemas stay deliberately open, so only the input path enforces closure.
+    check = check_operation_input_schema if name == "input_schema" else check_operation_schema
     try:
-        check_operation_schema(schema)
+        check(schema)
     except ContractValidationError as exc:
         raise StateManifestError(f"State operation {operation_id} {name} {exc}") from exc
     return json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

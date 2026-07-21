@@ -961,3 +961,421 @@ def run_skills_from_snapshot(snapshot: Any, purposes: Mapping[str, str]) -> tupl
         )
         skills.append(RunSkill(id=skill.id, digest=skill.digest, purpose=purpose))
     return tuple(skills)
+
+
+# ---------------------------------------------------------------------------
+# Typed operation spine (state-context-operations:T006.1 / T006.2 / T006.3)
+# ---------------------------------------------------------------------------
+#
+# These are the shared, frozen value objects for the typed-operation critical
+# path: hub-side descriptor resolution of a model/workflow operation request
+# (T006.1), the bridge's immediate authority preflight (T006.2), and the durable
+# idempotent receipts + reconciliation records (T006.3).  They deliberately
+# mirror the published contract shapes -- ``model-proposal.operation-request``,
+# ``bridge-command.invoke-operation``, and ``operation-receipt`` -- so a typed
+# refusal carries a stable code (like :data:`workflow_snapshot.DRIFT_KINDS`) and
+# a receipt is a closed, redacted record with no field a secret, path, or raw
+# command could ride through.
+
+OPERATION_RECEIPT_SCHEMA_VERSION = "workbench-operation-receipt/v1"
+
+#: Terminal receipt statuses, mirrored from ``operation-receipt.v1.schema.json``.
+#: ``unknown``/``reconciliation_required`` mean an external effect MAY have
+#: occurred and the outcome must be reconciled, never blindly retried.
+OPERATION_RECEIPT_STATUSES = frozenset(
+    {"succeeded", "failed", "denied", "unknown", "reconciliation_required"}
+)
+
+#: The closed set of stable typed refusal codes for the whole spine.  Like
+#: ``DRIFT_KINDS`` these strings are durable receipt/reconciliation metadata:
+#: extend the set, never rename or repurpose a member.  The ``operation.*``
+#: family is raised by hub-side resolution (T006.1); the ``command.*``,
+#: ``lease.*``, ``work_packet.*``, and ``approval.*`` families by the bridge's
+#: immediate preflight (T006.2).
+OPERATION_REFUSAL_CODES = frozenset({
+    # --- T006.1 hub-side descriptor resolution ---
+    "proposal.malformed",
+    "operation.provider_unknown",
+    "operation.unknown",
+    "operation.digest_drift",
+    "operation.unprofiled",
+    "operation.input_not_object",
+    "operation.input_invalid",
+    "operation.schema_unresolvable",
+    # --- T006.2 bridge-side immediate authority preflight ---
+    "command.malformed",
+    "command.expired",
+    "lease.missing",
+    "lease.expired",
+    "lease.epoch_mismatch",
+    "work_packet.digest_changed",
+    "approval.missing",
+    "approval.action_mismatch",
+    "approval.hash_mismatch",
+    "approval.invalid",
+})
+
+#: The credential-class token guard mirrored from the ``error.safe_summary``
+#: ``not`` clause in ``operation-receipt.v1.schema.json``.  A summary that
+#: literally names one of these classes is refused by the schema, so a receipt
+#: can never be constructed carrying it (defence in depth behind redaction).
+_RECEIPT_FORBIDDEN_SUMMARY = re.compile(
+    r"(?i)(authorization|bearer|api[_ -]?key|github[_ -]?token|password|secret)"
+)
+_RECEIPT_ID = re.compile(r"^rcpt_[a-zA-Z0-9_-]{8,128}$")
+_RECEIPT_TASK_REF = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\.[0-9]{1,3})?$")
+_RECEIPT_EXTERNAL_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_RECEIPT_EXTERNAL_VALUE = re.compile(r"^[A-Za-z0-9._:/-]{1,160}$")
+_RECEIPT_EVIDENCE_REF = re.compile(
+    r"^(?:evidence|artifact|state_event|route|verification)_[A-Za-z0-9._-]{1,128}$"
+)
+_OP_ID = re.compile(r"^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$")
+
+
+def new_receipt_id() -> str:
+    return f"rcpt_{uuid4().hex}"
+
+
+def safe_receipt_summary(text: Any, limit: int = 500) -> str:
+    """Scrub a refusal/error summary and fail closed on a forbidden token.
+
+    The summary is first run through :func:`redact_config_text` (the wider
+    config-class scrubber that removes credentials, endpoints, and paths), then
+    bounded, then checked against the schema's forbidden credential-class token
+    guard.  A summary that would still name a credential class is replaced with
+    a fixed safe sentence rather than persisted, so no receipt can ever carry a
+    leaky summary even if a caller passed one.
+    """
+    scrubbed = redact_config_text(str(text))[:limit]
+    if _RECEIPT_FORBIDDEN_SUMMARY.search(scrubbed):
+        return "operation refused; consult the typed refusal code"
+    return scrubbed
+
+
+#: The schema-valid opaque token an ``external_ref`` value collapses to when the
+#: last-hop scrub finds a credential, endpoint, or path shape inside it.  Chosen
+#: to stay within :data:`_RECEIPT_EXTERNAL_VALUE` so a redacted receipt or
+#: reconciliation record still serializes and validates.
+_REDACTED_EXTERNAL_REF_VALUE = "redacted"
+
+
+def safe_external_ref_value(key: Any, value: Any) -> str:
+    """Scrub one ``external_ref`` value with the same last-hop guard as a summary.
+
+    ``external_ref`` is a bounded opaque-token map (``owner/repo``, ``gh:1``, a
+    ``state_event`` id).  The bounded :data:`_RECEIPT_EXTERNAL_VALUE` pattern is
+    kept as a STRUCTURAL BACKSTOP -- it still refuses a space/``=``/``?``/``@``
+    free-text shape -- but it deliberately admits ``/`` and ``:`` so a legit
+    ``owner/repo`` ref survives, which means a slash-free token or a path built
+    only from ``[A-Za-z0-9._:/-]`` (``sk-proj-AbC123def456xyz789``,
+    ``/etc/anvil/secrets.env``, ``C:/Users/x/.aws/credentials``,
+    ``/home/deploy/.ssh/id_rsa``) would otherwise ride through verbatim.  So on
+    top of the backstop every value is routed through
+    :func:`redact_config_text` and the forbidden-credential-token guard, exactly
+    like :func:`safe_receipt_summary` scrubs a summary.  A value carrying any
+    credential, endpoint, or path shape collapses to
+    :data:`_REDACTED_EXTERNAL_REF_VALUE` instead of being persisted, closing the
+    asymmetry where ``safe_summary`` was scrubbed but the sibling ``external_ref``
+    on the same record was not.
+    """
+    _rc_require(bool(_RECEIPT_EXTERNAL_KEY.match(str(key))), f"external_ref key is invalid: {key!r}")
+    raw = str(value)
+    _rc_require(bool(_RECEIPT_EXTERNAL_VALUE.match(raw)), f"external_ref value is invalid: {key!r}")
+    scrubbed = redact_config_text(raw)
+    if scrubbed != raw or _RECEIPT_FORBIDDEN_SUMMARY.search(scrubbed):
+        return _REDACTED_EXTERNAL_REF_VALUE
+    return scrubbed
+
+
+@dataclass(frozen=True)
+class OperationRef:
+    """A pinned operation descriptor reference (provider/id/version/digest).
+
+    The exact four-tuple that identifies one reviewed operation at its pinned
+    catalog revision.  Frozen and validated; it never carries an adapter, a
+    command, a path, or a credential -- only the identifying digest.
+    """
+
+    provider: str
+    id: str
+    contract_version: str
+    operation_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", _rc_ident(self.provider, "operation provider"))
+        _rc_require(
+            isinstance(self.id, str) and bool(_OP_ID.match(self.id)),
+            "operation id is not a valid dotted identifier",
+        )
+        _rc_require(
+            isinstance(self.contract_version, str) and bool(_RC_CONTRACT_VERSION.match(self.contract_version)),
+            "operation contract_version is not semantic",
+        )
+        object.__setattr__(self, "operation_digest", _rc_digest(self.operation_digest, "operation_digest"))
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.provider, self.id, self.contract_version, self.operation_digest)
+
+    @property
+    def versioned_key(self) -> tuple[str, str, str]:
+        return (self.provider, self.id, self.contract_version)
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "provider": self.provider,
+            "id": self.id,
+            "contract_version": self.contract_version,
+            "operation_digest": self.operation_digest,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Any, label: str = "operation") -> "OperationRef":
+        if not isinstance(value, Mapping):
+            raise TypedOperationError(
+                OperationRefusal("proposal.malformed", f"{label} reference is not an object")
+            )
+        allowed = {"provider", "id", "contract_version", "operation_digest"}
+        if set(value) - allowed:
+            raise TypedOperationError(
+                OperationRefusal("proposal.malformed", f"{label} reference carries undeclared fields")
+            )
+        try:
+            return cls(
+                provider=str(value.get("provider", "")),
+                id=str(value.get("id", "")),
+                contract_version=str(value.get("contract_version", "")),
+                operation_digest=str(value.get("operation_digest", "")),
+            )
+        except RunContextError as exc:
+            raise TypedOperationError(OperationRefusal("proposal.malformed", str(exc))) from exc
+
+
+@dataclass(frozen=True)
+class OperationRefusal:
+    """One stable, redacted typed refusal for the operation spine.
+
+    ``code`` is a member of :data:`OPERATION_REFUSAL_CODES`; ``safe_summary`` is
+    scrubbed and forbidden-token-guarded on construction.  A refusal is the unit
+    a denied receipt or a reconciliation item records, so it must never leak.
+    """
+
+    code: str
+    safe_summary: str
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        _rc_require(self.code in OPERATION_REFUSAL_CODES, f"operation refusal code is not declared: {self.code!r}")
+        _rc_require(isinstance(self.retryable, bool), "refusal retryable must be a boolean")
+        object.__setattr__(self, "safe_summary", safe_receipt_summary(self.safe_summary))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"code": self.code, "safe_summary": self.safe_summary, "retryable": self.retryable}
+
+
+class TypedOperationError(ValueError):
+    """A typed operation refusal carrying a stable code and a redacted summary.
+
+    Raised by hub-side resolution (T006.1) and bridge preflight (T006.2) so a
+    caller asserts on the CLAIMED reason (``err.code``) rather than incidentally
+    on a message; the carried :class:`OperationRefusal` is what a denied receipt
+    or reconciliation item persists.
+    """
+
+    def __init__(self, refusal: OperationRefusal) -> None:
+        self.refusal = refusal
+        super().__init__(f"{refusal.code}: {refusal.safe_summary}")
+
+    @property
+    def code(self) -> str:
+        return self.refusal.code
+
+
+@dataclass(frozen=True)
+class ResolvedOperation:
+    """A hub-resolved operation: the pinned descriptor plus validated inputs.
+
+    The output of T006.1 resolution.  ``effect`` and ``gate_required`` come from
+    the pinned descriptor (never from the caller), and ``inputs`` has already
+    been validated against the descriptor's pinned input schema.  It carries no
+    adapter, transport, command, or path -- the bridge resolves those locally.
+
+    ``gate_required`` is ADVISORY hub metadata: it is derived from the effect
+    class (``effect in {external_effect, policy_mutation}``), NOT from the
+    descriptor's ``gates.human_approval``.  It is deliberately conservative --
+    it may over-report a gate -- and exists only so the hub/browser can preview
+    that an approval is likely needed.  It is NOT the authority gate: the bridge
+    preflight (:func:`workbench.bridge.preflight_operation`) reads the pinned
+    descriptor's ``gates.human_approval`` and binds/consumes the approval there.
+    A downstream consumer must treat the bridge preflight, never this field, as
+    the gate that decides whether an approval is required.
+    """
+
+    operation: OperationRef
+    effect: str
+    gate_required: bool
+    approval_action: str | None
+    inputs: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        _rc_require(isinstance(self.operation, OperationRef), "resolved operation requires an OperationRef")
+        _rc_require(self.effect in RUN_EFFECTS, f"resolved operation effect is not declared: {self.effect!r}")
+        _rc_require(isinstance(self.gate_required, bool), "resolved operation gate_required must be a boolean")
+        object.__setattr__(self, "inputs", dict(self.inputs))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "operation": self.operation.as_dict(),
+            "effect": self.effect,
+            "gate_required": self.gate_required,
+            "approval_action": self.approval_action,
+            "inputs": dict(self.inputs),
+        }
+
+
+@dataclass(frozen=True)
+class OperationReceipt:
+    """One redacted, typed terminal receipt for an operation attempt (T006.3).
+
+    Serializes to a payload valid against ``operation-receipt.v1.schema.json``.
+    Every human-readable field is scrubbed, the error summary is
+    forbidden-token-guarded, and the closed field set means a secret, a raw
+    command, a path, or a provider payload has no field to arrive through.
+    """
+
+    receipt_id: str
+    command_id: str
+    run_id: str
+    operation: OperationRef
+    status: str
+    idempotency_key: str
+    started_at: datetime
+    finished_at: datetime
+    redaction_status: str = "redacted"
+    redaction_ruleset: str = "workbench-default-v1"
+    error: OperationRefusal | None = None
+    external_ref: Mapping[str, str] = field(default_factory=dict)
+    evidence_refs: tuple[str, ...] = ()
+    task_ref: str | None = None
+    request_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _rc_require(bool(_RECEIPT_ID.match(self.receipt_id)), "receipt_id is invalid")
+        _rc_require(isinstance(self.operation, OperationRef), "receipt requires an OperationRef")
+        _rc_require(self.status in OPERATION_RECEIPT_STATUSES, f"receipt status is not declared: {self.status!r}")
+        _rc_require(self.redaction_status in ("redacted", "metadata_only"), "receipt redaction status is invalid")
+        _rc_require(bool(self.idempotency_key) and len(self.idempotency_key) <= 256, "receipt idempotency_key is invalid")
+        object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+        for ref in self.evidence_refs:
+            _rc_require(bool(_RECEIPT_EVIDENCE_REF.match(str(ref))), f"receipt evidence ref is invalid: {ref!r}")
+        clean_external: dict[str, str] = {}
+        for key, value in dict(self.external_ref).items():
+            clean_external[str(key)] = safe_external_ref_value(key, value)
+        object.__setattr__(self, "external_ref", clean_external)
+        if self.task_ref is not None:
+            _rc_require(bool(_RECEIPT_TASK_REF.match(self.task_ref)), "receipt task_ref is invalid")
+        if self.error is not None:
+            _rc_require(isinstance(self.error, OperationRefusal), "receipt error must be an OperationRefusal")
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "schema_version": OPERATION_RECEIPT_SCHEMA_VERSION,
+            "receipt_id": self.receipt_id,
+            "command_id": self.command_id,
+            "run_id": self.run_id,
+            "operation": self.operation.as_dict(),
+            "status": self.status,
+            "idempotency_key": self.idempotency_key,
+            "redaction": {"status": self.redaction_status, "ruleset": self.redaction_ruleset},
+            "started_at": _rfc3339(self.started_at),
+            "finished_at": _rfc3339(self.finished_at),
+        }
+        if self.external_ref:
+            data["external_ref"] = dict(self.external_ref)
+        if self.evidence_refs:
+            data["evidence_refs"] = list(self.evidence_refs)
+        correlation: dict[str, str] = {}
+        if self.task_ref is not None:
+            correlation["task_id"] = self.task_ref
+        if self.request_id is not None:
+            correlation["request_id"] = self.request_id
+        if correlation:
+            data["correlation"] = correlation
+        if self.error is not None:
+            data["error"] = {
+                "code": self.error.code,
+                "safe_summary": self.error.safe_summary,
+                "retryable": self.error.retryable,
+            }
+        return data
+
+
+#: The closed set of reconciliation reasons for an unknown/interrupted outcome.
+RECONCILIATION_REASONS = frozenset({
+    "unknown_outcome",
+    "lost_lease",
+    "digest_drift",
+    "approval_replay",
+    "verification_failed",
+    "provider_failure",
+    "interrupted",
+})
+_RECONCILE_ID = re.compile(r"^recon_[a-zA-Z0-9_-]{8,128}$")
+
+
+def new_reconciliation_id() -> str:
+    return f"recon_{uuid4().hex}"
+
+
+@dataclass(frozen=True)
+class ReconciliationItem:
+    """One durable unknown-outcome record for an operation that may have run.
+
+    Created exactly once per unresolved attempt (T006.3): an external effect
+    whose outcome is unknown must be reconciled, never silently retried.  It is
+    a closed, redacted record; ``external_ref`` names only opaque references to
+    a possibly-partial effect, never a raw payload.
+    """
+
+    id: str
+    run_id: str
+    command_id: str
+    operation: OperationRef
+    reason: str
+    idempotency_key: str
+    safe_summary: str
+    external_ref: Mapping[str, str] = field(default_factory=dict)
+    resolved: bool = False
+    created_at: datetime = field(default_factory=now_utc)
+
+    def __post_init__(self) -> None:
+        _rc_require(bool(_RECONCILE_ID.match(self.id)), "reconciliation id is invalid")
+        _rc_require(isinstance(self.operation, OperationRef), "reconciliation requires an OperationRef")
+        _rc_require(self.reason in RECONCILIATION_REASONS, f"reconciliation reason is not declared: {self.reason!r}")
+        _rc_require(bool(self.idempotency_key) and len(self.idempotency_key) <= 256, "reconciliation idempotency_key is invalid")
+        object.__setattr__(self, "safe_summary", safe_receipt_summary(self.safe_summary))
+        clean_external: dict[str, str] = {}
+        for key, value in dict(self.external_ref).items():
+            clean_external[str(key)] = safe_external_ref_value(key, value)
+        object.__setattr__(self, "external_ref", clean_external)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "run_id": self.run_id,
+            "command_id": self.command_id,
+            "operation": self.operation.as_dict(),
+            "reason": self.reason,
+            "idempotency_key": self.idempotency_key,
+            "safe_summary": self.safe_summary,
+            "external_ref": dict(self.external_ref),
+            "resolved": self.resolved,
+            "created_at": _rfc3339(self.created_at),
+        }
+
+
+def _rfc3339(value: datetime) -> str:
+    """Render a UTC datetime as a compact RFC 3339 ``...Z`` timestamp."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
