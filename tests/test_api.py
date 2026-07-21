@@ -1413,6 +1413,223 @@ def test_preference_write_rejects_unknown_body_fields():
 
 
 # --------------------------------------------------------------------------- #
+# preferences-configuration:T006 — configuration export / import / scoped reset
+# through the ACTUAL wired /api/configuration surface.
+# --------------------------------------------------------------------------- #
+
+from workbench.configuration_transfer import (
+    CONFIGURATION_EXPORT_SCHEMA_VERSION as _CFG_SCHEMA,
+    ConfigurationTransferService as _CfgService,
+)
+
+# The corpus of dangerous strings a redacted export must never carry. Seeded into
+# authority (deployment/policy) namespaces the export never ranges over, so their
+# absence proves the STRUCTURAL exclusion (actor-view only) — the scrub is the
+# defence-in-depth second layer.
+_CFG_SECRET_PATH = r"C:\\deploy\\secrets\\prod.pem"
+_CFG_HEADER = "X-Api-Key-serving:8443"
+
+
+def _cfg_service(store: _MemoryPreferenceStore) -> _CfgService:
+    return _CfgService(store.catalog, store, audit_key=b"configuration-audit-key-0")
+
+
+def _cfg_client(service: _CfgService | None) -> TestClient:
+    return TestClient(create_app(
+        settings=_pref_settings(), store=MemoryStore(), graph=NullGraph(),
+        configuration_transfer_service=service,
+    ))
+
+
+def _seeded_store() -> _MemoryPreferenceStore:
+    store = _MemoryPreferenceStore(_pref_catalog())
+    # Authority secret/path corpus in namespaces the export never reads.
+    store.seed_authority_value("deployment", "deployment.state_read_location", _CFG_SECRET_PATH)
+    store.seed_authority_value("deployment", "deployment.identity_header_name", _CFG_HEADER)
+    store.seed_authority_value("policy", "policy.transcript_retention_max_days", 30)
+    # Portable actor/project overrides the export SHOULD carry.
+    store.set_preference("personal", "operator", "personal.landing_surface", "dashboard", 0, "operator")
+    store.set_preference("personal", "operator", "personal.chat_transcript_retention_days", 20, 0, "operator")
+    store.set_preference("project", "project_1", "project.delivery_route", "route.delivery-heavy", 0, "operator")
+    return store
+
+
+def test_configuration_surface_fails_closed_when_unconfigured():
+    with _cfg_client(None) as test_client:
+        assert test_client.get("/api/configuration/export", headers=_PREF_ACTOR).status_code == 503
+        assert test_client.post(
+            "/api/configuration/import/preview", headers=_PREF_ACTOR,
+            json={"envelope": {"schema_version": _CFG_SCHEMA, "settings": []}},
+        ).status_code == 503
+
+
+def test_configuration_export_is_closed_redacted_and_opaque_actor_ref():
+    # T006.1: the export carries ONLY portable actor/project settings + schema
+    # version + source scope + a SAFE OPAQUE actor reference, and NONE of the
+    # seeded secret/path/authority corpus appears anywhere in the body.
+    store = _seeded_store()
+    with _cfg_client(_cfg_service(store)) as test_client:
+        resp = test_client.get("/api/configuration/export?project_id=project_1", headers=_PREF_ACTOR)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["schema_version"] == _CFG_SCHEMA
+    ids = {entry["setting_id"] for entry in body["settings"]}
+    # Only portable (actor-view) ids appear; no authority/secret/path id.
+    assert ids == {"personal.landing_surface", "personal.chat_transcript_retention_days", "project.delivery_route"}
+    for authority_id in ("deployment.state_read_location", "deployment.identity_header_name", "policy.transcript_retention_max_days"):
+        assert authority_id not in _pref_json.dumps(body)
+    # The opaque actor ref is a keyed token, never the raw actor identity.
+    assert body["source"]["actor_ref"].startswith("actorref:")
+    assert "operator" not in body["source"]["actor_ref"]
+    # NO secret/path/host marker survives to the serialized export.
+    blob = resp.text
+    for marker in ("prod.pem", "deploy", "secrets", ":8443", "X-Api-Key"):
+        assert marker not in blob, marker
+
+
+def test_configuration_import_preview_distinguishes_typed_categories():
+    # T006.2 #2: creates / changes / resets / skipped-read-only / unavailable-refs
+    # are DISTINCT typed outcomes, not a collapsed diff.
+    store = _seeded_store()
+    envelope = {"schema_version": _CFG_SCHEMA, "settings": [
+        {"setting_id": "personal.landing_surface", "value": "delivery"},          # change
+        {"setting_id": "personal.time_format", "value": "format_12h"},            # create
+        {"setting_id": "personal.chat_transcript_retention_days", "value": 30},   # reset to default
+        {"setting_id": "personal.default_chat_route", "value": "route.ghost"},    # unavailable ref
+        {"setting_id": "policy.transcript_retention_max_days", "value": 5},       # skipped read-only
+    ]}
+    with _cfg_client(_cfg_service(store)) as test_client:
+        resp = test_client.post(
+            "/api/configuration/import/preview", headers=_PREF_ACTOR,
+            json={"envelope": envelope, "project_id": "project_1"},
+        )
+    assert resp.status_code == 200
+    preview = resp.json()
+    assert preview["valid"] is True
+    assert [c["setting_id"] for c in preview["changes"]] == ["personal.landing_surface"]
+    assert [c["setting_id"] for c in preview["creates"]] == ["personal.time_format"]
+    assert [c["setting_id"] for c in preview["resets"]] == ["personal.chat_transcript_retention_days"]
+    assert preview["unavailable_references"][0]["setting_id"] == "personal.default_chat_route"
+    assert preview["skipped_read_only"][0]["setting_id"] == "policy.transcript_retention_max_days"
+
+
+def test_configuration_invalid_import_applies_nothing_and_lists_repairable_fields():
+    # T006.2 #1: an invalid import identifies EVERY repairable field and applies
+    # NOTHING (a 422, and the store is untouched).
+    store = _seeded_store()
+    before = dict(store.stored_values("personal", "operator"))
+    envelope = {"schema_version": _CFG_SCHEMA, "settings": [
+        {"setting_id": "personal.time_format", "value": "not_a_format"},          # bad enum
+        {"setting_id": "personal.chat_transcript_retention_days", "value": 9999},  # out of bounds
+        {"setting_id": "personal.landing_surface", "value": "delivery"},          # would-be valid change
+    ]}
+    with _cfg_client(_cfg_service(store)) as test_client:
+        preview = test_client.post(
+            "/api/configuration/import/preview", headers=_PREF_ACTOR, json={"envelope": envelope},
+        ).json()
+        assert preview["valid"] is False
+        repairable_ids = {r["setting_id"] for r in preview["repairable"]}
+        assert repairable_ids == {"personal.time_format", "personal.chat_transcript_retention_days"}
+        applied = test_client.post(
+            "/api/configuration/import/apply", headers=_PREF_ACTOR, json={"envelope": envelope},
+        )
+        assert applied.status_code == 422
+    # Nothing was applied — even the one valid entry did not land (atomicity).
+    assert store.stored_values("personal", "operator") == before
+
+
+def test_configuration_import_apply_is_atomic_version_checked_and_audited():
+    # T006.2 #3: a valid apply is atomic, version-checked, and audited; a stale
+    # base version fails closed as a 409 and applies nothing.
+    store = _seeded_store()
+    service = _cfg_service(store)
+    envelope = {"schema_version": _CFG_SCHEMA, "settings": [
+        {"setting_id": "personal.landing_surface", "value": "delivery"},
+        {"setting_id": "personal.chat_transcript_retention_days", "value": 45},
+    ]}
+    with _cfg_client(service) as test_client:
+        preview = test_client.post(
+            "/api/configuration/import/preview", headers=_PREF_ACTOR, json={"envelope": envelope},
+        ).json()
+        # A stale base version → 409 reload-required, nothing applied.
+        stale = dict(preview["base_versions"])
+        stale["personal.landing_surface"] = 99
+        conflict = test_client.post(
+            "/api/configuration/import/apply", headers=_PREF_ACTOR,
+            json={"envelope": envelope, "base_versions": stale},
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"]["reload_required"] is True
+        assert store.stored_values("personal", "operator")["personal.landing_surface"] == "dashboard"
+        # A correct apply lands atomically and is audited.
+        ok = test_client.post(
+            "/api/configuration/import/apply", headers=_PREF_ACTOR,
+            json={"envelope": envelope, "base_versions": preview["base_versions"]},
+        )
+        assert ok.status_code == 200
+        audit = test_client.get("/api/configuration/audit", headers=_PREF_ACTOR).json()["audit"]
+    assert store.stored_values("personal", "operator")["personal.landing_surface"] == "delivery"
+    assert store.stored_values("personal", "operator")["personal.chat_transcript_retention_days"] == 45
+    actions = {(a["action"], a["setting_id"]) for a in audit}
+    assert ("configuration.import", "personal.landing_surface") in actions
+    # The audit trail carries a keyed fingerprint, never the raw actor identity.
+    assert all("operator" not in a["scope_key_fingerprint"] for a in audit)
+
+
+def test_configuration_unknown_extension_envelope_is_rejected_not_interpreted():
+    # T006.1 #2: an unknown/unsupported extension envelope is REJECTED (closed
+    # schema), not interpreted loosely.
+    store = _seeded_store()
+    with _cfg_client(_cfg_service(store)) as test_client:
+        extension = test_client.post(
+            "/api/configuration/import/preview", headers=_PREF_ACTOR,
+            json={"envelope": {"schema_version": _CFG_SCHEMA, "settings": [], "extensions": {"x": 1}}},
+        )
+        assert extension.status_code == 422
+        wrong_version = test_client.post(
+            "/api/configuration/import/preview", headers=_PREF_ACTOR,
+            json={"envelope": {"schema_version": "some-other/v9", "settings": []}},
+        )
+        assert wrong_version.status_code == 422
+
+
+def test_configuration_scoped_reset_previews_applies_and_isolates_scopes():
+    # T006.3: reset previews the exact values + scope, applies atomically +
+    # version-checked + audited, and touches ONLY the selected namespace — another
+    # actor, the project scope, and deployment configuration are byte-identical.
+    store = _seeded_store()
+    # The other actor holds an OVERLAPPING setting id (the same id the operator
+    # resets), so a reset that leaked across the namespace boundary would wrongly
+    # clear it — the strong cross-scope-mutation probe.
+    store.set_preference("personal", "reviewer", "personal.landing_surface", "delivery", 0, "reviewer")
+    store.set_preference("personal", "reviewer", "personal.time_format", "format_12h", 0, "reviewer")
+    before_other = dict(store.stored_values("personal", "reviewer"))
+    before_project = dict(store.stored_values("project", "project_1"))
+    before_deploy = dict(store.stored_values("deployment", "deployment"))
+    before_policy = dict(store.stored_values("policy", "policy"))
+    service = _cfg_service(store)
+    with _cfg_client(service) as test_client:
+        preview = test_client.post(
+            "/api/configuration/reset/preview", headers=_PREF_ACTOR, json={"scope": "personal"},
+        ).json()
+        preview_ids = {c["setting_id"] for c in preview["changes"]}
+        assert preview_ids == {"personal.landing_surface", "personal.chat_transcript_retention_days"}
+        applied = test_client.post(
+            "/api/configuration/reset/apply", headers=_PREF_ACTOR,
+            json={"scope": "personal", "base_versions": preview["base_versions"]},
+        )
+        assert applied.status_code == 200
+        audit = test_client.get("/api/configuration/audit", headers=_PREF_ACTOR).json()["audit"]
+    # The operator's personal overrides are gone; every OTHER scope is untouched.
+    assert store.stored_values("personal", "operator") == {}
+    assert store.stored_values("personal", "reviewer") == before_other
+    assert store.stored_values("project", "project_1") == before_project
+    assert store.stored_values("deployment", "deployment") == before_deploy
+    assert store.stored_values("policy", "policy") == before_policy
+    assert any(a["action"] == "configuration.reset" for a in audit)
+
+
+# --------------------------------------------------------------------------- #
 # plan-task-delivery T002/T004/T008 — delivery projection browser surface,
 # pinned operational rows/approval bindings, and typed directive semantics
 # through the ACTUAL wired API entrypoint.

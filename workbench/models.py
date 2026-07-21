@@ -1465,6 +1465,39 @@ def require_pref_audit_key(key: bytes) -> bytes:
     return bytes(key)
 
 
+def preference_scope_key_fingerprint(scope: str, scope_key: str, *, key: bytes) -> str:
+    """A keyed, non-reversible short fingerprint of a ``(scope, scope_key)`` identity.
+
+    The single audit-fingerprint primitive shared by
+    :meth:`PreferenceRecord.audit_metadata` and the configuration-transfer audit
+    trail, so a preference write, an import apply, and a scoped reset all correlate
+    an actor/project in an audit log through the SAME keyed HMAC-SHA256 without ever
+    exposing the raw identity.  The server-held ``key`` never sits beside the tag,
+    so a guessable email/slug cannot be recovered by hashing candidate identities.
+    """
+    material = _PREF_AUDIT_FINGERPRINT_PREFIX + f"{scope}:{scope_key}".encode("utf-8")
+    return hmac.new(require_pref_audit_key(key), material, hashlib.sha256).hexdigest()[:12]
+
+
+#: A DISTINCT HMAC domain for an export's opaque scope reference, so the export's
+#: ``actor_ref``/``project_ref`` cannot be correlated with the audit fingerprint of
+#: the same identity (different purposes, different tags) even though both are
+#: keyed by the same server-held key.
+_CONFIG_EXPORT_REF_PREFIX = b"anvil-workbench/configuration-export-ref/v1\0"
+
+
+def opaque_scope_ref(kind: str, identity: str, *, key: bytes) -> str:
+    """A safe, opaque, keyed reference to a scope identity for an export envelope.
+
+    NEVER the raw actor/project identity: a keyed HMAC-SHA256 over ``kind:identity``
+    so the identity cannot be recovered from the export by hashing candidate ids.
+    The export records source scope + this opaque reference (T006.1 criterion 3),
+    so a redacted export never carries a raw email/slug/actor id.
+    """
+    material = _CONFIG_EXPORT_REF_PREFIX + f"{kind}:{identity}".encode("utf-8")
+    return f"{kind}ref:" + hmac.new(require_pref_audit_key(key), material, hashlib.sha256).hexdigest()[:16]
+
+
 class PreferenceValidationError(ValueError):
     """A preference value is malformed or out of range for its descriptor.
 
@@ -1763,8 +1796,7 @@ class PreferenceRecord:
         unsalted digest of a known email/slug would be trivially reversible; this
         is not.
         """
-        material = _PREF_AUDIT_FINGERPRINT_PREFIX + f"{self.scope}:{self.scope_key}".encode("utf-8")
-        fingerprint = hmac.new(require_pref_audit_key(key), material, hashlib.sha256).hexdigest()[:12]
+        fingerprint = preference_scope_key_fingerprint(self.scope, self.scope_key, key=key)
         return {
             "setting_id": self.setting_id,
             "scope": self.scope,
