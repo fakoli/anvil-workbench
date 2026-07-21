@@ -15,6 +15,7 @@ Each test group maps to an acceptance criterion of chat-first-voice:T003.3:
 from __future__ import annotations
 
 import dataclasses
+import sys
 import threading
 
 import pytest
@@ -157,6 +158,10 @@ def test_in_progress_may_carry_a_usage_heartbeat_before_terminal():
 
 def test_concurrent_advances_cannot_regress_a_terminal():
     store, _ = begun_store()
+    # Force aggressive thread switching so the race is real: without the lock
+    # this interval produces frequent double-wins; with it, never.
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
     barrier = threading.Barrier(2)
     results: dict[str, object] = {}
 
@@ -187,6 +192,7 @@ def test_concurrent_advances_cannot_regress_a_terminal():
     assert settled.is_terminal
     assert settled.state == results[successes[0]].state
     assert len(store.rows.responses) == 1
+    sys.setswitchinterval(previous_interval)
 
 
 def test_advance_rejects_an_unknown_state_and_an_unbegun_request():
@@ -305,3 +311,26 @@ def test_stream_outcome_maps_to_a_lifecycle_terminal():
 
     # The bridge covers exactly the relay's terminal outcome set.
     assert set(LIFECYCLE_STATE_FOR_OUTCOME) == {o.value for o in StreamOutcome}
+
+
+def test_serving_unavailable_outcome_persists_as_a_direct_interrupted_advance():
+    # The relay bridge maps serving_unavailable -> interrupted; the store must
+    # accept that as a direct in_progress -> interrupted advance (the actual
+    # bridge use), settling a terminal that reconnect never restarts.
+    assert LIFECYCLE_STATE_FOR_OUTCOME["serving_unavailable"] == "interrupted"
+    store, _ = begun_store()
+    settled = store.advance(ALICE, REQ, LIFECYCLE_STATE_FOR_OUTCOME["serving_unavailable"])
+    assert settled.state == "interrupted" and settled.is_terminal
+    assert store.reconnect(ALICE, REQ).state == "interrupted"
+
+
+def test_a_safeusage_subclass_with_a_free_form_field_is_refused():
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class RogueUsage(SafeUsage):
+        bearer: str = "sk-live-secret"
+
+    store, _ = begun_store()
+    with pytest.raises(ResponseLifecycleError, match="exactly a SafeUsage"):
+        store.advance(ALICE, REQ, "in_progress", usage=RogueUsage())

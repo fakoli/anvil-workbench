@@ -14,10 +14,11 @@ State machine (the four acceptance criteria this slice binds):
   ``in_progress`` state (the streaming phase).  It then advances, via
   :meth:`advance`, to exactly ONE terminal state — ``completed``, ``cancelled``,
   ``timed_out``, or ``interrupted`` — after which the record is IMMUTABLE.
-  ``interrupted`` is also the reload-recovery state: a record still
-  ``in_progress`` after a hub restart is surfaced by
-  :meth:`recover_interrupted` as ``interrupted`` (its stream is gone), never
-  silently completed and never restarted.  This mirrors the streaming ->
+  ``interrupted`` is reached two ways: a direct :meth:`advance` (the relay
+  bridges its ``serving_unavailable`` outcome to ``interrupted``), and
+  reload recovery — a record still ``in_progress`` after a hub restart is
+  surfaced by :meth:`recover_interrupted` as ``interrupted`` (its stream is
+  gone), never silently completed and never restarted.  This mirrors the streaming ->
   ``interrupted`` recovery of :mod:`workbench.conversation_store`.
 * :meth:`reconnect` returns the last persisted state (criterion 1) and NEVER
   mutates, restarts, or re-streams: a terminal response reconnects to its
@@ -296,8 +297,10 @@ class MemoryResponseLifecycleStore:
         retry can never duplicate or restart a response by re-issuing ``begin``.
         """
         self._require_actor(actor)
-        if usage is not None and not isinstance(usage, SafeUsage):
-            raise ResponseLifecycleError("usage must be a SafeUsage or None")
+        if usage is not None and type(usage) is not SafeUsage:
+            # Exactly SafeUsage, not a subclass: a subclass could add a free-form
+            # string field and defeat the 'no credential can be persisted' shape.
+            raise ResponseLifecycleError("usage must be exactly a SafeUsage or None")
         if self.rows.responses.get(self._key(actor, request_id)) is not None:
             raise ResponseLifecycleError("response request has already begun; it cannot be restarted")
         now = now_utc()
@@ -328,8 +331,10 @@ class MemoryResponseLifecycleStore:
         record = self._owned(actor, request_id)
         if state not in LIFECYCLE_STATES:
             raise ResponseLifecycleError(f"response lifecycle state is not allowlisted: {state!r}")
-        if usage is not None and not isinstance(usage, SafeUsage):
-            raise ResponseLifecycleError("usage must be a SafeUsage or None")
+        if usage is not None and type(usage) is not SafeUsage:
+            # Exactly SafeUsage, not a subclass: a subclass could add a free-form
+            # string field and defeat the 'no credential can be persisted' shape.
+            raise ResponseLifecycleError("usage must be exactly a SafeUsage or None")
         if record.is_terminal:
             raise ResponseLifecycleError(
                 "committed lifecycle is immutable; a terminal response cannot advance"
