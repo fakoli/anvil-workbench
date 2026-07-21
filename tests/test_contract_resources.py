@@ -792,3 +792,294 @@ def _walk(value: object):
             yield from _walk(nested)
     else:
         yield value
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T009: reviewed OpenAPI -> read-only descriptor compile.
+#
+# Compilation is a REVIEW-TIME operator action: it emits read_only_connector
+# descriptors that validate under the EXISTING manifest prohibitions, carries
+# READ-ONLY effect classes only, ignores the document's server URLs, and NO
+# runtime/browser path ingests an OpenAPI URL/document. Document/digest drift
+# after pinning refuses dispatch as drift.
+# =========================================================================== #
+
+from workbench.config import reviewed_openapi_source_location as _t009_source
+from workbench.contracts import (
+    RuntimeOpenApiIngestionError as _T009_RuntimeError,
+    assert_connector_document_current as _t009_assert_current,
+    compile_openapi_read_connector_plugin as _t009_compile,
+    openapi_document_digest as _t009_doc_digest,
+    refuse_runtime_openapi_ingestion as _t009_refuse_runtime,
+    reviewed_openapi_catalog as _t009_catalog,
+    validate_plugin_catalog as _t009_validate,
+)
+
+_T009_PROVENANCE = {
+    "signer_kind": "operator_owner_key", "key_id": "operator-key-01",
+    "reviewed_at": "2026-07-21T00:00:00Z",
+}
+_T009_REVIEWS = {
+    "issues.read": {
+        "title": "Read one reviewed issue",
+        "summary": "Read one mirrored issue redacted summary through the host-mediated connector.",
+        "output_schema": {
+            "type": "object", "additionalProperties": False, "required": ["title"],
+            "properties": {"title": {"type": "string", "maxLength": 200}},
+        },
+        "data_access": ["read_project_metadata"],
+        "host_access": [{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+        "receipts": ["plugin.issues.read"],
+    }
+}
+
+
+def _t009_doc(extra_paths=None):
+    paths = {
+        "/issues/{ref}": {
+            "get": {
+                "operationId": "issues.read",
+                "summary": "Read one issue",
+                "parameters": [
+                    {"name": "ref", "in": "path", "required": True,
+                     "schema": {"type": "string", "pattern": "^[a-z0-9-]{1,40}$"}},
+                ],
+            }
+        }
+    }
+    if extra_paths:
+        paths.update(extra_paths)
+    return {
+        "openapi": "3.0.3",
+        "info": {"title": "Issues", "version": "1.0.0"},
+        # A server URL the compiler must IGNORE -- never carried into a descriptor.
+        "servers": [{"url": "https://internal.evil.example/api"}],
+        "paths": paths,
+    }
+
+
+def _t009_compile_plugin(doc=None, plugin_id="reviewed-issues"):
+    return _t009_compile(
+        doc or _t009_doc(),
+        plugin_id=plugin_id, title="Reviewed issues", version="1.0.0",
+        publisher={"name": "Anvil Workbench", "kind": "first_party"},
+        description="Read-only reviewed issue mirror compiled from a digest-pinned OpenAPI document.",
+        runtime={"kind": "connector", "api_version": "1.0.0", "min_host_version": "1.0.0"},
+        support_status="supported", data_access=["read_project_metadata"],
+        host_access=[{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+        retention="none", docs="docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed",
+        compiled_at="2026-07-21T00:00:00Z", tool_reviews=_T009_REVIEWS,
+    )
+
+
+def test_t009_compiles_read_only_connector_that_validates_under_manifest_prohibitions():
+    plugin = _t009_compile_plugin()
+    catalog = _t009_catalog([plugin], registry_id="reviewed-connectors", revision="1.0.0", provenance=_T009_PROVENANCE)
+    _t009_validate(catalog)  # existing manifest prohibitions enforce closed I/O, no shell/fetch/credential
+    tool = catalog["plugins"][0]["tools"][0]
+    assert tool["tool_kind"] == "read_only_connector"
+    assert tool["effect"] == "read"
+    assert tool["gates"]["human_approval"] == "not_required"
+    # openapi_source pins the reviewed document digest only -- never a URL/body.
+    assert catalog["plugins"][0]["openapi_source"]["document_digest"] == _t009_doc_digest(_t009_doc())
+
+
+def test_t009_compilation_refuses_a_write_operation():
+    write_doc = _t009_doc(extra_paths={
+        "/issues": {"post": {"operationId": "issues.create", "summary": "Create an issue"}}
+    })
+    with pytest.raises(ContractValidationError, match="only read-only GET"):
+        _t009_compile_plugin(doc=write_doc)
+
+
+def test_t009_compiled_descriptor_never_carries_a_server_url_or_document_body():
+    plugin = _t009_compile_plugin()
+    blob = json.dumps(plugin)
+    assert "evil.example" not in blob  # the server URL is ignored, never compiled in
+    assert "servers" not in plugin
+    assert "://" not in blob  # no URL/endpoint anywhere in the descriptor
+
+
+def test_t009_no_runtime_or_browser_path_ingests_openapi():
+    for what in ("a browser-supplied OpenAPI URL", "an inline document"):
+        with pytest.raises(_T009_RuntimeError):
+            _t009_refuse_runtime(what)
+
+
+def test_t009_a_smuggled_open_or_non_scalar_param_is_refused():
+    # An OpenAPI param that is a non-scalar object (a smuggle vector for
+    # {"command": "...", "cwd": "/etc"}) is refused at compile time.
+    hostile = _t009_doc(extra_paths={
+        "/run": {"get": {
+            "operationId": "issues.run", "summary": "hostile",
+            "parameters": [{"name": "payload", "in": "query", "required": True,
+                            "schema": {"type": "object"}}],
+        }}
+    })
+    reviews = dict(_T009_REVIEWS)
+    reviews["issues.run"] = dict(_T009_REVIEWS["issues.read"])
+    with pytest.raises(ContractValidationError, match="scalar"):
+        _t009_compile(
+            hostile, plugin_id="reviewed-issues", title="Reviewed issues", version="1.0.0",
+            publisher={"name": "Anvil Workbench", "kind": "first_party"},
+            description="Read-only reviewed issue mirror compiled from a digest-pinned OpenAPI document.",
+            runtime={"kind": "connector", "api_version": "1.0.0", "min_host_version": "1.0.0"},
+            support_status="supported", data_access=["read_project_metadata"],
+            host_access=[{"scope_id": "anvil-issues-mirror", "egress": "host_mediated"}],
+            retention="none", docs="docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed",
+            compiled_at="2026-07-21T00:00:00Z", tool_reviews=reviews,
+        )
+
+
+def test_t009_document_digest_is_tamper_evident_and_drift_refuses():
+    plugin = _t009_compile_plugin()
+    live = _t009_doc_digest(_t009_doc())
+    _t009_assert_current(plugin, live)  # baseline: current
+    # A changed document yields a different digest -> drift refusal.
+    changed = _t009_doc()
+    changed["info"]["version"] = "2.0.0"
+    assert _t009_doc_digest(changed) != live
+    with pytest.raises(ContractValidationError, match="drift"):
+        _t009_assert_current(plugin, _t009_doc_digest(changed))
+
+
+def test_t009_config_openapi_source_is_local_only_never_a_url():
+    assert _t009_source("catalogs/issues.openapi.json") == "catalogs/issues.openapi.json"
+    for url in ("https://x/y.json", "//host/y.json", "http://10.0.0.7/api"):
+        with pytest.raises(ValueError, match="local path"):
+            _t009_source(url)
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T011: non-secret plugin preference fields.
+#
+# Declared fields carry type/bounds/default/scope and resolve through the
+# standard precedence (per_turn -> actor -> project -> safe default). Catalog
+# validation REJECTS any actor-selectable field marked OR detected as secret/
+# credential-bearing.
+# =========================================================================== #
+
+from workbench.contracts import (
+    plugin_preference_actor_view as _t011_actor_view,
+    validate_plugin_catalog as _t011_validate,
+    validate_plugin_preference_value as _t011_value,
+)
+from workbench.store import resolve_plugin_tool_preferences as _t011_resolve
+
+_T011_EX = ROOT / "docs" / "contracts" / "examples"
+
+
+def _t011_catalog(fields):
+    catalog = json.loads((_T011_EX / "plugin.catalog.v1.json").read_text(encoding="utf-8"))
+    plugin = next(p for p in catalog["plugins"] if p["id"] == "anvil-tasks-viewer")
+    tool = next(t for t in plugin["tools"] if t["tool_id"] == "tasks.list")
+    tool["preference_fields"] = fields
+    for p in catalog["plugins"]:
+        p["plugin_digest"] = contract_digest("plugin", p)
+    catalog["catalog_digest"] = contract_digest("plugin-catalog", catalog)
+    return catalog
+
+
+def _t011_tool(catalog):
+    plugin = next(p for p in catalog["plugins"] if p["id"] == "anvil-tasks-viewer")
+    return next(t for t in plugin["tools"] if t["tool_id"] == "tasks.list")
+
+
+def test_t011_non_secret_fields_validate_and_carry_type_bounds_default_scope():
+    catalog = _t011_catalog([
+        {"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}, "default": 25},
+        {"name": "sort", "type": "enum", "scope": "per_turn", "allowed_values": ["newest", "oldest"], "default": "newest"},
+        {"name": "compact", "type": "bool", "scope": "project", "default": False},
+    ])
+    _t011_validate(catalog)
+    field = _t011_tool(catalog)["preference_fields"][0]
+    assert field["type"] == "int" and field["scope"] == "actor" and field["default"] == 25
+    assert field["bounds"] == {"min": 1, "max": 100}
+
+
+def test_t011_marked_secret_or_path_like_field_is_rejected():
+    for marker in ({"sensitivity": "secret"}, {"path_like": True}):
+        catalog = _t011_catalog([dict({"name": "page_size", "type": "int", "scope": "actor", "default": 25}, **marker)])
+        with pytest.raises(ContractValidationError, match="secret or path-like"):
+            _t011_validate(catalog)
+
+
+def test_t011_detected_secret_field_by_name_is_rejected():
+    for hostile_name in ("api_token", "auth_bearer", "connector_host", "backend_url", "db_password"):
+        catalog = _t011_catalog([{"name": hostile_name, "type": "string", "scope": "actor", "default": "x"}])
+        with pytest.raises(ContractValidationError, match="secret/credential-bearing"):
+            _t011_validate(catalog)
+
+
+def test_t011_detected_secret_field_by_default_shape_is_rejected():
+    # A field whose DEFAULT carries a secret/endpoint/host/path shape is detected
+    # via the shared redaction corpus and refused (a benign name is not enough).
+    for hostile_default in (
+        "serving:8443", "AKIAIOSFODNN7EXAMPLE", "eyJhbGciOiJIUzI1NiJ9.a.b",
+        "ghp_secretsecretsecret1234567890", "postgresql://u:p@db/x", "/etc/passwd", "C:/creds/store",
+    ):
+        catalog = _t011_catalog([{"name": "note", "type": "string", "scope": "actor", "default": hostile_default}])
+        with pytest.raises(ContractValidationError, match="secret/credential-bearing"):
+            _t011_validate(catalog)
+
+
+def test_t011_enum_allowed_values_secret_option_is_refused():
+    # SHOULD-1: a secret/credential/host:port/path-shaped allowed_values OPTION is
+    # an actor-selectable value that would reach dispatch RAW, so it is refused at
+    # review time even when the field name and default are benign.
+    for hostile in (
+        "serving:8443", "AKIAIOSFODNN7EXAMPLE", "eyJhbGciOiJIUzI1NiJ9.a.b",
+        "postgresql://u:p@db/x", "/etc/passwd", "C:/creds/store",
+        "ghp_secretsecretsecret1234567890",
+    ):
+        catalog = _t011_catalog([{"name": "sort", "type": "enum", "scope": "actor",
+                                  "allowed_values": ["safe", hostile], "default": "safe"}])
+        with pytest.raises(ContractValidationError, match="secret/credential-bearing"):
+            _t011_validate(catalog)
+
+
+def test_t011_innocent_enum_allowed_values_still_pass():
+    catalog = _t011_catalog([{"name": "sort", "type": "enum", "scope": "actor",
+                              "allowed_values": ["newest", "oldest", "priority"], "default": "newest"}])
+    _t011_validate(catalog)
+
+
+def test_t011_enum_default_must_be_one_of_allowed_values():
+    catalog = _t011_catalog([{"name": "sort", "type": "enum", "scope": "actor",
+                              "allowed_values": ["newest", "oldest"], "default": "sideways"}])
+    with pytest.raises(ContractValidationError, match="default is invalid"):
+        _t011_validate(catalog)
+
+
+def test_t011_resolution_follows_standard_precedence():
+    fields = [{"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}, "default": 25}]
+    assert _t011_resolve(fields) == {"page_size": 25}                                   # safe default
+    assert _t011_resolve(fields, project={"page_size": 50}) == {"page_size": 50}         # project over default
+    assert _t011_resolve(fields, actor={"page_size": 10}, project={"page_size": 50}) == {"page_size": 10}  # actor over project
+    assert _t011_resolve(fields, per_turn={"page_size": 5}, actor={"page_size": 10}) == {"page_size": 5}   # per_turn wins
+    # An out-of-bounds stored value falls back to the safe default (never dispatched).
+    assert _t011_resolve(fields, actor={"page_size": 9999}) == {"page_size": 25}
+
+
+def test_t011_value_validation_reuses_typed_checks():
+    field = {"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}}
+    _t011_value(field, 10)
+    with pytest.raises(ContractValidationError):
+        _t011_value(field, 999)
+    with pytest.raises(ContractValidationError):
+        _t011_value(field, "not-an-int")
+
+
+def test_t011_preference_field_schema_tripwire_fails_closed(monkeypatch, tmp_path):
+    import workbench.contracts as _cm
+    _cm._reset_plugin_catalog_contract_validator_cache()
+    try:
+        base = json.loads((SCHEMAS / "plugin-catalog.v1.schema.json").read_text(encoding="utf-8"))
+        del base["$defs"]["preferenceField"]["additionalProperties"]
+        drifted = tmp_path / "drifted-preffield.schema.json"
+        drifted.write_text(json.dumps(base), encoding="utf-8")
+        monkeypatch.setattr(_cm, "_PLUGIN_CATALOG_CONTRACT_SCHEMA_PATH", drifted)
+        with pytest.raises(ContractValidationError, match="no longer closes its preferenceField object"):
+            _cm.plugin_catalog_contract_validator()
+    finally:
+        _cm._reset_plugin_catalog_contract_validator_cache()

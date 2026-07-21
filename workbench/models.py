@@ -1033,6 +1033,19 @@ OPERATION_REFUSAL_CODES = frozenset({
     # attempt stays retriable after a reload -- an unambiguous failure, never a
     # fabricated success (T004.3 criterion 2).
     "policy.stale_version",
+    # --- reviewed-tools-plugins:T008 skill-digest adoption gate ---
+    # A workflow start or a capability-profile validation named a skill whose
+    # EXACT reviewed digest the owner has not acknowledged for adoption.  The
+    # skill is refused before it is trusted -- a bridge skill body is never added
+    # to a run, and a profile pinning it never validates -- so a new or changed
+    # skill cannot silently enter a run without an owner acknowledgment.
+    "skill.unacknowledged",
+    # The named skill WAS acknowledged, but at a DIFFERENT digest: the reviewed
+    # body changed since the owner adopted it.  Acknowledging one digest never
+    # implicitly acknowledges a later change -- a re-acknowledgment of the exact
+    # new digest is always required, so a drifted skill fails closed rather than
+    # riding the stale adoption.
+    "skill.digest_changed",
 })
 
 #: The credential-class token guard mirrored from the ``error.safe_summary``

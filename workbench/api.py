@@ -12,7 +12,7 @@ import hashlib
 import uuid
 from typing import Any, Callable, Mapping
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, WebSocket, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Query, Request, WebSocket, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -23,9 +23,15 @@ from .contracts import settings_actor_view
 from .conversation_api import (
     build_conversation_router,
     build_hub_retention_router,
+    conversation_actor,
     register_conversation_handlers,
 )
-from .conversation_store import ConversationStore, MemoryConversationStore
+from .conversation_store import (
+    ConversationSearchService,
+    ConversationStore,
+    ConversationStoreError,
+    MemoryConversationStore,
+)
 from .delivery_projection import (
     DeliveryProjectionStore,
     UnknownDeliveryRecordError,
@@ -50,8 +56,9 @@ from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
 from .redaction import scrub_config_payload
 from .store import (
-    MemoryPreferenceStore, PostgresStore, PreferenceStoreError, StalePreferenceWriteError,
-    StoreError, UnknownPreferenceError, WorkbenchStore,
+    MemoryPluginPreferenceService, MemoryPreferenceStore, MemorySkillAdoptionStore, PluginPreferenceStoreError,
+    PostgresStore, PreferenceStoreError, StalePreferenceWriteError, StoreError,
+    UnknownPreferenceError, WorkbenchStore,
 )
 from .system_health import SystemHealthService, UnknownIntegrationError
 from .voice import (
@@ -651,6 +658,61 @@ def build_plugin_router(
     return router
 
 
+#: The single fixed 404 body an unknown skill-adoption lookup returns, so the
+#: adoption surface is never an existence oracle for an un-acknowledged skill id.
+_UNKNOWN_SKILL_ADOPTION_DETAIL = "unknown skill adoption"
+_SKILL_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,119}$"
+
+
+def build_skill_adoptions_router(
+    actor_dependency: Callable[..., str],
+    skill_adoption_store: "MemorySkillAdoptionStore | None",
+) -> APIRouter:
+    """Build the read-only owner skill-digest adoption browser surface (T008).
+
+    Serves only the acknowledgment ledger's SAFE metadata projection: each entry
+    carries a skill id, the acknowledged ``sha256:`` digest, a scrubbed
+    description, and the bare content hash -- never a skill instructions body and
+    never a local filesystem path (the ledger record makes both unrepresentable).
+    Every response body is scrubbed at this last hop with
+    :func:`~workbench.redaction.scrub_config_payload`, so even a mis-stored
+    description cannot ferry a secret, endpoint, or path to the UI.
+
+    The surface is deliberately READ-ONLY: it registers only ``GET`` routes.  An
+    acknowledgment is an owner decision recorded at the service/hub layer, never
+    a browser mutation.  When ``skill_adoption_store`` is ``None`` the lane is not
+    configured and every endpoint refuses with 503, mirroring the other injectable
+    read-models.
+    """
+    router = APIRouter(prefix="/api/skill-adoptions")
+
+    def store() -> "MemorySkillAdoptionStore":
+        if skill_adoption_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="skill adoption ledger is not configured",
+            )
+        return skill_adoption_store
+
+    @router.get("")
+    def list_adoptions(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """Every acknowledged skill's digest + safe-metadata projection."""
+        return scrub_config_payload({"adoptions": store().list_acknowledgments()})
+
+    @router.get("/{skill_id}")
+    def get_adoption(
+        skill_id: str = Path(pattern=_SKILL_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One acknowledged skill's projection; an un-acknowledged id is a plain 404."""
+        adoption = store().get(skill_id)
+        if adoption is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_SKILL_ADOPTION_DETAIL)
+        return scrub_config_payload({"adoption": adoption})
+
+    return router
+
+
 #: The single fixed 404 body an unknown dispatch receipt/reconciliation lookup
 #: returns, so the chat-tools surface is never an existence oracle for a
 #: never-dispatched request digest.
@@ -713,6 +775,115 @@ def build_chat_tools_router(
         if item is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_TOOL_RECORD_DETAIL)
         return scrub_config_payload({"reconciliation": item})
+
+    return router
+
+
+def build_conversation_search_router(
+    actor_dependency: Callable[..., str],
+    conversation_search_service: "ConversationSearchService | None",
+) -> APIRouter:
+    """Build the first-party read-only conversation-search browser surface (T010).
+
+    The search is scoped to the requesting actor BY CONSTRUCTION: the trusted
+    ``actor`` dependency is mapped to the owning
+    :class:`~workbench.conversation_models.ConversationActor` with
+    :func:`~workbench.conversation_api.conversation_actor`, and the service only
+    ever ranges over that actor's own conversations -- a client cannot name
+    another actor, so a cross-actor read is structurally impossible.  A query
+    that would match only a foreign actor's conversation and a query that matches
+    nothing return the BYTE-IDENTICAL empty envelope (always 200, never a
+    404-vs-empty distinction), so the surface is never a cross-actor existence
+    oracle.
+
+    Results are DELIMITED UNTRUSTED DATA (``content_trust=untrusted_task_data``,
+    the result list JSON-stringified into an inert ``payload_json``) carrying a
+    typed read receipt; the search reads title metadata only, so metadata-only,
+    purged, or deleted transcript content never appears.  Every response body is
+    scrubbed at this last hop with
+    :func:`~workbench.redaction.scrub_config_payload`.  The surface is READ-ONLY
+    (a single ``GET``) and refuses with 503 until a service is injected.
+    """
+    router = APIRouter(prefix="/api/conversation-search")
+
+    def service() -> "ConversationSearchService":
+        if conversation_search_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="conversation search is not configured",
+            )
+        return conversation_search_service
+
+    @router.get("")
+    def search(
+        query: str = Query(min_length=1, max_length=_SEARCH_QUERY_MAX_CHARS),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Delimited, actor-scoped conversation-search results + a typed receipt."""
+        try:
+            envelope = service().search(conversation_actor(actor), query)
+        except ConversationStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        return scrub_config_payload(envelope)
+
+    return router
+
+
+#: The query bound the first-party conversation-search surface accepts, matching
+#: the service-side ``_SEARCH_QUERY_MAX`` so an over-length query is refused at
+#: the edge before it reaches the store.
+_SEARCH_QUERY_MAX_CHARS = 200
+
+#: The fixed 404 body an unknown plugin/tool preference lookup returns, so the
+#: surface is never an existence oracle for an unknown plugin/tool.
+_UNKNOWN_PLUGIN_PREF_DETAIL = "unknown plugin tool"
+_TOOL_ID_PATTERN = r"^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"
+
+
+def build_plugin_preferences_router(
+    actor_dependency: Callable[..., str],
+    plugin_preference_service: "MemoryPluginPreferenceService | None",
+) -> APIRouter:
+    """Build the read-only NON-SECRET plugin-preference browser surface (T011).
+
+    Serves only a tool's actor-selectable preference field DESCRIPTORS (type,
+    bounds, allowed values, safe default, scope) and the resolved effective values
+    for the AUTHENTICATED actor -- resolved through the standard ``per_turn ->
+    actor -> project -> default`` precedence with the actor's own namespace keyed
+    by the trusted identity.  Because the catalog validator refuses any
+    secret/credential/host-bearing field, only non-secret fields exist here: a
+    connector-host configuration value is never accepted from nor returned to the
+    browser (it never round-trips).  Every response body is scrubbed at this last
+    hop with :func:`~workbench.redaction.scrub_config_payload`.  The surface is
+    READ-ONLY (a single ``GET``) and refuses with 503 until a service is injected.
+    """
+    router = APIRouter(prefix="/api/plugin-preferences")
+
+    def service() -> "MemoryPluginPreferenceService":
+        if plugin_preference_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="plugin preferences are not configured",
+            )
+        return plugin_preference_service
+
+    @router.get("/{plugin_id}/{tool_id}")
+    def effective_preferences(
+        plugin_id: str = Path(pattern=_PLUGIN_ID_PATTERN),
+        tool_id: str = Path(pattern=_TOOL_ID_PATTERN),
+        project_id: str | None = None,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The actor's resolved effective preference values + the field descriptors."""
+        try:
+            result = service().effective(plugin_id, tool_id, actor=actor, project_id=project_id)
+        except PluginPreferenceStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PLUGIN_PREF_DETAIL
+            ) from exc
+        return scrub_config_payload(result)
 
     return router
 
@@ -1220,6 +1391,9 @@ def create_app(
     system_health: SystemHealthService | None = None,
     plugin_host_service: "PluginHostService | None" = None,
     chat_tool_dispatch_service: "ChatToolDispatchService | None" = None,
+    skill_adoption_store: MemorySkillAdoptionStore | None = None,
+    conversation_search_service: "ConversationSearchService | None" = None,
+    plugin_preference_service: MemoryPluginPreferenceService | None = None,
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
@@ -1271,6 +1445,20 @@ def create_app(
     # closed (503). Tool dispatch itself is a bridge/hub effect at the service
     # layer, never a browser mutation path.
     app.state.chat_tool_dispatch_service = chat_tool_dispatch_service
+    # The owner skill-digest adoption ledger is a hub-side supervision read-model
+    # that is deliberately NOT wired into the live bridge poll loop; it stays
+    # ``None`` unless a store is injected, so the browser surface fails closed
+    # (503). An acknowledgment is an owner decision at the service/hub layer.
+    app.state.skill_adoption_store = skill_adoption_store
+    # The first-party conversation-search tool is a hub-side supervision read-model
+    # that is deliberately NOT auto-wired into the live poll loop; it stays ``None``
+    # unless a service is injected, so the browser surface fails closed (503).
+    app.state.conversation_search_service = conversation_search_service
+    # The non-secret plugin-preference service is a hub-side supervision read-model
+    # that is deliberately NOT auto-wired into the live poll loop; it stays ``None``
+    # unless a service is injected, so the browser surface fails closed (503). It
+    # never accepts nor returns a connector-host configuration value.
+    app.state.plugin_preference_service = plugin_preference_service
     # The scoped preference store is a hub-side supervision read/write model that
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless injected, so the browser surface fails closed (503).
@@ -1425,6 +1613,25 @@ def create_app(
     # redacted dispatch receipts / reconciliation items; a tool dispatch is a
     # bridge/hub effect at the service layer, never a browser mutation.
     app.include_router(build_chat_tools_router(actor, chat_tool_dispatch_service))
+    # Read-only owner skill-digest adoption surface (reviewed-tools-plugins T008):
+    # authenticated by the same trusted ``actor`` dependency, GET-only, and
+    # fail-closed (503) until an adoption ledger is injected. Serves only the
+    # acknowledgment ledger's digest + safe-metadata projection; a skill body or
+    # local path is never accepted from nor returned to the browser.
+    app.include_router(build_skill_adoptions_router(actor, skill_adoption_store))
+    # First-party read-only conversation-search surface (reviewed-tools-plugins
+    # T010): authenticated by the same trusted ``actor`` dependency, scoped to the
+    # actor's own conversations by construction, GET-only, and fail-closed (503)
+    # until a service is injected. Returns delimited untrusted results + a typed
+    # receipt; a cross-actor probe is byte-identical to a nonexistent one, and
+    # metadata-only / purged / deleted transcript content never appears.
+    app.include_router(build_conversation_search_router(actor, conversation_search_service))
+    # Read-only non-secret plugin-preference surface (reviewed-tools-plugins T011):
+    # authenticated by the same trusted ``actor`` dependency, GET-only, and
+    # fail-closed (503) until a service is injected. Serves only actor-selectable
+    # non-secret field descriptors + the actor's resolved effective values; a
+    # connector-host configuration value never round-trips through the browser.
+    app.include_router(build_plugin_preferences_router(actor, plugin_preference_service))
     # Actor-scoped preference read/write surface (preferences-configuration
     # T002.3): authenticated by the same trusted ``actor`` dependency, personal
     # namespace bound to the authenticated actor, and fail-closed (503) until a

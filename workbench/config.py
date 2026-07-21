@@ -46,6 +46,17 @@ class Settings:
     #: service/bridge concern and is deliberately not on the live poll loop.
     plugin_catalog_file: str = ""
     plugin_capability_file: str = ""
+    #: Operator-declared LOCAL path to a reviewed, digest-pinned OpenAPI document
+    #: (reviewed-tools-plugins T009 / R016).  This is a REVIEW-TIME-ONLY input:
+    #: it is consumed by the OpenAPI -> descriptor compiler
+    #: (:func:`workbench.contracts.compile_openapi_read_connector_plugin`) during
+    #: operator catalog review to produce the reviewed ``plugin_catalog_file``.
+    #: ``create_app`` NEVER reads it -- there is deliberately no runtime or browser
+    #: path that ingests an OpenAPI URL or document; only the already-compiled,
+    #: digest-pinned catalog is loaded at runtime.  A URL / remote value is refused
+    #: by :func:`reviewed_openapi_source_location` (a document is a local reviewed
+    #: file, never fetched live).
+    plugin_openapi_document_file: str = ""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -74,4 +85,23 @@ class Settings:
             chat_routes=values.get("WORKBENCH_CHAT_ROUTES", "").strip(),
             plugin_catalog_file=values.get("WORKBENCH_PLUGIN_CATALOG_FILE", "").strip(),
             plugin_capability_file=values.get("WORKBENCH_PLUGIN_CAPABILITY_FILE", "").strip(),
+            plugin_openapi_document_file=values.get("WORKBENCH_PLUGIN_OPENAPI_DOCUMENT_FILE", "").strip(),
         )
+
+
+def reviewed_openapi_source_location(location: str) -> str:
+    """Resolve the operator-declared LOCAL reviewed OpenAPI document location.
+
+    Review-time only: the returned path is consumed by the OpenAPI -> descriptor
+    compiler during operator catalog review, NEVER by ``create_app`` at runtime.
+    A URL or remote transport is refused -- a reviewed OpenAPI document is a
+    local, digest-pinned, operator-reviewed file, never fetched live from a
+    browser- or hub-supplied URL (R016).
+    """
+    text = str(location).strip()
+    if not text:
+        raise ValueError("no reviewed OpenAPI document location is configured")
+    lowered = text.lower()
+    if "://" in lowered or lowered.startswith("//"):
+        raise ValueError("a reviewed OpenAPI document must be a local path, never a URL")
+    return text
