@@ -345,6 +345,35 @@ def test_contract_schemas_reject_privilege_and_binding_shortcuts() -> None:
         _validator("operation-receipt.v1.schema.json").validate(receipt)
 
 
+def test_preference_operation_digest_is_domain_separated_and_full_payload_sensitive() -> None:
+    # T004.1: the typed policy-operation digest hashes the FULL canonical payload
+    # (no field escapes) and is domain-separated from the approval digest, so an
+    # equivalent payload hashes identically and any material field change differs.
+    from workbench.contracts import approval_payload_digest, preference_operation_digest
+
+    payload = {
+        "schema_version": "workbench-preference-operation/v1",
+        "operation": "preference.set",
+        "setting_id": "personal.chat_transcript_retention_days",
+        "scope": "personal",
+        "op_version": 1,
+        "value": 30,
+    }
+    advertised = preference_operation_digest(payload)
+    # Key order is irrelevant (canonical sort), content is not.
+    reordered = {key: payload[key] for key in reversed(list(payload))}
+    assert preference_operation_digest(reordered) == advertised
+    for field, changed in (
+        ("value", 31), ("scope", "project"), ("op_version", 2),
+        ("setting_id", "personal.time_format"), ("operation", "preference.reset"),
+    ):
+        mutated = dict(payload)
+        mutated[field] = changed
+        assert preference_operation_digest(mutated) != advertised, field
+    # Domain separation: the same bytes never collide with the approval digest.
+    assert preference_operation_digest(payload) != approval_payload_digest(payload)
+
+
 def test_state_snapshot_digest_is_deterministic_order_independent_and_content_sensitive() -> None:
     snapshot = _load(EXAMPLES / "anvil-state.project-snapshot.v1.json")
     advertised = snapshot["snapshot_digest"]

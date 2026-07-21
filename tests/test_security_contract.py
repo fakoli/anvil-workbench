@@ -938,3 +938,86 @@ def test_a_model_operation_request_cannot_select_an_unprofiled_capability():
     with pytest.raises(TypedOperationError) as excinfo:
         resolve_operation_request(proposal, compile_delivery_snapshot(), published_catalog_set())
     assert excinfo.value.code == "operation.unprofiled"
+
+
+# ---------------------------------------------------------------------------
+# Preference configuration security lens (preferences-configuration:
+# T004.1 / T002.2)
+# ---------------------------------------------------------------------------
+
+
+def _pref_catalog_doc() -> dict:
+    path = _REPO_ROOT / "docs" / "contracts" / "examples" / "settings-descriptor.v1.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_secret_and_deployment_only_values_cannot_enter_a_policy_operation():
+    # T004.1 criterion 4 (security lens): a secret/path-like or deployment-only
+    # value is authority-owned and can never be carried in an operation payload.
+    from workbench.models import PolicyOperationError, build_policy_operation
+
+    catalog = _pref_catalog_doc()
+    by_id = {s["id"]: s for s in catalog["settings"]}
+    for setting_id in ("deployment.identity_header_name", "deployment.state_read_location"):
+        with pytest.raises(PolicyOperationError):
+            build_policy_operation(
+                by_id[setting_id], operation="preference.set", op_version=1, value="whatever",
+            )
+
+
+def test_preference_free_text_value_serializations_scrub_the_proven_leak_corpus():
+    # Security lens: a free-text preference value or operation payload that
+    # reaches a serialized/persisted record must be scrubbed with the hardened
+    # config-class scrubber, so no secret/endpoint/path can ride out. A revert to
+    # the transcript-only scrub (or dropping the as_dict scrub) fails this test.
+    from workbench.models import (
+        PolicyOperation,
+        PolicyOperationPreview,
+        PreferenceRecord,
+    )
+
+    poison = _corpus_field("note")
+
+    record = PreferenceRecord(
+        setting_id="personal.custom_label", scope="personal", scope_key="alice",
+        value=poison, write_version=1, updated_by="alice",
+    )
+    operation = PolicyOperation("preference.set", "personal.custom_label", "personal", 1, poison)
+    preview = PolicyOperationPreview(operation, poison)
+
+    blobs = [
+        json.dumps(record.as_dict()),
+        json.dumps(operation.as_dict()),
+        json.dumps(preview.as_dict()),
+    ]
+    for label, literal in _RUN_CONTEXT_LEAK_CORPUS.items():
+        for blob in blobs:
+            assert literal not in blob, f"a preference serialization leaked a {label!r} value"
+    for fragment in ("AKIAIOSFODNN7", "eyJhbGci", "BEGIN RSA PRIVATE KEY", "100.64.0.5", "db.internal", "state.db"):
+        for blob in blobs:
+            assert fragment not in blob, f"a preference serialization leaked fragment {fragment!r}"
+    # The audit metadata never carries the value at all (no leak surface).
+    assert poison not in json.dumps(record.audit_metadata())
+
+
+def test_preference_store_cross_scope_reads_are_byte_identical():
+    # T002.2 security lens: a cross-actor and a cross-project read return the
+    # exact same not-found bytes a genuinely missing record returns, so neither
+    # is a cross-scope existence oracle.
+    from workbench.store import MemoryPreferenceStore, UnknownPreferenceError
+
+    store = MemoryPreferenceStore(_pref_catalog_doc())
+    store.set_preference("personal", "alice", "personal.time_format", "format_12h", 0, "alice")
+    store.set_preference("project", "proj_1", "project.delivery_route", "route.delivery-heavy", 0, "alice")
+
+    def _raw(fn) -> bytes:
+        try:
+            fn()
+        except UnknownPreferenceError as exc:
+            return repr(exc.args).encode("utf-8")
+        raise AssertionError("expected UnknownPreferenceError")
+
+    foreign_actor = _raw(lambda: store.get("personal", "mallory", "personal.time_format"))
+    foreign_project = _raw(lambda: store.get("project", "proj_9", "project.delivery_route"))
+    missing = _raw(lambda: store.get("personal", "nobody", "personal.landing_surface"))
+    assert foreign_actor == foreign_project == missing

@@ -990,3 +990,133 @@ def test_cli_and_system_health_api_render_identical_posture_findings(monkeypatch
     assert cli_findings == api_findings
     # And both agree with a direct run of the shared runner -- no surface drift.
     assert cli_findings == _sh_run_audit(settings).findings()
+
+
+# ---------------------------------------------------------------------------
+# Actor-scoped preference read/write surface (preferences-configuration:T002.3)
+# ---------------------------------------------------------------------------
+
+import json as _pref_json
+from pathlib import Path as _PrefPath
+
+from workbench.store import MemoryPreferenceStore as _MemoryPreferenceStore
+
+_PREF_ACTOR = {"X-Workbench-Actor": "operator"}
+_PREF_OTHER = {"X-Workbench-Actor": "reviewer"}
+
+
+def _pref_settings() -> Settings:
+    return Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://100.87.34.66:8000/v1", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+
+
+def _pref_catalog() -> dict:
+    path = _PrefPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples" / "settings-descriptor.v1.json"
+    return _pref_json.loads(path.read_text(encoding="utf-8"))
+
+
+def _pref_client(store: _MemoryPreferenceStore | None) -> TestClient:
+    return TestClient(create_app(
+        settings=_pref_settings(), store=MemoryStore(), graph=NullGraph(), preference_store=store,
+    ))
+
+
+def test_preferences_surface_fails_closed_when_unconfigured():
+    # Not wired into the live loop: with no injected store every endpoint 503s.
+    with _pref_client(None) as test_client:
+        assert test_client.get("/api/preferences", headers=_PREF_ACTOR).status_code == 503
+        assert test_client.get(
+            "/api/preferences/personal.time_format", headers=_PREF_ACTOR
+        ).status_code == 503
+
+
+def test_preferences_effective_view_serializes_only_actor_view_and_clamps():
+    store = _MemoryPreferenceStore(_pref_catalog())
+    # Tighten the policy ceiling to 30 and set a personal value above it.
+    store.set_preference("policy", "policy", "policy.transcript_retention_max_days", 30, 0, "operator")
+    store.set_preference("personal", "operator", "personal.chat_transcript_retention_days", 60, 0, "operator")
+    with _pref_client(store) as test_client:
+        body = test_client.get("/api/preferences", headers=_PREF_ACTOR).json()
+    effective = {item["setting_id"]: item for item in body["effective"]}
+    # The personal value is clamped down to the policy ceiling.
+    assert effective["personal.chat_transcript_retention_days"]["value"] == 30
+    assert effective["personal.chat_transcript_retention_days"]["source"] == "clamped"
+    # Only actor-scope descriptors are serialized -- no authority/secret settings.
+    catalog_ids = {setting["id"] for setting in body["catalog"]["settings"]}
+    for authority_id in (
+        "policy.transcript_retention_max_days", "deployment.identity_header_name",
+        "deployment.state_read_location",
+    ):
+        assert authority_id not in catalog_ids
+        assert authority_id not in effective
+    blob = _pref_json.dumps(body)
+    assert "state_read_location" not in blob and "identity_header" not in blob
+
+
+def test_preference_write_read_and_version_increment_through_the_api():
+    store = _MemoryPreferenceStore(_pref_catalog())
+    with _pref_client(store) as test_client:
+        first = test_client.put(
+            "/api/preferences/personal.time_format", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "format_12h", "expected_version": 0},
+        )
+        assert first.status_code == 200 and first.json()["preference"]["write_version"] == 1
+        read = test_client.get(
+            "/api/preferences/personal.time_format?scope=personal", headers=_PREF_ACTOR,
+        )
+        assert read.status_code == 200 and read.json()["preference"]["value"] == "format_12h"
+
+
+def test_stale_write_is_reload_required_409_distinct_from_a_422_validation_error():
+    store = _MemoryPreferenceStore(_pref_catalog())
+    with _pref_client(store) as test_client:
+        test_client.put(
+            "/api/preferences/personal.time_format", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "format_12h", "expected_version": 0},
+        )
+        # A stale expected_version is a reload-required 409, not a validation error.
+        stale = test_client.put(
+            "/api/preferences/personal.time_format", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "format_24h", "expected_version": 0},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["reload_required"] is True
+        assert stale.json()["detail"]["current_version"] == 1
+        # A malformed value is a distinct 422 (not a reload conflict).
+        bad = test_client.put(
+            "/api/preferences/personal.chat_transcript_retention_days", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": 5000, "expected_version": 0},
+        )
+        assert bad.status_code == 422
+
+
+def test_cross_actor_preference_read_is_indistinct_not_found():
+    store = _MemoryPreferenceStore(_pref_catalog())
+    with _pref_client(store) as test_client:
+        test_client.put(
+            "/api/preferences/personal.time_format", headers=_PREF_ACTOR,
+            json={"scope": "personal", "value": "format_12h", "expected_version": 0},
+        )
+        # Another actor cannot read operator's personal value: the response is the
+        # SAME indistinct 404 body a genuinely missing preference returns.
+        foreign = test_client.get(
+            "/api/preferences/personal.time_format?scope=personal", headers=_PREF_OTHER,
+        )
+        missing = test_client.get(
+            "/api/preferences/personal.landing_surface?scope=personal", headers=_PREF_OTHER,
+        )
+        assert foreign.status_code == missing.status_code == 404
+        assert foreign.json() == missing.json() == {"detail": "unknown preference"}
+
+
+def test_malformed_setting_id_is_rejected_at_the_edge():
+    store = _MemoryPreferenceStore(_pref_catalog())
+    with _pref_client(store) as test_client:
+        # An id that does not match the setting-id grammar is a 422 at the edge.
+        assert test_client.get(
+            "/api/preferences/NotAValidId", headers=_PREF_ACTOR,
+        ).status_code == 422
