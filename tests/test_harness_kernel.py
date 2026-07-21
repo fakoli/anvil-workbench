@@ -2061,3 +2061,419 @@ def test_ptd_t008_directive_never_signals_a_bridge_effect():
     submit_directive(store, session.id, "please steer", "operator")
     assert store.commands == {} or all(len(q) == 0 for q in store.commands.values())
     assert store.list_runs() == []
+
+
+# --------------------------------------------------------------------------- #
+# reviewed-tools-plugins T004 (chat capability-profile pinning + typed tool
+# dispatch) and T005 (effectful preview/approval, invalidate-on-diff, fail-closed
+# replay/expiry/mismatch/digest-drift, reconcile-not-fabricate).  Every proof is
+# driven through the ACTUAL wired entrypoints -- ChatToolDispatchService.preview
+# and .dispatch -- never a hand-built receipt: a rejected request never reaches
+# the tool runner, and the reused typed-operation approval + receipt stores are
+# the ones the runtime would call.
+# --------------------------------------------------------------------------- #
+
+import contextlib as _rtp_contextlib
+import json as _rtp_json
+import threading as _rtp_threading
+from pathlib import Path as _RtpPath
+
+from workbench.contracts import (
+    approval_payload_digest as _rtp_subject_hash,
+    contract_digest as _rtp_digest,
+    _plugin_approval_subject as _rtp_subject,
+)
+from workbench.models import OperationRefusal as _RtpRefusal
+from workbench.store import OperationOutcome as _RtpOutcome, UnknownOutcomeError as _RtpUnknown
+from workbench.tool_dispatch import (
+    ChatToolDispatchService as _RtpService,
+    ChatToolSession as _RtpSession,
+    ToolDispatchError as _RtpError,
+)
+
+_RTP_EX = _RtpPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+_RTP_VIEWER_DIGEST = "sha256:4ae65e4cfc645dc1adf8a742e6485946c1961819b87039ffa0d93ea88253b4fd"
+_RTP_NOTIFIER_DIGEST = "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+
+
+def _rtp_load(name):
+    return _rtp_json.loads((_RTP_EX / name).read_text(encoding="utf-8"))
+
+
+def _rtp_catalog():
+    return _rtp_load("plugin.catalog.v1.json")
+
+
+def _rtp_capability():
+    return _rtp_load("plugin.capability.v1.json")
+
+
+def _rtp_service(health=None, catalog=None, capability=None):
+    session = _RtpSession(
+        session_id="chat0001",
+        catalog=catalog if catalog is not None else _rtp_catalog(),
+        capability=capability if capability is not None else _rtp_capability(),
+        bridge_id="bridge-a",
+        project_id="proj-1",
+    )
+    return _RtpService(session, health=health)
+
+
+def _rtp_read_request(status="ready", plugin_digest=_RTP_VIEWER_DIGEST, tool_id="tasks.list"):
+    req = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_taskslist000001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "anvil-tasks-viewer", "plugin_digest": plugin_digest},
+        "tool_call": {"tool_id": tool_id, "inputs": {"status": status}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    return req
+
+
+def _rtp_effect_request(message_ref="deploy-msg-1", grant_id="approval_chatgrant0001",
+                        plugin_digest=_RTP_NOTIFIER_DIGEST, tool_id="notify.send"):
+    req = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_notifysend0001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": plugin_digest},
+        "tool_call": {"tool_id": tool_id, "inputs": {"message_ref": message_ref}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    subject_hash = _rtp_subject_hash(_rtp_subject(req))
+    req["approval"] = {"grant_id": grant_id, "action": "invoke_effect_tool", "payload_hash": subject_hash}
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    return req, subject_hash
+
+
+def _rtp_grant(service, subject_hash, grant_id="approval_chatgrant0001",
+               bridge_id="bridge-a", project_id="proj-1", ttl_seconds=300):
+    return service.approvals.grant(grant_id, "invoke_effect_tool", subject_hash,
+                                   bridge_id, project_id, ttl_seconds=ttl_seconds)
+
+
+def _rtp_never(_disc, _inputs):
+    raise AssertionError("the tool runner must never be reached for a rejected request")
+
+
+# --- T004: capability-profile pinning is fail-closed and immutable ---------- #
+
+def test_rtp_t004_session_pins_and_fail_closes_on_a_drifted_catalog():
+    catalog = _rtp_catalog()
+    catalog["plugins"][0]["tools"][0]["title"] = "tampered"
+    with pytest.raises(Exception):
+        _RtpSession(session_id="c", catalog=catalog, capability=_rtp_capability(),
+                    bridge_id="bridge-a", project_id="proj-1")
+
+
+def test_rtp_t004_session_lists_only_pinned_enabled_tools_by_reference():
+    service = _rtp_service()
+    tools = {t["tool_id"] for p in service.list_tools() for t in p["tools"]}
+    assert tools == {"tasks.list", "issues.read", "notify.send"}
+    for plugin in service.list_tools():
+        cred = plugin["credential"]
+        assert "value" not in cred and "secret" not in cred and "token" not in cred
+
+
+# --- T004: reject-before-dispatch on the CLAIMED typed reason ---------------- #
+
+def test_rtp_t004_unknown_plugin_is_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["plugin"]["plugin_id"] = "ghost-plugin"
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.unknown_plugin"
+
+
+def test_rtp_t004_drifted_plugin_digest_is_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request(plugin_digest="sha256:" + "0" * 64)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.digest_drift"
+
+
+def test_rtp_t004_unknown_tool_is_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["tool_call"]["tool_id"] = "tasks.delete"
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.unknown_tool"
+
+
+def test_rtp_t004_a_tool_absent_from_the_profile_is_not_selected():
+    capability = _rtp_capability()
+    viewer = next(e for e in capability["plugins"] if e["plugin_id"] == "anvil-tasks-viewer")
+    viewer["enabled_tools"] = ["tasks.list"]
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+    req = _rtp_read_request(tool_id="issues.read")
+    req["tool_call"]["inputs"] = {"issue_ref": "repo#12"}
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.tool_not_selected"
+
+
+def test_rtp_t004_schema_invalid_inputs_are_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["tool_call"]["inputs"] = {"status": "not-a-valid-enum"}
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.input_invalid"
+
+
+def test_rtp_t004_an_unhealthy_tool_is_refused_before_the_runner():
+    service = _rtp_service(health=lambda _p, _t: False)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(_rtp_read_request(), _rtp_never)
+    assert exc.value.code == "tool.unhealthy"
+
+
+def test_rtp_t004_a_tampered_request_digest_is_refused():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["tool_call"]["inputs"] = {"status": "done"}
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.invalid_request"
+
+
+# --- T004: a read tool routes ungated and correlates request <-> result ----- #
+
+def test_rtp_t004_read_tool_dispatches_ungated_and_correlated():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    result = service.dispatch(req, lambda d, i: _RtpOutcome("succeeded", external_ref={"rows": "7"}))
+    receipt = result.receipt
+    assert receipt["status"] == "succeeded"
+    assert receipt["correlation"]["request_id"] == "plugreq_taskslist000001"
+    assert receipt["idempotency_key"] == req["request_digest"]
+    assert receipt["operation"] == {
+        "provider": "anvil-tasks-viewer", "id": "tasks.list",
+        "contract_version": "1.2.0", "operation_digest": _RTP_VIEWER_DIGEST,
+    }
+    assert "gates" not in receipt and "credential" not in receipt
+
+
+def test_rtp_t004_a_read_call_never_requires_or_consumes_an_approval():
+    service = _rtp_service()
+    result = service.dispatch(_rtp_read_request(), lambda d, i: _RtpOutcome("succeeded"))
+    assert result.receipt["status"] == "succeeded"
+    assert service.approvals.grants == {}
+
+
+# --- T005: preview is hash-bound and non-mutating --------------------------- #
+
+def test_rtp_t005_effect_preview_requires_a_subject_bound_approval():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    preview = service.preview(req)
+    assert preview["kind"] == "tool_call" and preview["effect"] == "external_effect"
+    assert preview["approval"] == {
+        "required": True, "action": "invoke_effect_tool", "payload_hash": subject_hash,
+    }
+    assert service.approvals.grants == {}
+    assert service.get_receipt(req["request_digest"]) is None
+
+
+def test_rtp_t005_read_preview_declares_no_approval_required():
+    service = _rtp_service()
+    preview = service.preview(_rtp_read_request())
+    assert preview["approval"] == {"required": False}
+
+
+def test_rtp_t005_a_changed_input_previews_a_different_binding():
+    _, hash_one = _rtp_effect_request(message_ref="deploy-msg-1")
+    _, hash_two = _rtp_effect_request(message_ref="deploy-msg-2")
+    assert hash_one != hash_two
+
+
+# --- T005: effectful dispatch consumes a one-time hash-bound approval -------- #
+
+def test_rtp_t005_effect_dispatch_consumes_the_grant_and_records_a_receipt():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+    ran = []
+    result = service.dispatch(req, lambda d, i: (ran.append(i), _RtpOutcome(
+        "succeeded", external_ref={"channel": "deploy"}))[1])
+    assert result.receipt["status"] == "succeeded"
+    assert ran == [{"message_ref": "deploy-msg-1"}]
+    grant = service.approvals.grants["approval_chatgrant0001"]
+    assert grant.consumed_at is not None
+
+
+def test_rtp_t005_effect_dispatch_without_a_grant_fails_closed():
+    service = _rtp_service()
+    req, _ = _rtp_effect_request()
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.approval_invalid"
+
+
+def test_rtp_t005_replay_of_a_consumed_grant_fails_closed():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+    first = service.dispatch(req, lambda d, i: _RtpOutcome(
+        "failed", error=_RtpRefusal("operation.input_invalid", "downstream rejected", retryable=True)))
+    assert first.receipt["status"] == "failed"
+    assert service.get_receipt(req["request_digest"]) is None
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.approval_invalid"
+
+
+def test_rtp_t005_all_grant_failures_collapse_to_one_non_oracular_reason():
+    req, subject_hash = _rtp_effect_request()
+    scenarios = []
+
+    svc = _rtp_service(); _rtp_grant(svc, subject_hash, ttl_seconds=-1)
+    scenarios.append(svc)
+    svc = _rtp_service(); _rtp_grant(svc, subject_hash, bridge_id="bridge-z")
+    scenarios.append(svc)
+    svc = _rtp_service(); _rtp_grant(svc, subject_hash, project_id="proj-z")
+    scenarios.append(svc)
+    svc = _rtp_service()
+    svc.approvals.grant("approval_chatgrant0001", "install_plugin", subject_hash, "bridge-a", "proj-1")
+    scenarios.append(svc)
+    svc = _rtp_service(); _rtp_grant(svc, _rtp_subject_hash({"tampered": True}))
+    scenarios.append(svc)
+
+    for svc in scenarios:
+        with pytest.raises(_RtpError) as exc:
+            svc.dispatch(dict(req), _rtp_never)
+        assert exc.value.code == "tool.approval_invalid"
+
+
+def test_rtp_t005_a_grant_for_the_previewed_input_cannot_authorize_a_changed_call():
+    service = _rtp_service()
+    _, old_hash = _rtp_effect_request(message_ref="deploy-msg-1")
+    _rtp_grant(service, old_hash)
+    changed, _ = _rtp_effect_request(message_ref="deploy-msg-2")
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(changed, _rtp_never)
+    assert exc.value.code == "tool.approval_invalid"
+
+
+# --- T005: idempotent replay + reconcile-not-fabricate ---------------------- #
+
+def test_rtp_t005_idempotent_replay_returns_the_stored_receipt_without_rerun():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+    runs = []
+    first = service.dispatch(req, lambda d, i: (runs.append(1), _RtpOutcome(
+        "succeeded", external_ref={"channel": "deploy"}))[1])
+    second = service.dispatch(req, _rtp_never)
+    assert first.replayed is False and second.replayed is True
+    assert first.receipt["receipt_id"] == second.receipt["receipt_id"]
+    assert runs == [1]
+
+
+def test_rtp_t005_unknown_effect_outcome_reconciles_and_is_not_a_success():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+
+    def unconfirmed(_d, _i):
+        raise _RtpUnknown("the deploy notification outcome is unknown", reason="unknown_outcome")
+
+    result = service.dispatch(req, unconfirmed)
+    assert result.receipt["status"] == "reconciliation_required"
+    item = service.get_reconciliation(req["request_digest"])
+    assert item is not None and item["reason"] == "unknown_outcome"
+    assert len(service.list_reconciliations()) == 1
+    replay = service.dispatch(req, _rtp_never)
+    assert replay.replayed is True and replay.receipt["status"] == "reconciliation_required"
+
+
+def test_rtp_t005_a_runner_that_raises_an_arbitrary_error_reconciles_not_500s():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+
+    def boom(_d, _i):
+        raise RuntimeError("connector crashed mid-send")
+
+    result = service.dispatch(req, boom)
+    assert result.receipt["status"] == "reconciliation_required"
+    assert service.get_reconciliation(req["request_digest"]) is not None
+
+
+# --- T004/T005: real concurrency guards -------------------------------------- #
+
+def test_rtp_t004_over_budget_when_the_pinned_tool_call_budget_is_exhausted():
+    # Pin a one-call budget; the second DISTINCT dispatch is over budget and never
+    # reaches the runner.  A replay or a rejected request consumes no budget, so
+    # the ceiling counts only real admitted dispatches.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+    ok = service.dispatch(_rtp_read_request("ready"),
+                          lambda d, i: _RtpOutcome("succeeded", external_ref={"rows": "7"}))
+    assert ok.receipt["status"] == "succeeded"
+    # A replay of the SAME request does not consume more budget.
+    replay = service.dispatch(_rtp_read_request("ready"), _rtp_never)
+    assert replay.replayed is True
+    # A second distinct request is refused before the runner.
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(_rtp_read_request("claimed"), _rtp_never)
+    assert exc.value.code == "tool.over_budget"
+
+
+def test_rtp_t005_concurrent_same_read_executes_once_and_the_receipt_lock_is_load_bearing():
+    service = _rtp_service()
+    req = _rtp_read_request("ready")
+    runs = []
+    replayed = []
+
+    def once(_d, _i):
+        runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    def go():
+        replayed.append(service.dispatch(req, once).replayed)
+
+    threads = [_rtp_threading.Thread(target=go) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(3.0)
+    assert runs.count(1) == 1
+    assert replayed.count(False) == 1 and replayed.count(True) == 5
+
+    service2 = _rtp_service()
+    req2 = _rtp_read_request("ready")
+    store = service2._receipts
+    real_lock = store._lock
+    store._lock = _rtp_contextlib.nullcontext()
+    runs2 = []
+    barrier = _rtp_threading.Barrier(2)
+
+    def contended(_d, _i):
+        barrier.wait(2.0)
+        runs2.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    try:
+        threads = [_rtp_threading.Thread(target=lambda: service2.dispatch(req2, contended)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(3.0)
+        assert runs2.count(1) == 2
+    finally:
+        store._lock = real_lock

@@ -309,3 +309,99 @@ def test_ptd_t005_accepted_start_claims_once_and_replays_the_same_run():
     assert duplicate["status"] == "duplicate" and replayed2 is True
     assert duplicate["run"]["run_id"] == accepted["run"]["run_id"]
     assert effects == ["claim+launch"]
+
+
+# --------------------------------------------------------------------------- #
+# reviewed-tools-plugins T005 — effectful chat tool dispatch reuses the typed-
+# operation approval + receipt spine (MemoryOperationApprovalStore one-time
+# consume, MemoryOperationReceiptStore idempotent receipt + reconciliation).
+# Exercised through the ACTUAL ChatToolDispatchService entrypoint the runtime
+# would call, over the reviewed plugin catalog/capability contracts.
+# --------------------------------------------------------------------------- #
+
+import json as _rtprw_json
+from pathlib import Path as _RtpRwPath
+
+from workbench.contracts import (
+    approval_payload_digest as _rtprw_subject_hash,
+    contract_digest as _rtprw_digest,
+    _plugin_approval_subject as _rtprw_subject,
+)
+from workbench.store import OperationOutcome as _RtpRwOutcome, UnknownOutcomeError as _RtpRwUnknown
+from workbench.tool_dispatch import (
+    ChatToolDispatchService as _RtpRwService,
+    ChatToolSession as _RtpRwSession,
+    ToolDispatchError as _RtpRwError,
+)
+
+_RTPRW_EX = _RtpRwPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+_RTPRW_NOTIFIER_DIGEST = "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+
+
+def _rtprw_service():
+    ex = _RTPRW_EX
+    catalog = _rtprw_json.loads((ex / "plugin.catalog.v1.json").read_text(encoding="utf-8"))
+    capability = _rtprw_json.loads((ex / "plugin.capability.v1.json").read_text(encoding="utf-8"))
+    session = _RtpRwSession(session_id="chatrw01", catalog=catalog, capability=capability,
+                            bridge_id="bridge-a", project_id="proj-1")
+    return _RtpRwService(session)
+
+
+def _rtprw_effect_request(message_ref="deploy-msg-1", grant_id="approval_rwgrant00001"):
+    req = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_notifyrw00001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": _RTPRW_NOTIFIER_DIGEST},
+        "tool_call": {"tool_id": "notify.send", "inputs": {"message_ref": message_ref}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    subject_hash = _rtprw_subject_hash(_rtprw_subject(req))
+    req["approval"] = {"grant_id": grant_id, "action": "invoke_effect_tool", "payload_hash": subject_hash}
+    req["request_digest"] = _rtprw_digest("plugin-request", req)
+    return req, subject_hash
+
+
+def test_rtp_t005_effect_dispatch_reuses_the_one_time_approval_and_receipt_spine():
+    service = _rtprw_service()
+    req, subject_hash = _rtprw_effect_request()
+    service.approvals.grant("approval_rwgrant00001", "invoke_effect_tool", subject_hash,
+                            "bridge-a", "proj-1")
+    runs = []
+    first = service.dispatch(req, lambda d, i: (runs.append(1), _RtpRwOutcome(
+        "succeeded", external_ref={"channel": "deploy"}))[1])
+    assert first.receipt["status"] == "succeeded" and first.replayed is False
+    # The typed-operation receipt store replays the stored receipt without a
+    # second execution, exactly as the spine's idempotency test proves.
+    second = service.dispatch(req, lambda d, i: (runs.append(1), _RtpRwOutcome("succeeded"))[1])
+    assert second.replayed is True and second.receipt["receipt_id"] == first.receipt["receipt_id"]
+    assert runs == [1]
+
+
+def test_rtp_t005_unknown_send_outcome_is_reconciled_not_retried_or_succeeded():
+    service = _rtprw_service()
+    req, subject_hash = _rtprw_effect_request()
+    service.approvals.grant("approval_rwgrant00001", "invoke_effect_tool", subject_hash,
+                            "bridge-a", "proj-1")
+
+    def unconfirmed(_d, _i):
+        raise _RtpRwUnknown("the deploy send outcome is unknown", reason="unknown_outcome")
+
+    result = service.dispatch(req, unconfirmed)
+    assert result.receipt["status"] == "reconciliation_required"
+    assert service.get_reconciliation(req["request_digest"])["reason"] == "unknown_outcome"
+    assert len(service.list_reconciliations()) == 1
+    # A replay returns the reconcile receipt; the unknown send is never retried.
+    assert service.dispatch(req, unconfirmed).receipt["status"] == "reconciliation_required"
+
+
+def test_rtp_t005_a_stale_grant_cannot_authorize_a_changed_send():
+    service = _rtprw_service()
+    _, old_hash = _rtprw_effect_request(message_ref="deploy-msg-1")
+    service.approvals.grant("approval_rwgrant00001", "invoke_effect_tool", old_hash,
+                            "bridge-a", "proj-1")
+    changed, _ = _rtprw_effect_request(message_ref="deploy-msg-2")
+    with pytest.raises(_RtpRwError) as exc:
+        service.dispatch(changed, lambda d, i: _RtpRwOutcome("succeeded"))
+    assert exc.value.code == "tool.approval_invalid"
