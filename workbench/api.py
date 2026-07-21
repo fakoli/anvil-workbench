@@ -7,9 +7,9 @@ bridge credential.  An identity-aware tailnet proxy should set
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, WebSocket, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,7 @@ from .conversation_api import (
 )
 from .conversation_store import ConversationStore, MemoryConversationStore
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
+from .project_context_store import ProjectContextStore, UnknownProjectionError
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
@@ -165,12 +166,83 @@ def _graph(settings: Settings) -> EvidenceGraph:
     return Neo4jEvidenceGraph(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password, retrieval=retrieval)
 
 
+#: The single non-leaking body every unknown-or-foreign project-context
+#: lookup gets, so a cross-project probe cannot distinguish "missing" from
+#: "belongs to another project".
+_UNKNOWN_PROJECTION_DETAIL = "unknown project context"
+
+#: The project-id / digest path grammars, mirrored from the projection and its
+#: store so a malformed scope is rejected at the edge (422) before it can reach
+#: the store as a distinguishable error.
+_PROJECT_ID_PATTERN = r"^[a-zA-Z0-9._-]{1,128}$"
+_SOURCE_DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
+
+
+def build_project_context_router(
+    actor_dependency: Callable[..., str],
+    project_context_store: ProjectContextStore | None,
+) -> APIRouter:
+    """Build the read-only, project-scoped context-projection browser surface.
+
+    Every endpoint is authenticated by the hub's trusted ``actor`` dependency
+    (tailnet identity + allowlist) and scoped by the ``project_id`` path
+    segment.  Responses serialize only the explicitly non-canonical display
+    projection (:meth:`ProjectContextProjection.as_dict`), whose closed field
+    set structurally cannot carry a State storage path, a credential-bearing
+    field, a token, or a raw executable provider payload — the projection is a
+    display read-model, never canonical authority.
+
+    Project scoping is a hard boundary: a digest that belongs to another
+    project is not in this project's namespace, so a cross-project read is
+    refused with the same indistinct not-found a genuinely missing record
+    raises (``UnknownProjectionError`` -> the fixed 404 body).  One project can
+    never learn whether another project's context exists.
+
+    When ``project_context_store`` is ``None`` the derived projection is not
+    configured (it is deliberately not wired into the live bridge poll loop)
+    and every endpoint refuses with 503, mirroring the unconfigured chat store.
+    """
+    router = APIRouter(prefix="/api/projects")
+
+    def context_store() -> ProjectContextStore:
+        if project_context_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="project-context projection is not configured",
+            )
+        return project_context_store
+
+    @router.get("/{project_id}/context")
+    def latest_project_context(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The acting project's latest non-canonical display projection."""
+        return {"context": context_store().get_latest(project_id).as_dict()}
+
+    @router.get("/{project_id}/context/{source_digest}")
+    def project_context_by_digest(
+        project_id: str = Path(pattern=_PROJECT_ID_PATTERN),
+        source_digest: str = Path(pattern=_SOURCE_DIGEST_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One of the acting project's projections addressed by its source digest.
+
+        A digest owned by another project resolves to the indistinct 404, so
+        this detail endpoint is not an existence oracle for foreign records.
+        """
+        return {"context": context_store().get(project_id, source_digest).as_dict()}
+
+    return router
+
+
 def create_app(
     settings: Settings | None = None,
     store: WorkbenchStore | None = None,
     graph: EvidenceGraph | None = None,
     conversation_store: ConversationStore | None = None,
     idempotency_store: IdempotencyStore | None = None,
+    project_context_store: ProjectContextStore | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
@@ -183,6 +255,10 @@ def create_app(
     app.state.graph = graph
     app.state.conversation_store = conversation_store
     app.state.idempotency_store = idempotency_store
+    # The derived project-context projection is a display read-model that is
+    # deliberately NOT wired into the live bridge poll loop; it stays ``None``
+    # unless an instance is injected, so the browser surface fails closed (503).
+    app.state.project_context_store = project_context_store
 
     def actor(request: Request) -> str:
         name = (request.headers.get(settings.identity_header) or "").strip()
@@ -217,6 +293,16 @@ def create_app(
     async def store_error_handler(_: Request, exc: StoreError):
         return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
 
+    # A missing projection and another project's projection raise the same
+    # ``UnknownProjectionError``; both render the identical fixed 404 body so the
+    # project-context read surface is never an existence oracle. This handler is
+    # more specific than ``StoreError`` above, so it wins for that subclass.
+    @app.exception_handler(UnknownProjectionError)
+    async def unknown_projection_handler(_: Request, __: UnknownProjectionError):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": _UNKNOWN_PROJECTION_DETAIL}
+        )
+
     # Actor-scoped chat surface (chat-first-voice T002.4): identity comes from
     # the same trusted ``actor`` dependency; the store enforces ownership.
     register_conversation_handlers(app)
@@ -225,6 +311,12 @@ def create_app(
     # batched enforce pass are operator-only and mounted OFF the actor surface;
     # a single actor can neither preview across nor delete another actor's records.
     app.include_router(build_hub_retention_router(owner, conversation_store))
+    # Read-only, project-scoped browser projection of the State-derived context
+    # (state-context-operations T003.3): authenticated by the same trusted
+    # ``actor`` dependency, scoped by the path ``project_id``, and fail-closed
+    # (503) until a projection store is configured. Serves only the explicitly
+    # non-canonical display read-model; never canonical State.
+    app.include_router(build_project_context_router(actor, project_context_store))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:

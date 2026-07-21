@@ -251,3 +251,183 @@ def test_skills_probe_and_router_only_hub_actions_are_explicit(monkeypatch):
         assert test_client.get("/api/routes").json()["routes"] == [{"workbench_run_id": "known", "request_id": "req-1", "model": "fast-local"}]
         assert test_client.post("/api/sandbox", json={"model": "fast-local", "input": "hello"}).json()["output_text"] == "safe"
         assert test_client.post("/api/sandbox", json={"model": "heavy-local", "input": "hello"}).status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Read-only project-context browser projection (state-context-operations
+# T003.3 / T003.4): the hub exposes the explicitly non-canonical display
+# read-model, project-scoped and fail-closed.
+# ---------------------------------------------------------------------------
+
+import json as _json
+from pathlib import Path as _Path
+
+from workbench.project_context import ProjectContextProjection
+from workbench.project_context_store import MemoryProjectContextStore
+from workbench.state_manifest import pin_state_read_operations
+from workbench.state_snapshot_adapter import validate_snapshot_payload
+
+_ROOT = _Path(__file__).resolve().parents[1]
+_EXAMPLE_CATALOG = _ROOT / "docs" / "contracts" / "examples" / "anvil-state.catalog.v1.json"
+_EXAMPLE_SNAPSHOT = _ROOT / "docs" / "contracts" / "examples" / "anvil-state.project-snapshot.v1.json"
+
+CTX_ACTOR = {"X-Workbench-Actor": "operator"}
+
+
+def _snapshot_projection() -> ProjectContextProjection:
+    """A realistic projection derived from the checked-in snapshot fixture."""
+    catalog = _json.loads(_EXAMPLE_CATALOG.read_text(encoding="utf-8"))
+    operation = pin_state_read_operations(catalog).project_snapshot
+    payload = _json.loads(_EXAMPLE_SNAPSHOT.read_text(encoding="utf-8"))
+    snapshot = validate_snapshot_payload(payload, operation)
+    return ProjectContextProjection.from_snapshot(snapshot)
+
+
+def context_client(store: MemoryProjectContextStore | None) -> TestClient:
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), project_context_store=store,
+    ))
+
+
+def test_project_context_response_is_readable_scoped_and_non_canonical():
+    # T003.3 criterion 1: readable hierarchy, scoped identifiers, source
+    # revision/digest, and an explicit non-canonical label.
+    store = MemoryProjectContextStore()
+    projection = _snapshot_projection()
+    store.publish(projection.project_id, projection)
+    with context_client(store) as client_:
+        response = client_.get(f"/api/projects/{projection.project_id}/context", headers=CTX_ACTOR)
+        assert response.status_code == 200, response.text
+        context = response.json()["context"]
+
+        # Explicit non-canonical labeling at the projection and summary level.
+        assert context["canonical"] is False and context["non_canonical"] is True
+        assert context["project_id"] == projection.project_id
+        assert context["source_digest"] == projection.source_digest
+
+        # Readable hierarchy with scoped identifiers and per-summary attribution.
+        prd_ids = {p["scoped_id"] for p in context["prds"]}
+        task_ids = {t["scoped_id"] for t in context["tasks"]}
+        feature_ids = {f["scoped_id"] for f in context["features"]}
+        assert prd_ids == {"release-alpha", "release-beta"}
+        assert task_ids == {"release-alpha:T001", "release-beta:T001", "release-beta:T002.2"}
+        assert feature_ids == {"release-alpha:F001", "release-beta:F001", "release-beta:F002"}
+        for summary in context["prds"] + context["features"] + context["tasks"]:
+            assert summary["non_canonical"] is True
+            assert summary["source_digest"] == projection.source_digest
+            assert summary["source_revision"] >= 1
+
+        # The by-digest detail endpoint returns the same projection.
+        detail = client_.get(
+            f"/api/projects/{projection.project_id}/context/{projection.source_digest}",
+            headers=CTX_ACTOR,
+        )
+        assert detail.status_code == 200
+        assert detail.json()["context"] == context
+
+
+def test_project_context_duplicate_task_identities_are_preserved():
+    # T003.4 criterion 3: same-numbered tasks in different PRDs stay distinct.
+    store = MemoryProjectContextStore()
+    projection = _snapshot_projection()
+    store.publish(projection.project_id, projection)
+    with context_client(store) as client_:
+        context = client_.get(
+            f"/api/projects/{projection.project_id}/context", headers=CTX_ACTOR,
+        ).json()["context"]
+        task_ids = [t["scoped_id"] for t in context["tasks"]]
+        assert "release-alpha:T001" in task_ids and "release-beta:T001" in task_ids
+        assert len(task_ids) == len(set(task_ids))
+
+
+def test_cross_project_context_read_is_indistinct_from_missing():
+    # T003.3 criterion 2 / T003.4 criterion 2: project A cannot read project B's
+    # context through the latest or detail endpoint; a foreign digest resolves
+    # to the byte-identical 404 of a truly missing record -- no existence oracle.
+    store = MemoryProjectContextStore()
+    projection = _snapshot_projection()  # owned by "project_example"
+    store.publish(projection.project_id, projection)
+    with context_client(store) as client_:
+        # A different project's latest is simply missing.
+        missing_latest = client_.get("/api/projects/other-project/context", headers=CTX_ACTOR)
+        assert missing_latest.status_code == 404
+
+        # Reading project_example's real digest under another project's scope is
+        # byte-identical to reading a digest that was never published.
+        foreign = client_.get(
+            f"/api/projects/other-project/context/{projection.source_digest}", headers=CTX_ACTOR,
+        )
+        never = client_.get(
+            "/api/projects/other-project/context/sha256:" + "0" * 64, headers=CTX_ACTOR,
+        )
+        assert foreign.status_code == never.status_code == 404
+        assert foreign.json() == never.json()
+        # And the same body a genuinely-missing latest returns.
+        assert missing_latest.json() == foreign.json()
+
+
+def test_project_context_response_carries_no_prohibited_fields():
+    # T003.3 criterion 3 / T003.4 criterion 3: no State path, credential field,
+    # token, or raw provider payload is representable in the response.
+    store = MemoryProjectContextStore()
+    projection = _snapshot_projection()
+    store.publish(projection.project_id, projection)
+    with context_client(store) as client_:
+        raw = client_.get(
+            f"/api/projects/{projection.project_id}/context", headers=CTX_ACTOR,
+        ).text
+        lowered = raw.lower()
+        for marker in ("state.db", ".anvil", "-wal", "-shm", "://", "sqlite", "api_key", "bearer", "argv"):
+            assert marker not in lowered, f"response leaked marker {marker!r}"
+
+
+def test_unconfigured_project_context_store_fails_closed():
+    # Fail-closed when the projection is not configured (it is deliberately not
+    # wired into the live poll loop): every endpoint refuses with 503.
+    with context_client(None) as client_:
+        assert client_.get("/api/projects/project_example/context", headers=CTX_ACTOR).status_code == 503
+        assert client_.get(
+            "/api/projects/project_example/context/sha256:" + "a" * 64, headers=CTX_ACTOR,
+        ).status_code == 503
+
+
+def test_project_context_read_requires_a_trusted_allowlisted_actor():
+    # The read surface is behind the same trusted actor dependency as the rest
+    # of the hub: a non-allowlisted identity is refused (403), never served.
+    store = MemoryProjectContextStore()
+    projection = _snapshot_projection()
+    store.publish(projection.project_id, projection)
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=False,
+    )
+    with TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), project_context_store=store,
+    )) as client_:
+        # No identity header at all -> 401.
+        assert client_.get(f"/api/projects/{projection.project_id}/context").status_code == 401
+        # A present but non-allowlisted identity -> 403.
+        assert client_.get(
+            f"/api/projects/{projection.project_id}/context",
+            headers={"X-Workbench-Actor": "intruder"},
+        ).status_code == 403
+
+
+def test_malformed_project_scope_or_digest_is_rejected_before_the_store():
+    store = MemoryProjectContextStore()
+    projection = _snapshot_projection()
+    store.publish(projection.project_id, projection)
+    with context_client(store) as client_:
+        # A malformed digest is rejected by the path pattern (422), never
+        # reaching the store as a distinguishable error.
+        assert client_.get(
+            f"/api/projects/{projection.project_id}/context/not-a-digest", headers=CTX_ACTOR,
+        ).status_code == 422
