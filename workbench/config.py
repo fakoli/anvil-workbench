@@ -35,6 +35,14 @@ class Settings:
     #: (chat-first-voice T003.1).  Parsed and fail-closed validated by
     #: :mod:`workbench.chat_routes`; unset means no chat route is allowed.
     chat_routes: str = ""
+    #: Operator-reviewed local paths to the signed reviewed plugin catalog and the
+    #: enable-only capability profile (reviewed-tools-plugins T002).  They are the
+    #: operator-declared trust root for :class:`workbench.plugin_host.PluginHostService`,
+    #: mirroring the provider-catalog local-JSON precedent.  Both unset means the
+    #: plugin host is not configured and its browser surface fails closed (503);
+    #: the lane is deliberately not wired into the live poll loop yet.
+    plugin_catalog_file: str = ""
+    plugin_capability_file: str = ""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -61,4 +69,6 @@ class Settings:
             allow_insecure_dev_actor=values.get("WORKBENCH_ALLOW_INSECURE_DEV_ACTOR", "").lower() in {"1", "true", "yes"},
             chat_content_hash_key=values.get("WORKBENCH_CHAT_HASH_KEY", ""),
             chat_routes=values.get("WORKBENCH_CHAT_ROUTES", "").strip(),
+            plugin_catalog_file=values.get("WORKBENCH_PLUGIN_CATALOG_FILE", "").strip(),
+            plugin_capability_file=values.get("WORKBENCH_PLUGIN_CAPABILITY_FILE", "").strip(),
         )

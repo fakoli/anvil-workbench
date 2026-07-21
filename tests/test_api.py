@@ -990,3 +990,169 @@ def test_cli_and_system_health_api_render_identical_posture_findings(monkeypatch
     assert cli_findings == api_findings
     # And both agree with a direct run of the shared runner -- no surface drift.
     assert cli_findings == _sh_run_audit(settings).findings()
+
+
+# ---------------------------------------------------------------------------
+# Read-only reviewed-plugin discovery + install-receipt browser surface
+# (reviewed-tools-plugins T002/T003): the hub exposes the redacted discovery
+# projection and stored receipts, credential-reference-only and fail-closed.
+# ---------------------------------------------------------------------------
+
+import json as _pl_json
+from pathlib import Path as _PlPath
+
+from workbench.contracts import approval_payload_digest as _pl_approval_hash, contract_digest as _pl_digest
+from workbench.plugin_host import (
+    CredentialBroker as _PlBroker,
+    HostInstallOutcome as _PlOutcome,
+    PluginDiscovery as _PlDiscovery,
+    PluginHostService as _PlService,
+)
+
+_PL_ROOT = _PlPath(__file__).resolve().parents[1]
+_PL_EXAMPLES = _PL_ROOT / "docs" / "contracts" / "examples"
+_PL_ACTOR = {"X-Workbench-Actor": "operator"}
+_PL_NOTIFIER_DIGEST = "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+
+
+def _pl_load(name: str) -> dict:
+    return _pl_json.loads((_PL_EXAMPLES / name).read_text(encoding="utf-8"))
+
+
+def _pl_service_with_install():
+    catalog = _pl_load("plugin.catalog.v1.json")
+    capability = _pl_load("plugin.capability.v1.json")
+    service = _PlService(_PlDiscovery(catalog, capability))
+    # Persist one accepted install receipt so the receipt endpoint has a subject.
+    subject = {
+        "kind": "install", "plugin_id": "deploy-notifier",
+        "plugin_digest": _PL_NOTIFIER_DIGEST, "target_version": "1.0.0",
+    }
+    request = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_installnotifier01",
+        "request_digest": "sha256:" + "0" * 64,
+        "kind": "install",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": _PL_NOTIFIER_DIGEST},
+        "lifecycle": {"target_version": "1.0.0"},
+        "approval": {
+            "grant_id": "approval_installnotifier01", "action": "install_plugin",
+            "payload_hash": _pl_approval_hash(subject),
+        },
+        "preview_ref": {"preview_id": "plugprev_installnotifier01"},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    request["request_digest"] = _pl_digest("plugin-request", request)
+    broker = _PlBroker({"anvil-connector-host": ["deploy-channel-ref"]})
+    service.store.install(
+        request, _PlDiscovery(catalog, capability), broker,
+        lambda discovered, handles: _PlOutcome(status="installed", output={"ok": True},
+                                               summary="Installed deploy-notifier 1.0.0."),
+    )
+    return service, request["request_digest"]
+
+
+def _pl_client(service) -> TestClient:
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), plugin_host_service=service,
+    ))
+
+
+def test_unconfigured_plugin_host_fails_closed():
+    # Fail-closed when the plugin host is not configured (deliberately not wired
+    # into the live poll loop): every endpoint refuses with 503.
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as client_:
+        assert client_.get("/api/plugins", headers=_PL_ACTOR).status_code == 503
+        assert client_.get("/api/plugins/deploy-notifier", headers=_PL_ACTOR).status_code == 503
+        assert client_.get(
+            "/api/plugins/receipts/sha256:" + "0" * 64, headers=_PL_ACTOR
+        ).status_code == 503
+
+
+def test_plugin_discovery_lists_only_approved_and_enabled_plugins():
+    # T002 criterion 1: the projection shows exactly the approved AND capability-
+    # enabled plugins, and only the enabled tools of each.
+    service, _ = _pl_service_with_install()
+    with _pl_client(service) as client_:
+        body = client_.get("/api/plugins", headers=_PL_ACTOR).json()
+        ids = {p["plugin_id"] for p in body["plugins"]}
+        assert ids == {"anvil-tasks-viewer", "deploy-notifier"}
+        viewer = next(p for p in body["plugins"] if p["plugin_id"] == "anvil-tasks-viewer")
+        # Only the profile-enabled tools are projected (tasks.list, issues.read).
+        assert {t["tool_id"] for t in viewer["tools"]} == {"tasks.list", "issues.read"}
+
+
+def test_plugin_discovery_returns_no_credential_value_to_the_browser():
+    # T003 criterion 1 (return direction): the discovery projection reports
+    # credentials by opaque reference only -- never a value.
+    service, _ = _pl_service_with_install()
+    with _pl_client(service) as client_:
+        raw = client_.get("/api/plugins", headers=_PL_ACTOR).text
+        notifier = next(
+            p for p in client_.get("/api/plugins", headers=_PL_ACTOR).json()["plugins"]
+            if p["plugin_id"] == "deploy-notifier"
+        )
+        assert notifier["credential"] == {
+            "requirement": "host_owned",
+            "owner_host": "anvil-connector-host",
+            "credential_refs": ["deploy-channel-ref"],
+        }
+        lowered = raw.lower()
+        for marker in ("secret", "password", "api_key", "bearer", "://"):
+            assert marker not in lowered, f"discovery leaked {marker!r}"
+
+
+def test_plugin_detail_is_indistinct_for_unknown_or_not_enabled():
+    # An unknown plugin returns the byte-identical 404 of a genuinely missing one
+    # (no existence oracle); a known+enabled one returns 200.
+    service, _ = _pl_service_with_install()
+    with _pl_client(service) as client_:
+        assert client_.get("/api/plugins/deploy-notifier", headers=_PL_ACTOR).status_code == 200
+        unknown = client_.get("/api/plugins/some-other-plugin", headers=_PL_ACTOR)
+        never = client_.get("/api/plugins/zzz-not-here", headers=_PL_ACTOR)
+        assert unknown.status_code == never.status_code == 404
+        assert unknown.content == never.content
+
+
+def test_plugin_receipt_endpoint_serves_redacted_receipt_and_404s_missing():
+    service, digest = _pl_service_with_install()
+    with _pl_client(service) as client_:
+        ok = client_.get(f"/api/plugins/receipts/{digest}", headers=_PL_ACTOR)
+        assert ok.status_code == 200
+        receipt = ok.json()["receipt"]
+        assert receipt["status"] == "accepted"
+        assert receipt["credential_use"]["requirement"] == "host_owned"
+        # No credential value in the served receipt.
+        blob = ok.text.lower()
+        for marker in ("secret", "password", "bearer", "://"):
+            assert marker not in blob
+        missing = client_.get("/api/plugins/receipts/sha256:" + "0" * 64, headers=_PL_ACTOR)
+        assert missing.status_code == 404
+
+
+def test_plugin_surface_requires_an_allowlisted_actor():
+    service, _ = _pl_service_with_install()
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=False,
+    )
+    with TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), plugin_host_service=service,
+    )) as client_:
+        assert client_.get("/api/plugins", headers={"X-Workbench-Actor": "intruder"}).status_code == 403
+        assert client_.get("/api/plugins").status_code == 401
