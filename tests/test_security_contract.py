@@ -248,3 +248,84 @@ def test_project_context_browser_response_exposes_no_state_path_credential_or_pa
         lowered = value.lower()
         for marker in ("state.db", ".anvil", "-wal", "-shm", "://"):
             assert marker not in lowered, f"response value {value!r} leaked {marker!r}"
+
+
+# --- historical run-context response safety (state-context-operations T005.3 /
+# T005.4): the rendered queue-time run context keeps trusted policy and
+# untrusted PRD/task data in two separately labeled structures, exposes no
+# State-internal FIELD (storage path, credential, execution surface), and scrubs
+# credential-shaped strings seeded into the untrusted prose on the last hop. ----
+
+
+def _seeded_run_context_response() -> dict:
+    """Render a historical run-context response from secret-seeded task prose."""
+    from fastapi.testclient import TestClient
+
+    from conftest import build_run_context
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.models import UntrustedEvidence, UntrustedTask, UntrustedTaskRef
+    from workbench.run_context_store import MemoryRunContextStore
+
+    context = build_run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=5),
+            title="Fix token=supersecretvalue in api_key=leak",
+            acceptance_criteria=("Rotate Bearer sk-live-abc123DEADBEEF now",),
+            work_packet_digest="sha256:" + "8" * 64,
+        ),
+        evidence=(UntrustedEvidence(citation="state-event:1", summary="secret=zzz seen"),),
+    )
+    store = MemoryRunContextStore()
+    store.capture("project_a", context)
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    app = create_app(settings=settings, store=MemoryStore(), graph=NullGraph(), run_context_store=store)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/projects/project_a/runs/{context.run_id}/context",
+            headers={"X-Workbench-Actor": "operator"},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["context"]
+
+
+def test_run_context_browser_response_separates_trust_and_exposes_no_leak():
+    context = _seeded_run_context_response()
+
+    # Two separately labeled trust structures.
+    assert context["trusted"]["trust"] == "trusted_execution_policy"
+    assert context["untrusted"]["content_trust"] == "untrusted_task_data"
+
+    keys: list[str] = []
+    strings: list[str] = []
+    _walk_ctx(context, keys, strings)
+
+    # No serialized FIELD NAME names a State-storage, credential, or raw
+    # execution surface. (Effect/gate enums are safe policy words; the closed
+    # run-context field set has no execution/adapter/command field at all.)
+    forbidden_key_markers = (
+        "state_db", "sqlite", "journal", "wal", "shm", "mount",
+        "token", "secret", "api_key", "apikey", "password", "credential", "bearer",
+        "adapter", "argv", "command", "input_schema", "output_schema",
+    )
+    for key in keys:
+        lowered = key.lower()
+        for marker in forbidden_key_markers:
+            assert marker not in lowered, f"run-context field {key!r} looks like a {marker!r} surface"
+
+    # The adversarial secrets seeded into the untrusted prose are scrubbed.
+    blob = json.dumps(context)
+    for leaked in ("supersecretvalue", "sk-live-abc123DEADBEEF", "zzz"):
+        assert leaked not in blob
+    assert "[REDACTED]" in blob
+
+    # No serialized VALUE carries a State-storage path or URL.
+    for value in strings:
+        lowered = value.lower()
+        for marker in ("state.db", ".anvil", "-wal", "-shm", "://"):
+            assert marker not in lowered, f"run-context value {value!r} leaked {marker!r}"
