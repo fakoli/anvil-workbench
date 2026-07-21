@@ -79,10 +79,12 @@ class ToolDispatchError(RuntimeError):
     ``code`` is a stable machine-checkable reason.  The reject-before-dispatch
     family maps each pre-dispatch guard to its own reason so a caller can tell an
     unknown plugin from a drifted digest from a not-selected tool from an
-    unhealthy or over-budget one.  The approval-consume family deliberately
-    COLLAPSES every one-time-grant failure (replay, expiry, action/hash mismatch,
-    cross-actor/bridge, digest drift) to a single non-oracular ``approval_invalid``
-    so a probe cannot learn which specific check failed.
+    actor-mismatched, unhealthy, or over-budget one; each such reason is a
+    structural authority fact (not a secret) so distinguishing them leaks nothing.
+    The approval-consume family, by contrast, deliberately COLLAPSES every
+    one-time-grant failure (replay, expiry, action/hash mismatch, cross-bridge,
+    cross-project, digest drift) to a single non-oracular ``approval_invalid`` so a
+    probe holding a ``grant_id`` cannot learn which specific grant check failed.
     """
 
     def __init__(self, code: str, message: str) -> None:
@@ -122,9 +124,16 @@ class ChatToolSession:
     a :class:`PluginDiscovery`, which fail-closed validates both up front, so an
     unknown/drifted/not-enabled tool request is refused against exactly the
     profile the session was created with -- never a later, live one.  Also pins
-    the session's ``bridge_id``/``project_id`` (the approval-grant binding scope)
-    and a per-session concurrency budget derived from the pinned profile's
+    the session's ``actor_id`` (the session is created for exactly one verified
+    actor) and ``bridge_id``/``project_id`` (the approval-grant binding scope) and
+    a per-session tool-call budget derived from the pinned profile's
     ``limits.max_concurrent_tool_calls``.
+
+    The ``actor_id`` pin is load-bearing authority, not correlation metadata: a
+    request whose ``actor.actor_id`` differs from the session's is refused before
+    the tool runner (``tool.actor_mismatch``), so a grant minted by one actor's
+    session can never be consumed by a dispatch presented under another actor --
+    the request's actor block is no longer merely schema-checked.
     """
 
     def __init__(
@@ -133,11 +142,14 @@ class ChatToolSession:
         session_id: str,
         catalog: Mapping[str, Any],
         capability: Mapping[str, Any],
+        actor_id: str,
         bridge_id: str,
         project_id: str,
     ) -> None:
         if not session_id:
             raise ToolDispatchError("tool.invalid_session", "a chat tool session requires an id")
+        if not actor_id:
+            raise ToolDispatchError("tool.invalid_session", "a chat tool session must pin an actor")
         if not bridge_id or not project_id:
             raise ToolDispatchError("tool.invalid_session", "a chat tool session must pin a bridge and project")
         # Fail closed on either document before the session is usable, exactly as
@@ -146,24 +158,27 @@ class ChatToolSession:
         validate_plugin_catalog(catalog)
         validate_plugin_capability(capability)
         self.session_id = str(session_id)
+        self.actor_id = str(actor_id)
         self.bridge_id = str(bridge_id)
         self.project_id = str(project_id)
         # run_id/command_id are receipt correlation fields, not authority; derive
         # a stable run id from the session so receipts of one session correlate.
         self.run_id = f"chat_{self.session_id}"
         self.discovery = PluginDiscovery(catalog, capability)
-        self._catalog = self.discovery._catalog  # the deep-copied, validated pin
+        self._catalog = self.discovery.catalog  # the deep-copied, validated pin
         limits = capability.get("limits") if isinstance(capability.get("limits"), Mapping) else {}
         raw_budget = limits.get("max_concurrent_tool_calls")
         # The pinned profile's tool-call budget.  The hermetic receipt store
         # SERIALIZES every dispatch's check-execute-store under one lock, so true
         # in-flight execution can never exceed one; the pinned
         # ``max_concurrent_tool_calls`` is therefore enforced here as a per-session
-        # ceiling on the number of tool-call dispatches this session ADMITS -- a
-        # conservative bound (a runaway chat cannot invoke unbounded tools) that a
-        # production async dispatcher would refine into a live in-flight gate.  A
-        # profile without an explicit limit gets a single call -- fail safe, never
-        # unbounded.
+        # lifetime ceiling on the number of tool-call dispatches that GENUINELY
+        # EXECUTE -- a slot is consumed only when a non-replay, non-rejected
+        # dispatch actually reaches its runner, so a rejected or replayed request
+        # consumes none.  A conservative bound (a runaway chat cannot invoke
+        # unbounded tools) that a production async dispatcher would refine into a
+        # live in-flight gate.  A profile without an explicit limit gets a single
+        # call -- fail safe, never unbounded.
         self.max_tool_calls = raw_budget if isinstance(raw_budget, int) and raw_budget > 0 else 1
 
     @property
@@ -218,9 +233,12 @@ class ChatToolDispatchService:
         self._health: ToolHealthProbe = health or (lambda _p, _t: True)
         self._receipts = receipt_store if receipt_store is not None else MemoryOperationReceiptStore()
         self._approvals = approval_store if approval_store is not None else MemoryOperationApprovalStore()
-        # The per-session tool-call budget counter.  A real (non-replay) dispatch
-        # that passes every gate consumes one of the pinned
-        # ``max_tool_calls``; a replayed or rejected request consumes none.
+        # The per-session tool-call budget counter.  A slot is committed only at
+        # the genuine execution point (inside the receipt store's replay-guarded
+        # executor), so a rejected request (bad approval, unhealthy, ...) and a
+        # replayed request both consume none, while the ceiling is PRE-CHECKED
+        # before any approval is consumed so an over-budget call never burns a
+        # grant or reaches the runner.
         self._budget_lock = threading.Lock()
         self._dispatched = 0
 
@@ -257,8 +275,18 @@ class ChatToolDispatchService:
         tool) binds the exact typed subject.  Because that hash covers the exact
         inputs, a later request with a changed input previews a different hash, so
         an approval minted from this preview cannot authorize the changed call.
+
+        Preview is the step that PRODUCES the payload_hash an approval binds, so it
+        does NOT require the request to already carry an approval block (that
+        requirement belongs at dispatch): ``require_approval=False``.  The produced
+        ``approval.payload_hash`` is the exact subject hash the dispatch will
+        recompute and the grant will bind, even though the not-yet-approved
+        preview request and the later approved dispatch request have different
+        ``request_digest`` values.
         """
-        discovered, effect, effectful = self._resolve_for(request, catalog_checked=True)
+        discovered, effect, effectful = self._resolve_for(
+            request, catalog_checked=True, require_approval=False
+        )
         plugin_ref = dict(request["plugin"])
         preview: dict[str, Any] = {
             "schema_version": "workbench-plugin-preview/v1",
@@ -308,13 +336,15 @@ class ChatToolDispatchService:
         2. idempotent replay -- a stored receipt for this request digest is
            returned without re-consuming an approval, re-running the runner, or
            reserving a budget slot;
-        3. resolution against the PINNED catalog+profile -- unknown / drifted /
-           not-selected / unknown-tool / tool-not-selected each fail closed on
-           their own reason;
+        3. session actor identity + resolution against the PINNED catalog+profile
+           -- an actor-mismatched request, and unknown / drifted / not-selected /
+           unknown-tool / tool-not-selected each fail closed on their own reason;
         4. full request validation against the pinned catalog -- inputs must match
-           the reviewed tool schema and an effectful call must carry an approval;
+           the reviewed tool schema, an effectful call must carry an approval, and
+           a read must NOT carry one;
         5. health -- an unhealthy tool is refused;
-        6. budget -- a real dispatch reserves an in-flight concurrency slot;
+        6. budget -- the lifetime tool-call ceiling is PRE-CHECKED (before any
+           grant is consumed); the slot is committed only at genuine execution;
         7. approval -- an effectful call CONSUMES its one-time hash-bound grant
            before the effect runs; a replayed/expired/mismatched grant fails
            closed on the collapsed ``approval_invalid`` reason;
@@ -346,11 +376,12 @@ class ChatToolDispatchService:
         if not self._health(discovered.plugin_id, tool_id):
             raise ToolDispatchError("tool.unhealthy", "the selected tool is not healthy")
 
-        # 6. budget: a real (non-replay) dispatch that has passed every gate
-        #    consumes one of the session's pinned tool-call budget.  Checked
-        #    before any approval is consumed so an over-budget request never burns
-        #    a grant and never reaches the tool runner.
-        self._reserve_budget()
+        # 6. budget: PRE-CHECK the lifetime ceiling before any approval is
+        #    consumed, so an over-budget request never burns a grant and never
+        #    reaches the tool runner.  The slot is not committed here -- it is
+        #    committed at the genuine execution point (inside the executor below),
+        #    so a rejected or replayed request consumes none.
+        self._check_budget()
 
         # 7. approval: an effectful call consumes its one-time grant now.
         if effectful:
@@ -361,6 +392,10 @@ class ChatToolDispatchService:
         inputs = dict(request["tool_call"].get("inputs") or {})
 
         def executor() -> OperationOutcome:
+            # Reached ONLY on a genuine (non-replay) execution: record_attempt
+            # returns a stored receipt without calling the executor.  Commit the
+            # budget slot here so exactly one slot is spent per real execution.
+            self._commit_budget()
             try:
                 outcome = tool_runner(discovered, inputs)
             except UnknownOutcomeError:
@@ -378,12 +413,23 @@ class ChatToolDispatchService:
                 return OperationOutcome(
                     "failed",
                     error=OperationRefusal(
-                        "operation.schema_unresolvable",
+                        "operation.runner_failed",
                         safe_receipt_summary(f"the read tool failed: {exc}"),
                         retryable=True,
                     ),
                 )
             if not isinstance(outcome, OperationOutcome):
+                # A malformed RETURN (not an exception) from the runner.  For an
+                # effectful call the effect may already have taken hold, so treat
+                # it EXACTLY like an unknown outcome -- reconcile (receipt + one
+                # reconciliation item) rather than raising a bare error that would
+                # leave the possibly-applied effect with no durable record.  A read
+                # has nothing to reconcile, so it keeps the typed contract error.
+                if effectful:
+                    raise UnknownOutcomeError(
+                        "the plugin tool effect outcome could not be confirmed",
+                        reason="unknown_outcome",
+                    )
                 raise ToolDispatchError(
                     "tool.runner_contract", "a tool runner must return an OperationOutcome"
                 )
@@ -403,14 +449,15 @@ class ChatToolDispatchService:
     # --- internals ----------------------------------------------------------- #
 
     def _resolve_for(
-        self, request: Mapping[str, Any], *, catalog_checked: bool
+        self, request: Mapping[str, Any], *, catalog_checked: bool, require_approval: bool = True
     ) -> tuple[DiscoveredPlugin, str, bool]:
         """Resolve a request against the pin; raise the typed reject reason.
 
         Runs the same reject-before-dispatch gate used by both ``preview`` and
-        ``dispatch`` so they never diverge: structural validity, exact-entry
-        resolution against the pinned catalog+profile, and -- when
-        ``catalog_checked`` -- full input-schema + effectful-approval validation.
+        ``dispatch`` so they never diverge: structural validity, the session's
+        pinned-actor identity, exact-entry resolution against the pinned
+        catalog+profile, and -- when ``catalog_checked`` -- full input-schema +
+        (unless ``require_approval`` is False) effectful-approval validation.
         """
         try:
             validate_plugin_request(request)
@@ -418,6 +465,15 @@ class ChatToolDispatchService:
             raise ToolDispatchError("tool.invalid_request", _safe(str(exc))) from exc
         if request.get("kind") != "tool_call":
             raise ToolDispatchError("tool.unsupported_kind", "chat dispatch invokes plugin tools only")
+        # The session is created for exactly ONE verified actor.  A request whose
+        # actor differs from the session's pin is refused here -- before the
+        # runner, before any budget, before any grant is consumed -- so a grant
+        # minted under one actor's session cannot be exercised by another actor.
+        actor = request.get("actor") if isinstance(request.get("actor"), Mapping) else {}
+        if str(actor.get("actor_id")) != self._session.actor_id:
+            raise ToolDispatchError(
+                "tool.actor_mismatch", "the request actor is not the session's pinned actor"
+            )
         plugin_ref = request.get("plugin") if isinstance(request.get("plugin"), Mapping) else {}
         tool_call = request.get("tool_call") if isinstance(request.get("tool_call"), Mapping) else {}
         try:
@@ -432,10 +488,13 @@ class ChatToolDispatchService:
             ) from exc
         if catalog_checked:
             try:
-                validate_plugin_request(request, self._session.catalog)
+                validate_plugin_request(
+                    request, self._session.catalog, require_approval=require_approval
+                )
             except ContractValidationError as exc:
-                # A schema-invalid input, or an effectful call missing its
-                # approval, is refused here -- before the tool runner.
+                # A schema-invalid input, an effectful call missing its approval
+                # (dispatch only), or a read carrying an approval is refused here
+                # -- before the tool runner.
                 raise ToolDispatchError("tool.input_invalid", _safe(str(exc))) from exc
         effect = str(discovered.tool["effect"])
         return discovered, effect, effect in _PLUGIN_EFFECTFUL
@@ -466,12 +525,29 @@ class ChatToolDispatchService:
         except OperationReceiptStoreError as exc:
             raise ToolDispatchError("tool.approval_invalid", "the tool approval is not valid") from exc
 
-    def _reserve_budget(self) -> None:
+    def _check_budget(self) -> None:
+        """Refuse fail-closed when the lifetime tool-call ceiling is reached.
+
+        A read-only pre-check (no slot is committed) run BEFORE any approval is
+        consumed, so an over-budget call never burns a grant and never reaches the
+        runner.  The slot itself is committed later, at the genuine execution
+        point (:meth:`_commit_budget`), so only a real execution spends budget.
+        """
         with self._budget_lock:
             if self._dispatched >= self._session.max_tool_calls:
                 raise ToolDispatchError(
                     "tool.over_budget", "the chat session has exhausted its pinned tool-call budget"
                 )
+
+    def _commit_budget(self) -> None:
+        """Commit one budget slot at the genuine (non-replay) execution point.
+
+        Called from inside the receipt store's replay-guarded executor, which runs
+        at most once per idempotency key and never for a replay, so exactly one
+        slot is spent per real execution.  A rejected request (refused before the
+        runner) and a replayed request both reach this never, consuming none.
+        """
+        with self._budget_lock:
             self._dispatched += 1
 
 

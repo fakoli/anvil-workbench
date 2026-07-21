@@ -1697,7 +1697,8 @@ def _ctd_load(name):
 def _ctd_service_with_reconcile():
     session = _CtdSession(
         session_id="chatapi1", catalog=_ctd_load("plugin.catalog.v1.json"),
-        capability=_ctd_load("plugin.capability.v1.json"), bridge_id="bridge-a", project_id="proj-1",
+        capability=_ctd_load("plugin.capability.v1.json"),
+        actor_id="operator-01", bridge_id="bridge-a", project_id="proj-1",
     )
     service = _CtdService(session)
     req = {

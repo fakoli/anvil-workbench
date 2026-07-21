@@ -2258,6 +2258,7 @@ def validate_plugin_capability(profile: Mapping[str, Any]) -> None:
 
 def validate_plugin_request(
     request: Mapping[str, Any], catalog: Mapping[str, Any] | None = None,
+    *, require_approval: bool = True,
 ) -> None:
     """Fail closed when a plugin request is tampered with, unauthorized, or unsafe.
 
@@ -2281,8 +2282,11 @@ def validate_plugin_request(
       subject, never a raw command;
     * when a trusted ``catalog`` is supplied for a ``tool_call``, the plugin
       must be present at its pinned digest, the tool must exist, the typed
-      inputs must validate against that tool's reviewed input schema, and an
-      effect-capable tool call must carry an approval.
+      inputs must validate against that tool's reviewed input schema, an
+      effect-capable tool call must carry an approval (unless ``require_approval``
+      is False, the preview path that PRODUCES the payload_hash the approval will
+      later bind), and a ``read`` tool call must NOT carry an approval — an
+      approval on a non-effectful call is a caller error, refused not ignored.
     """
     try:
         plugin_request_contract_validator().validate(dict(request))
@@ -2307,8 +2311,10 @@ def validate_plugin_request(
 
     # Fail-closed on EVERY kind: an attached approval must name the action that
     # corresponds to the request kind and its payload_hash must bind the exact
-    # typed subject. A bogus {action: install_plugin} on a disable, or an
-    # unexpected approval on a read tool_call, is refused rather than ignored.
+    # typed subject. A bogus {action: install_plugin} on a disable is refused
+    # rather than ignored. (Whether a tool_call is a read that may not carry an
+    # approval at all is an effect-class fact known only from the catalog, so that
+    # refusal lives in the catalog branch below, not here.)
     if isinstance(approval, Mapping):
         expected_action = _PLUGIN_KIND_APPROVAL_ACTION.get(kind)
         if approval.get("action") != expected_action:
@@ -2360,8 +2366,18 @@ def validate_plugin_request(
                 ) from exc
             except Exception as exc:
                 raise ContractValidationError(f"tool input schema cannot be evaluated: {exc}") from exc
-            if tool.get("effect") in _PLUGIN_EFFECTFUL and not isinstance(approval, Mapping):
-                raise ContractValidationError("effect-capable tool call requires an approval")
+            effect_class = tool.get("effect")
+            if effect_class in _PLUGIN_EFFECTFUL:
+                if require_approval and not isinstance(approval, Mapping):
+                    # The dispatch path requires the grant; the preview path
+                    # (require_approval=False) is exactly the step that produces
+                    # the payload_hash the approval will bind, so it is exempt.
+                    raise ContractValidationError("effect-capable tool call requires an approval")
+            elif isinstance(approval, Mapping):
+                # A read tool is ungated: an attached approval is never consumed,
+                # so accepting it would silently ignore a caller's mistaken grant.
+                # Refuse it instead of ignoring it.
+                raise ContractValidationError("a read tool call cannot carry an approval")
 
 
 def validate_plugin_preview(

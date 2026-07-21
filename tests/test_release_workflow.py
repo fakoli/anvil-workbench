@@ -343,7 +343,7 @@ def _rtprw_service():
     catalog = _rtprw_json.loads((ex / "plugin.catalog.v1.json").read_text(encoding="utf-8"))
     capability = _rtprw_json.loads((ex / "plugin.capability.v1.json").read_text(encoding="utf-8"))
     session = _RtpRwSession(session_id="chatrw01", catalog=catalog, capability=capability,
-                            bridge_id="bridge-a", project_id="proj-1")
+                            actor_id="operator-01", bridge_id="bridge-a", project_id="proj-1")
     return _RtpRwService(session)
 
 

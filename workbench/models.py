@@ -1004,6 +1004,11 @@ OPERATION_REFUSAL_CODES = frozenset({
     "operation.input_not_object",
     "operation.input_invalid",
     "operation.schema_unresolvable",
+    # A declared operation runner (e.g. a plugin read tool) raised at execution
+    # time rather than at resolution: a genuine, retriable runtime failure that is
+    # neither a schema nor a resolution problem.  Extends the set (never renames a
+    # member) so a read-tool runner crash records an ACCURATE typed refusal.
+    "operation.runner_failed",
     # --- T006.2 bridge-side immediate authority preflight ---
     "command.malformed",
     "command.expired",
