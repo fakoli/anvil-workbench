@@ -22,6 +22,7 @@ from .conversation_api import (
 )
 from .conversation_store import ConversationStore, MemoryConversationStore
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
+from .plugin_host import PluginHostService
 from .project_context_store import ProjectContextStore, UnknownProjectionError
 from .run_context_store import RunContextStore, UnknownRunContextError
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
@@ -160,6 +161,26 @@ def _conversation_store(settings: Settings) -> ConversationStore | None:
         return None
     return MemoryConversationStore(
         content_hash_key=settings.chat_content_hash_key.encode("utf-8"), recover_on_open=True,
+    )
+
+
+def _plugin_host_service(settings: Settings) -> "PluginHostService | None":
+    """Build the read-only reviewed-plugin discovery surface from operator config.
+
+    Mirrors how the provider catalog and system health derive from operator-
+    declared config: when BOTH the reviewed catalog and the enable-only capability
+    profile paths are declared, load and fail-closed validate them into a
+    :class:`PluginHostService`.  This is operator trust-root config, not live-loop
+    wiring — the service is a read-only discovery + stored-receipt surface, the
+    router stays GET-only, and the install effect remains a service/bridge concern.
+    When either path is unset the plugin host is not configured and stays ``None``
+    so the browser surface fails closed (503).  A configured-but-invalid file
+    raises loudly here rather than serving a drifted catalog.
+    """
+    if not settings.plugin_catalog_file or not settings.plugin_capability_file:
+        return None
+    return PluginHostService.from_files(
+        settings.plugin_catalog_file, settings.plugin_capability_file,
     )
 
 
@@ -379,6 +400,86 @@ def build_system_health_router(
     def system_posture(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
         """The deterministic observational posture audit (same runner as the CLI)."""
         return scrub_config_payload(health_service.posture().as_dict())
+
+    return router
+
+
+#: The plugin-id path grammar, mirrored from the reviewed plugin catalog's
+#: ``pluginId`` so a malformed id is rejected at the edge (422) before it reaches
+#: the discovery projection as a distinguishable lookup.
+_PLUGIN_ID_PATTERN = r"^[a-z][a-z0-9-]{1,62}$"
+_REQUEST_DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
+
+#: The single non-leaking body every unknown-or-not-enabled plugin lookup gets,
+#: so the discovery surface is never an existence oracle for a reviewed-but-not-
+#: enabled or an unknown plugin.
+_UNKNOWN_PLUGIN_DETAIL = "unknown plugin"
+_UNKNOWN_PLUGIN_RECEIPT_DETAIL = "unknown plugin receipt"
+
+
+def build_plugin_router(
+    actor_dependency: Callable[..., str],
+    plugin_host_service: "PluginHostService | None",
+) -> APIRouter:
+    """Build the read-only reviewed-plugin discovery and receipt browser surface.
+
+    Every endpoint is authenticated by the hub's trusted ``actor`` dependency and
+    serves only the redacted discovery projection (approved AND capability-enabled
+    plugins) or a stored, redacted install receipt.  The browser never receives a
+    credential value: the discovery projection reports credential handling by
+    opaque reference only, and a receipt reports credential use by reference only
+    (reviewed-tools-plugins T002 criterion 1 / T003 criterion 1).  Every response
+    body is scrubbed at this last hop with
+    :func:`~workbench.redaction.scrub_config_payload`, so even untrusted plugin
+    prose (a title, summary, description, or receipt line) cannot ferry a secret,
+    endpoint, or path to the UI.
+
+    The surface is deliberately read-only: it registers only ``GET`` routes and
+    exposes no install/mutation path (an install is a bridge/host effect, never a
+    browser mutation).  When ``plugin_host_service`` is ``None`` the lane is not
+    configured (it is deliberately NOT wired into the live bridge poll loop) and
+    every endpoint refuses with 503, mirroring the unconfigured context stores.
+    """
+    router = APIRouter(prefix="/api/plugins")
+
+    def service() -> "PluginHostService":
+        if plugin_host_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="plugin host is not configured",
+            )
+        return plugin_host_service
+
+    @router.get("")
+    def list_plugins(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """Every approved, capability-enabled plugin's redacted projection."""
+        return scrub_config_payload({"plugins": service().list_plugins()})
+
+    @router.get("/{plugin_id}")
+    def get_plugin(
+        plugin_id: str = Path(pattern=_PLUGIN_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One approved, enabled plugin; an unknown/not-enabled id is a plain 404.
+
+        A reviewed-but-not-enabled or an unknown plugin returns the byte-identical
+        not-found body, so this endpoint is not an existence oracle.
+        """
+        plugin = service().get_plugin(plugin_id)
+        if plugin is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PLUGIN_DETAIL)
+        return scrub_config_payload({"plugin": plugin})
+
+    @router.get("/receipts/{request_digest}")
+    def get_receipt(
+        request_digest: str = Path(pattern=_REQUEST_DIGEST_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One stored install receipt, redacted; a missing digest is a plain 404."""
+        receipt = service().get_receipt(request_digest)
+        if receipt is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PLUGIN_RECEIPT_DETAIL)
+        return scrub_config_payload({"receipt": receipt})
 
     return router
 
@@ -614,6 +715,7 @@ def create_app(
     project_context_store: ProjectContextStore | None = None,
     run_context_store: RunContextStore | None = None,
     system_health: SystemHealthService | None = None,
+    plugin_host_service: "PluginHostService | None" = None,
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> FastAPI:
@@ -627,6 +729,12 @@ def create_app(
     # failing closed. An injected service lets tests exercise mock bridge health
     # or seeded prose without env plumbing.
     system_health = system_health or SystemHealthService(settings)
+    # The reviewed-plugin discovery surface derives from operator-declared config
+    # (both the reviewed catalog and the capability profile paths), mirroring the
+    # provider-catalog / system-health precedent. An injected service overrides for
+    # tests; otherwise it is built from Settings when both files are declared, and
+    # stays None (503) when they are not.
+    plugin_host_service = plugin_host_service or _plugin_host_service(settings)
     app = FastAPI(title="Anvil Workbench", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.settings = settings
     app.state.store = store
@@ -642,6 +750,10 @@ def create_app(
     # it stays ``None`` unless injected, so the browser surface fails closed (503).
     app.state.run_context_store = run_context_store
     app.state.system_health = system_health
+    # The reviewed-plugin discovery/receipt surface is a hub-side read-model that
+    # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
+    # unless a service is injected, so the browser surface fails closed (503).
+    app.state.plugin_host_service = plugin_host_service
     # The scoped preference store is a hub-side supervision read/write model that
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless injected, so the browser surface fails closed (503).
@@ -736,6 +848,13 @@ def create_app(
     # shapes. It never fails closed on an unconfigured integration -- a disabled
     # descriptor with safe remediation is the truthful answer.
     app.include_router(build_system_health_router(actor, system_health))
+    # Read-only reviewed-plugin discovery + install-receipt surface (reviewed-
+    # tools-plugins T002/T003): authenticated by the same trusted ``actor``
+    # dependency, GET-only, and fail-closed (503) until a plugin host service is
+    # configured. Serves only the redacted discovery projection and stored
+    # receipts; a credential value is never accepted from nor returned to the
+    # browser (credentials are reported by opaque reference only).
+    app.include_router(build_plugin_router(actor, plugin_host_service))
     # Actor-scoped preference read/write surface (preferences-configuration
     # T002.3): authenticated by the same trusted ``actor`` dependency, personal
     # namespace bound to the authenticated actor, and fail-closed (503) until a
