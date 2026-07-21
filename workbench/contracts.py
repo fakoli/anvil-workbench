@@ -858,6 +858,17 @@ def _check_plugin_schema_closed_and_bounded(node: Any, object_depth: int) -> Non
                 "must close every object with additionalProperties:false "
                 "(an open nested object schema is a smuggle hole)"
             )
+        if "patternProperties" in node:
+            # additionalProperties:false only governs keys NOT matched by
+            # patternProperties, so a pattern-keyed open string map still
+            # accepts arbitrary fields ({"command": "...| sh"}) through the
+            # "closed" boundary. A plugin tool's typed boundary must enumerate
+            # its fields via `properties` only.
+            raise ContractValidationError(
+                "must enumerate object fields via properties only; a plugin tool "
+                "schema may not use patternProperties (additionalProperties:false "
+                "does not close keys matched by patternProperties — a smuggle hole)"
+            )
         depth += 1
         if depth > _PLUGIN_TOOL_SCHEMA_MAX_OBJECT_DEPTH:
             raise ContractValidationError(
