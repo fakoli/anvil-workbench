@@ -201,9 +201,29 @@
 .setting-readonly-note{margin:0;color:#9db6bb;font-size:11px;line-height:1.55;padding:9px 11px;border:1px dashed #3a4d51;border-radius:6px;background:#0b171b}
 .setting-notice{margin:0;font-size:10px;line-height:1.5}
 .setting-notice-ok{color:#8ee4bb}.setting-notice-error{color:#e8b3a6}
+.setting-reset-preview{display:grid;gap:8px;padding:9px 11px;border:1px solid #4d4022;border-left-width:3px;border-radius:6px;background:#1a1710;color:#e8cf96;font-size:10px;line-height:1.5}
+.setting-reset-preview p{margin:0}.setting-reset-preview b{font-family:'DM Mono',monospace;color:#f0d9a2}
+.setting-reset-preview-actions{display:flex;gap:8px}
+.setting-reset-confirm{border:1px solid #6b5a2c;background:#2a2410;color:#e8cf96;border-radius:6px;padding:5px 11px;font-size:10px;font-weight:800}
+.setting-reset-cancel{border:1px solid #33484d;background:transparent;color:#adbec1;border-radius:6px;padding:5px 11px;font-size:10px;font-weight:800}
+.setting-reset-confirm:disabled,.setting-reset-cancel:disabled{opacity:.5;cursor:default}
 .settings-live{position:fixed;bottom:14px;left:262px;font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:#7fbfb2}
-:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
+/* Visible keyboard focus indicator (WCAG 2.4.7), SCOPED to this lane's own
+   Settings surface so it never restyles Chat/Delivery focus rings app-wide. The
+   `.settings` class + `:focus-visible` pseudo-class out-specify the search/editor
+   controls' `outline:none` (which would otherwise defeat the ring), and the
+   explicit control rule guarantees the search box and every editor
+   select/number/text/checkbox shows the ring on keyboard focus. */
+.settings :focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
+.settings-search input:focus-visible,
+.setting-editor select:focus-visible,
+.setting-editor input:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
 @media(max-width:900px){.settings-inner{padding:20px 16px 22px}.settings-live{left:16px}
+/* The global "hub unavailable" toast is fixed at left:252px;right:351px — sized
+   for Delivery's fixed rail. On the narrow Settings layout this lane makes
+   reachable, those insets would collapse it to zero/negative width and the
+   dismiss control would be unreachable. Match the chat/explorer narrow pattern. */
+.app-shell.settings-active .toast{left:16px;right:16px}
 /* Settings narrow/zoom layout (a11y #5): the app nav rail is position:fixed at
    full width and would otherwise occlude the settings controls once the page can
    shrink below 980px. Under .settings-active only, drop it out of the fixed layer
