@@ -60,3 +60,36 @@
 .app-shell.chat-active .rail .brand{padding:0 12px 0 0}
 .app-shell.chat-active .rail-footer{margin:0 0 0 auto}
 .app-shell.chat-active .workspace{margin-left:0;width:100%}}
+
+/* Delivery explorer (plan-task-delivery T003). Project → PRD → plan → task
+   master/detail over the redacted delivery projection. Titles + lineage lead;
+   scoped ids and revisions are muted secondary disclosure. Same teal-on-near-
+   black system, DM Mono for ids/digests, pill badges for status. */
+.explorer-grid{min-height:calc(100vh - 64px)}
+.explorer{display:grid;grid-template-columns:352px minmax(0,1fr);min-height:calc(100vh - 64px)}
+.explorer-rail{border-right:1px solid var(--line-soft);background:linear-gradient(180deg,#0b1519,#091317);padding:22px 17px 26px;display:flex;flex-direction:column;gap:14px;overflow-y:auto;max-height:calc(100vh - 64px)}
+.explorer-rail h1{margin:6px 0 0;font-size:20px;letter-spacing:-.04em}.explorer-intro{margin:0;color:var(--muted);font-size:10px;line-height:1.55}
+.explorer-section-title{margin:6px 0 2px;color:#5f7378;font-size:9px;text-transform:uppercase;letter-spacing:.08em}
+.explorer-project-list{display:grid;gap:6px}.explorer-project{display:grid;gap:2px;text-align:left;border:1px solid #1c2f34;background:#0d1a1e;border-radius:7px;padding:9px 11px;color:inherit}.explorer-project.selected{border-color:#3aa08e;box-shadow:inset 2px 0 var(--teal)}.explorer-project b{font-size:12px;color:#e4efec}.explorer-project small{font-family:'DM Mono',monospace;font-size:8px;color:#556a6f}
+.explorer-open{display:grid;gap:8px;border:1px solid #20343a;background:#0c181c;border-radius:8px;padding:11px 12px}.explorer-open label{display:grid;gap:6px;color:#b6c8c5;font-size:10px;font-weight:700}.explorer-open input{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:8px 10px;outline:none;font:inherit;font-size:11px}.explorer-open-prd{border:1px solid #32665e;background:#13342f;color:#b9f4e5;border-radius:6px;padding:8px 10px;font-size:10px;font-weight:800}.explorer-open-prd:disabled{opacity:.48;cursor:default}
+.explorer-filter{display:grid;gap:6px;color:#8aa19e;font-size:10px;font-weight:700}.explorer-filter input{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:8px 10px;outline:none;font:inherit;font-size:11px}
+.explorer-prds{display:grid;gap:11px}.explorer-empty,.explorer-none,.explorer-muted{color:#61757a;font-size:10px;line-height:1.55;margin:0}
+.explorer-degraded{color:#d7ab60;font-size:10px;line-height:1.55;margin:6px 0 0}
+.explorer-prd{border:1px solid #1c2f34;background:#0d1a1e;border-radius:9px;padding:12px 13px;display:grid;gap:9px}
+.explorer-prd-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.explorer-prd-title{margin:0;font-size:14px;letter-spacing:-.03em;color:#e6f1ee}.explorer-prd-lineage{margin:3px 0 0;color:#6f858a;font-size:9px}
+.explorer-prd-meta{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;margin:0}.explorer-prd-meta div{display:grid;gap:2px}.explorer-prd-meta dt{color:#66817b;font-size:8px;text-transform:uppercase;letter-spacing:.05em}.explorer-prd-meta dd{margin:0;color:#c3d5d1;font-size:10px}
+.explorer-read{justify-self:start;border:1px solid #33484d;background:transparent;color:#9dd6c9;border-radius:6px;padding:6px 10px;font-size:9px;font-weight:800}
+.explorer-task-list{list-style:none;margin:0;padding:0;display:grid;gap:5px}
+.explorer-task button{display:grid;gap:5px;width:100%;text-align:left;border:1px solid #182a30;background:#0b171b;border-radius:7px;padding:9px 10px;color:inherit}.explorer-task.selected button{border-color:#3aa08e;box-shadow:inset 2px 0 var(--teal)}.explorer-task button:hover{border-color:#2f5751}
+.explorer-task-title{font-size:12px;font-weight:700;color:#e4efec;line-height:1.3}.explorer-task-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.explorer-scoped{font-family:'DM Mono',monospace;font-size:8px;color:#556a6f}
+.explorer-pill{font-family:'DM Mono',monospace;font-size:8px;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:20px;border:1px solid #2b4a45;color:#8fd3c4}.explorer-pill.delivery{border-color:#33484d;color:#9db6bb}
+.explorer-detail-pane{padding:28px 34px 30px;overflow-y:auto;max-height:calc(100vh - 64px);max-width:760px;width:100%;display:flex;flex-direction:column;gap:14px}.explorer-detail-pane.empty{justify-content:center}
+.explorer-detail-title{margin:6px 0 0;font-size:23px;letter-spacing:-.04em;outline:none}.explorer-detail-title:focus-visible{outline:1px solid #3aa08e;outline-offset:4px}
+.explorer-detail-badges{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.explorer-ids{border:1px solid #20343a;background:#0c181c;border-radius:7px;padding:8px 11px}.explorer-ids summary{font-size:9px;color:#6f858a;cursor:pointer}.explorer-ids dl{display:grid;gap:4px;margin:9px 0 0}.explorer-ids div{display:grid;grid-template-columns:80px 1fr;gap:8px}.explorer-ids dt{color:#66817b;font-size:8px;text-transform:uppercase}.explorer-ids dd{margin:0;color:#b6d8d1;font-family:'DM Mono',monospace;font-size:9px;overflow-wrap:anywhere}
+.explorer-detail-block{border-top:1px solid var(--line-soft);padding-top:12px}.explorer-detail-block h3{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#8ca49b}.explorer-detail-block p{margin:0;color:#c3d5d1;font-size:12px;line-height:1.6}
+.explorer-deps{list-style:none;margin:0;padding:0;display:grid;gap:4px}.explorer-deps li{font-family:'DM Mono',monospace;font-size:10px;color:#bacbca}
+.explorer-eligibility{display:grid;gap:8px}.explorer-eligibility ul{list-style:none;margin:0;padding:0;display:grid;gap:6px}.explorer-eligibility li{font-size:11px;color:#c3d5d1;line-height:1.5}.explorer-eligibility b{font-family:'DM Mono',monospace;color:#9be5d3;font-size:10px}
+.explorer-prd-body{margin:0;border:1px solid #1b2d32;background:#0a1417;border-radius:8px;padding:14px;color:#c1d2ce;font:11px/1.65 'DM Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:none}
+.explorer-live{position:fixed;bottom:14px;left:262px;font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:#7fbfb2}
+@media(max-width:900px){.explorer{grid-template-columns:1fr}.explorer-rail{max-height:none;border-right:0;border-bottom:1px solid var(--line-soft)}.explorer-detail-pane{padding:20px 18px}.explorer-live{left:16px}}

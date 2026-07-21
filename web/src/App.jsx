@@ -5,8 +5,13 @@ import {
   archiveConversation, branchTurn, createConversation, deleteConversation, fetchChatRoutes,
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
+  fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
 } from './api'
 import { describeConversation, selectChatRoute, successorTurnBody, terminalToStatus } from './chat-api'
+import {
+  describeEligibility, describePrdContent, describeTaskReference, filterDescribedTasks,
+  freshnessLabel, progressSummaryLabel,
+} from './delivery-explorer'
 
 const emptyData = {
   projects: [], runs: [], sessions: [], workflows: [], approvals: [], skills: [], directives: [], audit: [],
@@ -17,7 +22,7 @@ const emptyData = {
 // Chat is first and selected by default; Delivery stays reachable directly below
 // it (chat-first-voice T004.4). The order here IS the rendered nav order.
 const nav = [
-  ['Chat', '◇'], ['Delivery', '⌘'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'],
+  ['Chat', '◇'], ['Delivery', '⌘'], ['Explorer', '▦'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'],
   ['Evidence', '◈'], ['Skills', '✦'], ['Sandbox', '□'],
 ]
 
@@ -511,6 +516,249 @@ function ChatView({ append }) {
   </main>
 }
 
+// --- Delivery explorer (plan-task-delivery T003) -----------------------------
+//
+// A read-only Project → PRD → plan → task explorer over the merged
+// delivery-projection GET surface (workbench/api.py build_delivery_projection_router).
+// Titles and lineage are the primary visible hierarchy; the scoped id
+// `<prd_id>:<task_id>` disambiguates two PRDs' `T001` in navigation AND in the
+// URL hash / selection state (R004 / criterion 2). The merged router serves
+// per-(project, prd) reads ONLY — there is no served PRD/project enumeration —
+// so the explorer lists Projects from bootstrap and opens a PRD by its id,
+// rendering a truthful note about the missing enumeration rather than
+// fabricating a PRD list. Every load failure (including a 503 when the
+// projection is not configured) renders a truthful degraded state.
+
+function ExplorerEligibility({ eligibility }) {
+  if (!eligibility || eligibility.status === 'idle' || eligibility.status === 'loading') {
+    return <p className="explorer-muted">{eligibility?.status === 'loading' ? 'Checking eligibility…' : 'No eligibility loaded.'}</p>
+  }
+  if (eligibility.status === 'error') {
+    return <p className="explorer-degraded">{eligibility.message || 'Eligibility is unavailable for this task.'}</p>
+  }
+  const verdict = eligibility.value
+  if (!verdict) return <p className="explorer-muted">No eligibility verdict for this task.</p>
+  return <div className="explorer-eligibility">
+    <Status tone={verdict.eligible ? 'green' : 'amber'}>{verdict.state}</Status>
+    <ul>{verdict.reasons.map((reason) => <li key={reason.code}><b>{reason.code}</b> — {reason.explanation}</li>)}</ul>
+  </div>
+}
+
+function ExplorerTaskRow({ task, selected, onOpen }) {
+  return <li className={`explorer-task ${selected ? 'selected' : ''}`}>
+    <button aria-label={`Open task ${task.scopedId}`} aria-current={selected ? 'true' : undefined} onClick={() => onOpen(task)}>
+      <span className="explorer-task-title">{task.title}</span>
+      <span className="explorer-task-meta">
+        <Status tone={tone(task.status)}>{task.status}</Status>
+        <span className="explorer-pill delivery">{task.latestDeliveryStatus}</span>
+      </span>
+      <small className="explorer-scoped">{task.scopedId}</small>
+    </button>
+  </li>
+}
+
+function ExplorerPrdCard({ entry, filter, selectedScopedId, onReadPrd, onOpenTask }) {
+  const described = (entry.tasks || []).map(describeTaskReference)
+  const filtered = filterDescribedTasks(described, filter)
+  const heading = entry.prd ? entry.prd.title : entry.prdId
+  return <article className="explorer-prd" aria-label={`PRD ${heading}`}>
+    <header className="explorer-prd-head">
+      <div>
+        <h2 className="explorer-prd-title">{heading}</h2>
+        <p className="explorer-prd-lineage">{entry.projectName} / {heading}</p>
+      </div>
+      {entry.prd ? <Status tone={tone(entry.prd.status)}>{entry.prd.status}</Status> : entry.prdError ? <Status tone="amber">unavailable</Status> : null}
+    </header>
+    {entry.prd && <>
+      <dl className="explorer-prd-meta">
+        <div><dt>Release</dt><dd>{entry.prd.release || '—'}</dd></div>
+        <div><dt>Revision</dt><dd>r{entry.prd.revision ?? '—'}</dd></div>
+        <div><dt>Freshness</dt><dd>{freshnessLabel(entry.prd.generatedAt)}</dd></div>
+        <div><dt>Progress</dt><dd>{progressSummaryLabel(entry.tasks)}</dd></div>
+      </dl>
+      <button className="explorer-read" onClick={() => onReadPrd(entry)}>Read PRD content</button>
+    </>}
+    {entry.prdError && <p className="explorer-degraded">{entry.prdError}</p>}
+    {entry.tasksError
+      ? <p className="explorer-degraded">{entry.tasksError}</p>
+      : <ul className="explorer-task-list" aria-label={`Tasks in ${heading}`}>
+          {filtered.length
+            ? filtered.map((task) => <ExplorerTaskRow key={task.scopedId} task={task} selected={selectedScopedId === task.scopedId} onOpen={(chosen) => onOpenTask(entry, chosen)} />)
+            : <li className="explorer-none">{described.length ? 'No tasks match that filter.' : 'No tasks in this PRD projection.'}</li>}
+        </ul>}
+  </article>
+}
+
+function ExplorerDetail({ selection, reading, eligibility, detailRef, onClose }) {
+  const onKeyDown = (event) => { if (event.key === 'Escape') onClose() }
+  if (selection) {
+    const task = selection.task
+    const lineage = [task.prdTitle, task.featureId, task.scopedId].filter(Boolean).join(' / ')
+    return <section className="explorer-detail-pane" aria-label={`Task ${task.scopedId}`} data-scoped-id={task.scopedId} onKeyDown={onKeyDown}>
+      <span className="crumb">{lineage}</span>
+      <h2 className="explorer-detail-title" tabIndex={-1} ref={detailRef}>{task.title}</h2>
+      <div className="explorer-detail-badges">
+        <Status tone={tone(task.status)}>{task.status}</Status>
+        {task.priority && <span className="explorer-pill">{task.priority}</span>}
+        <span className="explorer-pill delivery">delivery: {task.latestDeliveryStatus}</span>
+      </div>
+      <details className="explorer-ids"><summary>scoped identity</summary>
+        <dl>
+          <div><dt>Scoped id</dt><dd>{task.scopedId}</dd></div>
+          <div><dt>Run label</dt><dd>{task.runLabel || '—'}</dd></div>
+          <div><dt>PRD revision</dt><dd>r{task.prdRevision ?? '—'}</dd></div>
+        </dl>
+      </details>
+      <section aria-label="Dependencies" className="explorer-detail-block">
+        <h3>Dependencies</h3>
+        {task.dependsOn.length
+          ? <ul className="explorer-deps">{task.dependsOn.map((dep) => <li key={dep.scopedId}>{dep.scopedId}{dep.prdRevision != null ? ` @r${dep.prdRevision}` : ''}</li>)}</ul>
+          : <p className="explorer-muted">No dependencies.</p>}
+      </section>
+      <section aria-label="Acceptance criteria" className="explorer-detail-block">
+        <h3>Acceptance criteria</h3>
+        <p>{task.acceptanceCriteriaCount} acceptance {task.acceptanceCriteriaCount === 1 ? 'criterion' : 'criteria'}</p>
+      </section>
+      <section aria-label="Verification" className="explorer-detail-block">
+        <h3>Verification</h3>
+        <p>{task.verificationSummary || 'No verification summary in this projection.'}</p>
+      </section>
+      <section aria-label="Delivery eligibility" className="explorer-detail-block">
+        <h3>Delivery eligibility</h3>
+        <ExplorerEligibility eligibility={eligibility} />
+      </section>
+    </section>
+  }
+  if (reading) {
+    const prd = reading.prd
+    return <section className="explorer-detail-pane" aria-label={`PRD ${prd ? prd.title : reading.prdId}`} onKeyDown={onKeyDown}>
+      <span className="crumb">PRD content / {prd?.redactionStatus || 'redacted'}</span>
+      <h2 className="explorer-detail-title" tabIndex={-1} ref={detailRef}>{prd ? prd.title : reading.prdId}</h2>
+      {prd ? <>
+        <dl className="explorer-prd-meta">
+          <div><dt>Release</dt><dd>{prd.release || '—'}</dd></div>
+          <div><dt>Revision</dt><dd>r{prd.revision ?? '—'}</dd></div>
+          <div><dt>State status</dt><dd>{prd.status}</dd></div>
+          <div><dt>Freshness</dt><dd>{freshnessLabel(prd.generatedAt)}</dd></div>
+        </dl>
+        {prd.truncated && <p className="explorer-muted">Showing a redacted, truncated projection{prd.totalBytes != null ? ` (${prd.totalBytes} bytes total)` : ''}.</p>}
+        <pre className="explorer-prd-body">{prd.body || 'No PRD body in this projection.'}</pre>
+      </> : <p className="explorer-degraded">{reading.prdError || 'PRD content is unavailable.'}</p>}
+    </section>
+  }
+  return <section className="explorer-detail-pane empty" aria-label="Nothing selected">
+    <h2 className="explorer-detail-title">Open a PRD, then a task</h2>
+    <p className="explorer-muted">Select a project and open a PRD by its id to read its content and browse its plan and tasks. Titles and lineage lead; the scoped id keeps two PRDs' tasks distinct.</p>
+  </section>
+}
+
+function ExplorerView({ data, append }) {
+  const projects = data.projects || []
+  const [selectedProjectId, setSelectedProjectId] = useState(projects[0]?.id || '')
+  const [prdInput, setPrdInput] = useState('')
+  const [entries, setEntries] = useState([])
+  const [filter, setFilter] = useState('')
+  const [selection, setSelection] = useState(null)
+  const [reading, setReading] = useState(null)
+  const [eligibility, setEligibility] = useState({ status: 'idle', value: null, message: null })
+  const [announce, setAnnounce] = useState('')
+  const detailRef = useRef(null)
+  const railRef = useRef(null)
+
+  useEffect(() => { if (!selectedProjectId && projects[0]) setSelectedProjectId(projects[0].id) }, [projects, selectedProjectId])
+  // Move focus to the opened detail heading so a view switch / detail open never
+  // drops focus to <body> (a11y focus management). tabIndex=-1 makes the h2 a
+  // programmatic focus target without adding it to the tab order.
+  useEffect(() => { if (selection || reading) detailRef.current?.focus() }, [selection?.scopedId, reading?.key])
+
+  const loadEligibility = async (entry, task) => {
+    setEligibility({ status: 'loading', value: null, message: null })
+    try {
+      const value = await fetchTaskEligibility(entry.projectId, entry.prdId, task.taskId)
+      setEligibility({ status: 'loaded', value: describeEligibility(value.eligibility), message: null })
+    } catch (error) {
+      setEligibility({ status: 'error', value: null, message: error.message })
+    }
+  }
+
+  const openPrd = async () => {
+    const project = projects.find((item) => item.id === selectedProjectId)
+    const prdId = prdInput.trim()
+    if (!project || !prdId) return
+    const key = `${project.id}::${prdId}`
+    setAnnounce(`Loading PRD ${prdId}…`)
+    const [contentResult, tasksResult] = await Promise.allSettled([
+      fetchPrdContent(project.id, prdId),
+      fetchPrdTasks(project.id, prdId),
+    ])
+    const entry = {
+      key, projectId: project.id, projectName: project.name, prdId,
+      prd: contentResult.status === 'fulfilled' ? describePrdContent(contentResult.value.content) : null,
+      prdError: contentResult.status === 'rejected' ? contentResult.reason.message : null,
+      tasks: tasksResult.status === 'fulfilled' ? (tasksResult.value.tasks || []) : [],
+      tasksError: tasksResult.status === 'rejected' ? tasksResult.reason.message : null,
+    }
+    setEntries((current) => [entry, ...current.filter((item) => item.key !== key)])
+    setPrdInput('')
+    if (entry.prd) setAnnounce(`Loaded PRD ${entry.prd.title} with ${entry.tasks.length} tasks`)
+    else { setAnnounce(entry.prdError || `PRD ${prdId} could not be loaded`); append?.(entry.prdError || `PRD ${prdId} could not be loaded`) }
+  }
+
+  const readPrd = (entry) => {
+    setSelection(null)
+    setReading(entry)
+    setAnnounce(`Reading PRD ${entry.prd ? entry.prd.title : entry.prdId}`)
+  }
+
+  const openTask = (entry, task) => {
+    setReading(null)
+    setSelection({ scopedId: task.scopedId, entry, task })
+    // Reflect the scoped identity in the URL so two PRDs' T001 are distinct in
+    // state AND in the address bar (criterion 2), not merely on screen.
+    if (task.scopedId) window.location.hash = `explorer/${task.scopedId}`
+    setAnnounce(`Opened task ${task.scopedId}: ${task.title}`)
+    loadEligibility(entry, task)
+  }
+
+  const closeDetail = () => {
+    const had = selection || reading
+    setSelection(null)
+    setReading(null)
+    setEligibility({ status: 'idle', value: null, message: null })
+    if (had) {
+      setAnnounce('Closed detail')
+      railRef.current?.querySelector('.explorer-open-prd, input, button')?.focus()
+    }
+  }
+
+  return <main className="explorer" aria-label="Delivery explorer">
+    <aside className="explorer-rail" ref={railRef}>
+      <span className="crumb">Explorer / PRD → plan → task</span>
+      <h1>Delivery explorer</h1>
+      <p className="explorer-intro">Read-only Project → PRD → plan → task lineage from the redacted delivery projection.</p>
+      <section aria-label="Projects" className="explorer-projects">
+        <p className="explorer-section-title">Projects</p>
+        {projects.length
+          ? <div className="explorer-project-list">{projects.map((project) => <button key={project.id} className={`explorer-project ${selectedProjectId === project.id ? 'selected' : ''}`} aria-pressed={selectedProjectId === project.id} aria-label={`Select project ${project.name}`} onClick={() => setSelectedProjectId(project.id)}><b>{project.name}</b><small>{project.id}</small></button>)}</div>
+          : <p className="explorer-muted">No projects yet. Create one from Delivery.</p>}
+      </section>
+      <form className="explorer-open" onSubmit={(event) => { event.preventDefault(); openPrd() }}>
+        <label>Open a PRD by id<input aria-label="PRD id" value={prdInput} onChange={(event) => setPrdInput(event.target.value)} placeholder="e.g. release-alpha" disabled={!selectedProjectId} /></label>
+        <button className="explorer-open-prd" type="submit" disabled={!selectedProjectId || !prdInput.trim()}>Open PRD</button>
+        <small className="explorer-muted">PRD enumeration is not served by the projection; open a PRD by its id.</small>
+      </form>
+      <label className="explorer-filter">Filter tasks<input type="search" aria-label="Filter tasks" value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="title, scoped id, or status" /></label>
+      <section aria-label="Loaded PRDs" className="explorer-prds">
+        {entries.length
+          ? entries.map((entry) => <ExplorerPrdCard key={entry.key} entry={entry} filter={filter} selectedScopedId={selection?.scopedId || null} onReadPrd={readPrd} onOpenTask={openTask} />)
+          : <p className="explorer-empty">No PRD opened yet. Choose a project and open a PRD by id.</p>}
+      </section>
+    </aside>
+    <ExplorerDetail selection={selection} reading={reading} eligibility={eligibility} detailRef={detailRef} onClose={closeDetail} />
+    <div className="explorer-live" role="status" aria-live="polite">{announce}</div>
+  </main>
+}
+
 function App() {
   const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false)
   const load = async () => { const value = await bootstrap(); setData({ ...emptyData, ...value, sandbox: { ...emptyData.sandbox, ...(value.sandbox || {}) }, voice: { ...emptyData.voice, ...(value.voice || {}) } }); return value }
@@ -528,6 +776,8 @@ function App() {
       {notificationsOpen && <Notifications audit={data.audit || []} read={notificationsRead} onRead={() => setNotificationsRead(true)} />}
       {active === 'Chat'
         ? <div className="chat-grid"><ChatView append={setNotice} /></div>
+        : active === 'Explorer'
+        ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} /></div>
         : <div className="main-grid">
             {active === 'Delivery' ? <Delivery data={data} append={setNotice} onDirective={addDirection} onGuide={() => setGuideOpen(true)} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} append={setNotice} refresh={load} selectApproval={selectApproval} />}
             <Trace data={data} setActive={setActive} append={setNotice} refresh={load} selectedApprovalId={selectedApprovalId} clearApproval={() => setSelectedApprovalId(null)} />

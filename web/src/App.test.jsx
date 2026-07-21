@@ -8,6 +8,7 @@ import {
   archiveConversation, branchTurn, createConversation, deleteConversation, fetchChatRoutes,
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
+  fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
 } from './api'
 
 vi.mock('./api', () => ({
@@ -17,6 +18,7 @@ vi.mock('./api', () => ({
   archiveConversation: vi.fn(), branchTurn: vi.fn(), createConversation: vi.fn(), deleteConversation: vi.fn(),
   fetchChatRoutes: vi.fn(), getConversation: vi.fn(), listConversations: vi.fn(), renameConversation: vi.fn(),
   retryTurn: vi.fn(), searchConversations: vi.fn(), sendMessage: vi.fn(), unarchiveConversation: vi.fn(),
+  fetchPrdContent: vi.fn(), fetchPrdTasks: vi.fn(), fetchTaskReference: vi.fn(), fetchTaskEligibility: vi.fn(),
 }))
 
 const fixture = {
@@ -478,5 +480,215 @@ describe('Chat routing, navigation, and accessibility (T004.4)', () => {
     await user.type(composer, 'announce this')
     await user.keyboard('{Enter}')
     expect(await screen.findByText('Response complete')).toBeTruthy() // lifecycle announced in the live region
+  })
+})
+
+// --- Delivery explorer (plan-task-delivery T003) -----------------------------
+//
+// Fixtures mirror the EXACT wrapped shapes the merged delivery-projection router
+// serves (workbench/api.py: {content}, {tasks}, {task}, {eligibility}) over
+// task-reference.v1 / prd-content.v1 / delivery-eligibility.v1, so a drift from
+// the served contract breaks these tests rather than passing vacuously.
+
+function prdContent(prdId, title, overrides = {}) {
+  return {
+    content: {
+      schema_version: 'workbench-prd-content/v1',
+      provider: 'anvil-state',
+      generated_at: overrides.generatedAt ?? '2026-07-19T00:00:00Z',
+      prd: { prd_id: prdId, title, status: overrides.status ?? 'approved', revision: overrides.revision ?? 5 },
+      content_trust: 'untrusted_task_data',
+      content: { format: 'markdown', body: overrides.body ?? `# ${title}\n\nRedacted body.`, truncated: overrides.truncated ?? false, total_bytes: overrides.totalBytes ?? 42 },
+      redaction: { status: 'redacted', ruleset: 'workbench-default-v1' },
+    },
+  }
+}
+
+function taskRef(prdId, taskId, title, overrides = {}) {
+  const revision = overrides.revision ?? 4
+  return {
+    schema_version: 'workbench-task-reference/v1',
+    ref: { prd_id: prdId, task_id: taskId, prd_revision: revision },
+    scoped_id: `${prdId}:${taskId}`,
+    run_label: `${prdId}:${taskId}@r${revision}`,
+    source: { provider: 'anvil-state', snapshot_digest: `sha256:${'a'.repeat(64)}` },
+    hierarchy: { prd_id: prdId, prd_title: overrides.prdTitle ?? 'PRD', feature_id: `${prdId}:F001` },
+    summary: {
+      content_trust: 'untrusted_task_data',
+      title,
+      status: overrides.status ?? 'ready',
+      priority: overrides.priority ?? 'critical',
+      latest_delivery_status: overrides.delivery ?? 'not_started',
+      acceptance_criteria_count: overrides.ac ?? 3,
+      verification_summary: overrides.vs ?? 'Three acceptance criteria; one automated verification defined.',
+      depends_on: overrides.deps ?? [],
+    },
+  }
+}
+
+function eligibilityVerdict(prdId, taskId, overrides = {}) {
+  return {
+    eligibility: {
+      schema_version: 'workbench-delivery-eligibility/v1',
+      ref: { prd_id: prdId, task_id: taskId, prd_revision: 4 },
+      scoped_id: `${prdId}:${taskId}`,
+      eligible: overrides.eligible ?? false,
+      state: overrides.state ?? 'blocked',
+      reasons: overrides.reasons ?? [{ class: 'blocked', code: 'blocked.dependency_unmet', content_trust: 'untrusted_task_data', explanation: 'A dependency has not merged.' }],
+    },
+  }
+}
+
+// Two PRDs, each with its own T001, so duplicate task-number disambiguation is
+// exercised against a real two-PRD fixture (T003 criterion 2 / R004).
+function setupTwoPrds() {
+  fetchPrdContent.mockImplementation((_projectId, prdId) =>
+    Promise.resolve(prdId === 'release-alpha'
+      ? prdContent('release-alpha', 'Chat-first Workbench')
+      : prdContent('release-beta', 'State context and operations')))
+  fetchPrdTasks.mockImplementation((_projectId, prdId) =>
+    Promise.resolve(prdId === 'release-alpha'
+      ? { tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { prdTitle: 'Chat-first Workbench', deps: [{ prd_id: 'release-alpha', task_id: 'T000', prd_revision: 4 }] })] }
+      : { tasks: [taskRef('release-beta', 'T001', 'Persist retention', { prdTitle: 'State context and operations' })] }))
+  fetchTaskEligibility.mockImplementation((_projectId, prdId, taskId) => Promise.resolve(eligibilityVerdict(prdId, taskId)))
+}
+
+async function renderExplorer() {
+  const user = userEvent.setup()
+  render(<App />)
+  await user.click(await screen.findByRole('button', { name: 'Explorer' }))
+  await screen.findByRole('heading', { name: 'Delivery explorer' })
+  await screen.findByRole('button', { name: 'Select project Workbench qualification' })
+  return user
+}
+
+async function openPrd(user, prdId) {
+  const input = screen.getByRole('textbox', { name: 'PRD id' })
+  await waitFor(() => expect(input.disabled).toBe(false))
+  await user.type(input, prdId)
+  await user.click(screen.getByRole('button', { name: 'Open PRD' }))
+}
+
+describe('Delivery explorer (plan-task-delivery T003)', () => {
+  it('opens a PRD by id and renders its card + scoped tasks from the served projection shape', async () => {
+    setupTwoPrds()
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    expect(fetchPrdContent).toHaveBeenCalledWith('project_1', 'release-alpha')
+    expect(fetchPrdTasks).toHaveBeenCalledWith('project_1', 'release-alpha')
+    const card = await screen.findByRole('article', { name: 'PRD Chat-first Workbench' })
+    // PRD card: title, release, revision, State status, source freshness (criterion 3).
+    expect(within(card).getByText('release-alpha')).toBeTruthy() // release id
+    expect(within(card).getByText('r5')).toBeTruthy() // served prd.revision
+    expect(within(card).getByText('approved')).toBeTruthy() // State status
+    expect(within(card).getByText(/source as of 2026-07-19/)).toBeTruthy() // freshness
+    // Title leads; the scoped id is muted secondary disclosure (criterion 1).
+    expect(within(card).getByText('Add routed chat')).toBeTruthy()
+    const scoped = within(card).getByText('release-alpha:T001')
+    expect(scoped.tagName).toBe('SMALL')
+  })
+
+  it('keeps two PRDs T001 tasks distinguishable in navigation, detail state, and the URL (criterion 2)', async () => {
+    setupTwoPrds()
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    await screen.findByRole('article', { name: 'PRD Chat-first Workbench' })
+    await openPrd(user, 'release-beta')
+    await screen.findByRole('article', { name: 'PRD State context and operations' })
+    // Both T001 rows exist and are addressed by their SCOPED id, never a bare number.
+    expect(screen.getByRole('button', { name: 'Open task release-alpha:T001' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open task release-beta:T001' })).toBeTruthy()
+    // Open alpha's T001: detail shows its distinct title, scoped state, and URL.
+    await user.click(screen.getByRole('button', { name: 'Open task release-alpha:T001' }))
+    const detailA = await screen.findByRole('region', { name: 'Task release-alpha:T001' })
+    expect(within(detailA).getByRole('heading', { name: 'Add routed chat' })).toBeTruthy()
+    expect(detailA.getAttribute('data-scoped-id')).toBe('release-alpha:T001')
+    expect(window.location.hash).toContain('release-alpha:T001')
+    // Open beta's T001: a DIFFERENT title, scoped state, and URL — no collapse.
+    await user.click(screen.getByRole('button', { name: 'Open task release-beta:T001' }))
+    const detailB = await screen.findByRole('region', { name: 'Task release-beta:T001' })
+    expect(within(detailB).getByRole('heading', { name: 'Persist retention' })).toBeTruthy()
+    expect(detailB.getAttribute('data-scoped-id')).toBe('release-beta:T001')
+    expect(window.location.hash).toContain('release-beta:T001')
+    expect(window.location.hash).not.toContain('release-alpha')
+  })
+
+  it('opens task detail with dependencies, acceptance criteria, verification, delivery status, and eligibility', async () => {
+    setupTwoPrds()
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    await user.click(await screen.findByRole('button', { name: 'Open task release-alpha:T001' }))
+    const detail = await screen.findByRole('region', { name: 'Task release-alpha:T001' })
+    expect(within(detail).getByText(/release-alpha:T000/)).toBeTruthy() // dependency, scoped
+    expect(within(detail).getByText('3 acceptance criteria')).toBeTruthy()
+    expect(within(detail).getByText(/automated verification defined/)).toBeTruthy()
+    expect(within(detail).getByText('delivery: not_started')).toBeTruthy() // latest delivery status
+    // Eligibility is fetched from its OWN endpoint and rendered, not fabricated.
+    expect(fetchTaskEligibility).toHaveBeenCalledWith('project_1', 'release-alpha', 'T001')
+    expect(await within(detail).findByText('blocked.dependency_unmet')).toBeTruthy()
+  })
+
+  it('reads a PRD content body through the redacted projection (screen-reader smoke: reading the PRD)', async () => {
+    setupTwoPrds()
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    await user.click(await screen.findByRole('button', { name: 'Read PRD content' }))
+    const reading = await screen.findByRole('region', { name: 'PRD Chat-first Workbench' })
+    expect(within(reading).getByRole('heading', { name: 'Chat-first Workbench' })).toBeTruthy()
+    expect(within(reading).getByText(/Redacted body/)).toBeTruthy()
+  })
+
+  it('filters the task list by title, scoped id, or status (screen-reader smoke: filtering tasks)', async () => {
+    fetchPrdContent.mockResolvedValue(prdContent('release-alpha', 'Chat-first Workbench'))
+    fetchPrdTasks.mockResolvedValue({ tasks: [
+      taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' }),
+      taskRef('release-alpha', 'T002', 'Persist retention', { status: 'blocked' }),
+    ] })
+    fetchTaskEligibility.mockResolvedValue(eligibilityVerdict('release-alpha', 'T001'))
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    expect(await screen.findByRole('button', { name: 'Open task release-alpha:T001' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open task release-alpha:T002' })).toBeTruthy()
+    await user.type(screen.getByRole('searchbox', { name: 'Filter tasks' }), 'routed')
+    // Real render assertion: the non-matching row is removed, not merely a call.
+    expect(screen.getByRole('button', { name: 'Open task release-alpha:T001' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Open task release-alpha:T002' })).toBeNull()
+  })
+
+  it('announces lifecycle in a live region and moves focus to detail, with Escape returning focus to the rail', async () => {
+    setupTwoPrds()
+    const user = await renderExplorer()
+    const live = screen.getByRole('status')
+    expect(live.getAttribute('aria-live')).toBe('polite')
+    await openPrd(user, 'release-alpha')
+    expect(await screen.findByText(/Loaded PRD Chat-first Workbench/)).toBeTruthy() // live region updated
+    await user.click(await screen.findByRole('button', { name: 'Open task release-alpha:T001' }))
+    const heading = await screen.findByRole('heading', { name: 'Add routed chat' })
+    await waitFor(() => expect(document.activeElement).toBe(heading)) // focus not dropped to <body>
+    expect(screen.getByText(/Opened task release-alpha:T001/)).toBeTruthy() // announced
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Task release-alpha:T001' })).toBeNull())
+    expect(document.activeElement).not.toBe(document.body) // focus returned to the rail
+  })
+
+  it('renders a truthful degraded state when the projection is not configured (no fabrication)', async () => {
+    fetchPrdContent.mockRejectedValue(new Error('Delivery projection is not configured for this hub'))
+    fetchPrdTasks.mockRejectedValue(new Error('Delivery projection is not configured for this hub'))
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    const card = await screen.findByRole('article', { name: 'PRD release-alpha' })
+    expect(within(card).getByText('unavailable')).toBeTruthy()
+    expect(within(card).getAllByText(/not configured/).length).toBeGreaterThan(0)
+    // No fabricated task card is shown for the failed load.
+    expect(screen.queryByText('Add routed chat')).toBeNull()
+  })
+
+  it('shows a truthful no-projects state instead of a fabricated project list', async () => {
+    bootstrap.mockResolvedValueOnce({ projects: [] })
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Explorer' }))
+    expect(await screen.findByText(/No projects yet/)).toBeTruthy()
+    expect(screen.getByRole('textbox', { name: 'PRD id' }).disabled).toBe(true)
   })
 })
