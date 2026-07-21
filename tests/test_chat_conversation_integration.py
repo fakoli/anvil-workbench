@@ -15,9 +15,17 @@ recovery, and so the hub-internal audit can be read after the HTTP lifecycle.
 
 Acceptance-criteria map (each criterion → the test that binds it):
 
-1. Create / search / rename / archive / branch / reload / delete entirely
-   through actor-scoped APIs → `test_full_conversation_lifecycle_through_the_actor_api`.
-2. Cross-actor enumeration and mutation fail without revealing existence →
+1. The FULL lifecycle on ONE conversation entirely through actor-scoped APIs —
+   create / append / rename+search / retry / branch / streaming-status advance /
+   pin+unpin / tag add+remove / folder set+clear / mid-test reload over the same
+   rows / archive+unarchive / delete → `test_full_conversation_lifecycle_through_the_actor_api`.
+   (This binds strictly MORE than `test_conversation_api.test_full_conversation_
+   lifecycle_through_the_api`: it adds the pin/tag/folder organization verbs and
+   an in-lifecycle reload the unit test never exercises, and keeps the streaming
+   advance + content_trust assertions the unit test has.)
+2. Cross-actor enumeration and mutation of EVERY registered per-conversation-id
+   endpoint (probe list derived from the app's route table, addition-proof) fail
+   byte-identically to a missing id, revealing no existence →
    `test_cross_actor_enumeration_and_mutation_reveal_no_existence`.
 3. Reload preserves committed turns, marks in-flight turns interrupted, keeps
    append-only branch/retry lineage → `test_reload_recovers_interrupted_and_preserves_lineage`.
@@ -30,8 +38,11 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import hmac
+import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
 from workbench.api import create_app
@@ -44,6 +55,32 @@ KEY = "integration-content-hash-key-32b!"
 
 OWNER = "operator"
 OTHER = "reviewer"
+
+# Independent re-derivation of the keyed turn-content fingerprint.  This test
+# module deliberately does NOT call `conversation_models.turn_content_hash` (that
+# would be a tautology — the code under test verifying itself).  Instead we
+# reconstruct, from first principles, the exact bytes it HMACs:
+#   * the canonical JSON of a sorted list of {content_trust, kind, text} blocks
+#     (string keys, sorted, compact separators, UTF-8 — the documented canonical
+#     contract encoding), and
+#   * the domain-separation prefix, spelled out here as a literal.
+# The prefix literal is the crux: it binds domain separation (kill-mutation
+# `_CHAT_CONTENT_PREFIX` removal).  If the code drops the prefix, its stored hash
+# no longer matches this independently-prefixed expectation and the test fails.
+_CHAT_CONTENT_PREFIX_LITERAL = b"anvil-workbench/chat-turn-content/v1\0"
+_CONTENT_TRUST_LITERAL = "untrusted_task_data"
+
+
+def _expected_turn_content_hash(key: str, blocks: list[dict]) -> str:
+    payload = [
+        {"content_trust": _CONTENT_TRUST_LITERAL, "kind": block["kind"], "text": block["text"]}
+        for block in blocks
+    ]
+    canonical = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hmac.new(key.encode("utf-8"), _CHAT_CONTENT_PREFIX_LITERAL + canonical, hashlib.sha256)
+    return "hmac-sha256:" + digest.hexdigest()
 
 
 def _settings(**overrides) -> Settings:
@@ -138,12 +175,77 @@ def test_full_conversation_lifecycle_through_the_actor_api():
         ).json()
         assert branched["lineage"]["kind"] == "branch"
 
-        # the full read returns every turn in lineage order; committed history intact
+        # a streaming assistant turn is advanced to a terminal state through the
+        # /status verb (the streaming-status advance the unit lifecycle covers).
+        streaming = client.post(f"/api/conversations/{conversation_id}/turns", json={
+            "role": "assistant", "status": "streaming",
+            "lineage": {"parent_turn_id": branched["id"], "sibling_index": 0, "kind": "branch"},
+        }, headers=_as(OWNER)).json()
+        assert streaming["completed_at"] is None and streaming["committed"] is False
+        advanced = client.post(
+            f"/api/conversations/{conversation_id}/turns/{streaming['id']}/status",
+            json={"status": "complete"}, headers=_as(OWNER),
+        )
+        assert advanced.status_code == 200 and advanced.json()["committed"] is True
+
+        # the full read returns every turn in lineage order; committed history intact,
+        # and each block still carries the untrusted-task-data trust badge.
         full = client.get(f"/api/conversations/{conversation_id}", headers=_as(OWNER)).json()
         assert [turn["id"] for turn in full["turns"]] == [
-            root["id"], reply["id"], retried["id"], branched["id"],
+            root["id"], reply["id"], retried["id"], branched["id"], streaming["id"],
         ]
         assert all(turn["committed"] for turn in full["turns"])
+        assert full["turns"][0]["content"] == [
+            {"kind": "text", "text": "plan the demo", "content_trust": "untrusted_task_data"},
+        ]
+
+        # Organization verbs (chat-first-voice T011) through the actor API:
+        # pin then unpin, tag add then remove, folder set then clear — each
+        # reflected in the conversation projection and the list filters.
+        assert client.post(f"/api/conversations/{conversation_id}/pin", headers=_as(OWNER)).json()["pinned"] is True
+        pinned_only = client.get(
+            "/api/conversations", params={"pinned": "true"}, headers=_as(OWNER),
+        ).json()["conversations"]
+        assert [item["id"] for item in pinned_only] == [conversation_id]
+        assert client.post(f"/api/conversations/{conversation_id}/unpin", headers=_as(OWNER)).json()["pinned"] is False
+        assert client.get(
+            "/api/conversations", params={"pinned": "true"}, headers=_as(OWNER),
+        ).json()["conversations"] == []
+
+        assert client.post(
+            f"/api/conversations/{conversation_id}/tags", json={"tag": "demo"}, headers=_as(OWNER),
+        ).json()["tags"] == ["demo"]
+        tagged = client.get(
+            "/api/conversations", params={"tag": "demo"}, headers=_as(OWNER),
+        ).json()["conversations"]
+        assert [item["id"] for item in tagged] == [conversation_id]
+        assert client.post(
+            f"/api/conversations/{conversation_id}/tags/remove", json={"tag": "demo"}, headers=_as(OWNER),
+        ).json()["tags"] == []
+
+        assert client.post(
+            f"/api/conversations/{conversation_id}/folder", json={"folder": "planning"}, headers=_as(OWNER),
+        ).json()["folder"] == "planning"
+        foldered = client.get(
+            "/api/conversations", params={"folder": "planning"}, headers=_as(OWNER),
+        ).json()["conversations"]
+        assert [item["id"] for item in foldered] == [conversation_id]
+        assert client.post(
+            f"/api/conversations/{conversation_id}/folder/clear", headers=_as(OWNER),
+        ).json()["folder"] is None
+
+    # MID-TEST RELOAD: a fresh hub over the SAME persisted rows (a simulated
+    # restart) must serve the committed lifecycle unchanged — every turn already
+    # advanced to a terminal state stays complete, none is lost, order holds.
+    reloaded = MemoryConversationStore(
+        store.rows, content_hash_key=KEY.encode("utf-8"), recover_on_open=True,
+    )
+    with _client(reloaded) as client:
+        reread = client.get(f"/api/conversations/{conversation_id}", headers=_as(OWNER)).json()
+        assert [turn["id"] for turn in reread["turns"]] == [
+            root["id"], reply["id"], retried["id"], branched["id"], streaming["id"],
+        ]
+        assert all(turn["status"] == "complete" and turn["committed"] for turn in reread["turns"])
 
         # archive hides it from the default list; the archived filter shows it; unarchive restores
         assert client.post(
@@ -179,6 +281,80 @@ def test_full_conversation_lifecycle_through_the_actor_api():
 # --- Criterion 2: cross-actor isolation with no existence leak ---------------
 
 
+# The prefix every per-conversation-id endpoint shares.  The probe list below is
+# DERIVED from the app's registered routes under this prefix, not hand-listed, so
+# a newly-added endpoint is probed automatically or the test fails loudly — the
+# oracle surface can never silently grow past its cross-actor coverage.
+_CONVERSATION_ID_PREFIX = "/api/conversations/{conversation_id}"
+
+# A minimal, pydantic-valid body for each per-conversation-id endpoint, keyed by
+# the route's path suffix.  Ownership (`_owned`) is checked strictly before any
+# body-derived validation, so a foreign/missing id fails closed at the ownership
+# gate with the fixed 404 body regardless of these values — but they must still
+# parse, or the two arms would diverge at a 422 instead of meeting at the 404.
+_PROBE_BODY_BY_SUFFIX: dict[str, dict | None] = {
+    "": None,  # GET the conversation
+    "/rename": {"title": "hijack"},
+    "/archive": None,
+    "/unarchive": None,
+    "/pin": None,
+    "/unpin": None,
+    "/tags": {"tag": "hijacktag"},
+    "/tags/remove": {"tag": "hijacktag"},
+    "/folder": {"folder": "hijackfolder"},
+    "/folder/clear": None,
+    "/delete": {"mode": "purge_all_records"},
+    "/turns": {"role": "assistant", "status": "complete"},
+    "/turns/{turn_id}/retry": {"role": "assistant", "status": "complete"},
+    "/turns/{turn_id}/branch": {"role": "assistant", "status": "complete"},
+    "/turns/{turn_id}/status": {"status": "complete"},
+}
+
+
+def _flatten_routes(app) -> list:
+    """Every leaf route the app serves, unwrapping the hub's ``_IncludedRouter``
+    lazy-mount wrappers (whose real routes hang off ``original_router``) so the
+    conversation router's endpoints are actually seen — not just the wrapper."""
+    leaves: list = []
+
+    def _walk(container) -> None:
+        for route in getattr(container, "routes", []):
+            wrapped = getattr(route, "original_router", None)
+            if wrapped is not None:
+                _walk(wrapped)
+            else:
+                leaves.append(route)
+
+    _walk(app)
+    return leaves
+
+
+def _derive_conversation_id_probes(app) -> list[tuple[str, str, dict | None]]:
+    """Enumerate (method, path_template, body) for EVERY registered route under
+    ``/api/conversations/{conversation_id}``.
+
+    Addition-proof by construction: the probe set is the app's own route table,
+    and a route whose suffix has no declared minimal body fails the test rather
+    than being silently skipped — so a new per-conversation-id endpoint cannot
+    land without cross-actor coverage.
+    """
+    probes: list[tuple[str, str, dict | None]] = []
+    for route in _flatten_routes(app):
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if not path or not methods or not path.startswith(_CONVERSATION_ID_PREFIX):
+            continue
+        suffix = path[len(_CONVERSATION_ID_PREFIX):]
+        if suffix not in _PROBE_BODY_BY_SUFFIX:
+            pytest.fail(
+                f"registered per-conversation-id route {path!r} has no cross-actor probe "
+                f"(unknown suffix {suffix!r}); add a minimal body to _PROBE_BODY_BY_SUFFIX",
+            )
+        for method in sorted(methods - {"HEAD", "OPTIONS"}):
+            probes.append((method, path, _PROBE_BODY_BY_SUFFIX[suffix]))
+    return probes
+
+
 def test_cross_actor_enumeration_and_mutation_reveal_no_existence():
     store = _durable_store()
     with _client(store) as client:
@@ -191,28 +367,30 @@ def test_cross_actor_enumeration_and_mutation_reveal_no_existence():
             "/api/conversations/search", params={"query": "private"}, headers=_as(OTHER),
         ).json()["conversations"] == []
 
-        # Every cross-actor mutation/read is byte-identical to a truly missing id.
-        turn_body = {"role": "assistant", "status": "complete"}
-
-        def probes(target: str):
-            prefix = f"/api/conversations/{target}"
-            return [
-                ("GET", prefix, None),
-                ("POST", f"{prefix}/rename", {"title": "hijack"}),
-                ("POST", f"{prefix}/archive", None),
-                ("POST", f"{prefix}/delete", {"mode": "purge_all_records"}),
-                ("POST", f"{prefix}/turns/{turn_id}/retry", turn_body),
-                ("POST", f"{prefix}/turns/{turn_id}/branch", turn_body),
-                ("POST", f"{prefix}/turns/{turn_id}/status", {"status": "complete"}),
-            ]
-
+        # Derive one probe per registered per-conversation-id route+method.
+        probes = _derive_conversation_id_probes(client.app)
+        probed_suffixes = {
+            template[len(_CONVERSATION_ID_PREFIX):] for _method, template, _body in probes
+        }
+        # Every currently-implemented endpoint must be in the derived set — this
+        # is the concrete floor beneath the addition-proof derivation, and it
+        # includes the three (unpin / tags-remove / folder-clear) that previously
+        # had ZERO cross-actor coverage anywhere in the suite.
+        assert probed_suffixes == set(_PROBE_BODY_BY_SUFFIX), probed_suffixes
         missing_id = "conv_does_not_exist0"
-        for (method, url, body), (_, missing_url, missing_body) in zip(probes(conversation_id), probes(missing_id)):
-            foreign = client.request(method, url, json=body, headers=_as(OTHER))
-            missing = client.request(method, missing_url, json=missing_body, headers=_as(OWNER))
-            assert foreign.status_code == 404, (url, foreign.text)
-            assert missing.status_code == 404, (missing_url, missing.text)
-            assert foreign.content == missing.content  # no existence oracle
+
+        def _url(template: str, target: str) -> str:
+            return template.replace("{conversation_id}", target).replace("{turn_id}", turn_id)
+
+        for method, template, body in probes:
+            foreign = client.request(method, _url(template, conversation_id), json=body, headers=_as(OTHER))
+            missing = client.request(method, _url(template, missing_id), json=body, headers=_as(OWNER))
+            assert foreign.status_code == 404, (template, foreign.text)
+            assert missing.status_code == 404, (template, missing.text)
+            # Raw bytes + status are byte-identical: a foreign id is indistinguishable
+            # from a nonexistent one, so there is no cross-actor existence oracle.
+            assert foreign.content == missing.content, template
+            assert foreign.status_code == missing.status_code, template
 
         # None of the refused foreign mutations touched the owner's record.
         owner_read = client.get(f"/api/conversations/{conversation_id}", headers=_as(OWNER)).json()
@@ -294,6 +472,11 @@ def test_retention_and_deletion_remove_content_keep_safe_metadata():
         assert "expired secret content" not in client.get(
             f"/api/conversations/{expired['id']}", headers=_as(OWNER),
         ).text
+        # Direct durable-removal proof: the content is gone from the persisted
+        # rows themselves, not merely absent from the HTTP projection.  Neither
+        # the transcript body nor the (now-null) title survives in the store.
+        assert "expired secret content" not in repr(store.rows)
+        assert "expired secret" not in repr(store.rows)
 
         # Explicit tombstone deletion of a live conversation removes content too.
         live = _create(client, title="doomed")["id"]
@@ -309,6 +492,10 @@ def test_retention_and_deletion_remove_content_keep_safe_metadata():
         # The keyed fingerprint is never serialized to the actor either.
         assert "content_hash" not in tombstone_read.text
         assert "hmac-sha256" not in tombstone_read.text
+        # Direct durable-removal proof for the explicit tombstone path too: the
+        # secret words and the title are absent from the persisted rows.
+        assert "the actual secret words" not in repr(store.rows)
+        assert "doomed" not in repr(store.rows)
 
 
 def test_audit_stream_is_content_free_and_carries_only_the_keyed_fingerprint():
@@ -345,3 +532,20 @@ def test_audit_stream_is_content_free_and_carries_only_the_keyed_fingerprint():
     for turn_audit_record in turn_audits:
         assert turn_audit_record.content_hash.startswith("hmac-sha256:")
         assert not turn_audit_record.content_hash.startswith("sha256:")
+
+    # Domain-separation binding, verified INDEPENDENTLY: the stored fingerprint of
+    # the appended turn equals the HMAC we recompute from first principles with the
+    # domain-separation prefix spelled out as a literal (never via
+    # `turn_content_hash`).  This kills the mutation that drops
+    # `_CHAT_CONTENT_PREFIX`: without the prefix, the code's stored hash diverges
+    # from this independently-prefixed expectation and the equality below fails.
+    append_audits = [
+        event.record for event in audit
+        if event.kind == "turn.appended" and hasattr(event.record, "content_hash")
+    ]
+    assert len(append_audits) == 1, "exactly one turn was appended in this lifecycle"
+    expected = _expected_turn_content_hash(KEY, [{"kind": "text", "text": secret}])
+    assert append_audits[0].content_hash == expected
+    # Guard the guard: a different content produces a different fingerprint, so the
+    # equality above is content-sensitive, not a constant that any string matches.
+    assert _expected_turn_content_hash(KEY, [{"kind": "text", "text": secret + "!"}]) != expected

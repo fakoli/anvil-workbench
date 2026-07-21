@@ -25,11 +25,17 @@ Acceptance-criteria map:
 3. Only declared controls and safe route/usage metadata cross the browser
    boundary → `test_browser_projection_carries_only_safe_route_and_usage_metadata`.
 4. No failure path reaches a raw provider or exposes server-held auth →
-   `test_no_failure_path_reaches_a_raw_provider_or_exposes_auth`.
+   `test_no_failure_path_reaches_a_raw_provider_or_exposes_auth` (source +
+   scheme + dynamic-import scan) and
+   `test_runtime_import_closure_pulls_in_no_http_client` (the transitive
+   sys.modules closure of the runtime names no socket-opening client).
 """
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -266,6 +272,10 @@ def test_terminal_states_are_persisted_truthfully_never_complete():
         assert result.lifecycle_state == lifecycle_state
         assert result.lifecycle_state != "completed"
         assert result.browser_view["lifecycle"]["is_terminal"] is True
+        # Even a non-completed terminal settles at the highest committed seq: the
+        # lifecycle's last_committed_seq is in parity with the final relayed frame,
+        # so a truthful interruption still carries a coherent resume cursor.
+        assert result.browser_view["lifecycle"]["last_committed_seq"] == result.seqs[-1]
         # The upstream request was torn down on the non-completed exit.
         assert result.transport.closed is True
 
@@ -417,7 +427,13 @@ def test_no_failure_path_reaches_a_raw_provider_or_exposes_auth():
             r"(?m)^\s*(?:import|from)\s+(urllib|http\.client|requests|httpx|aiohttp|socket|websockets?)\b",
             raw,
         ) is None, module
-        for scheme in ("http://", "https://"):
+        # No dynamic-import primitive either: a static import regex is trivially
+        # evaded by importlib.import_module("httpx"), so the source must name no
+        # dynamic-import token at all — a socket-opening client cannot be smuggled
+        # in behind a computed name.
+        for dynamic_import_token in ("importlib", "__import__", "import_module"):
+            assert dynamic_import_token not in raw, f"{module} names dynamic import {dynamic_import_token!r}"
+        for scheme in ("http://", "https://", "ws://", "wss://"):
             assert scheme not in raw, module
 
     # The persisted lifecycle record structurally cannot carry authentication:
@@ -435,3 +451,31 @@ def test_no_failure_path_reaches_a_raw_provider_or_exposes_auth():
         blob = repr(vars(event)).lower()
         for forbidden in ("bearer", "authorization", "secret", "password", "://"):
             assert forbidden not in blob
+
+
+# A source scan proves no HTTP client is named; the import CLOSURE proves none is
+# reachable transitively.  A dependency two hops down that opened sockets would
+# pass every text scan above yet still be pulled into the runtime's process — so
+# we import the four modules in a fresh interpreter and assert the resulting
+# sys.modules names no socket-opening client anywhere in the transitive closure.
+_HTTP_CLIENT_DENYLIST = frozenset({
+    "httpx", "requests", "aiohttp", "urllib3",
+    "http.client", "urllib.request", "socket", "websockets", "websocket",
+})
+
+
+def test_runtime_import_closure_pulls_in_no_http_client():
+    program = (
+        "import sys, json\n"
+        "import workbench.chat_routes, workbench.chat_stream, "
+        "workbench.response_lifecycle_store, workbench.stream_sequence\n"
+        "print(json.dumps(sorted(sys.modules)))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=str(_REPO_ROOT), capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    loaded = set(json.loads(proc.stdout.splitlines()[-1]))
+    leaked = _HTTP_CLIENT_DENYLIST & loaded
+    assert not leaked, f"runtime import closure reached HTTP client(s): {sorted(leaked)}"
