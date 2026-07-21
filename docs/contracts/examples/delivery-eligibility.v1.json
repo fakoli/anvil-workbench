@@ -1,0 +1,30 @@
+{
+  "schema_version": "workbench-delivery-eligibility/v1",
+  "ref": {
+    "prd_id": "release-alpha",
+    "task_id": "T001",
+    "prd_revision": 4
+  },
+  "scoped_id": "release-alpha:T001",
+  "eligible": false,
+  "state": "blocked",
+  "reasons": [
+    {
+      "class": "blocked",
+      "code": "blocked.dependency_unmet",
+      "content_trust": "untrusted_task_data",
+      "explanation": "A dependency task has not reached an accepted merge yet, so delivery cannot start.",
+      "blocking_ref": {
+        "prd_id": "release-alpha",
+        "task_id": "T000",
+        "prd_revision": 4
+      }
+    },
+    {
+      "class": "stale",
+      "code": "stale.prd_revision_changed",
+      "content_trust": "untrusted_task_data",
+      "explanation": "The PRD was revised after this view was read; refresh the project to see the current tasks."
+    }
+  ]
+}
