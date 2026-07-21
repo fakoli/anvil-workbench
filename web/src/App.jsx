@@ -174,7 +174,13 @@ function DeliverSheet({ project, workflows, sessions, runs, onClose, onDeliver }
   // tears the sheet down while the start promise may still settle, and neither
   // its success nor its abort must poke React state on the gone component.
   const mountedRef = useRef(true)
-  useEffect(() => () => { mountedRef.current = false }, [])
+  // Set-on-mount as well as clear-on-unmount so a StrictMode dev remount (mount →
+  // cleanup → remount) does not leave the ref stuck false, which would otherwise
+  // swallow setBusy(false)/announce on a genuine start failure in development.
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   // Only a draft workflow whose session has no active run is startable — the same
   // gate the Sessions view uses. Options carry the session TITLE (human) with the
