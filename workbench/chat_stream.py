@@ -257,7 +257,15 @@ class ChatStreamRelay:
         transport: ServingStreamTransport,
         cancel: CancellationToken | None = None,
     ) -> None:
-        self._request = build_bounded_request(selection, prompt)
+        self._init_common(build_bounded_request(selection, prompt), transport, cancel)
+
+    def _init_common(
+        self,
+        request: dict[str, Any],
+        transport: ServingStreamTransport,
+        cancel: CancellationToken | None,
+    ) -> None:
+        self._request = request
         if not isinstance(transport, ServingStreamTransport):
             raise ChatStreamError("relay requires a ServingStreamTransport")
         self._transport = transport
@@ -265,6 +273,32 @@ class ChatStreamRelay:
         self._outcome: StreamOutcome | None = None
         self._parts: list[str] = []
         self._chars = 0
+
+    @classmethod
+    def for_prepared_request(
+        cls,
+        request: Mapping[str, Any],
+        transport: ServingStreamTransport,
+        cancel: CancellationToken | None = None,
+    ) -> "ChatStreamRelay":
+        """Build a relay over an already-assembled bounded request.
+
+        The chat surface assembles its request from a validated
+        :class:`ChatRouteSelection` via the normal constructor.  Advanced mode
+        (advanced-model-playground T003) assembles an equivalent *bounded*
+        request from its own validated route/control selection and reuses this
+        exact stream state machine -- the same distinct terminal outcomes,
+        cancellation semantics, and upstream teardown -- without duplicating the
+        relay loop.  The request must be a mapping of already-bounded Serving ids
+        and controls (no endpoint, URL, or credential); this constructor performs
+        no control validation of its own, so the caller is responsible for having
+        bounded every value first, exactly as ``build_bounded_request`` does.
+        """
+        if not isinstance(request, Mapping):
+            raise ChatStreamError("a prepared relay request must be a mapping")
+        relay = cls.__new__(cls)
+        relay._init_common(dict(request), transport, cancel)
+        return relay
 
     @property
     def request(self) -> dict[str, Any]:
