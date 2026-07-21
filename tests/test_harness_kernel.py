@@ -2588,6 +2588,74 @@ def test_rtp_fix2_a_replay_consumes_no_budget_even_at_the_ceiling():
     assert runs == [1]
 
 
+def test_rtp_fix_distinct_concurrent_dispatches_admit_exactly_one_at_ceiling_one():
+    # REGRESSION (atomic admission): two CONCURRENT DISTINCT dispatches against a
+    # ceiling of one must admit exactly ONE and refuse the other tool.over_budget.
+    # The prior split (a read-only check, then a separate commit inside the
+    # executor) let both pass the check at dispatched=0 and both commit -> a
+    # ceiling of one admitted two.  We line both threads up at the receipt store's
+    # record_attempt entry -- the step that follows admission on both shapes -- so
+    # the split reaches it with each thread having seen an un-incremented counter
+    # (over-admitting two), while ATOMIC admission refuses the loser at reserve,
+    # before record_attempt is ever reached.  This test over-admits (2 executions,
+    # 0 refusals) against the split and holds (1 execution, 1 refusal) after the fix.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+
+    req_a = _rtp_read_request("ready")
+    req_b = _rtp_read_request("claimed")
+    assert req_a["request_digest"] != req_b["request_digest"]  # genuinely distinct
+
+    runs = []
+
+    def runner(_d, _i):
+        runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    # Park every thread that REACHES record_attempt (i.e. that was admitted) until
+    # both arrive, so a non-atomic check cannot let the first admit-and-commit
+    # before the second checks.  On the atomic path the loser is refused at reserve
+    # and never arrives here; it aborts the barrier so the lone winner proceeds.
+    gate = _rtp_threading.Barrier(2)
+    orig_ra = service._receipts.record_attempt
+
+    def gated_record_attempt(*args, **kwargs):
+        try:
+            gate.wait(timeout=2.0)
+        except _rtp_threading.BrokenBarrierError:
+            pass  # the sibling was refused before admission -- proceed alone
+        return orig_ra(*args, **kwargs)
+
+    service._receipts.record_attempt = gated_record_attempt
+
+    results = {}
+
+    def go(name, req):
+        try:
+            result = service.dispatch(req, runner)
+            results[name] = ("ok", result.receipt["status"])
+        except _RtpError as exc:
+            results[name] = ("refused", exc.code)
+            gate.abort()  # release a winner parked at the record_attempt gate
+
+    threads = [
+        _rtp_threading.Thread(target=go, args=("a", req_a)),
+        _rtp_threading.Thread(target=go, args=("b", req_b)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5.0)
+
+    admitted = [v for v in results.values() if v[0] == "ok"]
+    refused = [v for v in results.values() if v[0] == "refused"]
+    assert len(admitted) == 1 and admitted[0][1] == "succeeded", results
+    assert len(refused) == 1 and refused[0][1] == "tool.over_budget", results
+    assert runs == [1]  # exactly one genuine execution, never two
+
+
 def test_rtp_t005_concurrent_same_read_executes_once_and_the_receipt_lock_is_load_bearing():
     service = _rtp_service()
     req = _rtp_read_request("ready")

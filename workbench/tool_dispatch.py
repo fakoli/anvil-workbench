@@ -168,17 +168,16 @@ class ChatToolSession:
         self._catalog = self.discovery.catalog  # the deep-copied, validated pin
         limits = capability.get("limits") if isinstance(capability.get("limits"), Mapping) else {}
         raw_budget = limits.get("max_concurrent_tool_calls")
-        # The pinned profile's tool-call budget.  The hermetic receipt store
-        # SERIALIZES every dispatch's check-execute-store under one lock, so true
-        # in-flight execution can never exceed one; the pinned
-        # ``max_concurrent_tool_calls`` is therefore enforced here as a per-session
-        # lifetime ceiling on the number of tool-call dispatches that GENUINELY
-        # EXECUTE -- a slot is consumed only when a non-replay, non-rejected
-        # dispatch actually reaches its runner, so a rejected or replayed request
-        # consumes none.  A conservative bound (a runaway chat cannot invoke
-        # unbounded tools) that a production async dispatcher would refine into a
-        # live in-flight gate.  A profile without an explicit limit gets a single
-        # call -- fail safe, never unbounded.
+        # The pinned profile's tool-call budget.  The pinned
+        # ``max_concurrent_tool_calls`` is enforced by the dispatch service as a
+        # per-session lifetime ceiling on the number of DISTINCT tool-call
+        # dispatches that genuinely execute: admission is reserved ATOMICALLY
+        # (check + record under one lock) before any effect, and released if the
+        # request is later rejected, so a rejected or replayed request consumes
+        # none.  A conservative bound (a runaway chat cannot invoke unbounded
+        # tools) that a production async dispatcher would refine into a live
+        # in-flight gate.  A profile without an explicit limit gets a single call
+        # -- fail safe, never unbounded.
         self.max_tool_calls = raw_budget if isinstance(raw_budget, int) and raw_budget > 0 else 1
 
     @property
@@ -233,14 +232,22 @@ class ChatToolDispatchService:
         self._health: ToolHealthProbe = health or (lambda _p, _t: True)
         self._receipts = receipt_store if receipt_store is not None else MemoryOperationReceiptStore()
         self._approvals = approval_store if approval_store is not None else MemoryOperationApprovalStore()
-        # The per-session tool-call budget counter.  A slot is committed only at
-        # the genuine execution point (inside the receipt store's replay-guarded
-        # executor), so a rejected request (bad approval, unhealthy, ...) and a
-        # replayed request both consume none, while the ceiling is PRE-CHECKED
-        # before any approval is consumed so an over-budget call never burns a
-        # grant or reaches the runner.
+        # The per-session tool-call budget, tracked as the SET of idempotency keys
+        # that hold an admitted slot.  Admission is ATOMIC: :meth:`_reserve_budget`
+        # checks the ceiling AND records the key under ONE lock section, BEFORE any
+        # approval is consumed.  Two concurrent DISTINCT requests at a ceiling of
+        # one therefore can never both be admitted -- exactly one reserves and the
+        # other is refused ``tool.over_budget`` -- and an over-budget request never
+        # burns a grant or reaches the runner.  Keying admission by idempotency key
+        # (not a bare counter) makes a reservation idempotent per request, so a
+        # concurrent duplicate of an already-admitted request neither takes a second
+        # slot nor is spuriously refused; it goes on to replay the one committed
+        # receipt.  A slot is a LIFETIME reservation: a genuinely executed dispatch
+        # keeps it, while a request rejected AFTER reserving (bad approval,
+        # runner-contract, ...) releases it and a replayed request never takes one,
+        # so only real executions count against the ceiling.
         self._budget_lock = threading.Lock()
-        self._dispatched = 0
+        self._admitted: set[str] = set()
 
     # --- read surface -------------------------------------------------------- #
 
@@ -343,14 +350,22 @@ class ChatToolDispatchService:
            the reviewed tool schema, an effectful call must carry an approval, and
            a read must NOT carry one;
         5. health -- an unhealthy tool is refused;
-        6. budget -- the lifetime tool-call ceiling is PRE-CHECKED (before any
-           grant is consumed); the slot is committed only at genuine execution;
+        6. budget -- the lifetime tool-call ceiling is RESERVED ATOMICALLY (check
+           + record in one lock section) BEFORE any grant is consumed, so two
+           concurrent distinct requests at a ceiling of one admit exactly one and
+           refuse the other ``tool.over_budget``; an over-budget request never
+           burns a grant or reaches the runner;
         7. approval -- an effectful call CONSUMES its one-time hash-bound grant
            before the effect runs; a replayed/expired/mismatched grant fails
            closed on the collapsed ``approval_invalid`` reason;
         8. dispatch through the reused receipt store -- exactly-once execution,
            a redacted typed receipt, and reconciliation (never a fabricated
            success) for an unconfirmed effectful outcome.
+
+        Any rejection AFTER the budget reservation (a bad approval, a
+        runner-contract violation) RELEASES the reserved slot in a ``finally``, and
+        a replay (a sibling that only replayed a committed receipt) never keeps
+        one, so only a genuinely executed dispatch spends budget.
         """
         # 1. structural validation, independent of the pinned catalog.
         try:
@@ -376,75 +391,92 @@ class ChatToolDispatchService:
         if not self._health(discovered.plugin_id, tool_id):
             raise ToolDispatchError("tool.unhealthy", "the selected tool is not healthy")
 
-        # 6. budget: PRE-CHECK the lifetime ceiling before any approval is
-        #    consumed, so an over-budget request never burns a grant and never
-        #    reaches the tool runner.  The slot is not committed here -- it is
-        #    committed at the genuine execution point (inside the executor below),
-        #    so a rejected or replayed request consumes none.
-        self._check_budget()
+        # 6. budget: RESERVE the lifetime ceiling ATOMICALLY (check + record under
+        #    one lock) before any approval is consumed, so two concurrent distinct
+        #    requests at a ceiling of one admit exactly one and refuse the other,
+        #    and an over-budget request never burns a grant or reaches the runner.
+        #    ``reserved`` is True iff THIS call took a new slot (a concurrent
+        #    duplicate of an already-admitted key takes none); the slot is released
+        #    below unless the dispatch genuinely executes.
+        reserved = self._reserve_budget(idem)
 
-        # 7. approval: an effectful call consumes its one-time grant now.
-        if effectful:
-            self._consume_approval(request)
+        # A rejection AFTER the reservation (bad approval, runner-contract) or a
+        # replay must not spend budget: keep the slot ONLY for a genuine execution.
+        keep_slot = False
+        try:
+            # 7. approval: an effectful call consumes its one-time grant now.
+            if effectful:
+                self._consume_approval(request)
 
-        # 8. dispatch through the reused typed-operation receipt store.
-        operation = _operation_ref(discovered)
-        inputs = dict(request["tool_call"].get("inputs") or {})
+            # 8. dispatch through the reused typed-operation receipt store.
+            operation = _operation_ref(discovered)
+            inputs = dict(request["tool_call"].get("inputs") or {})
 
-        def executor() -> OperationOutcome:
-            # Reached ONLY on a genuine (non-replay) execution: record_attempt
-            # returns a stored receipt without calling the executor.  Commit the
-            # budget slot here so exactly one slot is spent per real execution.
-            self._commit_budget()
-            try:
-                outcome = tool_runner(discovered, inputs)
-            except UnknownOutcomeError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - convert to a safe outcome
-                if effectful:
-                    # The effect may have taken hold; the outcome is UNKNOWN.
-                    # Reconcile -- never retry blindly, never fabricate success.
-                    raise UnknownOutcomeError(
-                        "the plugin tool effect outcome could not be confirmed",
-                        reason="unknown_outcome",
-                    ) from exc
-                # A read has no external effect to reconcile: record a retriable
-                # failed receipt on a typed refusal instead of vanishing into a 500.
-                return OperationOutcome(
-                    "failed",
-                    error=OperationRefusal(
-                        "operation.runner_failed",
-                        safe_receipt_summary(f"the read tool failed: {exc}"),
-                        retryable=True,
-                    ),
-                )
-            if not isinstance(outcome, OperationOutcome):
-                # A malformed RETURN (not an exception) from the runner.  For an
-                # effectful call the effect may already have taken hold, so treat
-                # it EXACTLY like an unknown outcome -- reconcile (receipt + one
-                # reconciliation item) rather than raising a bare error that would
-                # leave the possibly-applied effect with no durable record.  A read
-                # has nothing to reconcile, so it keeps the typed contract error.
-                if effectful:
-                    raise UnknownOutcomeError(
-                        "the plugin tool effect outcome could not be confirmed",
-                        reason="unknown_outcome",
+            def executor() -> OperationOutcome:
+                # Reached ONLY on a genuine (non-replay) execution: record_attempt
+                # returns a stored receipt without calling the executor.
+                try:
+                    outcome = tool_runner(discovered, inputs)
+                except UnknownOutcomeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - convert to a safe outcome
+                    if effectful:
+                        # The effect may have taken hold; the outcome is UNKNOWN.
+                        # Reconcile -- never retry blindly, never fabricate success.
+                        raise UnknownOutcomeError(
+                            "the plugin tool effect outcome could not be confirmed",
+                            reason="unknown_outcome",
+                        ) from exc
+                    # A read has no external effect to reconcile: record a retriable
+                    # failed receipt on a typed refusal instead of vanishing into a 500.
+                    return OperationOutcome(
+                        "failed",
+                        error=OperationRefusal(
+                            "operation.runner_failed",
+                            safe_receipt_summary(f"the read tool failed: {exc}"),
+                            retryable=True,
+                        ),
                     )
-                raise ToolDispatchError(
-                    "tool.runner_contract", "a tool runner must return an OperationOutcome"
-                )
-            return outcome
+                if not isinstance(outcome, OperationOutcome):
+                    # A malformed RETURN (not an exception) from the runner.  For an
+                    # effectful call the effect may already have taken hold, so treat
+                    # it EXACTLY like an unknown outcome -- reconcile (receipt + one
+                    # reconciliation item) rather than raising a bare error that would
+                    # leave the possibly-applied effect with no durable record.  A read
+                    # has nothing to reconcile, so it keeps the typed contract error.
+                    if effectful:
+                        raise UnknownOutcomeError(
+                            "the plugin tool effect outcome could not be confirmed",
+                            reason="unknown_outcome",
+                        )
+                    raise ToolDispatchError(
+                        "tool.runner_contract", "a tool runner must return an OperationOutcome"
+                    )
+                return outcome
 
-        receipt, replayed = self._receipts.record_attempt(
-            run_id=self._session.run_id,
-            command_id=str(request["request_id"]),
-            operation=operation,
-            idempotency_key=idem,
-            executor=executor,
-            request_id=str(request["request_id"]),
-            unknown_summary="the plugin tool effect outcome could not be confirmed",
-        )
-        return DispatchResult(receipt=receipt, replayed=replayed)
+            receipt, replayed = self._receipts.record_attempt(
+                run_id=self._session.run_id,
+                command_id=str(request["request_id"]),
+                operation=operation,
+                idempotency_key=idem,
+                executor=executor,
+                request_id=str(request["request_id"]),
+                unknown_summary="the plugin tool effect outcome could not be confirmed",
+            )
+            # This dispatch genuinely executed iff record_attempt ran the executor
+            # (``replayed`` is False).  A replay -- a concurrent sibling that only
+            # returned the committed receipt -- keeps no slot; the genuine sibling
+            # that reserved the key already holds it.
+            keep_slot = reserved and not replayed
+            return DispatchResult(receipt=receipt, replayed=replayed)
+        finally:
+            # Release the reserved slot on any post-reserve rejection (a raised
+            # approval_invalid / runner_contract) or a replay, so only a genuinely
+            # executed dispatch counts against the lifetime ceiling.  A concurrent
+            # duplicate that reserved nothing (``reserved`` False) never releases
+            # the key the genuine sibling holds.
+            if reserved and not keep_slot:
+                self._release_budget(idem)
 
     # --- internals ----------------------------------------------------------- #
 
@@ -525,30 +557,43 @@ class ChatToolDispatchService:
         except OperationReceiptStoreError as exc:
             raise ToolDispatchError("tool.approval_invalid", "the tool approval is not valid") from exc
 
-    def _check_budget(self) -> None:
-        """Refuse fail-closed when the lifetime tool-call ceiling is reached.
+    def _reserve_budget(self, idempotency_key: str) -> bool:
+        """Atomically admit one request against the lifetime tool-call ceiling.
 
-        A read-only pre-check (no slot is committed) run BEFORE any approval is
-        consumed, so an over-budget call never burns a grant and never reaches the
-        runner.  The slot itself is committed later, at the genuine execution
-        point (:meth:`_commit_budget`), so only a real execution spends budget.
+        The check and the record happen together under ONE lock section, BEFORE
+        any approval is consumed, so admission is atomic: two concurrent DISTINCT
+        requests at a ceiling of one can never both pass -- exactly one records its
+        key and the other is refused ``tool.over_budget`` -- and an over-budget
+        request never burns a grant or reaches the runner.
+
+        Admission is keyed by idempotency key so a reservation is idempotent per
+        request: a concurrent duplicate of an ALREADY-admitted key (a racing
+        replay that slipped past the step-2 receipt short-circuit) neither takes a
+        second slot nor is spuriously refused.  Returns True iff THIS call recorded
+        a NEW slot (so the caller knows whether it -- and only it -- must release
+        on a later rejection); False for such a duplicate, which holds no slot of
+        its own.
         """
         with self._budget_lock:
-            if self._dispatched >= self._session.max_tool_calls:
+            if idempotency_key in self._admitted:
+                return False
+            if len(self._admitted) >= self._session.max_tool_calls:
                 raise ToolDispatchError(
                     "tool.over_budget", "the chat session has exhausted its pinned tool-call budget"
                 )
+            self._admitted.add(idempotency_key)
+            return True
 
-    def _commit_budget(self) -> None:
-        """Commit one budget slot at the genuine (non-replay) execution point.
+    def _release_budget(self, idempotency_key: str) -> None:
+        """Return a reserved slot when a dispatch does not genuinely execute.
 
-        Called from inside the receipt store's replay-guarded executor, which runs
-        at most once per idempotency key and never for a replay, so exactly one
-        slot is spent per real execution.  A rejected request (refused before the
-        runner) and a replayed request both reach this never, consuming none.
+        Called only for the caller that reserved the key, and only when the
+        dispatch was rejected after reserving (a bad approval, a runner-contract
+        violation) or merely replayed -- never after a genuine execution -- so the
+        lifetime ceiling counts exactly the dispatches that really ran.
         """
         with self._budget_lock:
-            self._dispatched += 1
+            self._admitted.discard(idempotency_key)
 
 
 def _operation_ref(discovered: DiscoveredPlugin) -> OperationRef:
