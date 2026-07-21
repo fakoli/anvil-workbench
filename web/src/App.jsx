@@ -521,10 +521,15 @@ function TurnView({ turn, onRetry, onBranch, streamActive, conversationId, autop
   const streaming = turn.status === 'streaming'
   const distinct = !streaming && turn.status !== 'complete'
   const lineage = turn.lineage?.kind && turn.lineage.kind !== 'initial' ? turn.lineage.kind : null
+  // A tuned Advanced run is a sibling branch turn; surface its `mode:'advanced'`
+  // as a distinct badge alongside the lineage chip so it is distinguishable from
+  // an ordinary branch turn (S4).
+  const advancedMode = turn.mode === 'advanced'
   return <li className={`turn turn-${turn.role} turn-${turn.status}`}>
     <div className="turn-head">
       <span className="turn-role">{turn.role === 'user' ? 'You' : 'Assistant'}</span>
       {lineage && <span className="turn-lineage">{lineage}</span>}
+      {advancedMode && <span className="turn-advanced" aria-label="Advanced tuned run">advanced</span>}
       {streaming && <span className="turn-status streaming">streaming…</span>}
       {distinct && <span className={`turn-status turn-status-${turn.status}`}>{turn.status}</span>}
     </div>
@@ -901,10 +906,15 @@ function ChatView({ append }) {
       .then((payload) => setVoicePreferences(voiceAutoplayFromPreferences(payload)))
       .catch(() => setVoicePreferences({ voice_autoplay: false }))
   }, [])
-  // Load the reviewed advanced-route allowlist. The advanced runtime is not wired
-  // into the live bridge loop yet, so a 503 (the shared not-configured sentinel)
-  // or any failure sets a truthful unavailable state — the panel degrades and the
-  // ordinary transcript is never blocked.
+  // Load the reviewed advanced-route allowlist. NOTE (S6): the advanced HTTP
+  // surface — GET /api/chat/advanced/routes and POST
+  // /api/conversations/{id}/advanced/run, served by `build_advanced_router` — is
+  // NOT yet wired server-side. T005 is proven at the COMPONENT level over the
+  // merged serializer shapes (route/control/branch/advanced-trace.v1), and the
+  // live path degrades to `advUnavailable` (503 → the shared not-configured
+  // sentinel) pending that backend wiring under AMP:T007 (live qualification). So
+  // a 503 or any failure sets a truthful unavailable state — the panel degrades
+  // and the ordinary transcript is never blocked.
   useEffect(() => {
     fetchAdvancedRoutes()
       .then((value) => { setAdvRoutes(value.routes || []); setAdvUnavailable('') })
@@ -1012,13 +1022,17 @@ function ChatView({ append }) {
     const isCurrent = () => selectedIdRef.current === conversationId
     const ordinal = (seqRef.current += 1)
     const branchLocalId = `advbranch-${ordinal}`
+    // The panel's Run does not name a branch; give every branch a stable, readable
+    // default label so its row + per-branch control names are meaningful (never
+    // "undefined"). A rerun/fork carries the originating label forward.
+    const branchLabel = label || `Branch ${ordinal}`
     const parentTurnId = turns.length ? turns[turns.length - 1].id : null
     const controls = submittedControls(route, values)
     const userTurn = { id: `local-adv-user-${ordinal}`, role: 'user', status: 'complete', content: [{ text: prompt }], lineage: { kind: 'branch' }, mode: 'advanced' }
     setTurns((current) => [...current, userTurn])
     const assistant = { id: `local-adv-${ordinal}`, role: 'assistant', status: 'streaming', content: [{ text: '' }], lineage: { kind: 'branch' }, mode: 'advanced' }
     setStreamingTurn(assistant); setLifecycle('Advanced branch streaming')
-    setAdvBranches((current) => [...current, { id: branchLocalId, label, routeId: advRouteId, controlsValues: values, prompt, instructions, status: 'streaming', text: '', trace: null, saved: false }])
+    setAdvBranches((current) => [...current, { id: branchLocalId, label: branchLabel, routeId: advRouteId, controlsValues: values, prompt, instructions, status: 'streaming', text: '', trace: null, saved: false }])
     const controller = new AbortController(); abortRef.current = controller
     let capturedTrace = null
     try {

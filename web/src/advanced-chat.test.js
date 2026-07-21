@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   selectAdvancedRoute, controlDescriptors, initialControlValues, checkControlValue,
   previewRouteChange, valuesForRoute, coerceControlValue, submittedControls,
-  branchOps, isBranchSettled, newBranch, formatTrace, formatTraceEvent, shortDigest,
+  branchOps, BRANCH_OPS, isBranchSettled, newBranch, formatTrace, formatTraceEvent, shortDigest,
   traceStatusLabel, eventKindLabel,
 } from './advanced-chat'
 
@@ -111,12 +111,18 @@ describe('branch operation state machine (criterion 2)', () => {
   it('exposes only the operations available from a branch status', () => {
     const draft = newBranch({ id: 'b1', routeId: 'route.chat-fast', controls: {}, prompt: 'x' })
     expect(draft.status).toBe('draft')
-    expect(branchOps(draft, { streaming: false }).run).toBe(true)
-    expect(branchOps(draft, { streaming: true }).run).toBe(false) // one stream at a time
+    // A not-yet-settled branch offers none of the settled operations, and the
+    // dead `run`/`cancel` surface is gone (never bound to a rendered control).
+    const draftOps = branchOps(draft, { streaming: false })
+    expect(draftOps.run).toBeUndefined()
+    expect(draftOps.cancel).toBeUndefined()
+    expect(draftOps.retry).toBe(false)
+    expect(BRANCH_OPS).not.toContain('run')
+    expect(BRANCH_OPS).not.toContain('cancel')
 
     const streaming = { ...draft, status: 'streaming' }
-    expect(branchOps(streaming).cancel).toBe(true)
-    expect(branchOps(streaming).run).toBe(false)
+    expect(branchOps(streaming).retry).toBe(false) // not settled yet
+    expect(branchOps(streaming).inspect).toBe(false) // no trace yet
 
     const settled = { ...draft, status: 'complete', trace: { schema_version: 'workbench-advanced-trace/v1' } }
     expect(isBranchSettled(settled)).toBe(true)
@@ -126,6 +132,8 @@ describe('branch operation state machine (criterion 2)', () => {
     expect(ops.compare).toBe(true) // needs >= 2 settled
     expect(ops.inspect).toBe(true) // has a trace
     expect(ops.save).toBe(true)
+    // Retry/fork are disabled while another stream is in flight (one at a time).
+    expect(branchOps(settled, { settledCount: 2, streaming: true }).retry).toBe(false)
     // Compare disabled when only one settled branch exists.
     expect(branchOps(settled, { settledCount: 1 }).compare).toBe(false)
     // A saved branch offers reopen and not save.

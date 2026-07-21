@@ -137,11 +137,21 @@ export default function AdvancedPanel({
   const [instructions, setInstructions] = useState('')
   const [pending, setPending] = useState(null) // { route, stale, carried } — a previewed, not-yet-committed route change
   const [announce, setAnnounce] = useState('')
+  const [reopenConfirm, setReopenConfirm] = useState(null) // branch id whose reopen would clobber unsaved editor content
   const previewRef = useRef(null)
   const inspectorHeadingRef = useRef(null)
   const compareHeadingRef = useRef(null)
-  const cancelRef = useRef(null)
-  const wasStreamingRef = useRef(false)
+  const routeSelectRef = useRef(null)
+  // Every transient pane captures the control that OPENED it and restores focus to
+  // it on close, so no close path (Apply/Keep/Escape/Close) ever drops focus to
+  // <body> when the pane unmounts. The preview always restores to the route select
+  // (its only trigger); inspector/compare restore to the specific invoking button.
+  const inspectorTriggerRef = useRef(null)
+  const compareTriggerRef = useRef(null)
+  // Per-branch Reopen button nodes, so a Save can move focus to the now-enabled
+  // Reopen instead of letting the Save button disable itself out from under focus.
+  const reopenRefs = useRef({})
+  const justSavedRef = useRef(null)
 
   const selectedRoute = useMemo(() => routes.find((route) => route.route_id === routeId) || null, [routes, routeId])
 
@@ -154,18 +164,38 @@ export default function AdvancedPanel({
   }, [routes, routeId])
 
   // Move focus onto the preview when a route change is proposed, so a keyboard
-  // operator lands on the "what will be dropped" summary before committing.
+  // operator lands on the "what will be dropped" summary before committing. The
+  // close paths (applyRouteChange/keepRoute) restore focus to the route select.
   useEffect(() => { if (pending) previewRef.current?.focus() }, [pending])
-  // Focus the inspector / compare headings when they open (never drop to <body>).
-  useEffect(() => { if (inspectingId) inspectorHeadingRef.current?.focus() }, [inspectingId])
-  useEffect(() => { if (compareIds.length === 2) compareHeadingRef.current?.focus() }, [compareIds.length])
-  // Focus follows the Run↔Cancel swap: when a run starts move focus to Cancel so
-  // it is never dropped; the panel does not steal focus back on settle (the shared
-  // composer owns that), so we only push to Cancel on the streaming edge.
+  // Inspector focus: move to its heading on open; RESTORE to the invoking Inspect
+  // button on close (Close/Escape both route through onInspect(null)), never body.
   useEffect(() => {
-    if (streaming && !wasStreamingRef.current) cancelRef.current?.focus()
-    wasStreamingRef.current = streaming
-  }, [streaming])
+    if (inspectingId) inspectorHeadingRef.current?.focus()
+    else if (inspectorTriggerRef.current) { inspectorTriggerRef.current.focus?.(); inspectorTriggerRef.current = null }
+  }, [inspectingId])
+  // Compare focus: move to its heading when the pair opens; RESTORE to the invoking
+  // Compare control when the pane is fully closed (length 0), never body.
+  useEffect(() => {
+    if (compareIds.length === 2) compareHeadingRef.current?.focus()
+    else if (compareIds.length === 0 && compareTriggerRef.current) { compareTriggerRef.current.focus?.(); compareTriggerRef.current = null }
+  }, [compareIds.length])
+  // Save must not self-destruct focus: when the just-saved branch flips to saved,
+  // the Save button disables (→ body) so we move focus to its now-enabled Reopen.
+  useEffect(() => {
+    const id = justSavedRef.current
+    if (!id) return
+    const saved = branches.find((branch) => branch.id === id)
+    if (saved?.saved) {
+      const el = reopenRefs.current[id]
+      if (el && !el.disabled) el.focus()
+      justSavedRef.current = null
+    }
+  }, [branches])
+  // The Run↔Cancel focus swap is owned by the shared Composer (App.jsx): its
+  // effect runs after this panel's (later sibling wins), and it moves focus to a
+  // Cancel control on the streaming edge and back to the textarea on settle. A
+  // duplicate panel-level effect here would be immediately overridden, so it is
+  // deliberately NOT present — the composer path is the single real one.
 
   if (unavailable) {
     return <section className="advanced-panel" aria-label="Advanced controls">
@@ -201,8 +231,15 @@ export default function AdvancedPanel({
     setValues(valuesForRoute(nextRoute, pending.carried))
     setAnnounce(`Applied ${nextRoute.display_name || nextRoute.route_id}. ${pending.stale.length} value${pending.stale.length === 1 ? '' : 's'} dropped as unsupported.`)
     setPending(null)
+    // Restore focus to the trigger (the route select) so closing the preview never
+    // drops focus to <body>.
+    routeSelectRef.current?.focus()
   }
-  const keepRoute = () => { setPending(null); setAnnounce('Kept the current route. No tuned values were dropped.') }
+  const keepRoute = () => {
+    setPending(null)
+    setAnnounce('Kept the current route. No tuned values were dropped.')
+    routeSelectRef.current?.focus()
+  }
 
   const setControl = (name, value) => setValues((current) => ({ ...current, [name]: value }))
 
@@ -216,6 +253,7 @@ export default function AdvancedPanel({
   const reopen = (branch) => {
     // Reopen loads a saved branch's route + tuned values back into the editor for
     // further tuning; it never mutates the transcript.
+    setReopenConfirm(null)
     const branchRoute = routes.find((route) => route.route_id === branch.routeId)
     if (branchRoute) {
       setRouteId(branch.routeId)
@@ -226,13 +264,59 @@ export default function AdvancedPanel({
     onReopen?.(branch)
     setAnnounce(`Reopened ${branch.label} for tuning.`)
   }
+  // Reopen clobbers the in-progress editor. It is only destructive when the editor
+  // already holds non-empty content that DIFFERS from what this branch would load
+  // (loading identical content is not a clobber). In that case, confirm first (S3);
+  // a pristine editor — or one that already matches — reopens directly.
+  const reopenWouldClobber = (branch) => {
+    const p = prompt.trim(); const i = instructions.trim()
+    if (!p && !i) return false
+    return p !== (branch.prompt || '').trim() || i !== (branch.instructions || '').trim()
+  }
+  const requestReopen = (branch) => {
+    if (reopenWouldClobber(branch)) {
+      setReopenConfirm(branch.id)
+      setAnnounce(`Reopening ${branch.label} will replace your current prompt and instructions. Confirm to continue, or keep editing.`)
+    } else {
+      reopen(branch)
+    }
+  }
+  // Inspect/Compare capture the CLICKED control as the pane's focus-restore target
+  // before handing off to the parent's open/toggle state.
+  const openInspector = (event, branchId) => { inspectorTriggerRef.current = event.currentTarget; onInspect?.(branchId) }
+  const clickCompare = (event, branch) => {
+    compareTriggerRef.current = event.currentTarget
+    if (compareIds.includes(branch.id)) {
+      setAnnounce(`Branch ${branch.label} removed from comparison.`)
+    } else {
+      // Announce the SELECTION (not just aria-pressed) as it is picked (S2).
+      const next = Math.min(compareIds.length + 1, 2)
+      setAnnounce(`Branch ${branch.label} selected for comparison, ${next} of 2`)
+    }
+    onToggleCompare?.(branch.id)
+  }
+  // Save announces to the live region and, because the Save button disables itself
+  // on save, hands focus to the now-enabled Reopen via the justSaved effect (MUST-2).
+  const clickSave = (branch) => {
+    justSavedRef.current = branch.id
+    setAnnounce(`Branch ${branch.label} saved.`)
+    onSave?.(branch)
+  }
 
   const settledCount = branches.filter((branch) => ['complete', 'cancelled', 'interrupted', 'failed'].includes(branch.status)).length
   const comparePair = compareIds.map((id) => branches.find((branch) => branch.id === id)).filter(Boolean)
   const inspecting = branches.find((branch) => branch.id === inspectingId) || null
 
-  // The Escape-to-close/keep handler for the panel's transient panes; yields to a
-  // native select's own Escape (which closes its listbox first).
+  // The Escape-to-close/keep handler for the panel's transient panes. Each close
+  // path routes through a handler that restores focus to the pane's trigger
+  // (keepRoute → route select; onInspect(null)/onToggleCompare(null) → the
+  // captured invoking button via the focus effects), so Escape never drops to body.
+  //
+  // Tradeoff (NOTE): the blanket SELECT guard means Escape on the route <select>
+  // yields to the native listbox dismissal even when the select is CLOSED. React
+  // exposes no open/closed state for a native <select>, so we cannot tell a
+  // closed-select Escape from a listbox-dismissal one; deferring to the browser is
+  // the safe choice (a preview is re-openable, a mid-dropdown discard is not).
   const onPanelKeyDown = (event) => {
     if (event.key !== 'Escape') return
     if (event.target?.tagName === 'SELECT') return
@@ -246,25 +330,25 @@ export default function AdvancedPanel({
 
     <div className="adv-route-row">
       <label className="adv-route-select"><span>Advanced route</span>
-        <select aria-label="Advanced route" value={pending ? pending.route.route_id : routeId}
+        <select ref={routeSelectRef} aria-label="Advanced route" value={pending ? pending.route.route_id : routeId}
           onChange={(event) => onRouteSelect(event.target.value)}>
           {routes.map((route) => <option key={route.route_id} value={route.route_id}>{route.display_name || route.route_id}</option>)}
         </select>
       </label>
     </div>
 
-    {pending && <div className="adv-preview" role="alertdialog" aria-label="Route change preview" tabIndex={-1} ref={previewRef}>
+    {pending && <div className="adv-preview" role="alertdialog" aria-label="Route change preview" aria-describedby="adv-preview-desc" tabIndex={-1} ref={previewRef}>
       <h3 className="adv-preview-head">Switching to {pending.route.display_name || pending.route.route_id}</h3>
       {pending.stale.length
         ? <>
-            <p>These tuned values are <b>not supported</b> on that route and will be dropped if you apply the change:</p>
+            <p id="adv-preview-desc">These tuned values are <b>not supported</b> on that route and will be dropped if you apply the change:</p>
             <ul className="adv-stale-list" aria-label="Values that will be dropped">
               {pending.stale.map((entry) => <li key={entry.name}>
                 <b>{entry.name}</b> = <code>{String(entry.value)}</code> — {staleReasonLabel(entry.reason)}
               </li>)}
             </ul>
           </>
-        : <p>All current tuned values are supported on that route; none will be dropped.</p>}
+        : <p id="adv-preview-desc">All current tuned values are supported on that route; none will be dropped.</p>}
       <div className="adv-preview-actions">
         <button type="button" className="adv-apply" onClick={applyRouteChange}>Apply route change</button>
         <button type="button" className="adv-keep secondary-button" onClick={keepRoute}>Keep current route</button>
@@ -289,7 +373,7 @@ export default function AdvancedPanel({
 
     <div className="adv-run-row">
       {streaming
-        ? <button ref={cancelRef} type="button" className="adv-cancel" aria-label="Cancel advanced run" onClick={onCancel}>Cancel run</button>
+        ? <button type="button" className="adv-cancel" aria-label="Cancel advanced run" onClick={onCancel}>Cancel run</button>
         : <button type="button" className="adv-run" aria-label="Run advanced branch" disabled={!canRun} onClick={run}>Run branch</button>}
     </div>
 
@@ -306,12 +390,20 @@ export default function AdvancedPanel({
               <small>{branch.routeId}{branch.saved ? ' · saved' : ''}</small>
             </div>
             <div className="adv-branch-actions">
-              <button type="button" aria-label={`Inspect ${branch.label}`} disabled={!ops.inspect} onClick={() => onInspect?.(branch.id)}>Inspect</button>
+              <button type="button" aria-label={`Inspect ${branch.label}`} disabled={!ops.inspect} onClick={(event) => openInspector(event, branch.id)}>Inspect</button>
               <button type="button" aria-label={`Retry ${branch.label}`} disabled={!ops.retry} onClick={() => onRerun?.(branch, 'retry')}>Retry</button>
               <button type="button" aria-label={`Fork ${branch.label}`} disabled={!ops.fork} onClick={() => onRerun?.(branch, 'fork')}>Fork</button>
-              <button type="button" aria-label={`Compare ${branch.label}`} aria-pressed={comparing} disabled={!ops.compare && !comparing} onClick={() => onToggleCompare?.(branch.id)}>{comparing ? 'Comparing' : 'Compare'}</button>
-              <button type="button" aria-label={`Save ${branch.label}`} disabled={!ops.save} onClick={() => onSave?.(branch)}>{branch.saved ? 'Saved' : 'Save'}</button>
-              <button type="button" aria-label={`Reopen ${branch.label}`} disabled={!ops.reopen} onClick={() => reopen(branch)}>Reopen</button>
+              <button type="button" aria-label={`Compare ${branch.label}`} aria-pressed={comparing} disabled={!ops.compare && !comparing} onClick={(event) => clickCompare(event, branch)}>{comparing ? 'Comparing' : 'Compare'}</button>
+              {/* Save's accessible name tracks its state so the visible "Saved"
+                  always matches the name (WCAG 2.5.3); aria-pressed carries the
+                  saved state. On save, focus moves to Reopen (MUST-2). */}
+              <button type="button" aria-label={branch.saved ? `Saved ${branch.label}` : `Save ${branch.label}`} aria-pressed={branch.saved ? true : undefined} disabled={!ops.save} onClick={() => clickSave(branch)}>{branch.saved ? 'Saved' : 'Save'}</button>
+              {reopenConfirm === branch.id
+                ? <>
+                    <button type="button" className="adv-reopen-confirm" aria-label={`Confirm reopen ${branch.label}`} onClick={() => reopen(branch)}>Confirm reopen</button>
+                    <button type="button" aria-label={`Keep editing instead of reopening ${branch.label}`} onClick={() => { setReopenConfirm(null); setAnnounce('Kept your current editor content.') }}>Keep editing</button>
+                  </>
+                : <button type="button" ref={(el) => { if (el) reopenRefs.current[branch.id] = el; else delete reopenRefs.current[branch.id] }} aria-label={`Reopen ${branch.label}`} disabled={!ops.reopen} onClick={() => requestReopen(branch)}>Reopen</button>}
             </div>
           </li>
         })}

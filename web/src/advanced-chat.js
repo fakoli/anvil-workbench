@@ -178,8 +178,12 @@ export function submittedControls(route, values) {
 // map from the served chat-turn terminal (chat-api.terminalToStatus) and the
 // advanced-trace `status`.
 
-// The closed set of branch operations the panel offers.
-export const BRANCH_OPS = Object.freeze(['run', 'cancel', 'retry', 'fork', 'compare', 'inspect', 'save', 'reopen'])
+// The closed set of branch operations the panel offers. `run`/`cancel` are NOT
+// here: a branch is created already streaming (never a rendered `draft` row) and
+// the in-flight run is cancelled by the panel-level Cancel, so no per-branch row
+// ever binds a run/cancel control. Only the operations with a real rendered
+// affordance are listed — no dead surface.
+export const BRANCH_OPS = Object.freeze(['retry', 'fork', 'compare', 'inspect', 'save', 'reopen'])
 
 // A branch is settled once its single attempt reached a terminal turn status.
 const SETTLED_STATUSES = Object.freeze(['complete', 'cancelled', 'interrupted', 'failed'])
@@ -192,13 +196,10 @@ export function isBranchSettled(branch) {
 // (`settledCount` — how many settled branches exist for compare; `streaming` —
 // whether any stream is in flight). Every panel button keys its `disabled` off
 // this, so a rendered control is enabled ONLY when its effect is genuinely
-// available — no dead affordance, no reducer-only op the UI never invokes.
+// available — no dead affordance, no op the UI never invokes.
 export function branchOps(branch, { settledCount = 0, streaming = false } = {}) {
-  const status = branch?.status
   const settled = isBranchSettled(branch)
   return {
-    run: status === 'draft' && !streaming,
-    cancel: status === 'streaming',
     retry: settled && !streaming,
     fork: settled && !streaming,
     compare: settled && settledCount >= 2,

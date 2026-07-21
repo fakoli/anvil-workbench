@@ -77,6 +77,7 @@
 .adv-branch-actions button,.adv-close{border:1px solid #32665e;background:#13342f;color:#b9f4e5;border-radius:5px;padding:5px 8px;font-size:9px;font-weight:700}
 .adv-branch-actions button:disabled{opacity:.4;cursor:default}
 .adv-branch-actions button[aria-pressed=true]{background:#1a5951;color:#eafffb}
+.adv-branch-actions .adv-reopen-confirm{border-color:#7a5a2a;background:#3a2a10;color:#f0d9a6}
 .adv-pane-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.adv-pane-head h3,.adv-pane-head h4{margin:0;font-size:12px;color:#eafffb;outline:none}
 .adv-redaction-note{color:#7fbfae;font-size:9px}
 .adv-kv{display:grid;gap:4px;margin:0}.adv-kv>div{display:grid;grid-template-columns:minmax(0,120px) minmax(0,1fr);gap:8px}.adv-kv dt{font-size:9px;color:#6f858a;text-transform:uppercase;letter-spacing:.04em}.adv-kv dd{margin:0;font-size:10px;color:#c9d8d5;word-break:break-word}
@@ -95,7 +96,7 @@
 @media(max-width:640px){.adv-branch-row{flex-direction:column;align-items:flex-start}.adv-kv>div,.adv-event-fields>div{grid-template-columns:1fr}}
 .transcript-scroll{flex:1;overflow-y:auto;border:1px solid #1b2d32;background:#0a1417;border-radius:10px;padding:16px}
 .chat-empty{display:grid;place-content:center;gap:6px;text-align:center;min-height:220px;color:#7f9498}.chat-empty h2{margin:0;font-size:18px;letter-spacing:-.03em;color:#cadedb}.chat-empty p{margin:0;font-size:11px;max-width:340px}
-.transcript{list-style:none;margin:0;padding:0;display:grid;gap:16px}.turn{display:grid;gap:6px}.turn-head{display:flex;align-items:center;gap:8px}.turn-role{font-size:10px;font-weight:800;color:#9fb4b1}.turn-user .turn-role{color:#8ec7bd}.turn-lineage{font-size:8px;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:20px;background:#182a30;color:#9db6bb}
+.transcript{list-style:none;margin:0;padding:0;display:grid;gap:16px}.turn{display:grid;gap:6px}.turn-head{display:flex;align-items:center;gap:8px}.turn-role{font-size:10px;font-weight:800;color:#9fb4b1}.turn-user .turn-role{color:#8ec7bd}.turn-lineage{font-size:8px;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:20px;background:#182a30;color:#9db6bb}.turn-advanced{font-size:8px;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:20px;background:#13342f;color:#bff5e7;font-weight:800}
 .turn-status{font-family:'DM Mono',monospace;font-size:8px;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:20px}.turn-status.streaming{color:#8fd3c4;border:1px solid #2b4a45}.turn-status-interrupted{color:#d7ab60;border:1px solid #4d4022}.turn-status-cancelled{color:#c0b18a;border:1px solid #40412a}.turn-status-failed{color:#e88f8f;border:1px solid #4d2a2a}
 .turn-text{margin:0;border-radius:7px;padding:11px 13px;font-size:12px;line-height:1.65;background:#132126;color:#c8d4d3;white-space:pre-wrap;overflow-wrap:anywhere}.turn-assistant .turn-text{background:#0e1b1f;border:1px solid #1d3338;color:#bccdcc}.turn-failed .turn-text{border:1px solid #4d2a2a}
 .turn-actions{display:flex;gap:6px}.turn-actions button{border:1px solid #29424a;background:#0f1e22;color:#9fbdc0;border-radius:5px;padding:5px 9px;font-size:9px;font-weight:700}.turn-actions button:hover{border-color:#3a6f66;color:#cdeee5}

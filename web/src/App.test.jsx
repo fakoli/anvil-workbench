@@ -632,6 +632,138 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     expect(await screen.findByText('Response interrupted')).toBeTruthy() // distinct from 'Response failed'
   })
+
+  // --- Focus + live-region behavior for the transient panes (a11y MUST-1/2/3) ---
+  // These assert document.activeElement and the live region's textContent directly:
+  // the earlier suite never did, so the focus-to-<body> regressions on every close
+  // path shipped green. Each is written to FAIL against a build without the
+  // focus-restore / save-announce and PASS with it (revert-detection demonstrated
+  // for the preview-restore and the save-announce).
+
+  it('MUST-1: the stale preview takes focus on open and RESTORES focus to the route select on Keep and Escape', async () => {
+    const user = await openAdvanced()
+    const routeSelect = screen.getByRole('combobox', { name: 'Advanced route' })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'temperature_milli' }), { target: { value: '800' } })
+    // Open the preview by proposing a route switch.
+    fireEvent.change(routeSelect, { target: { value: 'route.chat-heavy' } })
+    const preview = await screen.findByRole('alertdialog', { name: 'Route change preview' })
+    expect(document.activeElement).toBe(preview) // focus moved INTO the pane, not left on body
+    // Keep restores focus to the invoking route select.
+    await user.click(within(preview).getByRole('button', { name: 'Keep current route' }))
+    expect(document.activeElement).toBe(routeSelect)
+
+    // Re-open and dismiss with Escape → focus restored to the route select again.
+    fireEvent.change(routeSelect, { target: { value: 'route.chat-heavy' } })
+    const preview2 = await screen.findByRole('alertdialog', { name: 'Route change preview' })
+    expect(document.activeElement).toBe(preview2)
+    await user.keyboard('{Escape}')
+    expect(document.activeElement).toBe(routeSelect)
+  })
+
+  it('MUST-1: Apply restores focus to the route select (never body) after the preview commits', async () => {
+    const user = await openAdvanced()
+    const routeSelect = screen.getByRole('combobox', { name: 'Advanced route' })
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'temperature_milli' }), { target: { value: '800' } })
+    fireEvent.change(routeSelect, { target: { value: 'route.chat-heavy' } })
+    const preview = await screen.findByRole('alertdialog', { name: 'Route change preview' })
+    await user.click(within(preview).getByRole('button', { name: 'Apply route change' }))
+    expect(document.activeElement).toBe(routeSelect)
+    expect(document.activeElement).not.toBe(document.body)
+  })
+
+  it('MUST-1: inspector and compare focus their heading on open and restore focus to the invoking button on close', async () => {
+    const user = await openAdvanced()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'inspect focus')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+
+    // Inspector: opening focuses its heading; Close restores to the Inspect button.
+    const inspectBtn = await screen.findByRole('button', { name: /Inspect/ })
+    await user.click(inspectBtn)
+    const inspectHeading = await screen.findByRole('heading', { name: /Trace inspector/ })
+    expect(document.activeElement).toBe(inspectHeading)
+    await user.click(screen.getByRole('button', { name: 'Close inspector' }))
+    expect(document.activeElement).toBe(inspectBtn)
+
+    // Escape also closes the inspector and restores focus to the Inspect button.
+    await user.click(inspectBtn)
+    await screen.findByRole('heading', { name: /Trace inspector/ })
+    await user.keyboard('{Escape}')
+    expect(document.activeElement).toBe(inspectBtn)
+
+    // Compare: run a second settled branch, select both, heading takes focus, and
+    // Close restores focus to the second (opening) Compare control.
+    runAdvancedBranch.mockResolvedValueOnce({ text: 'second tuned answer', terminal: 'completed', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv2', branchId: 'advbranch_srv2' })
+    await user.click(screen.getByRole('button', { name: /Fork/ }))
+    await screen.findByText('second tuned answer')
+    const compareButtons = screen.getAllByRole('button', { name: /Compare/ })
+    await user.click(compareButtons[0])
+    await user.click(compareButtons[1])
+    const compareHeading = await screen.findByRole('heading', { name: 'Comparing two branches' })
+    expect(document.activeElement).toBe(compareHeading)
+    await user.click(screen.getByRole('button', { name: 'Close comparison' }))
+    expect(document.activeElement).toBe(compareButtons[1])
+  })
+
+  it('MUST-2: saving a branch ANNOUNCES in the live region and moves focus to Reopen with a correct accessible name (never body)', async () => {
+    const user = await openAdvanced()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'save me')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+    const saveBtn = await screen.findByRole('button', { name: /^Save/ })
+    await user.click(saveBtn)
+    // Focus is NOT dropped to <body>; it lands on the now-enabled Reopen control.
+    const reopen = screen.getByRole('button', { name: /Reopen/ })
+    expect(document.activeElement).toBe(reopen)
+    expect(document.activeElement).not.toBe(document.body)
+    // The save is announced in the panel's role=status live region.
+    const live = document.querySelector('.adv-live')
+    expect(live.textContent).toMatch(/saved/i)
+    // The saved control's accessible name matches its visible text (WCAG 2.5.3).
+    const saved = screen.getByRole('button', { name: /^Saved/ })
+    expect(saved.textContent).toBe('Saved')
+  })
+
+  it('S1: the Retry control re-runs the SAME branch config as a sibling in the one transcript', async () => {
+    const user = await openAdvanced()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'retry me')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+    // Scope to the branch row's OWN Retry control (distinct from the transcript's
+    // per-turn "Retry this response"): this drives Retry's own enabled state + path.
+    const branchRegion = screen.getByRole('region', { name: 'Advanced branches' })
+    const retryBtn = await within(branchRegion).findByRole('button', { name: /Retry/ })
+    expect(retryBtn.disabled).toBe(false) // its own enabled state, driven by branchOps
+    runAdvancedBranch.mockResolvedValueOnce({ text: 'retried answer', terminal: 'completed', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv_r', branchId: 'advbranch_r' })
+    await user.click(retryBtn)
+    expect(await screen.findByText('retried answer')).toBeTruthy()
+    // Still exactly one transcript — Retry is a sibling, not a duplicate transcript.
+    expect(screen.getAllByRole('list', { name: 'Transcript' })).toHaveLength(1)
+    // Retry re-ran the identical route + prompt config.
+    const call = runAdvancedBranch.mock.calls.at(-1)[0]
+    expect(call.routeId).toBe('route.chat-fast')
+    expect(call.prompt).toBe('retry me')
+  })
+
+  it('S3: Reopen confirms before clobbering DIFFERENT in-progress editor content, then loads on confirm', async () => {
+    const user = await openAdvanced()
+    const promptField = screen.getByRole('textbox', { name: 'Advanced prompt' })
+    await user.type(promptField, 'original tuned prompt')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+    await user.click(await screen.findByRole('button', { name: /^Save/ }))
+    // Replace the editor with DIFFERENT unsaved work.
+    await user.clear(promptField)
+    await user.type(promptField, 'unsaved different work')
+    // Reopen now would clobber → it confirms instead of overwriting immediately.
+    await user.click(screen.getByRole('button', { name: /Reopen/ }))
+    expect(screen.getByRole('textbox', { name: 'Advanced prompt' }).value).toBe('unsaved different work')
+    const live = document.querySelector('.adv-live')
+    expect(live.textContent).toMatch(/replace your current prompt/i)
+    // Confirming performs the reopen and loads the saved branch's prompt.
+    await user.click(await screen.findByRole('button', { name: /Confirm reopen/ }))
+    expect(screen.getByRole('textbox', { name: 'Advanced prompt' }).value).toBe('original tuned prompt')
+  })
 })
 
 describe('Chat routing, navigation, and accessibility (T004.4)', () => {
