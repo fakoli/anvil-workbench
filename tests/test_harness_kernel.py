@@ -2767,6 +2767,177 @@ def test_rtp_fix_retriable_failed_read_is_bounded_at_one_execution():
     assert runs == [1]  # exactly one genuine execution, never unbounded
 
 
+def _rtp_ceiling_one_service():
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    return _rtp_service(capability=capability)
+
+
+def test_rtp_fix3_effectful_grant_race_window_is_bounded_by_the_executor_gate():
+    # RESIDUAL 3a (effectful grant-race window): two CONCURRENT DUPLICATES of the
+    # same effectful request race the one-time approval grant.  The grant-LOSER is
+    # forced to be the budget reserver, so when it fails approval_invalid its
+    # finally empties _in_flight while the grant-WINNER (parked before its
+    # executor) has NOT yet incremented _executed_count.  In that window a DISTINCT
+    # request dispatches.  Admission-time enforcement alone admits it (count 0,
+    # in_flight empty) -> TWO genuine executions at ceiling 1.  The execution-time
+    # gate bounds it: whichever genuine execution reaches the executor second finds
+    # _executed_count already at the ceiling and is refused tool.over_budget before
+    # its runner runs.  Over-admits (2 genuine) on HEAD; bounded at 1 after the fix.
+    service = _rtp_ceiling_one_service()
+    req_e, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+
+    effect_runs = []
+    distinct_runs = []
+
+    def effect_runner(_d, _i):
+        effect_runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"notified": "yes"})
+
+    def distinct_runner(_d, _i):
+        distinct_runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    # Force the grant-loser to reserve the budget key FIRST (so it, not the winner,
+    # holds the in-flight key it will release on failure) -- the exact window.
+    real_reserve = service._reserve_budget
+    loser_reserved = _rtp_threading.Event()
+
+    def ordered_reserve(idem):
+        if _rtp_threading.current_thread().name == "winner":
+            loser_reserved.wait(3.0)          # winner reserves AFTER the loser
+        took = real_reserve(idem)
+        if _rtp_threading.current_thread().name == "loser":
+            loser_reserved.set()
+        return took
+
+    service._reserve_budget = ordered_reserve
+
+    real_consume = service._consume_approval
+    winner_consumed = _rtp_threading.Event()
+    loser_failed = _rtp_threading.Event()
+    release_winner = _rtp_threading.Event()
+
+    def orchestrated_consume(request):
+        name = _rtp_threading.current_thread().name
+        if name == "loser":
+            assert winner_consumed.wait(3.0)  # the winner steals the one-time grant
+            real_consume(request)             # -> raises approval_invalid
+            return
+        if name == "winner":
+            real_consume(request)             # wins the one-time grant
+            winner_consumed.set()
+            assert loser_failed.wait(3.0)     # loser has failed + released its key
+            assert release_winner.wait(3.0)   # park BEFORE record_attempt / executor
+            return
+        real_consume(request)
+
+    service._consume_approval = orchestrated_consume
+
+    results = {}
+
+    def go(name, request, runner):
+        try:
+            results[name] = ("ok", service.dispatch(request, runner))
+        except _RtpError as exc:
+            results[name] = ("refused", exc.code)
+
+    loser = _rtp_threading.Thread(target=go, args=("loser", req_e, effect_runner), name="loser")
+    winner = _rtp_threading.Thread(target=go, args=("winner", req_e, effect_runner), name="winner")
+    loser.start()
+    winner.start()
+    loser.join(5.0)
+    assert results.get("loser") == ("refused", "tool.approval_invalid")
+    loser_failed.set()
+
+    # THE WINDOW: the winner (which WILL genuinely execute) has not yet incremented
+    # _executed_count and the loser's finally emptied _in_flight.  A distinct
+    # request now dispatches into that window.
+    window_state = (service._executed_count, set(service._in_flight))
+    try:
+        distinct_result = service.dispatch(_rtp_read_request("claimed"), distinct_runner)
+        distinct_outcome = ("ok", distinct_result.receipt["status"])
+    except _RtpError as exc:
+        distinct_outcome = ("refused", exc.code)
+
+    release_winner.set()
+    winner.join(5.0)
+    service._consume_approval = real_consume
+    service._reserve_budget = real_reserve
+
+    genuine = len(effect_runs) + len(distinct_runs)
+    assert genuine == 1, (
+        f"OVER-ADMISSION: window_state(count,in_flight)={window_state}, "
+        f"distinct_outcome={distinct_outcome}, winner_result={results.get('winner')}, "
+        f"effect_runs={effect_runs}, distinct_runs={distinct_runs}, "
+        f"executed_count={service._executed_count}, ceiling=1"
+    )
+    # The ledger never exceeds the ceiling, and the second genuine execution to
+    # reach the executor is refused tool.over_budget (its runner never runs).
+    assert service._executed_count == 1
+    over_budget = [v for v in (distinct_outcome, results.get("winner")) if v == ("refused", "tool.over_budget")]
+    assert len(over_budget) == 1, results
+
+
+def test_rtp_fix4_concurrent_duplicates_of_a_failing_read_are_bounded_at_one_execution():
+    # RESIDUAL EDGE2-concurrent: N CONCURRENT duplicates of an always-failing read
+    # at ceiling 1.  A failed read is not persisted, so the step-2 receipt
+    # short-circuit never fires, and keyed admission returns "duplicate" WITHOUT a
+    # ceiling check -- so all N pass admission, serialize on the store RLock, and
+    # (admission-time enforcement alone) each find no receipt and RE-EXECUTE ->
+    # up to N genuine executions at ceiling 1.  The execution-time gate bounds it:
+    # exactly ONE genuine execution passes _executed_count >= ceiling; the rest are
+    # refused tool.over_budget before their runner runs.  N genuine on HEAD; 1 after.
+    service = _rtp_ceiling_one_service()
+    req = _rtp_read_request("ready")
+    runs = []
+
+    def failing(_d, _i):
+        runs.append(1)
+        raise RuntimeError("the read backend is unavailable")
+
+    n = 4
+    real_reserve = service._reserve_budget
+    admitted_barrier = _rtp_threading.Barrier(n, timeout=5.0)
+
+    def barrier_reserve(idem):
+        took = real_reserve(idem)
+        admitted_barrier.wait()  # hold until all n are past admission (1 + n-1 dups)
+        return took
+
+    service._reserve_budget = barrier_reserve
+
+    results = []
+
+    def go():
+        try:
+            results.append(("ok", service.dispatch(req, failing)))
+        except _RtpError as exc:
+            results.append(("refused", exc.code))
+
+    threads = [_rtp_threading.Thread(target=go, name=f"dup{i}") for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10.0)
+    service._reserve_budget = real_reserve
+
+    assert len(runs) == 1, (
+        f"MULTI-EXECUTION: {len(runs)} genuine executions of a failing read at "
+        f"ceiling 1 in one concurrent duplicate burst: runs={runs}, "
+        f"executed_count={service._executed_count}, results={results}"
+    )
+    assert service._executed_count == 1
+    # Exactly one dispatch returns the (unpersisted) failed receipt; the rest are
+    # refused tool.over_budget at the authoritative execution-time gate.
+    ok = [r for r in results if r[0] == "ok"]
+    refused = [r for r in results if r == ("refused", "tool.over_budget")]
+    assert len(ok) == 1 and ok[0][1].receipt["status"] == "failed", results
+    assert len(refused) == n - 1, results
+
+
 def test_rtp_t005_concurrent_same_read_executes_once_and_the_receipt_lock_is_load_bearing():
     service = _rtp_service()
     req = _rtp_read_request("ready")

@@ -171,17 +171,18 @@ class ChatToolSession:
         # The pinned profile's tool-call budget.  The pinned
         # ``max_concurrent_tool_calls`` is enforced by the dispatch service as a
         # per-session lifetime ceiling on the number of tool-call dispatches that
-        # GENUINELY execute.  The service tracks the permanent cost as an
-        # ``_executed_count`` ledger (incremented once per genuine, non-replay
-        # runner execution, regardless of outcome) plus a transient ``_in_flight``
-        # keyed reservation set; admission checks ``_executed_count +
-        # len(_in_flight)`` atomically before any effect, and the in-flight key is
-        # always released afterwards.  So a rejected or replayed request consumes
-        # none, and a retriable failed read is bounded at one execution.  A
-        # conservative bound (a runaway chat cannot invoke unbounded tools) that a
-        # production async dispatcher would refine into a live in-flight gate.  A
-        # profile without an explicit limit gets a single call -- fail safe, never
-        # unbounded.
+        # GENUINELY execute.  The AUTHORITATIVE bound is an execution-time check:
+        # the service tracks the permanent cost as an ``_executed_count`` ledger and,
+        # inside the store executor (the point a genuine execution is serialized),
+        # checks ``_executed_count >= ceiling`` and increments in one atomic section
+        # per genuine, non-replay runner execution, regardless of outcome.  A
+        # transient ``_in_flight`` keyed reservation set drives a cheap early refuse
+        # at admission and is always released afterwards.  So a rejected or replayed
+        # request consumes none, and a retriable failed read is bounded at one
+        # execution even under a concurrent duplicate burst.  A conservative bound (a
+        # runaway chat cannot invoke unbounded tools) that a production async
+        # dispatcher would refine into a live in-flight gate.  A profile without an
+        # explicit limit gets a single call -- fail safe, never unbounded.
         self.max_tool_calls = raw_budget if isinstance(raw_budget, int) and raw_budget > 0 else 1
 
     @property
@@ -236,34 +237,38 @@ class ChatToolDispatchService:
         self._health: ToolHealthProbe = health or (lambda _p, _t: True)
         self._receipts = receipt_store if receipt_store is not None else MemoryOperationReceiptStore()
         self._approvals = approval_store if approval_store is not None else MemoryOperationApprovalStore()
-        # The per-session tool-call budget separates the PERMANENT cost from the
-        # TRANSIENT reservation, under one lock:
+        # The per-session tool-call budget is EXECUTION-TIME authoritative.  It
+        # separates the PERMANENT cost from the TRANSIENT reservation under one lock:
         #
         # * ``_executed_count`` is the ground-truth permanent cost -- the number of
-        #   GENUINE (non-replay) runner executions.  It is incremented by EXACTLY
-        #   ONE inside the receipt-store executor (the critical section that decides
-        #   "this is a genuine execution, run the runner"), regardless of the
-        #   outcome (succeeded / failed-retriable / reconciled).  A replay never
-        #   increments it.  Because the increment happens under this lock while the
-        #   admitting execution's key is still in-flight, it can never be lost to
-        #   the race where a concurrent DUPLICATE (not the reserving thread) is the
-        #   one the store runs.
-        # * ``_in_flight`` is the TRANSIENT keyed reservation set: pure
-        #   pre-approval admission control.  A key is added at admission and ALWAYS
-        #   removed in the ``finally`` (never conditioned on execution).
+        #   GENUINE (non-replay) runner executions.  The AUTHORITATIVE ceiling gate
+        #   lives inside the receipt-store executor: under ``_budget_lock`` it checks
+        #   ``_executed_count >= ceiling`` and, only if under, increments by EXACTLY
+        #   ONE, in ONE atomic section.  The executor runs at the SINGLE point a
+        #   genuine execution is serialized (record_attempt's per-key RLock), so no
+        #   two genuine executions can both pass at the ceiling: the second is
+        #   refused ``tool.over_budget`` BEFORE the runner runs.  The increment
+        #   regardless of outcome (succeeded / failed-retriable / reconciled), and a
+        #   replay never reaches the executor at all.
+        # * ``_in_flight`` is the TRANSIENT keyed reservation set used ONLY by
+        #   admission as a cheap early refuse.  A key is added at admission and
+        #   ALWAYS removed in the ``finally`` (never conditioned on execution).
         #
-        # Admission (``_reserve_budget``) checks ``_executed_count + len(_in_flight)
-        # >= ceiling`` and records the key under ONE lock section, BEFORE any
-        # approval is consumed, so an in-flight-but-not-yet-executed reservation
-        # still occupies the ceiling: two concurrent DISTINCT requests at a ceiling
-        # of one admit exactly one and refuse the other ``tool.over_budget``, and an
-        # over-budget request never burns a grant or reaches the runner.  Admission
-        # is keyed by idempotency key, so a concurrent duplicate of an already
-        # admitted key takes no second slot; it goes on to replay the one committed
-        # receipt.  Because ``_executed_count`` is the durable ledger, a rejected
-        # or replayed request consumes nothing and a retriable failed read is
-        # bounded at one genuine execution -- only real executions count against the
-        # lifetime ceiling.
+        # Admission (``_reserve_budget``) is a NON-authoritative EARLY REFUSE: it
+        # checks ``_executed_count + len(_in_flight) >= ceiling`` and records the key
+        # under ONE lock section, BEFORE any approval is consumed, so the common
+        # sequential over-budget case and two concurrent DISTINCT requests at a
+        # ceiling of one are refused cheaply -- before a grant is consumed or the
+        # runner is reached.  But admission is NOT the source of truth: a request
+        # that slips past it (a losing grant-race that empties ``_in_flight`` before
+        # the winner has incremented ``_executed_count``; concurrent duplicates of an
+        # unpersisted failed read that all pass the keyed admission) is still bounded
+        # by the executor-time gate above.  Admission is keyed by idempotency key, so
+        # a concurrent duplicate of an already admitted key takes no second slot; it
+        # goes on to replay the one committed receipt.  Because ``_executed_count`` is
+        # the durable ledger checked at execution time, a rejected or replayed
+        # request consumes nothing and a retriable failed read is bounded at one
+        # genuine execution -- only real executions count against the lifetime ceiling.
         self._budget_lock = threading.Lock()
         self._executed_count = 0
         self._in_flight: set[str] = set()
@@ -369,26 +374,31 @@ class ChatToolDispatchService:
            the reviewed tool schema, an effectful call must carry an approval, and
            a read must NOT carry one;
         5. health -- an unhealthy tool is refused;
-        6. budget -- the lifetime tool-call ceiling is RESERVED ATOMICALLY (check
-           ``_executed_count + len(_in_flight) >= ceiling`` + record the key in one
-           lock section) BEFORE any grant is consumed, so two concurrent distinct
-           requests at a ceiling of one admit exactly one and refuse the other
-           ``tool.over_budget``; an over-budget request never burns a grant or
-           reaches the runner;
+        6. budget (EARLY REFUSE) -- admission reserves a transient in-flight key and
+           cheaply refuses the common over-budget cases (``_executed_count +
+           len(_in_flight) >= ceiling``) BEFORE any grant is consumed, so the
+           sequential over-budget case and two concurrent distinct requests at a
+           ceiling of one are refused ``tool.over_budget`` without burning a grant.
+           Admission is NOT authoritative -- it is an optimization ahead of step 8;
         7. approval -- an effectful call CONSUMES its one-time hash-bound grant
            before the effect runs; a replayed/expired/mismatched grant fails
            closed on the collapsed ``approval_invalid`` reason;
         8. dispatch through the reused receipt store -- exactly-once execution,
            a redacted typed receipt, and reconciliation (never a fabricated
-           success) for an unconfirmed effectful outcome.  A GENUINE (non-replay)
-           execution increments ``_executed_count`` by one inside the store's
-           executor (the critical section that runs the runner), regardless of
-           outcome.
+           success) for an unconfirmed effectful outcome.  This is where the
+           AUTHORITATIVE ceiling gate lives: inside the store's executor, under
+           ``_budget_lock`` at the per-key RLock serialization point, a genuine
+           (non-replay) execution checks ``_executed_count >= ceiling`` and
+           increments by one in one atomic section, regardless of outcome -- so a
+           second genuine execution at the ceiling is refused ``tool.over_budget``
+           before the runner runs.
 
         The transient in-flight key is ALWAYS released in the ``finally``; the
         permanent cost lives in ``_executed_count``, incremented once per genuine
-        execution.  So a rejected or replayed request spends nothing, and a
-        retriable failed read is bounded at one genuine execution.
+        execution at the authoritative execution-time gate.  So a rejected or
+        replayed request spends nothing, and a retriable failed read (whether
+        sequential or a concurrent duplicate burst) is bounded at one genuine
+        execution.
         """
         # 1. structural validation, independent of the pinned catalog.
         try:
@@ -414,13 +424,16 @@ class ChatToolDispatchService:
         if not self._health(discovered.plugin_id, tool_id):
             raise ToolDispatchError("tool.unhealthy", "the selected tool is not healthy")
 
-        # 6. budget: RESERVE the lifetime ceiling ATOMICALLY (check
-        #    ``_executed_count + len(_in_flight) >= ceiling`` + record the key under
-        #    one lock) before any approval is consumed, so two concurrent distinct
-        #    requests at a ceiling of one admit exactly one and refuse the other,
-        #    and an over-budget request never burns a grant or reaches the runner.
-        #    ``added_key`` is True iff THIS call added the in-flight key (a
-        #    concurrent duplicate of an already-reserved key adds none); ONLY the
+        # 6. budget EARLY REFUSE: admission is a cheap, NON-authoritative refuse
+        #    ahead of the execution-time gate in step 8.  It records a transient
+        #    in-flight key and refuses the common over-budget cases (check
+        #    ``_executed_count + len(_in_flight) >= ceiling`` under one lock) before
+        #    any approval is consumed, so the sequential over-budget case and two
+        #    concurrent distinct requests at a ceiling of one are refused without
+        #    burning a grant.  A request that slips past admission is still bounded
+        #    by the authoritative ``_executed_count >= ceiling`` check in the
+        #    executor.  ``added_key`` is True iff THIS call added the in-flight key
+        #    (a concurrent duplicate of an already-reserved key adds none); ONLY the
         #    adder removes it in the finally, so it never discards a sibling's key.
         added_key = self._reserve_budget(idem)
 
@@ -432,17 +445,38 @@ class ChatToolDispatchService:
             # 8. dispatch through the reused typed-operation receipt store.
             operation = _operation_ref(discovered)
             inputs = dict(request["tool_call"].get("inputs") or {})
+            # The ceiling is the pinned profile's immutable max, read the same way
+            # admission reads it; because it never changes after construction, the
+            # admission read and this execution-time read are always consistent.
+            ceiling = self._session.max_tool_calls
 
             def executor() -> OperationOutcome:
                 # Reached ONLY on a genuine (non-replay) execution: record_attempt
                 # returns a stored receipt without calling the executor, and runs
-                # this closure at most once per idempotency key under its own lock.
-                # Count the PERMANENT cost HERE -- exactly once, atomic with the
-                # execute decision, and regardless of the outcome below -- so the
-                # increment lands even when the runner that genuinely executed was a
-                # concurrent DUPLICATE rather than the reserving thread, and a later
-                # retriable failure cannot re-spend the slot.
+                # this closure at most once per idempotency key under its own
+                # per-key RLock -- the SINGLE point at which a genuine execution is
+                # serialized.  So this is where the AUTHORITATIVE ceiling gate lives:
+                # under ``_budget_lock`` we check ``_executed_count >= ceiling`` and
+                # increment in ONE atomic section, at the exact serialization point,
+                # so no two genuine executions can both pass at the ceiling.  A
+                # second genuine execution finds the ledger already at the ceiling
+                # and is refused ``tool.over_budget`` BEFORE the runner runs -- no
+                # execution, no fabricated receipt.  Admission (``_reserve_budget``)
+                # is now only a cheap EARLY REFUSE; THIS check is the source of truth.
+                #
+                # CAVEAT (accepted, fail-safe): an effectful call whose one-time
+                # grant was already consumed at ``_consume_approval`` and is THEN
+                # refused here spends that grant with NO effect.  This is a rare
+                # concurrent-over-ceiling edge; the runner never runs, so it is safe.
+                # We surface it as the normal typed ``tool.over_budget`` (the runner
+                # never runs) rather than fabricate a success -- a clean typed
+                # refusal, not a receipt of an effect that never happened.
                 with self._budget_lock:
+                    if self._executed_count >= ceiling:
+                        raise ToolDispatchError(
+                            "tool.over_budget",
+                            "the chat session has exhausted its pinned tool-call budget",
+                        )
                     self._executed_count += 1
                 try:
                     outcome = tool_runner(discovered, inputs)
@@ -586,15 +620,20 @@ class ChatToolDispatchService:
             raise ToolDispatchError("tool.approval_invalid", "the tool approval is not valid") from exc
 
     def _reserve_budget(self, idempotency_key: str) -> bool:
-        """Atomically admit one request against the lifetime tool-call ceiling.
+        """EARLY-REFUSE admission against the lifetime tool-call ceiling.
 
-        The check and the record happen together under ONE lock section, BEFORE
-        any approval is consumed, so admission is atomic: the ceiling counts the
-        PERMANENT cost (``_executed_count``) plus every in-flight-but-not-yet
-        executed reservation (``len(_in_flight)``).  Two concurrent DISTINCT
-        requests at a ceiling of one therefore can never both pass -- exactly one
-        adds its key and the other is refused ``tool.over_budget`` -- and an
-        over-budget request never burns a grant or reaches the runner.
+        This is a cheap optimization, NOT the authoritative bound -- the real bound
+        is the execution-time ``_executed_count >= ceiling`` check inside the store
+        executor.  The check and the record happen together under ONE lock section,
+        BEFORE any approval is consumed, so the common over-budget cases are refused
+        early: the ceiling counts the permanent cost (``_executed_count``) plus every
+        in-flight reservation (``len(_in_flight)``), so the sequential over-budget
+        case and two concurrent DISTINCT requests at a ceiling of one are refused
+        ``tool.over_budget`` here -- before a grant is consumed or the runner is
+        reached.  A request that races past this early refuse (a losing grant-race
+        that empties ``_in_flight`` before the winner increments ``_executed_count``,
+        or concurrent duplicates of an unpersisted failed read) is NOT let through
+        unbounded: the executor-time gate refuses the over-ceiling genuine execution.
 
         Admission is keyed by idempotency key so a reservation is idempotent per
         request: a concurrent duplicate of an ALREADY-reserved key (a racing
