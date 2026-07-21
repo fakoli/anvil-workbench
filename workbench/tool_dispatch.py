@@ -170,14 +170,18 @@ class ChatToolSession:
         raw_budget = limits.get("max_concurrent_tool_calls")
         # The pinned profile's tool-call budget.  The pinned
         # ``max_concurrent_tool_calls`` is enforced by the dispatch service as a
-        # per-session lifetime ceiling on the number of DISTINCT tool-call
-        # dispatches that genuinely execute: admission is reserved ATOMICALLY
-        # (check + record under one lock) before any effect, and released if the
-        # request is later rejected, so a rejected or replayed request consumes
-        # none.  A conservative bound (a runaway chat cannot invoke unbounded
-        # tools) that a production async dispatcher would refine into a live
-        # in-flight gate.  A profile without an explicit limit gets a single call
-        # -- fail safe, never unbounded.
+        # per-session lifetime ceiling on the number of tool-call dispatches that
+        # GENUINELY execute.  The service tracks the permanent cost as an
+        # ``_executed_count`` ledger (incremented once per genuine, non-replay
+        # runner execution, regardless of outcome) plus a transient ``_in_flight``
+        # keyed reservation set; admission checks ``_executed_count +
+        # len(_in_flight)`` atomically before any effect, and the in-flight key is
+        # always released afterwards.  So a rejected or replayed request consumes
+        # none, and a retriable failed read is bounded at one execution.  A
+        # conservative bound (a runaway chat cannot invoke unbounded tools) that a
+        # production async dispatcher would refine into a live in-flight gate.  A
+        # profile without an explicit limit gets a single call -- fail safe, never
+        # unbounded.
         self.max_tool_calls = raw_budget if isinstance(raw_budget, int) and raw_budget > 0 else 1
 
     @property
@@ -232,22 +236,37 @@ class ChatToolDispatchService:
         self._health: ToolHealthProbe = health or (lambda _p, _t: True)
         self._receipts = receipt_store if receipt_store is not None else MemoryOperationReceiptStore()
         self._approvals = approval_store if approval_store is not None else MemoryOperationApprovalStore()
-        # The per-session tool-call budget, tracked as the SET of idempotency keys
-        # that hold an admitted slot.  Admission is ATOMIC: :meth:`_reserve_budget`
-        # checks the ceiling AND records the key under ONE lock section, BEFORE any
-        # approval is consumed.  Two concurrent DISTINCT requests at a ceiling of
-        # one therefore can never both be admitted -- exactly one reserves and the
-        # other is refused ``tool.over_budget`` -- and an over-budget request never
-        # burns a grant or reaches the runner.  Keying admission by idempotency key
-        # (not a bare counter) makes a reservation idempotent per request, so a
-        # concurrent duplicate of an already-admitted request neither takes a second
-        # slot nor is spuriously refused; it goes on to replay the one committed
-        # receipt.  A slot is a LIFETIME reservation: a genuinely executed dispatch
-        # keeps it, while a request rejected AFTER reserving (bad approval,
-        # runner-contract, ...) releases it and a replayed request never takes one,
-        # so only real executions count against the ceiling.
+        # The per-session tool-call budget separates the PERMANENT cost from the
+        # TRANSIENT reservation, under one lock:
+        #
+        # * ``_executed_count`` is the ground-truth permanent cost -- the number of
+        #   GENUINE (non-replay) runner executions.  It is incremented by EXACTLY
+        #   ONE inside the receipt-store executor (the critical section that decides
+        #   "this is a genuine execution, run the runner"), regardless of the
+        #   outcome (succeeded / failed-retriable / reconciled).  A replay never
+        #   increments it.  Because the increment happens under this lock while the
+        #   admitting execution's key is still in-flight, it can never be lost to
+        #   the race where a concurrent DUPLICATE (not the reserving thread) is the
+        #   one the store runs.
+        # * ``_in_flight`` is the TRANSIENT keyed reservation set: pure
+        #   pre-approval admission control.  A key is added at admission and ALWAYS
+        #   removed in the ``finally`` (never conditioned on execution).
+        #
+        # Admission (``_reserve_budget``) checks ``_executed_count + len(_in_flight)
+        # >= ceiling`` and records the key under ONE lock section, BEFORE any
+        # approval is consumed, so an in-flight-but-not-yet-executed reservation
+        # still occupies the ceiling: two concurrent DISTINCT requests at a ceiling
+        # of one admit exactly one and refuse the other ``tool.over_budget``, and an
+        # over-budget request never burns a grant or reaches the runner.  Admission
+        # is keyed by idempotency key, so a concurrent duplicate of an already
+        # admitted key takes no second slot; it goes on to replay the one committed
+        # receipt.  Because ``_executed_count`` is the durable ledger, a rejected
+        # or replayed request consumes nothing and a retriable failed read is
+        # bounded at one genuine execution -- only real executions count against the
+        # lifetime ceiling.
         self._budget_lock = threading.Lock()
-        self._admitted: set[str] = set()
+        self._executed_count = 0
+        self._in_flight: set[str] = set()
 
     # --- read surface -------------------------------------------------------- #
 
@@ -351,21 +370,25 @@ class ChatToolDispatchService:
            a read must NOT carry one;
         5. health -- an unhealthy tool is refused;
         6. budget -- the lifetime tool-call ceiling is RESERVED ATOMICALLY (check
-           + record in one lock section) BEFORE any grant is consumed, so two
-           concurrent distinct requests at a ceiling of one admit exactly one and
-           refuse the other ``tool.over_budget``; an over-budget request never
-           burns a grant or reaches the runner;
+           ``_executed_count + len(_in_flight) >= ceiling`` + record the key in one
+           lock section) BEFORE any grant is consumed, so two concurrent distinct
+           requests at a ceiling of one admit exactly one and refuse the other
+           ``tool.over_budget``; an over-budget request never burns a grant or
+           reaches the runner;
         7. approval -- an effectful call CONSUMES its one-time hash-bound grant
            before the effect runs; a replayed/expired/mismatched grant fails
            closed on the collapsed ``approval_invalid`` reason;
         8. dispatch through the reused receipt store -- exactly-once execution,
            a redacted typed receipt, and reconciliation (never a fabricated
-           success) for an unconfirmed effectful outcome.
+           success) for an unconfirmed effectful outcome.  A GENUINE (non-replay)
+           execution increments ``_executed_count`` by one inside the store's
+           executor (the critical section that runs the runner), regardless of
+           outcome.
 
-        Any rejection AFTER the budget reservation (a bad approval, a
-        runner-contract violation) RELEASES the reserved slot in a ``finally``, and
-        a replay (a sibling that only replayed a committed receipt) never keeps
-        one, so only a genuinely executed dispatch spends budget.
+        The transient in-flight key is ALWAYS released in the ``finally``; the
+        permanent cost lives in ``_executed_count``, incremented once per genuine
+        execution.  So a rejected or replayed request spends nothing, and a
+        retriable failed read is bounded at one genuine execution.
         """
         # 1. structural validation, independent of the pinned catalog.
         try:
@@ -391,18 +414,16 @@ class ChatToolDispatchService:
         if not self._health(discovered.plugin_id, tool_id):
             raise ToolDispatchError("tool.unhealthy", "the selected tool is not healthy")
 
-        # 6. budget: RESERVE the lifetime ceiling ATOMICALLY (check + record under
+        # 6. budget: RESERVE the lifetime ceiling ATOMICALLY (check
+        #    ``_executed_count + len(_in_flight) >= ceiling`` + record the key under
         #    one lock) before any approval is consumed, so two concurrent distinct
         #    requests at a ceiling of one admit exactly one and refuse the other,
         #    and an over-budget request never burns a grant or reaches the runner.
-        #    ``reserved`` is True iff THIS call took a new slot (a concurrent
-        #    duplicate of an already-admitted key takes none); the slot is released
-        #    below unless the dispatch genuinely executes.
-        reserved = self._reserve_budget(idem)
+        #    ``added_key`` is True iff THIS call added the in-flight key (a
+        #    concurrent duplicate of an already-reserved key adds none); ONLY the
+        #    adder removes it in the finally, so it never discards a sibling's key.
+        added_key = self._reserve_budget(idem)
 
-        # A rejection AFTER the reservation (bad approval, runner-contract) or a
-        # replay must not spend budget: keep the slot ONLY for a genuine execution.
-        keep_slot = False
         try:
             # 7. approval: an effectful call consumes its one-time grant now.
             if effectful:
@@ -414,7 +435,15 @@ class ChatToolDispatchService:
 
             def executor() -> OperationOutcome:
                 # Reached ONLY on a genuine (non-replay) execution: record_attempt
-                # returns a stored receipt without calling the executor.
+                # returns a stored receipt without calling the executor, and runs
+                # this closure at most once per idempotency key under its own lock.
+                # Count the PERMANENT cost HERE -- exactly once, atomic with the
+                # execute decision, and regardless of the outcome below -- so the
+                # increment lands even when the runner that genuinely executed was a
+                # concurrent DUPLICATE rather than the reserving thread, and a later
+                # retriable failure cannot re-spend the slot.
+                with self._budget_lock:
+                    self._executed_count += 1
                 try:
                     outcome = tool_runner(discovered, inputs)
                 except UnknownOutcomeError:
@@ -463,19 +492,18 @@ class ChatToolDispatchService:
                 request_id=str(request["request_id"]),
                 unknown_summary="the plugin tool effect outcome could not be confirmed",
             )
-            # This dispatch genuinely executed iff record_attempt ran the executor
-            # (``replayed`` is False).  A replay -- a concurrent sibling that only
-            # returned the committed receipt -- keeps no slot; the genuine sibling
-            # that reserved the key already holds it.
-            keep_slot = reserved and not replayed
+            # The permanent cost was already recorded inside the executor on a
+            # genuine execution; ``_executed_count`` -- not this key -- is what the
+            # ceiling counts, so nothing execution-conditional happens here.
             return DispatchResult(receipt=receipt, replayed=replayed)
         finally:
-            # Release the reserved slot on any post-reserve rejection (a raised
-            # approval_invalid / runner_contract) or a replay, so only a genuinely
-            # executed dispatch counts against the lifetime ceiling.  A concurrent
-            # duplicate that reserved nothing (``reserved`` False) never releases
-            # the key the genuine sibling holds.
-            if reserved and not keep_slot:
+            # ALWAYS release the transient in-flight reservation this call added.
+            # The permanent cost is ``_executed_count``, so releasing the key here
+            # -- whether the dispatch executed, replayed, or was rejected after
+            # reserving -- never loses a genuine execution and never leaks a slot.
+            # A concurrent duplicate that added no key (``added_key`` False) never
+            # discards the reserving sibling's key.
+            if added_key:
                 self._release_budget(idem)
 
     # --- internals ----------------------------------------------------------- #
@@ -561,39 +589,41 @@ class ChatToolDispatchService:
         """Atomically admit one request against the lifetime tool-call ceiling.
 
         The check and the record happen together under ONE lock section, BEFORE
-        any approval is consumed, so admission is atomic: two concurrent DISTINCT
-        requests at a ceiling of one can never both pass -- exactly one records its
-        key and the other is refused ``tool.over_budget`` -- and an over-budget
-        request never burns a grant or reaches the runner.
+        any approval is consumed, so admission is atomic: the ceiling counts the
+        PERMANENT cost (``_executed_count``) plus every in-flight-but-not-yet
+        executed reservation (``len(_in_flight)``).  Two concurrent DISTINCT
+        requests at a ceiling of one therefore can never both pass -- exactly one
+        adds its key and the other is refused ``tool.over_budget`` -- and an
+        over-budget request never burns a grant or reaches the runner.
 
         Admission is keyed by idempotency key so a reservation is idempotent per
-        request: a concurrent duplicate of an ALREADY-admitted key (a racing
-        replay that slipped past the step-2 receipt short-circuit) neither takes a
-        second slot nor is spuriously refused.  Returns True iff THIS call recorded
-        a NEW slot (so the caller knows whether it -- and only it -- must release
-        on a later rejection); False for such a duplicate, which holds no slot of
-        its own.
+        request: a concurrent duplicate of an ALREADY-reserved key (a racing
+        replay that slipped past the step-2 receipt short-circuit) takes no second
+        slot and is not refused.  Returns True iff THIS call ADDED the in-flight
+        key (so the caller -- and only it -- removes it in the finally); False for
+        such a duplicate, which added no key of its own.
         """
         with self._budget_lock:
-            if idempotency_key in self._admitted:
+            if idempotency_key in self._in_flight:
                 return False
-            if len(self._admitted) >= self._session.max_tool_calls:
+            if self._executed_count + len(self._in_flight) >= self._session.max_tool_calls:
                 raise ToolDispatchError(
                     "tool.over_budget", "the chat session has exhausted its pinned tool-call budget"
                 )
-            self._admitted.add(idempotency_key)
+            self._in_flight.add(idempotency_key)
             return True
 
     def _release_budget(self, idempotency_key: str) -> None:
-        """Return a reserved slot when a dispatch does not genuinely execute.
+        """Release the TRANSIENT in-flight reservation this dispatch added.
 
-        Called only for the caller that reserved the key, and only when the
-        dispatch was rejected after reserving (a bad approval, a runner-contract
-        violation) or merely replayed -- never after a genuine execution -- so the
-        lifetime ceiling counts exactly the dispatches that really ran.
+        Called from the dispatch ``finally`` for the caller that added the key,
+        ALWAYS -- whether the dispatch executed, replayed, or was rejected after
+        reserving.  It never touches ``_executed_count`` (the permanent cost),
+        which is incremented once per genuine execution inside the store executor,
+        so releasing the key here neither loses a real execution nor leaks a slot.
         """
         with self._budget_lock:
-            self._admitted.discard(idempotency_key)
+            self._in_flight.discard(idempotency_key)
 
 
 def _operation_ref(discovered: DiscoveredPlugin) -> OperationRef:

@@ -2656,6 +2656,117 @@ def test_rtp_fix_distinct_concurrent_dispatches_admit_exactly_one_at_ceiling_one
     assert runs == [1]  # exactly one genuine execution, never two
 
 
+def test_rtp_fix_nonreserver_execution_permanently_consumes_the_slot():
+    # EDGE 1 (over-admission): two CONCURRENT DUPLICATES of the SAME request race
+    # so the NON-reserving duplicate is the one the receipt store genuinely runs
+    # (record_attempt's lock, not the admission order, picks the runner), while the
+    # reserving duplicate only replays.  When the budget tracked "which thread
+    # reserved", the reserver's finally released the slot the duplicate actually
+    # spent -> the slot leaked and a later DISTINCT request wrongly executed
+    # (ceiling 1 -> 2).  With the executed-count ledger, the genuine execution
+    # permanently consumes the one slot regardless of WHICH thread ran it, so the
+    # distinct request is refused.  Over-admits on HEAD; refuses after the fix.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+
+    req = _rtp_read_request("ready")
+    runs = []
+
+    def runner(_d, _i):
+        runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    # Force the leak-prone interleave deterministically: the RESERVING call (the
+    # one whose _reserve_budget returns True) parks BEFORE it reaches
+    # record_attempt, so the duplicate reserves nothing, enters record_attempt
+    # first, and is the thread that genuinely executes.  Then the reserver is
+    # released and only replays.  The patched wrapper preserves the real bool
+    # contract (True iff this call took the reservation) on BOTH HEAD and the fix.
+    real_reserve = service._reserve_budget
+    reserver_parked = _rtp_threading.Event()
+    release_reserver = _rtp_threading.Event()
+
+    def parking_reserve(idem):
+        took = real_reserve(idem)
+        if took:
+            reserver_parked.set()
+            release_reserver.wait(3.0)  # hold the reserver behind record_attempt
+        return took
+
+    service._reserve_budget = parking_reserve
+
+    results = {}
+
+    def go(name):
+        try:
+            results[name] = ("ok", service.dispatch(req, runner))
+        except _RtpError as exc:  # not expected in the burst
+            results[name] = ("refused", exc.code)
+
+    reserver = _rtp_threading.Thread(target=go, args=("reserver",))
+    reserver.start()
+    assert reserver_parked.wait(3.0)  # reserver holds the slot, parked pre-record
+
+    duplicate = _rtp_threading.Thread(target=go, args=("duplicate",))
+    duplicate.start()
+    duplicate.join(5.0)  # the duplicate reserves nothing, executes, and commits
+
+    release_reserver.set()
+    reserver.join(5.0)   # the reserver wakes and only replays the committed receipt
+
+    service._reserve_budget = real_reserve  # drop the coordination for the probe
+
+    # Exactly one genuine execution happened in the burst (the duplicate ran it;
+    # the reserver replayed), and it must have PERMANENTLY consumed the one slot.
+    assert runs == [1], results
+    replays = [r for _, r in results.values()]
+    assert sum(1 for r in replays if not r.replayed) == 1
+    assert sum(1 for r in replays if r.replayed) == 1
+
+    # A later DISTINCT request is refused: the single execution consumed the slot.
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(_rtp_read_request("claimed"), runner)
+    assert exc.value.code == "tool.over_budget"
+    assert runs == [1]  # the runner is never reached for the refused distinct call
+
+
+def test_rtp_fix_retriable_failed_read_is_bounded_at_one_execution():
+    # EDGE 2 (unbounded retry): a retriable ALWAYS-FAILING read at ceiling 1,
+    # dispatched sequentially, must genuinely execute EXACTLY once; every retry is
+    # refused tool.over_budget.  A failed read is not persisted, so the step-2
+    # receipt short-circuit does not fire on retry; when the budget kept a
+    # per-slot key without a permanent ledger, admission saw the key still held,
+    # returned "duplicate", and record_attempt (finding no receipt) RE-RAN the
+    # runner unbounded.  The executed-count ledger records the one genuine
+    # execution permanently, so the ceiling is honoured.  Unbounded on HEAD;
+    # bounded at one after the fix.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+
+    runs = []
+
+    def failing(_d, _i):
+        runs.append(1)
+        raise RuntimeError("the read backend is unavailable")
+
+    req = _rtp_read_request("ready")
+
+    first = service.dispatch(req, failing)  # attempt 1 genuinely executes...
+    assert first.replayed is False
+    assert first.receipt["status"] == "failed"  # ...and fails RETRIABLY (not persisted)
+
+    for _ in range(4):  # every retry of the SAME request is now over budget
+        with pytest.raises(_RtpError) as exc:
+            service.dispatch(req, failing)
+        assert exc.value.code == "tool.over_budget"
+
+    assert runs == [1]  # exactly one genuine execution, never unbounded
+
+
 def test_rtp_t005_concurrent_same_read_executes_once_and_the_receipt_lock_is_load_bearing():
     service = _rtp_service()
     req = _rtp_read_request("ready")
