@@ -50,8 +50,8 @@ from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
 from .redaction import scrub_config_payload
 from .store import (
-    MemoryPreferenceStore, PostgresStore, PreferenceStoreError, StalePreferenceWriteError,
-    StoreError, UnknownPreferenceError, WorkbenchStore,
+    MemoryPreferenceStore, MemorySkillAdoptionStore, PostgresStore, PreferenceStoreError,
+    StalePreferenceWriteError, StoreError, UnknownPreferenceError, WorkbenchStore,
 )
 from .system_health import SystemHealthService, UnknownIntegrationError
 from .voice import (
@@ -651,6 +651,61 @@ def build_plugin_router(
     return router
 
 
+#: The single fixed 404 body an unknown skill-adoption lookup returns, so the
+#: adoption surface is never an existence oracle for an un-acknowledged skill id.
+_UNKNOWN_SKILL_ADOPTION_DETAIL = "unknown skill adoption"
+_SKILL_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,119}$"
+
+
+def build_skill_adoptions_router(
+    actor_dependency: Callable[..., str],
+    skill_adoption_store: "MemorySkillAdoptionStore | None",
+) -> APIRouter:
+    """Build the read-only owner skill-digest adoption browser surface (T008).
+
+    Serves only the acknowledgment ledger's SAFE metadata projection: each entry
+    carries a skill id, the acknowledged ``sha256:`` digest, a scrubbed
+    description, and the bare content hash -- never a skill instructions body and
+    never a local filesystem path (the ledger record makes both unrepresentable).
+    Every response body is scrubbed at this last hop with
+    :func:`~workbench.redaction.scrub_config_payload`, so even a mis-stored
+    description cannot ferry a secret, endpoint, or path to the UI.
+
+    The surface is deliberately READ-ONLY: it registers only ``GET`` routes.  An
+    acknowledgment is an owner decision recorded at the service/hub layer, never
+    a browser mutation.  When ``skill_adoption_store`` is ``None`` the lane is not
+    configured and every endpoint refuses with 503, mirroring the other injectable
+    read-models.
+    """
+    router = APIRouter(prefix="/api/skill-adoptions")
+
+    def store() -> "MemorySkillAdoptionStore":
+        if skill_adoption_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="skill adoption ledger is not configured",
+            )
+        return skill_adoption_store
+
+    @router.get("")
+    def list_adoptions(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """Every acknowledged skill's digest + safe-metadata projection."""
+        return scrub_config_payload({"adoptions": store().list_acknowledgments()})
+
+    @router.get("/{skill_id}")
+    def get_adoption(
+        skill_id: str = Path(pattern=_SKILL_ID_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One acknowledged skill's projection; an un-acknowledged id is a plain 404."""
+        adoption = store().get(skill_id)
+        if adoption is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_SKILL_ADOPTION_DETAIL)
+        return scrub_config_payload({"adoption": adoption})
+
+    return router
+
+
 #: The single fixed 404 body an unknown dispatch receipt/reconciliation lookup
 #: returns, so the chat-tools surface is never an existence oracle for a
 #: never-dispatched request digest.
@@ -1220,6 +1275,7 @@ def create_app(
     system_health: SystemHealthService | None = None,
     plugin_host_service: "PluginHostService | None" = None,
     chat_tool_dispatch_service: "ChatToolDispatchService | None" = None,
+    skill_adoption_store: MemorySkillAdoptionStore | None = None,
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
@@ -1271,6 +1327,11 @@ def create_app(
     # closed (503). Tool dispatch itself is a bridge/hub effect at the service
     # layer, never a browser mutation path.
     app.state.chat_tool_dispatch_service = chat_tool_dispatch_service
+    # The owner skill-digest adoption ledger is a hub-side supervision read-model
+    # that is deliberately NOT wired into the live bridge poll loop; it stays
+    # ``None`` unless a store is injected, so the browser surface fails closed
+    # (503). An acknowledgment is an owner decision at the service/hub layer.
+    app.state.skill_adoption_store = skill_adoption_store
     # The scoped preference store is a hub-side supervision read/write model that
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless injected, so the browser surface fails closed (503).
@@ -1425,6 +1486,12 @@ def create_app(
     # redacted dispatch receipts / reconciliation items; a tool dispatch is a
     # bridge/hub effect at the service layer, never a browser mutation.
     app.include_router(build_chat_tools_router(actor, chat_tool_dispatch_service))
+    # Read-only owner skill-digest adoption surface (reviewed-tools-plugins T008):
+    # authenticated by the same trusted ``actor`` dependency, GET-only, and
+    # fail-closed (503) until an adoption ledger is injected. Serves only the
+    # acknowledgment ledger's digest + safe-metadata projection; a skill body or
+    # local path is never accepted from nor returned to the browser.
+    app.include_router(build_skill_adoptions_router(actor, skill_adoption_store))
     # Actor-scoped preference read/write surface (preferences-configuration
     # T002.3): authenticated by the same trusted ``actor`` dependency, personal
     # namespace bound to the authenticated actor, and fail-closed (503) until a

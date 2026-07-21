@@ -29,7 +29,14 @@ from datetime import datetime, timezone
 
 from .models import OperationRef, OperationRefusal, TypedOperationError, now_utc
 from .redaction import redact_value
-from .skills import LocalSkill, SkillError, SkillRegistry
+from .skills import (
+    LocalSkill,
+    SkillAdoptionStore,
+    SkillError,
+    SkillRegistry,
+    assert_skills_acknowledged,
+    skill_adoption_digest,
+)
 
 
 class BridgeError(RuntimeError):
@@ -412,18 +419,39 @@ class StateReader:
 class CodexRunner:
     """Launch Codex only through an Anvil Serving Responses-compatible route."""
 
-    def __init__(self, settings: BridgeSettings, emit: Callable[[str, Any], None], worktree_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        settings: BridgeSettings,
+        emit: Callable[[str, Any], None],
+        worktree_root: Path | None = None,
+        *,
+        skill_adoption_store: SkillAdoptionStore | None = None,
+    ) -> None:
         self.settings = settings
         self.emit = emit
         self.worktree_root = worktree_root or settings.project_root
+        # T008: when an owner adoption ledger is configured, a run refuses to
+        # START if any selected bridge skill's exact reviewed digest has not been
+        # acknowledged for adoption.  When None the gate is not exercised (the
+        # legacy behaviour), so an operator that has not opted in is unaffected.
+        self.skill_adoption_store = skill_adoption_store
 
     def run(self, run_id: str, work_packet: dict[str, Any], model: str, skills: Iterable[LocalSkill] = ()) -> int:
+        selected_skills = tuple(skills)
+        # T008 workflow-start adoption gate, BEFORE any router/model check and
+        # BEFORE a skill body is ever assembled into the run prompt: an
+        # unacknowledged (or since-changed) skill fails closed with a stable
+        # typed refusal, so a new or changed skill cannot silently enter a run.
+        if self.skill_adoption_store is not None and selected_skills:
+            assert_skills_acknowledged(
+                ((skill.skill_id, skill_adoption_digest(skill)) for skill in selected_skills),
+                self.skill_adoption_store,
+            )
         token = os.environ.get(self.settings.router_token_env, "")
         if not self.settings.router_base_url or not token:
             raise BridgeError("Anvil router base URL and local router token environment variable are required")
         if not model.strip():
             raise BridgeError("Codex runs require a Workbench-selected Anvil model route")
-        selected_skills = tuple(skills)
         skills_prompt = ""
         if selected_skills:
             skills_prompt = "\n\nUse only these operator-approved bridge skills when applicable:\n" + "\n\n".join(

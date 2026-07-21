@@ -11,7 +11,9 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol
+
+from .models import OperationRefusal, TypedOperationError
 
 
 class SkillError(RuntimeError):
@@ -96,3 +98,82 @@ class SkillRegistry:
                 raise SkillError(f"requested skill is not configured on this bridge: {skill_id}")
             selected.append(skill)
         return tuple(selected)
+
+
+# --------------------------------------------------------------------------- #
+# Skill-digest adoption gate (reviewed-tools-plugins T008).
+#
+# A workflow start (the bridge assembling a run's skills) and a capability-
+# profile validation both trust a set of skills identified by ``(id, digest)``.
+# Before either trusts one, the owner must have ACKNOWLEDGED that exact digest
+# for adoption.  A new or a changed skill is refused with a STABLE typed code
+# (reusing :data:`~workbench.models.OPERATION_REFUSAL_CODES`) until it is
+# acknowledged, so a skill body can never silently enter a run just because the
+# bridge discovered it or a profile pinned it.  The projections here carry a
+# skill's digest and SAFE metadata only -- never the instructions body or the
+# local path (which live on :class:`LocalSkill` and are deliberately dropped).
+# --------------------------------------------------------------------------- #
+
+
+class SkillAdoptionStore(Protocol):
+    """The acknowledgment-status surface the adoption gate reads (fail-closed)."""
+
+    def acknowledgment_status(self, skill_id: str, digest: str) -> str: ...
+
+
+def skill_adoption_digest(skill: "LocalSkill") -> str:
+    """The reviewed adoption digest an owner acknowledges for one local skill.
+
+    Derived from the skill's content hash in the ``sha256:`` contract form, so
+    the same body always produces the same digest and any edit to the body
+    produces a different one -- which forces a re-acknowledgment.
+    """
+    return "sha256:" + skill.content_sha256
+
+
+def skill_adoption_metadata(skill: "LocalSkill") -> dict[str, str]:
+    """Safe adoption metadata for one skill -- digest + safe fields ONLY.
+
+    Deliberately omits the skill ``instructions`` body and its local ``path``:
+    an adoption event carries the digest and safe display metadata, never a body
+    or a filesystem path.
+    """
+    return {
+        "skill_id": skill.skill_id,
+        "digest": skill_adoption_digest(skill),
+        "description": skill.description,
+        "content_sha256": skill.content_sha256,
+    }
+
+
+def assert_skills_acknowledged(
+    skills: Iterable[tuple[str, str]], adoption_store: SkillAdoptionStore
+) -> None:
+    """Refuse an unacknowledged or digest-changed skill with a STABLE code.
+
+    ``skills`` is an iterable of ``(skill_id, digest)`` pairs -- the exact skills
+    a workflow start or a capability-profile validation is about to trust.  Each
+    pair must carry an owner acknowledgment at that EXACT digest; a skill with no
+    acknowledgment refuses ``skill.unacknowledged`` and a skill whose
+    acknowledged digest differs (the body changed since it was reviewed) refuses
+    ``skill.digest_changed`` -- a re-acknowledgment of the exact new digest is
+    always required.  Both are stable typed :class:`OperationRefusal` codes, so a
+    caller (and a test) asserts the claimed reason, never an incidental message.
+    """
+    for skill_id, digest in skills:
+        status = adoption_store.acknowledgment_status(str(skill_id), str(digest))
+        if status == "acknowledged":
+            continue
+        if status == "digest_changed":
+            raise TypedOperationError(
+                OperationRefusal(
+                    "skill.digest_changed",
+                    f"the skill was reviewed at a different digest and must be re-acknowledged: {skill_id}",
+                )
+            )
+        raise TypedOperationError(
+            OperationRefusal(
+                "skill.unacknowledged",
+                f"the skill digest has not been acknowledged for adoption: {skill_id}",
+            )
+        )

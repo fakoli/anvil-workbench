@@ -52,6 +52,7 @@ from .contracts import (
     validate_profile,
 )
 from .provider_catalogs import ProviderCatalogError, PublishedCatalogSet
+from .skills import SkillAdoptionStore, assert_skills_acknowledged
 
 
 class CapabilityProfileError(RuntimeError):
@@ -242,6 +243,7 @@ def validate_project_profile(
     configured_model_profiles: Sequence[str],
     configured_skills: Mapping[str, str],
     approval_actions: Sequence[str] = (),
+    skill_adoption_store: SkillAdoptionStore | None = None,
 ) -> PinnedCapabilityProfile:
     """Fail-closed pin one reviewed profile against discovered local authority.
 
@@ -256,6 +258,15 @@ def validate_project_profile(
     Digest verification runs before any semantic check, mirroring
     :func:`workbench.provider_catalogs.validate_provider_catalog`, so a
     drifted profile fails closed even when its entries would otherwise pass.
+
+    When a ``skill_adoption_store`` is supplied (reviewed-tools-plugins T008),
+    the profile's pinned skills are additionally gated on owner acknowledgment:
+    a profile pinning a skill whose EXACT reviewed digest has not been
+    acknowledged for adoption fails closed with the stable ``skill.unacknowledged``
+    (or, on a since-changed body, ``skill.digest_changed``) typed refusal --
+    acknowledging one digest never implicitly acknowledges a later change.  When
+    it is ``None`` the adoption gate is not exercised (the legacy behaviour),
+    so an operator that has not opted into the adoption ledger is unaffected.
     """
     if not isinstance(published_catalogs, PublishedCatalogSet):
         raise CapabilityProfileError(
@@ -281,13 +292,23 @@ def validate_project_profile(
     allowed_skills = {str(key): str(value) for key, value in configured_skills.items()}
     allowed_actions = frozenset(str(action) for action in approval_actions)
     limits = profile["limits"]
+    pinned_skills = _pin_skills(profile, allowed_skills)
+    # T008 adoption gate: before the profile is trusted, every pinned skill's
+    # EXACT digest must be owner-acknowledged for adoption.  This runs after the
+    # digest/operator-configured checks (a stale or unconfigured skill is already
+    # refused) and only widens the gate: an unacknowledged or since-changed skill
+    # fails closed with a stable typed refusal instead of being silently trusted.
+    if skill_adoption_store is not None:
+        assert_skills_acknowledged(
+            ((grant.id, grant.digest) for grant in pinned_skills), skill_adoption_store
+        )
     return PinnedCapabilityProfile(
         id=str(profile["id"]),
         revision=str(profile["revision"]),
         digest=str(profile["digest"]),
         operations=_pin_operations(profile, published_catalogs),
         model_profiles=_pin_model_profiles(profile, allowed_model_profiles),
-        skills=_pin_skills(profile, allowed_skills),
+        skills=pinned_skills,
         limits=PinnedLimits(
             max_parallel_runs=int(limits["max_parallel_runs"]),
             max_agent_turns=int(limits["max_agent_turns"]),

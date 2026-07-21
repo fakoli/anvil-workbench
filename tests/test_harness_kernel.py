@@ -3628,3 +3628,166 @@ def test_amp_t004_delimit_helper_stringifies_arbitrary_injection():
     assert envelope["content_trust"] == "untrusted_task_data"
     assert isinstance(envelope["payload_json"], str)
     assert "select_tool" in envelope["payload_json"]
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T008: skill-digest adoption gate.
+#
+# A workflow start (the bridge assembling a run's skills) and a capability-
+# profile validation both REFUSE a skill whose exact reviewed digest the owner
+# has not acknowledged, with a STABLE typed refusal code; acknowledging one
+# digest never implicitly acknowledges a later change (re-ack on digest change).
+# =========================================================================== #
+
+from pathlib import Path as _T008_Path
+
+from workbench.bridge import (
+    BridgeError as _T008_BridgeError,
+    BridgeSettings as _T008_BridgeSettings,
+    CodexRunner as _T008_CodexRunner,
+)
+from workbench.capability_profiles import validate_project_profile as _t008_validate_profile
+from workbench.models import (
+    OPERATION_REFUSAL_CODES as _T008_REFUSAL_CODES,
+    TypedOperationError as _T008_TypedError,
+)
+from workbench.skills import (
+    LocalSkill as _T008_LocalSkill,
+    assert_skills_acknowledged as _t008_assert,
+    skill_adoption_digest as _t008_digest,
+)
+from workbench.store import (
+    MemorySkillAdoptionStore as _T008_AckStore,
+    SkillAdoptionStoreError as _T008_AckError,
+)
+
+from _support import (
+    capability_profile_document as _t008_profile_doc,
+    published_catalog_set as _t008_catalogs,
+)
+
+_T008_DIGEST_A = "sha256:" + "a" * 64
+_T008_DIGEST_B = "sha256:" + "b" * 64
+_T008_PROFILE_SKILL_DIGEST = "sha256:" + "7" * 64  # anvil:execute in the example profile
+
+
+def _t008_local_skill(*, body: str = "State-backed guidance.", sha: str = "a" * 64) -> _T008_LocalSkill:
+    return _T008_LocalSkill(
+        skill_id="anvil:execute",
+        description="Run the delivery loop.",
+        content_sha256=sha,
+        instructions=body,
+        path=_T008_Path("/bridge/local/skills/execute/SKILL.md"),
+    )
+
+
+def _t008_bridge_settings(tmp_path) -> _T008_BridgeSettings:
+    return _T008_BridgeSettings(
+        hub="http://hub", bridge_id="bridge_1", token="t", project_root=tmp_path,
+        project_id="proj_1", state_events=None, cursor_file=tmp_path / "cursor",
+        state_status_command="anvil status", state_claim_command="anvil claim",
+        state_work_packet_command="anvil work-packet", state_hook_command="anvil hook",
+        state_submit_command="anvil submit", state_apply_command="anvil apply",
+        codex_binary="codex", router_base_url="", router_token_env="ROUTER_TOKEN",
+        codex_config=(),
+    )
+
+
+def test_t008_refusal_codes_are_registered_and_stable() -> None:
+    assert "skill.unacknowledged" in _T008_REFUSAL_CODES
+    assert "skill.digest_changed" in _T008_REFUSAL_CODES
+
+
+def test_t008_adoption_store_status_and_reack_on_digest_change() -> None:
+    store = _T008_AckStore()
+    assert store.acknowledgment_status("anvil:execute", _T008_DIGEST_A) == "unacknowledged"
+    store.acknowledge("anvil:execute", _T008_DIGEST_A, content_sha256="a" * 64)
+    assert store.is_acknowledged("anvil:execute", _T008_DIGEST_A)
+    # Acking DIGEST_A does NOT ack DIGEST_B for the same skill: re-ack required.
+    assert store.acknowledgment_status("anvil:execute", _T008_DIGEST_B) == "digest_changed"
+    assert not store.is_acknowledged("anvil:execute", _T008_DIGEST_B)
+    # A fresh acknowledgment of the new digest is honoured; the old one is not.
+    store.acknowledge("anvil:execute", _T008_DIGEST_B, content_sha256="b" * 64)
+    assert store.is_acknowledged("anvil:execute", _T008_DIGEST_B)
+    assert store.acknowledgment_status("anvil:execute", _T008_DIGEST_A) == "digest_changed"
+
+
+def test_t008_adoption_store_rejects_non_sha256_digest() -> None:
+    store = _T008_AckStore()
+    with pytest.raises(_T008_AckError):
+        store.acknowledge("anvil:execute", "not-a-digest")
+
+
+def test_t008_gate_refuses_unacknowledged_and_digest_changed_and_passes_when_acked() -> None:
+    store = _T008_AckStore()
+    with pytest.raises(_T008_TypedError) as unack:
+        _t008_assert([("anvil:execute", _T008_DIGEST_A)], store)
+    assert unack.value.code == "skill.unacknowledged"
+
+    store.acknowledge("anvil:execute", _T008_DIGEST_A, content_sha256="a" * 64)
+    _t008_assert([("anvil:execute", _T008_DIGEST_A)], store)  # acknowledged -> passes
+
+    with pytest.raises(_T008_TypedError) as changed:
+        _t008_assert([("anvil:execute", _T008_DIGEST_B)], store)
+    assert changed.value.code == "skill.digest_changed"
+
+
+def test_t008_capability_profile_validation_gates_on_adoption() -> None:
+    catalogs = _t008_catalogs()
+    kwargs = dict(
+        configured_model_profiles=("coding-local", "planning-local"),
+        configured_skills={"anvil:execute": _T008_PROFILE_SKILL_DIGEST},
+        approval_actions=("commit_pr", "merge_and_accept"),
+    )
+    # No store -> legacy behaviour, validates.
+    _t008_validate_profile(_t008_profile_doc(), catalogs, **kwargs)
+
+    # With an EMPTY adoption ledger the pinned skill is unacknowledged -> refuse.
+    store = _T008_AckStore()
+    with pytest.raises(_T008_TypedError) as excinfo:
+        _t008_validate_profile(_t008_profile_doc(), catalogs, skill_adoption_store=store, **kwargs)
+    assert excinfo.value.code == "skill.unacknowledged"
+
+    # Acknowledge the exact pinned digest -> validation passes.
+    store.acknowledge("anvil:execute", _T008_PROFILE_SKILL_DIGEST, content_sha256="7" * 64)
+    profile = _t008_validate_profile(_t008_profile_doc(), catalogs, skill_adoption_store=store, **kwargs)
+    assert [g.id for g in profile.skills] == ["anvil:execute"]
+
+    # Revert-detection: an acknowledgment of a DIFFERENT digest does not satisfy
+    # the gate (a since-changed body must be re-acknowledged).
+    store.acknowledge("anvil:execute", _T008_DIGEST_A, content_sha256="a" * 64)
+    with pytest.raises(_T008_TypedError) as reverted:
+        _t008_validate_profile(_t008_profile_doc(), catalogs, skill_adoption_store=store, **kwargs)
+    assert reverted.value.code == "skill.digest_changed"
+
+
+def test_t008_bridge_workflow_start_refuses_unacknowledged_skill(tmp_path) -> None:
+    settings = _t008_bridge_settings(tmp_path)
+    store = _T008_AckStore()
+    skill = _t008_local_skill()
+    runner = _T008_CodexRunner(settings, lambda *_a: None, skill_adoption_store=store)
+    # The run REFUSES to start (before any router/model check) on the
+    # unacknowledged skill, with the stable typed code.
+    with pytest.raises(_T008_TypedError) as excinfo:
+        runner.run("run_1", {"task_id": "release-beta:T001"}, "coding-local", skills=(skill,))
+    assert excinfo.value.code == "skill.unacknowledged"
+
+    # Acknowledge the exact reviewed digest -> the adoption gate passes and the
+    # run proceeds far enough to hit the (unconfigured) router boundary instead.
+    store.acknowledge(skill.skill_id, _t008_digest(skill), content_sha256=skill.content_sha256)
+    with pytest.raises(_T008_BridgeError):
+        runner.run("run_1", {"task_id": "release-beta:T001"}, "coding-local", skills=(skill,))
+
+
+def test_t008_bridge_workflow_start_refuses_changed_skill_digest(tmp_path) -> None:
+    settings = _t008_bridge_settings(tmp_path)
+    store = _T008_AckStore()
+    reviewed = _t008_local_skill(body="Reviewed guidance.", sha="a" * 64)
+    store.acknowledge(reviewed.skill_id, _t008_digest(reviewed), content_sha256=reviewed.content_sha256)
+    # A changed body yields a different content hash -> a different adoption
+    # digest -> the stale acknowledgment no longer covers it.
+    changed = _t008_local_skill(body="Silently edited guidance.", sha="c" * 64)
+    runner = _T008_CodexRunner(settings, lambda *_a: None, skill_adoption_store=store)
+    with pytest.raises(_T008_TypedError) as excinfo:
+        runner.run("run_1", {"task_id": "release-beta:T001"}, "coding-local", skills=(changed,))
+    assert excinfo.value.code == "skill.digest_changed"
