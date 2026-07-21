@@ -1,0 +1,22 @@
+{
+  "schema_version": "workbench-deliver-start-receipt/v1",
+  "intent_digest": "sha256:54ce798bb99a3b9c947bd9e854ac170f843f3ee494505d9b36c38a2c23cf326c",
+  "status": "accepted",
+  "task_ref": {
+    "prd_id": "release-alpha",
+    "task_id": "T001",
+    "prd_revision": 4,
+    "scoped_id": "release-alpha:T001"
+  },
+  "run": {
+    "run_id": "run_release_alpha_t001_0001",
+    "workflow_digest": "sha256:08eb89de05b27a1d22db4b26ca743f4e5cf60b47efca0f5ff0d5fc65d868e73a",
+    "capability_profile_digest": "sha256:441250e1309aadd1eb1ffb543e0de05816f7a40e7e671a3f35aae56824f7252e",
+    "started_at": "2026-07-20T12:00:01Z",
+    "deadline": "2026-07-20T13:00:01Z",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  },
+  "redaction": {
+    "status": "redacted"
+  }
+}

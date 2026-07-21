@@ -38,6 +38,10 @@ These resources are the implementation-facing companion to
 | Inspect one Advanced attempt as a normalized, redacted request/route/tool/usage trace | [advanced trace](schemas/advanced-trace.v1.schema.json) | [advanced trace](examples/advanced-trace.v1.json) |
 | Save a digest-pinned, actor-private Advanced preset that repairs on route/tool drift | [advanced preset](schemas/advanced-preset.v1.schema.json) | [advanced preset](examples/advanced-preset.v1.json) |
 | Compare two to four sibling attempts by factual metrics with no invented winner | [advanced comparison](schemas/advanced-comparison.v1.schema.json) | [advanced comparison](examples/advanced-comparison.v1.json) |
+| Reference one task by its owning PRD, pinned revision, and source snapshot for a task row or detail view | [task reference](schemas/task-reference.v1.schema.json) | [task reference](examples/task-reference.v1.json) |
+| State whether a scoped task may enter a Deliver flow, with stable blocked/stale codes and human-safe explanations | [delivery eligibility](schemas/delivery-eligibility.v1.schema.json) | [delivery eligibility](examples/delivery-eligibility.v1.json) |
+| Start delivering a scoped task with an idempotent, ids-only Deliver intent | [deliver intent](schemas/deliver-intent.v1.schema.json) | [deliver intent](examples/deliver-intent.v1.json) |
+| Acknowledge a Deliver intent with a typed accepted/duplicate/denied start receipt | [deliver start receipt](schemas/deliver-start-receipt.v1.schema.json) | [start receipt](examples/deliver-start-receipt.v1.json), [start refusal](examples/deliver-start-receipt.refusal.v1.json) |
 
 ## Normative conventions
 

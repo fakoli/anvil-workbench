@@ -31,6 +31,7 @@ render it as lowercase `sha256:<64 hex>`.
 | PRD content read | `anvil-workbench/prd-content/v1\0` | Omit `content_digest` and volatile `generated_at`. |
 | Settings descriptor catalog | `anvil-workbench/settings-descriptor/v1\0` | Omit `catalog_digest`; sort `settings` by `id`. Preserve `scope_precedence` order (it encodes the total precedence, not a set). |
 | Advanced preset | `anvil-workbench/advanced-preset/v1\0` | Omit `preset_digest` and the volatile `repair` block; sort `control_values` by `name` and `tools` by `tool_id`. Drift is detected by comparing the preset's pinned route/profile/tool digests to live digests, never by the digest changing. |
+| Deliver intent | `anvil-workbench/deliver-intent/v1\0` | Omit `intent_digest`; sort `selections.catalogs` by `provider` and `selections.skills` by `(id, digest)`. The digest is the hub's idempotency key: replaying an identical intent starts the same run, and a mutated intent recomputes to a different key. |
 
 All documented sort rules use plain code-point lexicographic string
 comparison — no numeric, locale, or case-insensitive collation (so `T002.10`

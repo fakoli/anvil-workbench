@@ -1,0 +1,49 @@
+{
+  "schema_version": "workbench-deliver-intent/v1",
+  "intent_id": "deliver_release_alpha_t001_0001",
+  "intent_digest": "sha256:54ce798bb99a3b9c947bd9e854ac170f843f3ee494505d9b36c38a2c23cf326c",
+  "actor": {
+    "actor_id": "operator_example",
+    "kind": "operator"
+  },
+  "task_ref": {
+    "prd_id": "release-alpha",
+    "task_id": "T001",
+    "prd_revision": 4,
+    "scoped_id": "release-alpha:T001",
+    "snapshot_digest": "sha256:5ddaacfaf8405e6e3f0d0a920e0f1f2b20afadded4f8d98748fb42868da0ad2e"
+  },
+  "selections": {
+    "capability_profile_digest": "sha256:441250e1309aadd1eb1ffb543e0de05816f7a40e7e671a3f35aae56824f7252e",
+    "workflow": {
+      "id": "delivery",
+      "revision": "1",
+      "digest": "sha256:08eb89de05b27a1d22db4b26ca743f4e5cf60b47efca0f5ff0d5fc65d868e73a"
+    },
+    "route": {
+      "provider": "anvil-serving",
+      "route_id": "route.chat-fast",
+      "route_digest": "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+    },
+    "catalogs": [
+      {
+        "provider": "project-bridge",
+        "digest": "sha256:90e012a69c4aa5ebcec60f391d948a77c48bbf583632063c5b388cab7a75a563"
+      }
+    ],
+    "skills": [
+      {
+        "id": "delivery.guardrails",
+        "digest": "sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+      }
+    ],
+    "operation": {
+      "provider": "project-bridge",
+      "id": "bridge.github.commit_pr",
+      "contract_version": "1.0.0",
+      "operation_digest": "sha256:8aef716c52d7bf33f19a2829b56e7ad8f19cd5f1cce6cc6d5a10320410e512c3"
+    },
+    "approval_grant_id": "approval_example_0001"
+  },
+  "created_at": "2026-07-20T12:00:00Z"
+}
