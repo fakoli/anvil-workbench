@@ -1495,3 +1495,183 @@ def test_rtp_t004_served_tool_projection_reports_credentials_by_reference_only()
     assert '"value"' not in text and '"secret"' not in text
     for secret in _PTD_CORPUS:
         assert secret not in text
+
+
+# --- chat-first-voice T005.4: the voice relay leaks NO audio or draft ---------
+#
+# THE criterion for the voice slice: raw input audio, synthesized output audio,
+# and any unsubmitted transcript draft must NEVER reach the durable store, logs,
+# audit records, the graph projection, or an error payload. These tests prove it
+# through the SAME wired entrypoint (create_app) and the SAME persisted lifecycle
+# log the runtime uses -- never a hand-built object.
+
+import base64 as _vs_base64
+
+from workbench.voice import (
+    MemoryVoiceEventLog as _VsEventLog,
+    ServingVoiceTransport as _VsServingTransport,
+    VoiceRelayService as _VsService,
+    VoiceServingError as _VsServing,
+)
+
+#: A distinctive raw-audio marker and a distinctive transcript-draft marker. If
+#: either ever appears in a persisted, served, or error surface, the relay leaked.
+_VOICE_AUDIO_MARKER = b"RAW-AUDIO-SECRET-WAVEFORM-BYTES"
+_VOICE_DRAFT_MARKER = "unsubmitted private dictation draft text"
+
+#: The standard free-text leak corpus (three-lens finding 1): every one of these
+#: must be scrubbed / absent from any voice error prose the browser can see.
+_VOICE_LEAK_CORPUS = {
+    "akia": "AKIAIOSFODNN7EXAMPLE",
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig",
+    "pem": "-----BEGIN RSA PRIVATE KEY-----MIIabc-----END RSA PRIVATE KEY-----",
+    "dburl": "postgresql://user:pw@db.internal:5432/state",
+    "dotlesshost": "serving:8443",
+    "etcpath": "/etc/anvil/serving.token",
+    "winpath": "C:\\Users\\op\\serving.key",
+    "ip": "100.64.0.5:7687",
+}
+
+
+class _MarkerVoiceTransport:
+    """A stub Serving transport that echoes distinctive markers back.
+
+    The transcript it returns carries the DRAFT marker; the audio it synthesizes
+    carries the AUDIO marker. A correct relay stores neither.
+    """
+
+    def transcribe(self, request):
+        return {"text": _VOICE_DRAFT_MARKER, "is_final": True, "duration_ms": 1000}
+
+    def synthesize(self, request):
+        return {"audio_b64": _vs_base64.b64encode(_VOICE_AUDIO_MARKER).decode("ascii"), "format": "mp3", "sample_rate": 24000}
+
+
+def _marker_service(event_log):
+    return _VsService(
+        _MarkerVoiceTransport(), voice_authorized=frozenset({"alice"}),
+        scope_authorized=lambda a, c: True, event_log=event_log,
+    )
+
+
+def test_voice_lifecycle_log_persists_no_audio_or_transcript_draft():
+    # The event log is the ONLY durable voice sink. After a full STT+TTS cycle it
+    # must carry lifecycle state + correlation + counts, and NONE of the input
+    # audio, synthesized audio, or the transcript draft text.
+    log = _VsEventLog()
+    service = _marker_service(log)
+    service.transcribe(
+        actor="alice", conversation_id="conv_leak", correlation_id="corr_a",
+        audio=_VOICE_AUDIO_MARKER, audio_format="pcm16", is_final=True, duration_ms=1000,
+    )
+    service.synthesize(
+        actor="alice", conversation_id="conv_leak", correlation_id="corr_b",
+        message_ref="turn_1", text="please read this back", output_format="mp3",
+    )
+    events = log.events("conv_leak")
+    assert len(events) == 2
+    blob = json.dumps([e.as_event_data() for e in events])
+    # No transcript draft text, no raw audio, no base64 of either.
+    assert _VOICE_DRAFT_MARKER not in blob
+    assert _VOICE_AUDIO_MARKER.decode("latin-1") not in blob
+    assert _vs_base64.b64encode(_VOICE_AUDIO_MARKER).decode() not in blob
+    assert "data:audio" not in blob and "audio" not in blob
+    # But the useful content-free metadata IS present, so the scrub is real (not
+    # the events silently vanishing).
+    assert any(e.transcript_chars is not None for e in events)
+    assert any(e.byte_count is not None for e in events)
+
+
+def _voice_sec_client(service, conversation_store=None):
+    from fastapi.testclient import TestClient
+
+    from workbench.api import create_app
+    from workbench.config import Settings
+
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="alice", approvers=frozenset({"alice"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://serving", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+        chat_content_hash_key="voice-sec-test-content-hash-key",
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(),
+        conversation_store=conversation_store, voice_relay_service=service,
+    ))
+
+
+def test_voice_transcribe_served_response_never_echoes_the_input_audio():
+    # The STT response returns only the editable DRAFT; the raw input audio the
+    # browser posted is never echoed back in any field.
+    service = _marker_service(_VsEventLog())
+    client = _voice_sec_client(service)
+    audio_b64 = _vs_base64.b64encode(_VOICE_AUDIO_MARKER).decode()
+    r = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": "c", "audio_base64": audio_b64, "audio_format": "pcm16", "is_final": True,
+    }, headers={"X-Workbench-Actor": "alice"})
+    assert r.status_code == 200
+    body = r.text
+    assert audio_b64 not in body
+    assert _VOICE_AUDIO_MARKER.decode("latin-1") not in body
+    # The response is exactly the draft envelope -- no audio field of any name.
+    assert set(r.json().keys()) == {"draft"}
+    assert set(r.json()["draft"].keys()) == {"text", "is_final", "duration_ms"}
+
+
+def test_voice_error_payload_carries_no_audio_and_no_leak_corpus():
+    # A Serving failure whose upstream detail is stuffed with the full leak corpus
+    # AND raw audio must surface to the browser as a FIXED, non-leaking detail.
+    from workbench.router import RouterError
+
+    corpus_text = "install failed: " + " ".join(_VOICE_LEAK_CORPUS.values()) + " " + _vs_base64.b64encode(_VOICE_AUDIO_MARKER).decode()
+
+    class _LeakyTransport:
+        def transcribe(self, request):
+            raise RouterError(corpus_text)
+
+        def synthesize(self, request):
+            raise RouterError(corpus_text)
+
+    # Wrap the leaky transport in the production ServingVoiceTransport shim by
+    # monkeypatching the router functions it calls, so the WIRED failure path is
+    # exercised rather than a hand-built error.
+    import workbench.router as _router_mod
+    real_t, real_s = _router_mod.voice_transcribe, _router_mod.voice_synthesize
+
+    def boom(*a, **k):
+        raise RouterError(corpus_text)
+
+    _router_mod.voice_transcribe = boom
+    _router_mod.voice_synthesize = boom
+    try:
+        transport = _VsServingTransport("http://serving", "tok", "stt", "tts")
+        service = _VsService(transport, voice_authorized=frozenset({"alice"}), scope_authorized=lambda a, c: True)
+        client = _voice_sec_client(service)
+        r = client.post("/api/chat/voice/transcribe", json={
+            "conversation_id": "c", "audio_base64": _vs_base64.b64encode(b"x").decode(),
+            "audio_format": "pcm16", "is_final": True,
+        }, headers={"X-Workbench-Actor": "alice"})
+    finally:
+        _router_mod.voice_transcribe = real_t
+        _router_mod.voice_synthesize = real_s
+
+    assert r.status_code == 502
+    body = r.text
+    # The fixed detail leaks none of the corpus and no audio.
+    for name, literal in _VOICE_LEAK_CORPUS.items():
+        assert literal not in body, f"voice error leaked corpus item {name!r}: {literal!r}"
+    assert _vs_base64.b64encode(_VOICE_AUDIO_MARKER).decode() not in body
+    assert r.json()["detail"] == "voice relay is unavailable"
+
+
+def test_voice_relay_sources_reach_no_raw_provider():
+    # AGENTS.md boundary: STT/TTS relay only through Anvil Serving. The voice
+    # relay and its Serving audio functions must never name a raw provider host or
+    # a raw-provider API key env var.
+    forbidden = ("api.anthropic.com", "ANTHROPIC_API_KEY", "openai.com", "OPENAI_API_KEY")
+    voice_src = (_REPO_ROOT / "workbench" / "voice.py").read_text(encoding="utf-8")
+    router_src = (_REPO_ROOT / "workbench" / "router.py").read_text(encoding="utf-8")
+    for token in forbidden:
+        assert token not in voice_src, f"voice.py references a raw provider: {token}"
+        assert token not in router_src, f"router.py references a raw provider: {token}"

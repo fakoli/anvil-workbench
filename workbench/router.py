@@ -54,6 +54,95 @@ def route_decisions(base_url: str, token: str, limit: int = 50) -> list[dict[str
     return [{key: redact_value(row[key]) for key in allowed if key in row} for row in rows if isinstance(row, dict)]
 
 
+#: Anvil Serving's declared audio surface.  Serving is the ONLY managed model
+#: path and owns model policy (AGENTS.md); these two operator-configured
+#: endpoints are the only places the voice relay reaches for STT/TTS.  There is
+#: deliberately no provider fallback and no raw-provider path (no external
+#: provider host, no provider API key): a Serving failure settles as a
+#: :class:`RouterError`, never a retry against another provider.
+_SERVING_TRANSCRIBE_PATH = "/audio/transcriptions"
+_SERVING_SPEECH_PATH = "/audio/speech"
+
+#: Hard ceilings on what a Serving audio response may hand back, so a
+#: misbehaving upstream cannot smuggle an unbounded transcript or audio blob
+#: through the relay.  These mirror the durable content-text bound and the
+#: in-memory audio ceilings the relay service enforces on the way in.
+_MAX_TRANSCRIPT_CHARS = 20_000
+_MAX_SYNTH_AUDIO_B64 = 24_000_000
+
+
+def voice_transcribe(
+    base_url: str,
+    token: str,
+    *,
+    model: str,
+    audio_b64: str,
+    audio_format: str,
+    is_final: bool,
+) -> dict[str, Any]:
+    """Transcribe one in-memory audio chunk through Anvil Serving's STT surface.
+
+    The audio is relayed to Serving's declared ``/audio/transcriptions`` endpoint
+    only; the returned draft transcript is credential-scrubbed and bounded.  This
+    function persists nothing and returns no audio — it is a transient draft used
+    to seed an editable composer, never a committed turn.
+    """
+    response = _request(base_url, token, "POST", _SERVING_TRANSCRIBE_PATH, {
+        "model": model,
+        "audio": audio_b64,
+        "format": audio_format,
+        "mode": "final" if is_final else "interim",
+    })
+    if not isinstance(response, dict):
+        raise RouterError("Anvil Serving transcription result has an unexpected shape")
+    text = response.get("text")
+    if not isinstance(text, str):
+        text = ""
+    duration = response.get("duration_ms")
+    return {
+        # Scrub the draft the same way every retained transcript is scrubbed, so a
+        # credential the speaker uttered never rides the draft back to the browser.
+        "text": redact_value(text[:_MAX_TRANSCRIPT_CHARS]),
+        "is_final": bool(response.get("is_final", is_final)),
+        "duration_ms": duration if isinstance(duration, int) and not isinstance(duration, bool) else None,
+    }
+
+
+def voice_synthesize(
+    base_url: str,
+    token: str,
+    *,
+    model: str,
+    text: str,
+    output_format: str,
+) -> dict[str, Any]:
+    """Synthesize playable audio for a message's text through Serving's TTS surface.
+
+    The text is relayed to Serving's declared ``/audio/speech`` endpoint only.
+    The returned audio is transient playback bytes (base64) the caller streams to
+    the browser and never persists; this function mutates no message state.
+    """
+    response = _request(base_url, token, "POST", _SERVING_SPEECH_PATH, {
+        "model": model,
+        "input": text,
+        "format": output_format,
+    })
+    if not isinstance(response, dict):
+        raise RouterError("Anvil Serving speech result has an unexpected shape")
+    audio_b64 = response.get("audio")
+    if not isinstance(audio_b64, str) or not audio_b64:
+        raise RouterError("Anvil Serving speech result carried no audio")
+    if len(audio_b64) > _MAX_SYNTH_AUDIO_B64:
+        raise RouterError("Anvil Serving speech result exceeds the audio ceiling")
+    fmt = response.get("format")
+    sample_rate = response.get("sample_rate")
+    return {
+        "audio_b64": audio_b64,
+        "format": str(fmt) if isinstance(fmt, str) and fmt else output_format,
+        "sample_rate": sample_rate if isinstance(sample_rate, int) and not isinstance(sample_rate, bool) else None,
+    }
+
+
 def sandbox_response(base_url: str, token: str, model: str, text: str) -> dict[str, Any]:
     """Use the Responses contract through Serving with deliberately small limits."""
     response = _request(base_url, token, "POST", "/responses", {

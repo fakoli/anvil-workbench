@@ -2981,3 +2981,376 @@ def test_rtp_t005_concurrent_same_read_executes_once_and_the_receipt_lock_is_loa
         assert runs2.count(1) == 2
     finally:
         store._lock = real_lock
+
+
+# --- chat-first-voice T005: push-to-talk / read-aloud relay ------------------
+#
+# The relay is a DISTINCT request/response STT+TTS surface (not the Realtime
+# websocket above). These tests bind its four acceptance criteria: a draft that
+# creates NO turn, playback that mutates NO message, scope/auth failing BEFORE
+# the provider, and every bound (format/bytes/duration/timeout/per-actor
+# concurrency) enforced. Every relay hop uses a STUB transport -- no live
+# provider is ever called.
+
+import base64 as _v_base64
+import threading as _v_threading
+import time as _v_time
+
+from workbench.voice import (
+    MAX_STT_INPUT_BYTES as _V_MAX_BYTES,
+    MemoryVoiceEventLog as _VEventLog,
+    ServingVoiceTransport as _VServingTransport,
+    SynthesizedAudio as _VSynth,
+    TranscriptDraft as _VDraft,
+    VoiceBoundsError as _VBounds,
+    VoiceConcurrencyError as _VConcurrency,
+    VoiceLifecycleEvent as _VEvent,
+    VoiceRelayService as _VService,
+    VoiceScopeError as _VScope,
+    VoiceServingError as _VServing,
+    VoiceTimeoutError as _VTimeout,
+)
+
+
+class _StubVoiceTransport:
+    """A hermetic Serving stand-in. Records every call; never touches a network.
+
+    Satisfies the ``VoiceServingTransport`` protocol structurally (both methods),
+    so the relay service accepts it exactly as it would the production transport.
+    """
+
+    def __init__(self, *, text="hello there", audio=b"\x00\x01RAW-AUDIO\x02", fmt="mp3", block=None):
+        self.transcribe_calls = []
+        self.synthesize_calls = []
+        self._text = text
+        self._audio = audio
+        self._fmt = fmt
+        self._block = block
+
+    def transcribe(self, request):
+        self.transcribe_calls.append(dict(request))
+        if self._block is not None:
+            self._block.wait(5.0)
+        return {"text": self._text, "is_final": request.get("is_final", False), "duration_ms": 1200}
+
+    def synthesize(self, request):
+        self.synthesize_calls.append(dict(request))
+        if self._block is not None:
+            self._block.wait(5.0)
+        return {"audio_b64": _v_base64.b64encode(self._audio).decode("ascii"), "format": self._fmt, "sample_rate": 24000}
+
+
+def _voice_service(transport=None, *, authorized=frozenset({"alice"}), scope_ok=True, event_log=None, **kw):
+    return _VService(
+        transport or _StubVoiceTransport(),
+        voice_authorized=authorized,
+        scope_authorized=(scope_ok if callable(scope_ok) else (lambda a, c: bool(scope_ok))),
+        event_log=event_log,
+        **kw,
+    )
+
+
+def test_voice_stt_returns_editable_draft_creates_no_turn_and_logs_no_audio():
+    log = _VEventLog()
+    transport = _StubVoiceTransport(text="draft to review")
+    service = _voice_service(transport, event_log=log)
+    draft = service.transcribe(
+        actor="alice", conversation_id="conv_1", correlation_id="corr_1",
+        audio=b"pcm-bytes", audio_format="pcm16", is_final=True, duration_ms=900,
+    )
+    assert isinstance(draft, _VDraft)
+    assert draft.text == "draft to review" and draft.is_final is True
+    # ONE content-free lifecycle event: state + correlation + a CHAR COUNT only.
+    events = log.events("conv_1")
+    assert len(events) == 1
+    event = events[0]
+    assert event.state == "stt_commit" and event.correlation_id == "corr_1"
+    assert event.transcript_chars == len("draft to review")
+    # The persisted event body carries NO transcript text and NO audio.
+    body = event.as_event_data()
+    assert "transcript" not in body and "text" not in body and "audio" not in body
+    blob = json.dumps(body)
+    assert "draft to review" not in blob
+    assert "pcm-bytes" not in blob and _v_base64.b64encode(b"pcm-bytes").decode() not in blob
+
+
+def test_voice_stt_interim_and_final_states_are_distinct():
+    service = _voice_service(event_log=_VEventLog())
+    interim = service.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                                 audio=b"a", audio_format="pcm16", is_final=False)
+    assert interim.is_final is False
+
+
+def test_voice_tts_returns_transient_audio_and_logs_no_audio():
+    log = _VEventLog()
+    transport = _StubVoiceTransport(audio=b"SYNTH-AUDIO-BYTES", fmt="mp3")
+    service = _voice_service(transport, event_log=log)
+    synth = service.synthesize(
+        actor="alice", conversation_id="conv_2", correlation_id="corr_2",
+        message_ref="turn_7", text="read this aloud", output_format="mp3",
+    )
+    assert isinstance(synth, _VSynth)
+    assert synth.audio == b"SYNTH-AUDIO-BYTES" and synth.audio_format == "mp3"
+    events = log.events("conv_2")
+    assert len(events) == 1 and events[0].state == "tts_start"
+    assert events[0].byte_count == len(b"SYNTH-AUDIO-BYTES")
+    body_blob = json.dumps(events[0].as_event_data())
+    assert "SYNTH-AUDIO" not in body_blob
+    assert _v_base64.b64encode(b"SYNTH-AUDIO-BYTES").decode() not in body_blob
+
+
+def test_voice_relay_fails_scope_and_auth_before_the_provider():
+    # Criterion 3: an unauthorized actor or invalid chat scope FAILS before any
+    # provider/relay call -- the stub transport must never be invoked.
+    unauth_transport = _StubVoiceTransport()
+    unauth = _voice_service(unauth_transport, authorized=frozenset({"bob"}))
+    with pytest.raises(_VScope):
+        unauth.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                          audio=b"a", audio_format="pcm16", is_final=True)
+    assert unauth_transport.transcribe_calls == []
+
+    scope_transport = _StubVoiceTransport()
+    bad_scope = _voice_service(scope_transport, scope_ok=lambda a, c: False)
+    with pytest.raises(_VScope):
+        bad_scope.synthesize(actor="alice", conversation_id="c", correlation_id="x",
+                             message_ref="m", text="hi", output_format="mp3")
+    assert scope_transport.synthesize_calls == []
+
+
+def test_voice_relay_bounds_format_bytes_and_duration():
+    transport = _StubVoiceTransport()
+    service = _voice_service(transport)
+    # Format not in the closed allowlist.
+    with pytest.raises(_VBounds):
+        service.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                           audio=b"a", audio_format="flac", is_final=True)
+    # Byte ceiling.
+    with pytest.raises(_VBounds):
+        service.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                           audio=b"a" * (_V_MAX_BYTES + 1), audio_format="pcm16", is_final=True)
+    # Duration ceiling.
+    with pytest.raises(_VBounds):
+        service.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                           audio=b"a", audio_format="pcm16", is_final=True, duration_ms=10_000_000)
+    # TTS text ceiling + output-format allowlist.
+    with pytest.raises(_VBounds):
+        service.synthesize(actor="alice", conversation_id="c", correlation_id="x",
+                           message_ref="m", text="x" * 20_001, output_format="mp3")
+    with pytest.raises(_VBounds):
+        service.synthesize(actor="alice", conversation_id="c", correlation_id="x",
+                           message_ref="m", text="hi", output_format="flac")
+    # Every rejection happened BEFORE the transport was reached.
+    assert transport.transcribe_calls == [] and transport.synthesize_calls == []
+
+
+def test_voice_relay_timeout_is_bounded():
+    # Criterion 4: a hung Serving hop is bounded into a typed timeout, not an
+    # infinite block.
+    block = _v_threading.Event()  # never set -> the transport hangs
+    transport = _StubVoiceTransport(block=block)
+    service = _voice_service(transport, timeout_s=0.2)
+    started = _v_time.monotonic()
+    with pytest.raises(_VTimeout):
+        service.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                           audio=b"a", audio_format="pcm16", is_final=True)
+    assert _v_time.monotonic() - started < 3.0
+    block.set()
+
+
+def test_voice_relay_bounds_per_actor_concurrency_under_a_real_race():
+    # Criterion 4: per-actor concurrency is bounded. Proven with a REAL race --
+    # `limit` concurrent hops are pinned open at a barrier while one more actor
+    # request must fail closed. A lock-off (removing the guard's lock) would let
+    # the (limit+1)th slip through, so the guard's mutual exclusion is exercised,
+    # not merely present.
+    hold = _v_threading.Event()
+    ready = _v_threading.Barrier(3)  # 2 pinned hops + the test thread
+
+    class _PinningTransport:
+        def __init__(self):
+            self.active = 0
+            self._lock = _v_threading.Lock()
+            self.peak = 0
+
+        def transcribe(self, request):
+            with self._lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                ready.wait(5.0)
+                hold.wait(5.0)
+                return {"text": "held", "is_final": True, "duration_ms": 1}
+            finally:
+                with self._lock:
+                    self.active -= 1
+
+        def synthesize(self, request):  # unused
+            return {"audio_b64": _v_base64.b64encode(b"x").decode(), "format": "mp3"}
+
+    transport = _PinningTransport()
+    service = _voice_service(transport, concurrency_limit=2)
+
+    def pinned():
+        service.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                           audio=b"a", audio_format="pcm16", is_final=True)
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    threads = [_v_threading.Thread(target=pinned) for _ in range(2)]
+    try:
+        for t in threads:
+            t.start()
+        ready.wait(5.0)  # both hops are now inside the transport, holding both slots
+        # A third concurrent request from the SAME actor must fail closed.
+        with pytest.raises(_VConcurrency):
+            service.transcribe(actor="alice", conversation_id="c", correlation_id="y",
+                               audio=b"a", audio_format="pcm16", is_final=True)
+        # A DIFFERENT actor is unaffected (the bound is per-actor).
+        other = _voice_service(_StubVoiceTransport(), authorized=frozenset({"carol"}), concurrency_limit=2)
+        assert other.transcribe(actor="carol", conversation_id="c", correlation_id="z",
+                                audio=b"a", audio_format="pcm16", is_final=True).text
+    finally:
+        hold.set()
+        for t in threads:
+            t.join(5.0)
+        sys.setswitchinterval(old_interval)
+    assert transport.peak == 2  # never exceeded the ceiling
+
+
+def test_voice_concurrency_slot_is_released_after_each_hop():
+    # A completed hop must free its slot, so a serial caller is never throttled.
+    service = _voice_service(_StubVoiceTransport(), concurrency_limit=1)
+    for _ in range(5):
+        assert service.transcribe(actor="alice", conversation_id="c", correlation_id="x",
+                                  audio=b"a", audio_format="pcm16", is_final=True).text
+
+
+def test_voice_serving_transport_has_no_raw_provider_and_maps_failure():
+    # The production transport reaches Anvil Serving's declared surface only; a
+    # Serving RouterError settles as a VoiceServingError (never a fallback).
+    from workbench.router import RouterError
+    transport = _VServingTransport("http://serving", "tok", "stt-model", "tts-model")
+
+    def boom(*a, **k):
+        raise RouterError("Anvil Serving is unreachable: refused")
+
+    import workbench.router as _router_mod
+    real = _router_mod.voice_transcribe
+    _router_mod.voice_transcribe = boom
+    try:
+        with pytest.raises(_VServing):
+            transport.transcribe({"audio_b64": "AA==", "audio_format": "pcm16", "is_final": True})
+    finally:
+        _router_mod.voice_transcribe = real
+
+
+def test_voice_lifecycle_event_cannot_carry_audio_or_draft_text():
+    # The durable lifecycle record is content-free by construction: its closed
+    # field set has no audio/text field, and a bad state or over-bound count is
+    # refused.
+    with pytest.raises(_VBounds):
+        _VEvent(conversation_id="c", actor="a", state="not_a_state", correlation_id="x")
+    with pytest.raises(TypeError):
+        _VEvent(conversation_id="c", actor="a", state="tts_start", correlation_id="x", audio="blob")
+
+
+# --- Wired-path proofs through create_app (T005.1 / T005.4) ------------------
+
+def _voice_wired_client(service, conversation_store=None):
+    from fastapi.testclient import TestClient
+
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.graph import NullGraph
+    from workbench.store import MemoryStore
+
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="alice", approvers=frozenset({"alice"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://serving", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+        chat_content_hash_key="voice-wired-test-content-hash-key",
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(),
+        conversation_store=conversation_store, voice_relay_service=service,
+    ))
+
+
+def test_voice_relay_endpoints_are_503_until_configured():
+    # Not-wired-live: with no injected relay service every endpoint fails closed.
+    client = _voice_wired_client(None)
+    r = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": "c", "audio_base64": _v_base64.b64encode(b"a").decode(),
+        "audio_format": "pcm16", "is_final": True,
+    }, headers={"X-Workbench-Actor": "alice"})
+    assert r.status_code == 503
+    r2 = client.post("/api/chat/voice/speak", json={
+        "conversation_id": "c", "message_ref": "m", "text": "hi",
+    }, headers={"X-Workbench-Actor": "alice"})
+    assert r2.status_code == 503
+
+
+def test_voice_transcribe_through_wired_app_creates_no_turn():
+    from workbench.conversation_store import MemoryConversationStore
+
+    conv_store = MemoryConversationStore(content_hash_key=b"voice-wired-test-content-hash-key")
+    transport = _StubVoiceTransport(text="please review me")
+    service = _voice_service(transport, event_log=_VEventLog())
+    client = _voice_wired_client(service, conversation_store=conv_store)
+
+    created = client.post("/api/conversations", json={"title": "voice"}, headers={"X-Workbench-Actor": "alice"})
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["id"]
+
+    r = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": conversation_id, "audio_base64": _v_base64.b64encode(b"raw-audio").decode(),
+        "audio_format": "pcm16", "is_final": True,
+    }, headers={"X-Workbench-Actor": "alice"})
+    assert r.status_code == 200, r.text
+    assert r.json()["draft"]["text"] == "please review me"
+    # PROOF: no turn was created -- the transcript is a draft awaiting explicit
+    # submission through the ordinary turn-append path.
+    full = client.get(f"/api/conversations/{conversation_id}", headers={"X-Workbench-Actor": "alice"}).json()
+    assert full["turns"] == []
+
+
+def test_voice_speak_through_wired_app_leaves_message_state_unchanged():
+    from workbench.conversation_store import MemoryConversationStore
+
+    conv_store = MemoryConversationStore(content_hash_key=b"voice-wired-test-content-hash-key")
+    service = _voice_service(_StubVoiceTransport(audio=b"AUDIO"), event_log=_VEventLog())
+    client = _voice_wired_client(service, conversation_store=conv_store)
+
+    created = client.post("/api/conversations", json={"title": "voice"}, headers={"X-Workbench-Actor": "alice"})
+    conversation_id = created.json()["id"]
+    client.post(f"/api/conversations/{conversation_id}/turns", json={
+        "role": "user", "status": "complete",
+        "lineage": {"parent_turn_id": None, "sibling_index": 0, "kind": "initial"},
+        "content": [{"kind": "text", "text": "hello"}],
+    }, headers={"X-Workbench-Actor": "alice"})
+    before = client.get(f"/api/conversations/{conversation_id}", headers={"X-Workbench-Actor": "alice"}).json()
+
+    r = client.post("/api/chat/voice/speak", json={
+        "conversation_id": conversation_id, "message_ref": before["turns"][0]["id"], "text": "hello",
+    }, headers={"X-Workbench-Actor": "alice"})
+    assert r.status_code == 200, r.text
+    # PROOF: playback returned audio but mutated no message/conversation state.
+    after = client.get(f"/api/conversations/{conversation_id}", headers={"X-Workbench-Actor": "alice"}).json()
+    assert after == before
+
+
+def test_voice_wired_scope_failure_is_403_and_bounds_failure_is_422():
+    # Scope/auth denial (a foreign conversation) is 403; a bad format is 422.
+    service = _voice_service(_StubVoiceTransport(), scope_ok=lambda a, c: c == "mine")
+    client = _voice_wired_client(service)
+    denied = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": "not-mine", "audio_base64": _v_base64.b64encode(b"a").decode(),
+        "audio_format": "pcm16", "is_final": True,
+    }, headers={"X-Workbench-Actor": "alice"})
+    assert denied.status_code == 403
+    bad = client.post("/api/chat/voice/transcribe", json={
+        "conversation_id": "mine", "audio_base64": _v_base64.b64encode(b"a").decode(),
+        "audio_format": "flac", "is_final": True,
+    }, headers={"X-Workbench-Actor": "alice"})
+    assert bad.status_code == 422
