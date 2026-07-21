@@ -296,6 +296,16 @@ class PluginDiscovery:
                 raise PluginHostError("tool_not_enabled", "the tool is reviewed but not enabled by the capability profile")
         return DiscoveredPlugin(plugin=copy.deepcopy(dict(plugin)), tool=copy.deepcopy(dict(tool)) if tool else None)
 
+    @property
+    def catalog(self) -> Mapping[str, Any]:
+        """The deep-copied, validated catalog this discovery was pinned to.
+
+        A read-only accessor so a composing lane (e.g. the chat tool dispatch
+        session) can validate a request against the exact pinned catalog without
+        reaching into the private ``_catalog`` field.
+        """
+        return self._catalog
+
     def published(self) -> list[dict[str, Any]]:
         """The redacted browser projection of every approved, enabled plugin.
 

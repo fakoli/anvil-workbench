@@ -2061,3 +2061,923 @@ def test_ptd_t008_directive_never_signals_a_bridge_effect():
     submit_directive(store, session.id, "please steer", "operator")
     assert store.commands == {} or all(len(q) == 0 for q in store.commands.values())
     assert store.list_runs() == []
+
+
+# --------------------------------------------------------------------------- #
+# reviewed-tools-plugins T004 (chat capability-profile pinning + typed tool
+# dispatch) and T005 (effectful preview/approval, invalidate-on-diff, fail-closed
+# replay/expiry/mismatch/digest-drift, reconcile-not-fabricate).  Every proof is
+# driven through the ACTUAL wired entrypoints -- ChatToolDispatchService.preview
+# and .dispatch -- never a hand-built receipt: a rejected request never reaches
+# the tool runner, and the reused typed-operation approval + receipt stores are
+# the ones the runtime would call.
+# --------------------------------------------------------------------------- #
+
+import contextlib as _rtp_contextlib
+import json as _rtp_json
+import threading as _rtp_threading
+from pathlib import Path as _RtpPath
+
+from workbench.contracts import (
+    approval_payload_digest as _rtp_subject_hash,
+    contract_digest as _rtp_digest,
+    _plugin_approval_subject as _rtp_subject,
+)
+from workbench.models import OperationRefusal as _RtpRefusal
+from workbench.store import OperationOutcome as _RtpOutcome, UnknownOutcomeError as _RtpUnknown
+from workbench.tool_dispatch import (
+    ChatToolDispatchService as _RtpService,
+    ChatToolSession as _RtpSession,
+    ToolDispatchError as _RtpError,
+)
+
+_RTP_EX = _RtpPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+_RTP_VIEWER_DIGEST = "sha256:4ae65e4cfc645dc1adf8a742e6485946c1961819b87039ffa0d93ea88253b4fd"
+_RTP_NOTIFIER_DIGEST = "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+
+
+def _rtp_load(name):
+    return _rtp_json.loads((_RTP_EX / name).read_text(encoding="utf-8"))
+
+
+def _rtp_catalog():
+    return _rtp_load("plugin.catalog.v1.json")
+
+
+def _rtp_capability():
+    return _rtp_load("plugin.capability.v1.json")
+
+
+def _rtp_service(health=None, catalog=None, capability=None):
+    session = _RtpSession(
+        session_id="chat0001",
+        catalog=catalog if catalog is not None else _rtp_catalog(),
+        capability=capability if capability is not None else _rtp_capability(),
+        actor_id="operator-01",
+        bridge_id="bridge-a",
+        project_id="proj-1",
+    )
+    return _RtpService(session, health=health)
+
+
+def _rtp_read_request(status="ready", plugin_digest=_RTP_VIEWER_DIGEST, tool_id="tasks.list"):
+    req = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_taskslist000001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "anvil-tasks-viewer", "plugin_digest": plugin_digest},
+        "tool_call": {"tool_id": tool_id, "inputs": {"status": status}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    return req
+
+
+def _rtp_effect_request(message_ref="deploy-msg-1", grant_id="approval_chatgrant0001",
+                        plugin_digest=_RTP_NOTIFIER_DIGEST, tool_id="notify.send"):
+    req = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_notifysend0001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": plugin_digest},
+        "tool_call": {"tool_id": tool_id, "inputs": {"message_ref": message_ref}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    subject_hash = _rtp_subject_hash(_rtp_subject(req))
+    req["approval"] = {"grant_id": grant_id, "action": "invoke_effect_tool", "payload_hash": subject_hash}
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    return req, subject_hash
+
+
+def _rtp_grant(service, subject_hash, grant_id="approval_chatgrant0001",
+               bridge_id="bridge-a", project_id="proj-1", ttl_seconds=300):
+    return service.approvals.grant(grant_id, "invoke_effect_tool", subject_hash,
+                                   bridge_id, project_id, ttl_seconds=ttl_seconds)
+
+
+def _rtp_never(_disc, _inputs):
+    raise AssertionError("the tool runner must never be reached for a rejected request")
+
+
+# --- T004: capability-profile pinning is fail-closed and immutable ---------- #
+
+def test_rtp_t004_session_pins_and_fail_closes_on_a_drifted_catalog():
+    catalog = _rtp_catalog()
+    catalog["plugins"][0]["tools"][0]["title"] = "tampered"
+    with pytest.raises(Exception):
+        _RtpSession(session_id="c", catalog=catalog, capability=_rtp_capability(),
+                    actor_id="operator-01", bridge_id="bridge-a", project_id="proj-1")
+
+
+def test_rtp_t004_session_lists_only_pinned_enabled_tools_by_reference():
+    service = _rtp_service()
+    tools = {t["tool_id"] for p in service.list_tools() for t in p["tools"]}
+    assert tools == {"tasks.list", "issues.read", "notify.send"}
+    for plugin in service.list_tools():
+        cred = plugin["credential"]
+        assert "value" not in cred and "secret" not in cred and "token" not in cred
+
+
+# --- T004: reject-before-dispatch on the CLAIMED typed reason ---------------- #
+
+def test_rtp_t004_unknown_plugin_is_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["plugin"]["plugin_id"] = "ghost-plugin"
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.unknown_plugin"
+
+
+def test_rtp_t004_drifted_plugin_digest_is_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request(plugin_digest="sha256:" + "0" * 64)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.digest_drift"
+
+
+def test_rtp_t004_unknown_tool_is_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["tool_call"]["tool_id"] = "tasks.delete"
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.unknown_tool"
+
+
+def test_rtp_t004_a_tool_absent_from_the_profile_is_not_selected():
+    capability = _rtp_capability()
+    viewer = next(e for e in capability["plugins"] if e["plugin_id"] == "anvil-tasks-viewer")
+    viewer["enabled_tools"] = ["tasks.list"]
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+    req = _rtp_read_request(tool_id="issues.read")
+    req["tool_call"]["inputs"] = {"issue_ref": "repo#12"}
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.tool_not_selected"
+
+
+def test_rtp_t004_schema_invalid_inputs_are_refused_before_the_runner():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["tool_call"]["inputs"] = {"status": "not-a-valid-enum"}
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.input_invalid"
+
+
+def test_rtp_t004_an_unhealthy_tool_is_refused_before_the_runner():
+    service = _rtp_service(health=lambda _p, _t: False)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(_rtp_read_request(), _rtp_never)
+    assert exc.value.code == "tool.unhealthy"
+
+
+def test_rtp_t004_a_tampered_request_digest_is_refused():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    req["tool_call"]["inputs"] = {"status": "done"}
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.invalid_request"
+
+
+# --- T004: a read tool routes ungated and correlates request <-> result ----- #
+
+def test_rtp_t004_read_tool_dispatches_ungated_and_correlated():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    result = service.dispatch(req, lambda d, i: _RtpOutcome("succeeded", external_ref={"rows": "7"}))
+    receipt = result.receipt
+    assert receipt["status"] == "succeeded"
+    assert receipt["correlation"]["request_id"] == "plugreq_taskslist000001"
+    assert receipt["idempotency_key"] == req["request_digest"]
+    assert receipt["operation"] == {
+        "provider": "anvil-tasks-viewer", "id": "tasks.list",
+        "contract_version": "1.2.0", "operation_digest": _RTP_VIEWER_DIGEST,
+    }
+    assert "gates" not in receipt and "credential" not in receipt
+
+
+def test_rtp_t004_a_read_call_never_requires_or_consumes_an_approval():
+    service = _rtp_service()
+    result = service.dispatch(_rtp_read_request(), lambda d, i: _RtpOutcome("succeeded"))
+    assert result.receipt["status"] == "succeeded"
+    assert service.approvals.grants == {}
+
+
+# --- T005: preview is hash-bound and non-mutating --------------------------- #
+
+def test_rtp_t005_effect_preview_requires_a_subject_bound_approval():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    preview = service.preview(req)
+    assert preview["kind"] == "tool_call" and preview["effect"] == "external_effect"
+    assert preview["approval"] == {
+        "required": True, "action": "invoke_effect_tool", "payload_hash": subject_hash,
+    }
+    assert service.approvals.grants == {}
+    assert service.get_receipt(req["request_digest"]) is None
+
+
+def test_rtp_t005_read_preview_declares_no_approval_required():
+    service = _rtp_service()
+    preview = service.preview(_rtp_read_request())
+    assert preview["approval"] == {"required": False}
+
+
+def test_rtp_t005_a_changed_input_previews_a_different_binding():
+    _, hash_one = _rtp_effect_request(message_ref="deploy-msg-1")
+    _, hash_two = _rtp_effect_request(message_ref="deploy-msg-2")
+    assert hash_one != hash_two
+
+
+# --- T005: effectful dispatch consumes a one-time hash-bound approval -------- #
+
+def test_rtp_t005_effect_dispatch_consumes_the_grant_and_records_a_receipt():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+    ran = []
+    result = service.dispatch(req, lambda d, i: (ran.append(i), _RtpOutcome(
+        "succeeded", external_ref={"channel": "deploy"}))[1])
+    assert result.receipt["status"] == "succeeded"
+    assert ran == [{"message_ref": "deploy-msg-1"}]
+    grant = service.approvals.grants["approval_chatgrant0001"]
+    assert grant.consumed_at is not None
+
+
+def test_rtp_t005_effect_dispatch_without_a_grant_fails_closed():
+    service = _rtp_service()
+    req, _ = _rtp_effect_request()
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.approval_invalid"
+
+
+def test_rtp_t005_replay_of_a_consumed_grant_fails_closed():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+    first = service.dispatch(req, lambda d, i: _RtpOutcome(
+        "failed", error=_RtpRefusal("operation.input_invalid", "downstream rejected", retryable=True)))
+    assert first.receipt["status"] == "failed"
+    assert service.get_receipt(req["request_digest"]) is None
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.approval_invalid"
+
+
+def test_rtp_t005_all_grant_failures_collapse_to_one_non_oracular_reason():
+    req, subject_hash = _rtp_effect_request()
+    scenarios = []
+
+    svc = _rtp_service(); _rtp_grant(svc, subject_hash, ttl_seconds=-1)
+    scenarios.append(svc)
+    svc = _rtp_service(); _rtp_grant(svc, subject_hash, bridge_id="bridge-z")
+    scenarios.append(svc)
+    svc = _rtp_service(); _rtp_grant(svc, subject_hash, project_id="proj-z")
+    scenarios.append(svc)
+    svc = _rtp_service()
+    svc.approvals.grant("approval_chatgrant0001", "install_plugin", subject_hash, "bridge-a", "proj-1")
+    scenarios.append(svc)
+    svc = _rtp_service(); _rtp_grant(svc, _rtp_subject_hash({"tampered": True}))
+    scenarios.append(svc)
+
+    for svc in scenarios:
+        with pytest.raises(_RtpError) as exc:
+            svc.dispatch(dict(req), _rtp_never)
+        assert exc.value.code == "tool.approval_invalid"
+
+
+def test_rtp_t005_a_grant_for_the_previewed_input_cannot_authorize_a_changed_call():
+    service = _rtp_service()
+    _, old_hash = _rtp_effect_request(message_ref="deploy-msg-1")
+    _rtp_grant(service, old_hash)
+    changed, _ = _rtp_effect_request(message_ref="deploy-msg-2")
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(changed, _rtp_never)
+    assert exc.value.code == "tool.approval_invalid"
+
+
+# --- T005: idempotent replay + reconcile-not-fabricate ---------------------- #
+
+def test_rtp_t005_idempotent_replay_returns_the_stored_receipt_without_rerun():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+    runs = []
+    first = service.dispatch(req, lambda d, i: (runs.append(1), _RtpOutcome(
+        "succeeded", external_ref={"channel": "deploy"}))[1])
+    second = service.dispatch(req, _rtp_never)
+    assert first.replayed is False and second.replayed is True
+    assert first.receipt["receipt_id"] == second.receipt["receipt_id"]
+    assert runs == [1]
+
+
+def test_rtp_t005_unknown_effect_outcome_reconciles_and_is_not_a_success():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+
+    def unconfirmed(_d, _i):
+        raise _RtpUnknown("the deploy notification outcome is unknown", reason="unknown_outcome")
+
+    result = service.dispatch(req, unconfirmed)
+    assert result.receipt["status"] == "reconciliation_required"
+    item = service.get_reconciliation(req["request_digest"])
+    assert item is not None and item["reason"] == "unknown_outcome"
+    assert len(service.list_reconciliations()) == 1
+    replay = service.dispatch(req, _rtp_never)
+    assert replay.replayed is True and replay.receipt["status"] == "reconciliation_required"
+
+
+def test_rtp_t005_a_runner_that_raises_an_arbitrary_error_reconciles_not_500s():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+
+    def boom(_d, _i):
+        raise RuntimeError("connector crashed mid-send")
+
+    result = service.dispatch(req, boom)
+    assert result.receipt["status"] == "reconciliation_required"
+    assert service.get_reconciliation(req["request_digest"]) is not None
+
+
+# --- Fix-round MUST #1: the session pins an actor; a grant minted under one
+# actor cannot be exercised by a dispatch presented under another actor. -------- #
+
+def test_rtp_fix1_a_grant_for_actor_a_cannot_authorize_a_dispatch_under_actor_b():
+    # The approval SUBJECT (plugin/tool/inputs) is actor-independent, so operator's
+    # grant and the intruder's request hash to the SAME subject.  Without the
+    # session-actor pin the intruder consumes operator's grant and the effect runs.
+    # With the pin, the intruder is refused BEFORE the runner and BEFORE the grant
+    # is touched.
+    service = _rtp_service()  # session pinned to actor operator-01
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)  # minted for operator-01's session
+
+    intruder = dict(req)
+    intruder["actor"] = {"actor_id": "intruder-99", "kind": "operator"}
+    intruder["request_digest"] = _rtp_digest("plugin-request", intruder)
+    # The intruder's approval still binds the identical subject hash (actor is not
+    # in the subject) -- only the session-actor pin stops the cross-actor consume.
+    assert intruder["approval"]["payload_hash"] == subject_hash
+
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(intruder, _rtp_never)  # runner must never be reached
+    assert exc.value.code == "tool.actor_mismatch"
+    # The grant is untouched: the effect was never authorized or run.
+    assert service.approvals.grants["approval_chatgrant0001"].consumed_at is None
+    assert service.get_receipt(intruder["request_digest"]) is None
+
+
+def test_rtp_fix1_preview_is_also_actor_pinned():
+    service = _rtp_service()
+    req, _ = _rtp_effect_request()
+    foreign = dict(req)
+    foreign["actor"] = {"actor_id": "intruder-99", "kind": "operator"}
+    foreign["request_digest"] = _rtp_digest("plugin-request", foreign)
+    with pytest.raises(_RtpError) as exc:
+        service.preview(foreign)
+    assert exc.value.code == "tool.actor_mismatch"
+
+
+# --- Fix-round #5: a read tool call carrying an approval is a caller error and is
+# refused before the runner, never accepted-and-silently-ignored. --------------- #
+
+def test_rtp_fix5_a_read_carrying_an_approval_is_refused_not_ignored():
+    service = _rtp_service()
+    req = _rtp_read_request()
+    # Attach a well-formed approval to a READ (a caller mistake): the read is
+    # ungated, so accepting it would silently ignore the grant.
+    subject_hash = _rtp_subject_hash(_rtp_subject(req))
+    req["approval"] = {"grant_id": "approval_bogus000001", "action": "invoke_effect_tool",
+                       "payload_hash": subject_hash}
+    req["request_digest"] = _rtp_digest("plugin-request", req)
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(req, _rtp_never)
+    assert exc.value.code == "tool.input_invalid"
+
+
+# --- Fix-round #4: preview PRODUCES the payload_hash without needing an approval
+# block; the previewed hash equals the later dispatch subject hash. ------------- #
+
+def test_rtp_fix4_effectful_call_can_be_previewed_without_an_approval_block():
+    service = _rtp_service()
+    # An effectful request with NO approval block (preview is the step that yields
+    # the hash the approval will bind).
+    unapproved = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_notifysend0001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": _RTP_NOTIFIER_DIGEST},
+        "tool_call": {"tool_id": "notify.send", "inputs": {"message_ref": "deploy-msg-1"}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    unapproved["request_digest"] = _rtp_digest("plugin-request", unapproved)
+
+    preview = service.preview(unapproved)  # no approval block -> still previewable
+    assert preview["approval"]["required"] is True
+    previewed_hash = preview["approval"]["payload_hash"]
+    # Preview minted no grant and stored no receipt (non-mutating).
+    assert service.approvals.grants == {}
+    assert service.get_receipt(unapproved["request_digest"]) is None
+
+    # The full approved dispatch request binds the SAME subject hash the preview
+    # produced, even though the two requests have different request_digests.
+    approved, subject_hash = _rtp_effect_request(message_ref="deploy-msg-1")
+    assert previewed_hash == subject_hash
+    assert approved["request_digest"] != unapproved["request_digest"]
+
+
+# --- Fix-round #3: an effectful runner that RETURNS a malformed value (not an
+# exception) reconciles like an unknown outcome -- it never vanishes as a bare
+# error with no durable record. -------------------------------------------------- #
+
+def test_rtp_fix3_effectful_runner_that_returns_a_raw_dict_reconciles():
+    service = _rtp_service()
+    req, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+
+    # A buggy runner returns a raw dict instead of an OperationOutcome.
+    result = service.dispatch(req, lambda d, i: {"sent": True})
+    assert result.receipt["status"] == "reconciliation_required"
+    item = service.get_reconciliation(req["request_digest"])
+    assert item is not None and item["reason"] == "unknown_outcome"
+    assert len(service.list_reconciliations()) == 1
+    # State is consistent: the grant was consumed (the effect was attempted) and a
+    # single reconciliation records the unknown outcome -- nothing vanished.
+    assert service.approvals.grants["approval_chatgrant0001"].consumed_at is not None
+
+
+def test_rtp_fix3_a_read_runner_that_returns_a_raw_dict_keeps_a_typed_error():
+    service = _rtp_service()
+    # A read has no effect to reconcile: a malformed return stays a typed error.
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(_rtp_read_request(), lambda d, i: {"rows": 7})
+    assert exc.value.code == "tool.runner_contract"
+
+
+# --- T004/T005: real concurrency guards -------------------------------------- #
+
+def test_rtp_t004_over_budget_when_the_pinned_tool_call_budget_is_exhausted():
+    # Pin a one-call budget; the second DISTINCT dispatch is over budget and never
+    # reaches the runner.  A replay or a rejected request consumes no budget, so
+    # the ceiling counts only genuinely-executed dispatches.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+    ok = service.dispatch(_rtp_read_request("ready"),
+                          lambda d, i: _RtpOutcome("succeeded", external_ref={"rows": "7"}))
+    assert ok.receipt["status"] == "succeeded"
+    # A replay of the SAME request does not consume more budget.
+    replay = service.dispatch(_rtp_read_request("ready"), _rtp_never)
+    assert replay.replayed is True
+    # A second distinct request is refused before the runner.
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(_rtp_read_request("claimed"), _rtp_never)
+    assert exc.value.code == "tool.over_budget"
+
+
+def test_rtp_fix2_a_rejected_request_consumes_no_budget():
+    # Pin a one-call budget.  A REJECTED effectful dispatch (no grant ->
+    # approval_invalid) must burn no slot, so a later legitimate read still runs.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+
+    rejected, _ = _rtp_effect_request()  # effectful, but no grant is minted
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(rejected, _rtp_never)
+    assert exc.value.code == "tool.approval_invalid"
+
+    # The rejected dispatch consumed no budget: the one real slot is still free.
+    ok = service.dispatch(_rtp_read_request("ready"),
+                          lambda d, i: _RtpOutcome("succeeded", external_ref={"rows": "7"}))
+    assert ok.receipt["status"] == "succeeded"
+
+
+def test_rtp_fix2_a_replay_consumes_no_budget_even_at_the_ceiling():
+    # Budget of exactly one: the first read spends it, an unbounded number of
+    # replays of that SAME request keep replaying (never over-budget, never a
+    # second execution).
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+    runs = []
+    first = service.dispatch(_rtp_read_request("ready"),
+                             lambda d, i: (runs.append(1), _RtpOutcome("succeeded"))[1])
+    assert first.replayed is False
+    for _ in range(3):
+        replay = service.dispatch(_rtp_read_request("ready"), _rtp_never)
+        assert replay.replayed is True
+    assert runs == [1]
+
+
+def test_rtp_fix_distinct_concurrent_dispatches_admit_exactly_one_at_ceiling_one():
+    # REGRESSION (atomic admission): two CONCURRENT DISTINCT dispatches against a
+    # ceiling of one must admit exactly ONE and refuse the other tool.over_budget.
+    # The prior split (a read-only check, then a separate commit inside the
+    # executor) let both pass the check at dispatched=0 and both commit -> a
+    # ceiling of one admitted two.  We line both threads up at the receipt store's
+    # record_attempt entry -- the step that follows admission on both shapes -- so
+    # the split reaches it with each thread having seen an un-incremented counter
+    # (over-admitting two), while ATOMIC admission refuses the loser at reserve,
+    # before record_attempt is ever reached.  This test over-admits (2 executions,
+    # 0 refusals) against the split and holds (1 execution, 1 refusal) after the fix.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+
+    req_a = _rtp_read_request("ready")
+    req_b = _rtp_read_request("claimed")
+    assert req_a["request_digest"] != req_b["request_digest"]  # genuinely distinct
+
+    runs = []
+
+    def runner(_d, _i):
+        runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    # Park every thread that REACHES record_attempt (i.e. that was admitted) until
+    # both arrive, so a non-atomic check cannot let the first admit-and-commit
+    # before the second checks.  On the atomic path the loser is refused at reserve
+    # and never arrives here; it aborts the barrier so the lone winner proceeds.
+    gate = _rtp_threading.Barrier(2)
+    orig_ra = service._receipts.record_attempt
+
+    def gated_record_attempt(*args, **kwargs):
+        try:
+            gate.wait(timeout=2.0)
+        except _rtp_threading.BrokenBarrierError:
+            pass  # the sibling was refused before admission -- proceed alone
+        return orig_ra(*args, **kwargs)
+
+    service._receipts.record_attempt = gated_record_attempt
+
+    results = {}
+
+    def go(name, req):
+        try:
+            result = service.dispatch(req, runner)
+            results[name] = ("ok", result.receipt["status"])
+        except _RtpError as exc:
+            results[name] = ("refused", exc.code)
+            gate.abort()  # release a winner parked at the record_attempt gate
+
+    threads = [
+        _rtp_threading.Thread(target=go, args=("a", req_a)),
+        _rtp_threading.Thread(target=go, args=("b", req_b)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5.0)
+
+    admitted = [v for v in results.values() if v[0] == "ok"]
+    refused = [v for v in results.values() if v[0] == "refused"]
+    assert len(admitted) == 1 and admitted[0][1] == "succeeded", results
+    assert len(refused) == 1 and refused[0][1] == "tool.over_budget", results
+    assert runs == [1]  # exactly one genuine execution, never two
+
+
+def test_rtp_fix_nonreserver_execution_permanently_consumes_the_slot():
+    # EDGE 1 (over-admission): two CONCURRENT DUPLICATES of the SAME request race
+    # so the NON-reserving duplicate is the one the receipt store genuinely runs
+    # (record_attempt's lock, not the admission order, picks the runner), while the
+    # reserving duplicate only replays.  When the budget tracked "which thread
+    # reserved", the reserver's finally released the slot the duplicate actually
+    # spent -> the slot leaked and a later DISTINCT request wrongly executed
+    # (ceiling 1 -> 2).  With the executed-count ledger, the genuine execution
+    # permanently consumes the one slot regardless of WHICH thread ran it, so the
+    # distinct request is refused.  Over-admits on HEAD; refuses after the fix.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+
+    req = _rtp_read_request("ready")
+    runs = []
+
+    def runner(_d, _i):
+        runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    # Force the leak-prone interleave deterministically: the RESERVING call (the
+    # one whose _reserve_budget returns True) parks BEFORE it reaches
+    # record_attempt, so the duplicate reserves nothing, enters record_attempt
+    # first, and is the thread that genuinely executes.  Then the reserver is
+    # released and only replays.  The patched wrapper preserves the real bool
+    # contract (True iff this call took the reservation) on BOTH HEAD and the fix.
+    real_reserve = service._reserve_budget
+    reserver_parked = _rtp_threading.Event()
+    release_reserver = _rtp_threading.Event()
+
+    def parking_reserve(idem):
+        took = real_reserve(idem)
+        if took:
+            reserver_parked.set()
+            release_reserver.wait(3.0)  # hold the reserver behind record_attempt
+        return took
+
+    service._reserve_budget = parking_reserve
+
+    results = {}
+
+    def go(name):
+        try:
+            results[name] = ("ok", service.dispatch(req, runner))
+        except _RtpError as exc:  # not expected in the burst
+            results[name] = ("refused", exc.code)
+
+    reserver = _rtp_threading.Thread(target=go, args=("reserver",))
+    reserver.start()
+    assert reserver_parked.wait(3.0)  # reserver holds the slot, parked pre-record
+
+    duplicate = _rtp_threading.Thread(target=go, args=("duplicate",))
+    duplicate.start()
+    duplicate.join(5.0)  # the duplicate reserves nothing, executes, and commits
+
+    release_reserver.set()
+    reserver.join(5.0)   # the reserver wakes and only replays the committed receipt
+
+    service._reserve_budget = real_reserve  # drop the coordination for the probe
+
+    # Exactly one genuine execution happened in the burst (the duplicate ran it;
+    # the reserver replayed), and it must have PERMANENTLY consumed the one slot.
+    assert runs == [1], results
+    replays = [r for _, r in results.values()]
+    assert sum(1 for r in replays if not r.replayed) == 1
+    assert sum(1 for r in replays if r.replayed) == 1
+
+    # A later DISTINCT request is refused: the single execution consumed the slot.
+    with pytest.raises(_RtpError) as exc:
+        service.dispatch(_rtp_read_request("claimed"), runner)
+    assert exc.value.code == "tool.over_budget"
+    assert runs == [1]  # the runner is never reached for the refused distinct call
+
+
+def test_rtp_fix_retriable_failed_read_is_bounded_at_one_execution():
+    # EDGE 2 (unbounded retry): a retriable ALWAYS-FAILING read at ceiling 1,
+    # dispatched sequentially, must genuinely execute EXACTLY once; every retry is
+    # refused tool.over_budget.  A failed read is not persisted, so the step-2
+    # receipt short-circuit does not fire on retry; when the budget kept a
+    # per-slot key without a permanent ledger, admission saw the key still held,
+    # returned "duplicate", and record_attempt (finding no receipt) RE-RAN the
+    # runner unbounded.  The executed-count ledger records the one genuine
+    # execution permanently, so the ceiling is honoured.  Unbounded on HEAD;
+    # bounded at one after the fix.
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    service = _rtp_service(capability=capability)
+
+    runs = []
+
+    def failing(_d, _i):
+        runs.append(1)
+        raise RuntimeError("the read backend is unavailable")
+
+    req = _rtp_read_request("ready")
+
+    first = service.dispatch(req, failing)  # attempt 1 genuinely executes...
+    assert first.replayed is False
+    assert first.receipt["status"] == "failed"  # ...and fails RETRIABLY (not persisted)
+
+    for _ in range(4):  # every retry of the SAME request is now over budget
+        with pytest.raises(_RtpError) as exc:
+            service.dispatch(req, failing)
+        assert exc.value.code == "tool.over_budget"
+
+    assert runs == [1]  # exactly one genuine execution, never unbounded
+
+
+def _rtp_ceiling_one_service():
+    capability = _rtp_capability()
+    capability["limits"]["max_concurrent_tool_calls"] = 1
+    capability["digest"] = _rtp_digest("plugin-capability", capability)
+    return _rtp_service(capability=capability)
+
+
+def test_rtp_fix3_effectful_grant_race_window_is_bounded_by_the_executor_gate():
+    # RESIDUAL 3a (effectful grant-race window): two CONCURRENT DUPLICATES of the
+    # same effectful request race the one-time approval grant.  The grant-LOSER is
+    # forced to be the budget reserver, so when it fails approval_invalid its
+    # finally empties _in_flight while the grant-WINNER (parked before its
+    # executor) has NOT yet incremented _executed_count.  In that window a DISTINCT
+    # request dispatches.  Admission-time enforcement alone admits it (count 0,
+    # in_flight empty) -> TWO genuine executions at ceiling 1.  The execution-time
+    # gate bounds it: whichever genuine execution reaches the executor second finds
+    # _executed_count already at the ceiling and is refused tool.over_budget before
+    # its runner runs.  Over-admits (2 genuine) on HEAD; bounded at 1 after the fix.
+    service = _rtp_ceiling_one_service()
+    req_e, subject_hash = _rtp_effect_request()
+    _rtp_grant(service, subject_hash)
+
+    effect_runs = []
+    distinct_runs = []
+
+    def effect_runner(_d, _i):
+        effect_runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"notified": "yes"})
+
+    def distinct_runner(_d, _i):
+        distinct_runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    # Force the grant-loser to reserve the budget key FIRST (so it, not the winner,
+    # holds the in-flight key it will release on failure) -- the exact window.
+    real_reserve = service._reserve_budget
+    loser_reserved = _rtp_threading.Event()
+
+    def ordered_reserve(idem):
+        if _rtp_threading.current_thread().name == "winner":
+            loser_reserved.wait(3.0)          # winner reserves AFTER the loser
+        took = real_reserve(idem)
+        if _rtp_threading.current_thread().name == "loser":
+            loser_reserved.set()
+        return took
+
+    service._reserve_budget = ordered_reserve
+
+    real_consume = service._consume_approval
+    winner_consumed = _rtp_threading.Event()
+    loser_failed = _rtp_threading.Event()
+    release_winner = _rtp_threading.Event()
+
+    def orchestrated_consume(request):
+        name = _rtp_threading.current_thread().name
+        if name == "loser":
+            assert winner_consumed.wait(3.0)  # the winner steals the one-time grant
+            real_consume(request)             # -> raises approval_invalid
+            return
+        if name == "winner":
+            real_consume(request)             # wins the one-time grant
+            winner_consumed.set()
+            assert loser_failed.wait(3.0)     # loser has failed + released its key
+            assert release_winner.wait(3.0)   # park BEFORE record_attempt / executor
+            return
+        real_consume(request)
+
+    service._consume_approval = orchestrated_consume
+
+    results = {}
+
+    def go(name, request, runner):
+        try:
+            results[name] = ("ok", service.dispatch(request, runner))
+        except _RtpError as exc:
+            results[name] = ("refused", exc.code)
+
+    loser = _rtp_threading.Thread(target=go, args=("loser", req_e, effect_runner), name="loser")
+    winner = _rtp_threading.Thread(target=go, args=("winner", req_e, effect_runner), name="winner")
+    loser.start()
+    winner.start()
+    loser.join(5.0)
+    assert results.get("loser") == ("refused", "tool.approval_invalid")
+    loser_failed.set()
+
+    # THE WINDOW: the winner (which WILL genuinely execute) has not yet incremented
+    # _executed_count and the loser's finally emptied _in_flight.  A distinct
+    # request now dispatches into that window.
+    window_state = (service._executed_count, set(service._in_flight))
+    try:
+        distinct_result = service.dispatch(_rtp_read_request("claimed"), distinct_runner)
+        distinct_outcome = ("ok", distinct_result.receipt["status"])
+    except _RtpError as exc:
+        distinct_outcome = ("refused", exc.code)
+
+    release_winner.set()
+    winner.join(5.0)
+    service._consume_approval = real_consume
+    service._reserve_budget = real_reserve
+
+    genuine = len(effect_runs) + len(distinct_runs)
+    assert genuine == 1, (
+        f"OVER-ADMISSION: window_state(count,in_flight)={window_state}, "
+        f"distinct_outcome={distinct_outcome}, winner_result={results.get('winner')}, "
+        f"effect_runs={effect_runs}, distinct_runs={distinct_runs}, "
+        f"executed_count={service._executed_count}, ceiling=1"
+    )
+    # The ledger never exceeds the ceiling, and the second genuine execution to
+    # reach the executor is refused tool.over_budget (its runner never runs).
+    assert service._executed_count == 1
+    over_budget = [v for v in (distinct_outcome, results.get("winner")) if v == ("refused", "tool.over_budget")]
+    assert len(over_budget) == 1, results
+
+
+def test_rtp_fix4_concurrent_duplicates_of_a_failing_read_are_bounded_at_one_execution():
+    # RESIDUAL EDGE2-concurrent: N CONCURRENT duplicates of an always-failing read
+    # at ceiling 1.  A failed read is not persisted, so the step-2 receipt
+    # short-circuit never fires, and keyed admission returns "duplicate" WITHOUT a
+    # ceiling check -- so all N pass admission, serialize on the store RLock, and
+    # (admission-time enforcement alone) each find no receipt and RE-EXECUTE ->
+    # up to N genuine executions at ceiling 1.  The execution-time gate bounds it:
+    # exactly ONE genuine execution passes _executed_count >= ceiling; the rest are
+    # refused tool.over_budget before their runner runs.  N genuine on HEAD; 1 after.
+    service = _rtp_ceiling_one_service()
+    req = _rtp_read_request("ready")
+    runs = []
+
+    def failing(_d, _i):
+        runs.append(1)
+        raise RuntimeError("the read backend is unavailable")
+
+    n = 4
+    real_reserve = service._reserve_budget
+    admitted_barrier = _rtp_threading.Barrier(n, timeout=5.0)
+
+    def barrier_reserve(idem):
+        took = real_reserve(idem)
+        admitted_barrier.wait()  # hold until all n are past admission (1 + n-1 dups)
+        return took
+
+    service._reserve_budget = barrier_reserve
+
+    results = []
+
+    def go():
+        try:
+            results.append(("ok", service.dispatch(req, failing)))
+        except _RtpError as exc:
+            results.append(("refused", exc.code))
+
+    threads = [_rtp_threading.Thread(target=go, name=f"dup{i}") for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10.0)
+    service._reserve_budget = real_reserve
+
+    assert len(runs) == 1, (
+        f"MULTI-EXECUTION: {len(runs)} genuine executions of a failing read at "
+        f"ceiling 1 in one concurrent duplicate burst: runs={runs}, "
+        f"executed_count={service._executed_count}, results={results}"
+    )
+    assert service._executed_count == 1
+    # Exactly one dispatch returns the (unpersisted) failed receipt; the rest are
+    # refused tool.over_budget at the authoritative execution-time gate.
+    ok = [r for r in results if r[0] == "ok"]
+    refused = [r for r in results if r == ("refused", "tool.over_budget")]
+    assert len(ok) == 1 and ok[0][1].receipt["status"] == "failed", results
+    assert len(refused) == n - 1, results
+
+
+def test_rtp_t005_concurrent_same_read_executes_once_and_the_receipt_lock_is_load_bearing():
+    service = _rtp_service()
+    req = _rtp_read_request("ready")
+    runs = []
+    replayed = []
+
+    def once(_d, _i):
+        runs.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    def go():
+        replayed.append(service.dispatch(req, once).replayed)
+
+    threads = [_rtp_threading.Thread(target=go) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(3.0)
+    assert runs.count(1) == 1
+    assert replayed.count(False) == 1 and replayed.count(True) == 5
+
+    service2 = _rtp_service()
+    req2 = _rtp_read_request("ready")
+    store = service2._receipts
+    real_lock = store._lock
+    store._lock = _rtp_contextlib.nullcontext()
+    runs2 = []
+    barrier = _rtp_threading.Barrier(2)
+
+    def contended(_d, _i):
+        barrier.wait(2.0)
+        runs2.append(1)
+        return _RtpOutcome("succeeded", external_ref={"rows": "7"})
+
+    try:
+        threads = [_rtp_threading.Thread(target=lambda: service2.dispatch(req2, contended)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(3.0)
+        assert runs2.count(1) == 2
+    finally:
+        store._lock = real_lock

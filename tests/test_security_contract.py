@@ -1375,3 +1375,123 @@ def test_ptd_t005_denied_receipt_summary_never_leaks():
                         preconditions=None)
     assert set(ok["run"]) <= {"run_id", "workflow_digest", "capability_profile_digest",
                               "started_at", "deadline", "traceparent"}
+
+
+# --------------------------------------------------------------------------- #
+# reviewed-tools-plugins T004/T005 — a chat tool dispatch's persisted + served
+# records (reconciliation summary, receipt error, external ref) never ferry a
+# credential, endpoint, or path.  Seeds the standard corpus INCLUDING the dotless
+# single-label host:port (serving:8443) the shared redact_config_text now
+# catches, and proves the scrub on the records the runtime persists and serves.
+# --------------------------------------------------------------------------- #
+
+import json as _rtpsec_json
+from pathlib import Path as _RtpSecPath
+
+from workbench.contracts import (
+    approval_payload_digest as _rtpsec_subject_hash,
+    contract_digest as _rtpsec_digest,
+    _plugin_approval_subject as _rtpsec_subject,
+)
+from workbench.models import OperationRefusal as _RtpSecRefusal
+from workbench.store import OperationOutcome as _RtpSecOutcome, UnknownOutcomeError as _RtpSecUnknown
+from workbench.tool_dispatch import (
+    ChatToolDispatchService as _RtpSecService,
+    ChatToolSession as _RtpSecSession,
+)
+
+_RTPSEC_EX = _RtpSecPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+_RTPSEC_NOTIFIER_DIGEST = "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+_RTPSEC_VIEWER_DIGEST = "sha256:4ae65e4cfc645dc1adf8a742e6485946c1961819b87039ffa0d93ea88253b4fd"
+
+
+def _rtpsec_service():
+    catalog = _rtpsec_json.loads((_RTPSEC_EX / "plugin.catalog.v1.json").read_text(encoding="utf-8"))
+    capability = _rtpsec_json.loads((_RTPSEC_EX / "plugin.capability.v1.json").read_text(encoding="utf-8"))
+    session = _RtpSecSession(session_id="chatsec1", catalog=catalog, capability=capability,
+                             actor_id="operator-01", bridge_id="bridge-a", project_id="proj-1")
+    return _RtpSecService(session)
+
+
+def _rtpsec_effect_request(grant_id="approval_secgrant0001"):
+    req = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_notifysec0001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": _RTPSEC_NOTIFIER_DIGEST},
+        "tool_call": {"tool_id": "notify.send", "inputs": {"message_ref": "deploy-msg-1"}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    subject_hash = _rtpsec_subject_hash(_rtpsec_subject(req))
+    req["approval"] = {"grant_id": grant_id, "action": "invoke_effect_tool", "payload_hash": subject_hash}
+    req["request_digest"] = _rtpsec_digest("plugin-request", req)
+    return req, subject_hash
+
+
+def _rtpsec_read_request():
+    req = {
+        "schema_version": "workbench-plugin-request/v1",
+        "request_id": "plugreq_taskssec00001",
+        "kind": "tool_call",
+        "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "anvil-tasks-viewer", "plugin_digest": _RTPSEC_VIEWER_DIGEST},
+        "tool_call": {"tool_id": "tasks.list", "inputs": {"status": "ready"}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    req["request_digest"] = _rtpsec_digest("plugin-request", req)
+    return req
+
+
+def test_rtp_t005_reconciliation_summary_never_leaks_the_corpus():
+    service = _rtpsec_service()
+    req, subject_hash = _rtpsec_effect_request()
+    service.approvals.grant("approval_secgrant0001", "invoke_effect_tool", subject_hash,
+                            "bridge-a", "proj-1")
+
+    def unconfirmed(_d, _i):
+        raise _RtpSecUnknown(_ptd_leaky_text(), reason="unknown_outcome")
+
+    result = service.dispatch(req, unconfirmed)
+    assert result.receipt["status"] == "reconciliation_required"
+    item = service.get_reconciliation(req["request_digest"])
+    blob = _ptd_scrub({"reconciliation": item})
+    text = _rtpsec_json.dumps(blob)
+    for secret in _PTD_CORPUS:
+        assert secret not in text, f"leak survived in served reconciliation: {secret}"
+
+
+def test_rtp_t005_read_failure_receipt_summary_never_leaks_the_corpus():
+    service = _rtpsec_service()
+
+    def boom(_d, _i):
+        raise RuntimeError(_ptd_leaky_text())
+
+    result = service.dispatch(_rtpsec_read_request(), boom)
+    assert result.receipt["status"] == "failed"
+    text = _rtpsec_json.dumps(_ptd_scrub({"receipt": result.receipt}))
+    for secret in _PTD_CORPUS:
+        assert secret not in text, f"leak survived in read failure receipt: {secret}"
+
+
+def test_rtp_t005_receipt_external_ref_leak_collapses_to_a_redacted_token():
+    # A tool that returns a leaky external_ref value: the receipt collapses it to
+    # a fixed redacted token rather than persisting the path/secret verbatim.
+    service = _rtpsec_service()
+    out = service.dispatch(_rtpsec_read_request(), lambda d, i: _RtpSecOutcome(
+        "succeeded", external_ref={"path": "/etc/anvil/secrets.env"}))
+    assert out.receipt["status"] == "succeeded"
+    text = _rtpsec_json.dumps(_ptd_scrub({"receipt": out.receipt}))
+    assert "/etc/anvil/secrets.env" not in text
+
+
+def test_rtp_t004_served_tool_projection_reports_credentials_by_reference_only():
+    service = _rtpsec_service()
+    served = _ptd_scrub({"tools": service.list_tools()})
+    text = _rtpsec_json.dumps(served)
+    # deploy-notifier declares a host-owned credential: it is present by reference
+    # (owner host + ref id) and carries no value/secret field.
+    assert "deploy-channel-ref" in text
+    assert '"value"' not in text and '"secret"' not in text
+    for secret in _PTD_CORPUS:
+        assert secret not in text

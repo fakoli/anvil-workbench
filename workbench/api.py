@@ -28,6 +28,7 @@ from .delivery_projection import (
 from .directives import session_directive_view, submit_directive
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore
 from .plugin_host import PluginHostService
+from .tool_dispatch import ChatToolDispatchService
 from .preference_gates import (
     PolicyGateError,
     PolicyGateService,
@@ -638,6 +639,72 @@ def build_plugin_router(
     return router
 
 
+#: The single fixed 404 body an unknown dispatch receipt/reconciliation lookup
+#: returns, so the chat-tools surface is never an existence oracle for a
+#: never-dispatched request digest.
+_UNKNOWN_TOOL_RECORD_DETAIL = "unknown tool record"
+
+
+def build_chat_tools_router(
+    actor_dependency: Callable[..., str],
+    chat_tool_dispatch_service: "ChatToolDispatchService | None",
+) -> APIRouter:
+    """Build the read-only chat capability-pin + dispatch-record browser surface.
+
+    Serves only the redacted projection of the chat session's PINNED, reviewed,
+    capability-enabled tools and its stored, redacted dispatch receipts /
+    reconciliation items.  Every response body is scrubbed at this last hop with
+    :func:`~workbench.redaction.scrub_config_payload`, so even untrusted tool
+    prose (a summary, a reconciliation line) cannot ferry a secret, endpoint, or
+    path to the UI (reviewed-tools-plugins T004 criterion 3 / T005).
+
+    The surface is deliberately READ-ONLY: it registers only ``GET`` routes.
+    A tool DISPATCH (and its effectful preview/approval) is a bridge/hub effect
+    exercised at the :class:`ChatToolDispatchService` layer, never a browser
+    mutation.  When ``chat_tool_dispatch_service`` is ``None`` the lane is not
+    configured (it is deliberately NOT wired into the live bridge poll loop) and
+    every endpoint refuses with 503, mirroring the unconfigured plugin host.
+    """
+    router = APIRouter(prefix="/api/chat/tools")
+
+    def service() -> "ChatToolDispatchService":
+        if chat_tool_dispatch_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="chat tool dispatch is not configured",
+            )
+        return chat_tool_dispatch_service
+
+    @router.get("")
+    def list_tools(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """Every pinned, capability-enabled tool's redacted projection."""
+        return scrub_config_payload({"tools": service().list_tools()})
+
+    @router.get("/receipts/{idempotency_key}")
+    def get_receipt(
+        idempotency_key: str = Path(pattern=_REQUEST_DIGEST_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One stored dispatch receipt, redacted; a missing key is a plain 404."""
+        receipt = service().get_receipt(idempotency_key)
+        if receipt is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_TOOL_RECORD_DETAIL)
+        return scrub_config_payload({"receipt": receipt})
+
+    @router.get("/reconciliations/{idempotency_key}")
+    def get_reconciliation(
+        idempotency_key: str = Path(pattern=_REQUEST_DIGEST_PATTERN),
+        _actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """One stored reconciliation item, redacted; a missing key is a plain 404."""
+        item = service().get_reconciliation(idempotency_key)
+        if item is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_TOOL_RECORD_DETAIL)
+        return scrub_config_payload({"reconciliation": item})
+
+    return router
+
+
 #: The setting-id path grammar, mirrored from the settings-descriptor
 #: ``settingId`` definition, so a malformed id is rejected at the edge (422)
 #: before it reaches the store as a distinguishable lookup.
@@ -1011,6 +1078,7 @@ def create_app(
     delivery_projection_store: DeliveryProjectionStore | None = None,
     system_health: SystemHealthService | None = None,
     plugin_host_service: "PluginHostService | None" = None,
+    chat_tool_dispatch_service: "ChatToolDispatchService | None" = None,
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
@@ -1055,6 +1123,12 @@ def create_app(
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless a service is injected, so the browser surface fails closed (503).
     app.state.plugin_host_service = plugin_host_service
+    # The chat capability-pin + tool-dispatch surface is a hub-side supervision
+    # read-model that is deliberately NOT wired into the live bridge poll loop; it
+    # stays ``None`` unless a service is injected, so the browser surface fails
+    # closed (503). Tool dispatch itself is a bridge/hub effect at the service
+    # layer, never a browser mutation path.
+    app.state.chat_tool_dispatch_service = chat_tool_dispatch_service
     # The scoped preference store is a hub-side supervision read/write model that
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless injected, so the browser surface fails closed (503).
@@ -1179,6 +1253,13 @@ def create_app(
     # receipts; a credential value is never accepted from nor returned to the
     # browser (credentials are reported by opaque reference only).
     app.include_router(build_plugin_router(actor, plugin_host_service))
+    # Read-only chat capability-pin + tool-dispatch-record surface (reviewed-
+    # tools-plugins T004/T005): authenticated by the same trusted ``actor``
+    # dependency, GET-only, and fail-closed (503) until a dispatch service is
+    # configured. Serves only the pinned redacted tool projection and stored,
+    # redacted dispatch receipts / reconciliation items; a tool dispatch is a
+    # bridge/hub effect at the service layer, never a browser mutation.
+    app.include_router(build_chat_tools_router(actor, chat_tool_dispatch_service))
     # Actor-scoped preference read/write surface (preferences-configuration
     # T002.3): authenticated by the same trusted ``actor`` dependency, personal
     # namespace bound to the authenticated actor, and fail-closed (503) until a

@@ -1663,3 +1663,111 @@ def test_ptd_t008_directive_reports_included_after_real_packet_assembly():
         assert [d["content"] for d in after["included"]] == ["Run the independent evidence check."]
         assert after["pending"] == []
         assert after["included_up_to_sequence"] >= directive_sequence
+
+
+# --------------------------------------------------------------------------- #
+# reviewed-tools-plugins T004/T005 — the read-only chat capability-pin +
+# dispatch-record browser surface: fail-closed (503) until a dispatch service is
+# injected, GET-only, and scrubbed at the last hop.
+# --------------------------------------------------------------------------- #
+
+import json as _ctd_json
+from pathlib import Path as _CtdPath
+
+from workbench.contracts import (
+    approval_payload_digest as _ctd_subject_hash,
+    contract_digest as _ctd_digest,
+    _plugin_approval_subject as _ctd_subject,
+)
+from workbench.store import UnknownOutcomeError as _CtdUnknown
+from workbench.tool_dispatch import (
+    ChatToolDispatchService as _CtdService,
+    ChatToolSession as _CtdSession,
+)
+
+_CTD_EX = _CtdPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+_CTD_ACTOR = {"X-Workbench-Actor": "operator"}
+_CTD_NOTIFIER_DIGEST = "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+
+
+def _ctd_load(name):
+    return _ctd_json.loads((_CTD_EX / name).read_text(encoding="utf-8"))
+
+
+def _ctd_service_with_reconcile():
+    session = _CtdSession(
+        session_id="chatapi1", catalog=_ctd_load("plugin.catalog.v1.json"),
+        capability=_ctd_load("plugin.capability.v1.json"),
+        actor_id="operator-01", bridge_id="bridge-a", project_id="proj-1",
+    )
+    service = _CtdService(session)
+    req = {
+        "schema_version": "workbench-plugin-request/v1", "request_id": "plugreq_notifyapi0001",
+        "kind": "tool_call", "actor": {"actor_id": "operator-01", "kind": "operator"},
+        "plugin": {"plugin_id": "deploy-notifier", "plugin_digest": _CTD_NOTIFIER_DIGEST},
+        "tool_call": {"tool_id": "notify.send", "inputs": {"message_ref": "deploy-msg-1"}},
+        "created_at": "2026-07-20T12:00:00Z",
+    }
+    subject_hash = _ctd_subject_hash(_ctd_subject(req))
+    req["approval"] = {"grant_id": "approval_apigrant0001", "action": "invoke_effect_tool",
+                       "payload_hash": subject_hash}
+    req["request_digest"] = _ctd_digest("plugin-request", req)
+    service.approvals.grant("approval_apigrant0001", "invoke_effect_tool", subject_hash,
+                            "bridge-a", "proj-1")
+
+    def unconfirmed(_d, _i):
+        raise _CtdUnknown("outcome unknown near serving:8443 token=ghp_abcdefghijklmnopqrstuvwxyz012345",
+                          reason="unknown_outcome")
+
+    service.dispatch(req, unconfirmed)
+    return service, req["request_digest"]
+
+
+def _ctd_client(service):
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph(),
+                                 chat_tool_dispatch_service=service))
+
+
+def test_unconfigured_chat_tools_surface_fails_closed():
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as client_:
+        assert client_.get("/api/chat/tools", headers=_CTD_ACTOR).status_code == 503
+        assert client_.get(
+            "/api/chat/tools/receipts/sha256:" + "0" * 64, headers=_CTD_ACTOR).status_code == 503
+        assert client_.get(
+            "/api/chat/tools/reconciliations/sha256:" + "0" * 64, headers=_CTD_ACTOR).status_code == 503
+
+
+def test_chat_tools_lists_pinned_tools_by_reference_only():
+    service, _ = _ctd_service_with_reconcile()
+    with _ctd_client(service) as client_:
+        body = client_.get("/api/chat/tools", headers=_CTD_ACTOR).json()
+    tools = {t["tool_id"] for p in body["tools"] for t in p["tools"]}
+    assert tools == {"tasks.list", "issues.read", "notify.send"}
+    text = _ctd_json.dumps(body)
+    assert '"value"' not in text and '"secret"' not in text
+
+
+def test_chat_tools_served_reconciliation_is_scrubbed_and_unknown_is_a_plain_404():
+    service, digest = _ctd_service_with_reconcile()
+    with _ctd_client(service) as client_:
+        resp = client_.get(f"/api/chat/tools/reconciliations/{digest}", headers=_CTD_ACTOR)
+        assert resp.status_code == 200
+        text = _ctd_json.dumps(resp.json())
+        assert "serving:8443" not in text
+        assert "ghp_abcdefghijklmnopqrstuvwxyz012345" not in text
+        # An unknown digest is a plain fixed 404 (not an existence oracle).
+        missing = client_.get(
+            "/api/chat/tools/reconciliations/sha256:" + "0" * 64, headers=_CTD_ACTOR)
+        assert missing.status_code == 404
