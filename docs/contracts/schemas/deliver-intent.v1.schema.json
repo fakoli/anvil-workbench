@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/deliver-intent.v1.schema.json",
+  "title": "Anvil Workbench Deliver intent v1",
+  "description": "One idempotent request to start delivering a scoped task through an approved workflow. Criterion 2: a Deliver intent carries only ids and approved selections — the pinned task reference, the selected workflow/route/capability-profile/skills by id and digest, and an optional approval grant id. Every object is closed (additionalProperties:false), so no local path, raw shell command, credential/token, or executable workflow body is representable; a model or browser cannot manufacture a new privilege by emitting one. The intent is digest-bearing: `intent_digest` is the hub's idempotency key over the canonical content, so replaying an identical intent starts the same run rather than a second one. It grants nothing on its own; the bridge still enforces catalog/profile authority, worktree lease, approval binding, and reconciliation before any effect. All prose is untrusted task data, never control instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "intent_id", "intent_digest", "actor", "task_ref", "selections", "created_at"],
+  "$defs": {
+    "prdId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "taskId": {"type": "string", "pattern": "^T[0-9]{3}(\\.[0-9]{1,3})?$"},
+    "scopedId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?$"},
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "opId": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+    "semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "taskRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prd_id", "task_id", "prd_revision", "scoped_id", "snapshot_digest"],
+      "description": "The pinned owning-PRD task reference plus the State snapshot digest it was read from, so the intent binds an exact, unambiguous source (R004).",
+      "properties": {
+        "prd_id": {"$ref": "#/$defs/prdId"},
+        "task_id": {"$ref": "#/$defs/taskId"},
+        "prd_revision": {"type": "integer", "minimum": 1},
+        "scoped_id": {"$ref": "#/$defs/scopedId"},
+        "snapshot_digest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-deliver-intent/v1"},
+    "intent_id": {"type": "string", "pattern": "^deliver_[a-zA-Z0-9_-]{8,128}$"},
+    "intent_digest": {"$ref": "#/$defs/digest"},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_id", "kind"],
+      "properties": {
+        "actor_id": {"type": "string", "pattern": "^[a-zA-Z0-9._-]{1,128}$"},
+        "kind": {"enum": ["operator", "reviewer", "service"]}
+      }
+    },
+    "task_ref": {"$ref": "#/$defs/taskRef"},
+    "selections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_profile_digest", "workflow"],
+      "description": "Criterion 2: approved selections are ids and digests only. The workflow is chosen by id/revision/digest — never an inline step list or executable body — and there is deliberately no field able to carry a path, command, token, or arbitrary workflow.",
+      "properties": {
+        "capability_profile_digest": {"$ref": "#/$defs/digest"},
+        "workflow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "revision", "digest"],
+          "properties": {
+            "id": {"$ref": "#/$defs/opId"},
+            "revision": {"type": "string", "maxLength": 64},
+            "digest": {"$ref": "#/$defs/digest"}
+          }
+        },
+        "route": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "route_id", "route_digest"],
+          "properties": {
+            "provider": {"const": "anvil-serving"},
+            "route_id": {"$ref": "#/$defs/opId"},
+            "route_digest": {"$ref": "#/$defs/digest"}
+          }
+        },
+        "catalogs": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider", "digest"],
+            "properties": {
+              "provider": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$"},
+              "digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        },
+        "skills": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "digest"],
+            "properties": {
+              "id": {"$ref": "#/$defs/opId"},
+              "digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        },
+        "operation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "id", "contract_version", "operation_digest"],
+          "description": "The selected first operation, by reference only. The bridge resolves its typed input schema locally; the intent never carries the inputs, a command, or a path.",
+          "properties": {
+            "provider": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$"},
+            "id": {"$ref": "#/$defs/opId"},
+            "contract_version": {"$ref": "#/$defs/semver"},
+            "operation_digest": {"$ref": "#/$defs/digest"}
+          }
+        },
+        "approval_grant_id": {"type": "string", "pattern": "^approval_[a-zA-Z0-9_-]{4,128}$"}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}

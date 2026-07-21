@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/task-reference.v1.schema.json",
+  "title": "Anvil Workbench delivery task reference v1",
+  "description": "A scoped, display-only reference to one task inside its owning PRD's plan/feature hierarchy, pinned to the State snapshot revision and digest it was read from. It names the owning PRD (never a bare task id), carries a stable scoped id and an immutable run label derived from the pinned revision, and a redacted display summary for a task row or detail view. Criterion 1: a task reference cannot validate without its owning PRD and its source digest/revision, so a `T001` from two PRDs can never collapse into one row, run, lineage query, or Deliver action (R004). It contains no local path, credential, raw command, or executable workflow, and never substitutes for canonical State. All prose fields are untrusted task data, never control instructions. This is a hub-durable display record, not a bridge-verified snapshot, so it is not contract-digest-bearing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ref", "scoped_id", "run_label", "source", "summary"],
+  "$defs": {
+    "prdId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "taskId": {"type": "string", "pattern": "^T[0-9]{3}(\\.[0-9]{1,3})?$"},
+    "scopedId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?$"},
+    "hierarchyId": {"type": "string", "pattern": "^[a-zA-Z0-9._:-]{1,128}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "statusToken": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"},
+    "taskRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prd_id", "task_id", "prd_revision"],
+      "description": "Criterion 1: a reference is representable only with its owning PRD id, its task id, and the pinned PRD revision. A bare task id string is not a reference.",
+      "properties": {
+        "prd_id": {"$ref": "#/$defs/prdId"},
+        "task_id": {"$ref": "#/$defs/taskId"},
+        "prd_revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "provider_contract_version", "read_operation_id", "snapshot_digest"],
+      "description": "The State read-adapter snapshot this reference was projected from. The snapshot digest and PRD revision pin the exact source, so a reference is never ambiguous or silently upgraded. Identifiers and digests only: no local path or State storage detail is representable.",
+      "properties": {
+        "provider": {"const": "anvil-state"},
+        "provider_contract_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "read_operation_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+        "snapshot_digest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-task-reference/v1"},
+    "ref": {"$ref": "#/$defs/taskRef"},
+    "scoped_id": {"$ref": "#/$defs/scopedId"},
+    "run_label": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?@r[0-9]+$",
+      "description": "An immutable label for a delivery run of this task, derived as `<scoped_id>@r<prd_revision>`. Because it embeds the pinned revision, it never changes for a fixed source; a new revision is a new label, never a rewrite. `workbench.contracts.validate_task_reference` refuses a label that does not equal the scoped id and pinned revision."
+    },
+    "source": {"$ref": "#/$defs/source"},
+    "hierarchy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prd_id"],
+      "description": "The task's display position within its owning PRD's plan/feature hierarchy (R002, R003). Ownership is by id only; this never implies a claim, lease, or effect grant.",
+      "properties": {
+        "prd_id": {"$ref": "#/$defs/prdId"},
+        "prd_title": {"type": "string", "maxLength": 500},
+        "plan_id": {"$ref": "#/$defs/hierarchyId"},
+        "feature_id": {"$ref": "#/$defs/hierarchyId"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "title", "status"],
+      "description": "The redacted display projection for a task row or detail view (R003). Titles, statuses, and counts only; no raw command, path, token, or transcript is representable.",
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "title": {"type": "string", "maxLength": 500},
+        "status": {"$ref": "#/$defs/statusToken"},
+        "priority": {"$ref": "#/$defs/statusToken"},
+        "latest_delivery_status": {"$ref": "#/$defs/statusToken"},
+        "acceptance_criteria_count": {"type": "integer", "minimum": 0, "maximum": 256},
+        "verification_summary": {"type": "string", "maxLength": 500},
+        "depends_on": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/taskRef"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": "workbench-deliver-start-receipt/v1",
+  "intent_digest": "sha256:54ce798bb99a3b9c947bd9e854ac170f843f3ee494505d9b36c38a2c23cf326c",
+  "status": "denied",
+  "task_ref": {
+    "prd_id": "release-alpha",
+    "task_id": "T001",
+    "prd_revision": 4,
+    "scoped_id": "release-alpha:T001"
+  },
+  "error": {
+    "code": "eligibility.blocked",
+    "safe_summary": "A dependency task has not reached an accepted merge yet, so delivery cannot start.",
+    "retryable": false
+  },
+  "redaction": {
+    "status": "metadata_only"
+  }
+}

@@ -290,6 +290,193 @@ def _reset_advanced_preset_contract_validator_cache() -> None:
     _advanced_preset_contract_validator_cache = None
 
 
+_TASK_REFERENCE_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "task-reference.v1.schema.json"
+)
+_task_reference_contract_validator_cache: Draft202012Validator | None = None
+
+
+def task_reference_contract_validator() -> Draft202012Validator:
+    """Load the task-reference contract schema once; fail closed if absent.
+
+    Shared by every task-reference consumer (the Project surface, a task row or
+    detail view, the Deliver flow) so there is exactly one interpretation of the
+    contract schema.  The closed-root and closed-reference guards refuse a schema
+    edit that would reopen the reference or its owning-PRD/source blocks to
+    unreviewed extension fields: a task reference must stay a closed record that
+    always names its owning PRD and pinned source, never an extensible envelope
+    through which a bare task id or a raw path could ride in.
+    """
+    global _task_reference_contract_validator_cache
+    if _task_reference_contract_validator_cache is None:
+        try:
+            schema = json.loads(_TASK_REFERENCE_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "task-reference contract schema is unavailable; refusing to validate references"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "task-reference contract schema no longer closes its root object; "
+                "refusing to validate references"
+            )
+        for name in ("taskRef", "source"):
+            node = schema.get("$defs", {}).get(name)
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"task-reference contract schema no longer closes its {name} object; "
+                    "refusing to validate references"
+                )
+        _task_reference_contract_validator_cache = Draft202012Validator(schema)
+    return _task_reference_contract_validator_cache
+
+
+def _reset_task_reference_contract_validator_cache() -> None:
+    """Test hook: force the next task-reference validation to reload the on-disk schema."""
+    global _task_reference_contract_validator_cache
+    _task_reference_contract_validator_cache = None
+
+
+_DELIVERY_ELIGIBILITY_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "delivery-eligibility.v1.schema.json"
+)
+_delivery_eligibility_contract_validator_cache: Draft202012Validator | None = None
+
+
+def delivery_eligibility_contract_validator() -> Draft202012Validator:
+    """Load the delivery-eligibility contract schema once; fail closed if absent.
+
+    Shared by every eligibility consumer so there is exactly one interpretation
+    of the contract schema.  The closed-root and closed-reason guards refuse a
+    schema edit that would reopen the verdict or a reason to unreviewed extension
+    fields: an eligibility verdict must stay a closed record whose blocked/stale
+    reasons are a bounded typed enumeration with a human-safe explanation, never
+    an extensible envelope through which a raw error string could ride in.
+    """
+    global _delivery_eligibility_contract_validator_cache
+    if _delivery_eligibility_contract_validator_cache is None:
+        try:
+            schema = json.loads(_DELIVERY_ELIGIBILITY_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "delivery-eligibility contract schema is unavailable; refusing to validate verdicts"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "delivery-eligibility contract schema no longer closes its root object; "
+                "refusing to validate verdicts"
+            )
+        reason = schema.get("properties", {}).get("reasons", {}).get("items", {})
+        if not isinstance(reason, dict) or reason.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "delivery-eligibility contract schema no longer closes its reason object; "
+                "refusing to validate verdicts"
+            )
+        _delivery_eligibility_contract_validator_cache = Draft202012Validator(schema)
+    return _delivery_eligibility_contract_validator_cache
+
+
+def _reset_delivery_eligibility_contract_validator_cache() -> None:
+    """Test hook: force the next eligibility validation to reload the on-disk schema."""
+    global _delivery_eligibility_contract_validator_cache
+    _delivery_eligibility_contract_validator_cache = None
+
+
+_DELIVER_INTENT_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "deliver-intent.v1.schema.json"
+)
+_deliver_intent_contract_validator_cache: Draft202012Validator | None = None
+
+
+def deliver_intent_contract_validator() -> Draft202012Validator:
+    """Load the Deliver-intent contract schema once; fail closed if absent.
+
+    Shared by every Deliver-intent consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root and closed-selections
+    guards refuse a schema edit that would reopen the intent or its selections to
+    unreviewed extension fields: a Deliver intent must stay a closed ids-only
+    record, never an extensible envelope through which a path, a raw command, a
+    token, or an executable workflow body could ride in.
+    """
+    global _deliver_intent_contract_validator_cache
+    if _deliver_intent_contract_validator_cache is None:
+        try:
+            schema = json.loads(_DELIVER_INTENT_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "deliver-intent contract schema is unavailable; refusing to validate intents"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "deliver-intent contract schema no longer closes its root object; "
+                "refusing to validate intents"
+            )
+        selections = schema.get("properties", {}).get("selections", {})
+        if not isinstance(selections, dict) or selections.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "deliver-intent contract schema no longer closes its selections object; "
+                "refusing to validate intents"
+            )
+        task_ref = schema.get("$defs", {}).get("taskRef")
+        if not isinstance(task_ref, dict) or task_ref.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "deliver-intent contract schema no longer closes its taskRef object; "
+                "refusing to validate intents"
+            )
+        _deliver_intent_contract_validator_cache = Draft202012Validator(schema)
+    return _deliver_intent_contract_validator_cache
+
+
+def _reset_deliver_intent_contract_validator_cache() -> None:
+    """Test hook: force the next Deliver-intent validation to reload the on-disk schema."""
+    global _deliver_intent_contract_validator_cache
+    _deliver_intent_contract_validator_cache = None
+
+
+_DELIVER_START_RECEIPT_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "deliver-start-receipt.v1.schema.json"
+)
+_deliver_start_receipt_contract_validator_cache: Draft202012Validator | None = None
+
+
+def deliver_start_receipt_contract_validator() -> Draft202012Validator:
+    """Load the Deliver start-receipt contract schema once; fail closed if absent.
+
+    Shared by every start-receipt consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root guard refuses a
+    schema edit that would reopen the receipt to unreviewed extension fields: a
+    start receipt must stay a closed redacted record, never an extensible
+    envelope through which an endpoint, a raw command, or a token could ride in.
+    """
+    global _deliver_start_receipt_contract_validator_cache
+    if _deliver_start_receipt_contract_validator_cache is None:
+        try:
+            schema = json.loads(_DELIVER_START_RECEIPT_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "deliver-start-receipt contract schema is unavailable; refusing to validate receipts"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "deliver-start-receipt contract schema no longer closes its root object; "
+                "refusing to validate receipts"
+            )
+        task_ref = schema.get("$defs", {}).get("taskRef")
+        if not isinstance(task_ref, dict) or task_ref.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "deliver-start-receipt contract schema no longer closes its taskRef object; "
+                "refusing to validate receipts"
+            )
+        _deliver_start_receipt_contract_validator_cache = Draft202012Validator(schema)
+    return _deliver_start_receipt_contract_validator_cache
+
+
+def _reset_deliver_start_receipt_contract_validator_cache() -> None:
+    """Test hook: force the next start-receipt validation to reload the on-disk schema."""
+    global _deliver_start_receipt_contract_validator_cache
+    _deliver_start_receipt_contract_validator_cache = None
+
+
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -384,6 +571,7 @@ _PREFIXES = {
     "prd-content": b"anvil-workbench/prd-content/v1\0",
     "settings-descriptor": b"anvil-workbench/settings-descriptor/v1\0",
     "advanced-preset": b"anvil-workbench/advanced-preset/v1\0",
+    "deliver-intent": b"anvil-workbench/deliver-intent/v1\0",
 }
 
 
@@ -514,6 +702,24 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
             payload["tools"] = sorted(
                 copy.deepcopy(tools), key=lambda item: str(item.get("tool_id", ""))
             )
+    elif kind == "deliver-intent":
+        # Exclude the digest: the same intent content must hash identically so
+        # the idempotency key is stable, and replaying an identical intent
+        # starts the same run rather than a second one.  Sort the selection
+        # lists so their order never changes the key.
+        payload = _without(value, "intent_digest")
+        selections = payload.get("selections")
+        if isinstance(selections, Mapping):
+            selections = copy.deepcopy(selections)
+            payload["selections"] = selections
+            catalogs = selections.get("catalogs")
+            if isinstance(catalogs, list):
+                selections["catalogs"] = sorted(catalogs, key=lambda item: str(item.get("provider", "")))
+            skills = selections.get("skills")
+            if isinstance(skills, list):
+                selections["skills"] = sorted(
+                    skills, key=lambda item: (str(item.get("id", "")), str(item.get("digest", "")))
+                )
     return payload
 
 
@@ -939,6 +1145,157 @@ def validate_advanced_preset(
             )
     elif status != "ready":
         raise ContractValidationError("advanced preset without digest drift must be ready")
+
+
+_DELIVERY_ELIGIBILITY_STATES = ("eligible", "blocked", "stale")
+_DELIVERY_REASON_CLASSES = ("blocked", "stale", "info")
+
+
+def validate_task_reference(reference: Mapping[str, Any]) -> None:
+    """Fail closed when a scoped task reference is internally inconsistent.
+
+    JSON Schema pins the shape and requires the owning PRD, the pinned revision,
+    and the source snapshot digest (criterion 1: a reference cannot validate
+    without its owning PRD and source digest/revision).  These are the
+    cross-field rules it cannot express:
+
+    * the display ``scoped_id`` must equal ``<prd_id>:<task_id>`` so two PRDs'
+      ``T001`` tasks can never collapse into one row or run (R004);
+    * the immutable ``run_label`` must equal ``<scoped_id>@r<prd_revision>``, so
+      the label is derived from the pinned revision and cannot silently drift;
+    * an optional ``hierarchy`` block must name the same owning PRD.
+    """
+    try:
+        task_reference_contract_validator().validate(dict(reference))
+    except ValidationError as exc:
+        raise ContractValidationError(f"task reference is not schema valid: {exc.message}") from exc
+
+    ref = reference.get("ref")
+    if not isinstance(ref, Mapping):
+        raise ContractValidationError("task reference has no typed reference")
+    prd_id = str(ref.get("prd_id"))
+    task_id = str(ref.get("task_id"))
+    scoped_id = f"{prd_id}:{task_id}"
+    if reference.get("scoped_id") != scoped_id:
+        raise ContractValidationError(f"scoped_id does not match its typed reference: {reference.get('scoped_id')}")
+    expected_label = f"{scoped_id}@r{ref.get('prd_revision')}"
+    if reference.get("run_label") != expected_label:
+        raise ContractValidationError(
+            f"run_label is not the immutable <scoped_id>@r<prd_revision> label: {reference.get('run_label')}"
+        )
+    hierarchy = reference.get("hierarchy")
+    if isinstance(hierarchy, Mapping) and hierarchy.get("prd_id") != prd_id:
+        raise ContractValidationError("hierarchy names a different owning PRD than the reference")
+
+
+def validate_delivery_eligibility(verdict: Mapping[str, Any]) -> None:
+    """Fail closed when a delivery-eligibility verdict is internally inconsistent.
+
+    JSON Schema pins each reason's shape and enumerates the stable codes and the
+    human-safe explanation pattern (criterion 3).  These are the cross-field
+    rules it cannot express:
+
+    * the ``state`` is derived, not free: ``blocked`` when any reason is blocked,
+      else ``stale`` when any reason is stale, else ``eligible``;
+    * ``eligible`` is true only when the derived state is ``eligible``;
+    * each reason's ``code`` prefix must match its declared ``class`` so a stale
+      code can never be filed under a blocked reason.
+    """
+    try:
+        delivery_eligibility_contract_validator().validate(dict(verdict))
+    except ValidationError as exc:
+        raise ContractValidationError(f"delivery eligibility is not schema valid: {exc.message}") from exc
+
+    scoped_id = verdict.get("scoped_id")
+    ref = verdict.get("ref")
+    if isinstance(ref, Mapping) and scoped_id != f"{ref.get('prd_id')}:{ref.get('task_id')}":
+        raise ContractValidationError(f"scoped_id does not match its typed reference: {scoped_id}")
+
+    reasons = verdict.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        raise ContractValidationError("delivery eligibility has no reasons")
+    classes: set[str] = set()
+    for reason in reasons:
+        if not isinstance(reason, Mapping):
+            raise ContractValidationError("delivery eligibility reason is not an object")
+        reason_class = str(reason.get("class"))
+        code = str(reason.get("code"))
+        if not code.startswith(f"{reason_class}."):
+            raise ContractValidationError(f"reason code does not match its class: {code}")
+        classes.add(reason_class)
+
+    expected_state = "blocked" if "blocked" in classes else "stale" if "stale" in classes else "eligible"
+    if verdict.get("state") != expected_state:
+        raise ContractValidationError(
+            f"eligibility state must be the derived {expected_state!r}, not {verdict.get('state')!r}"
+        )
+    if bool(verdict.get("eligible")) != (expected_state == "eligible"):
+        raise ContractValidationError("eligible flag disagrees with the derived state")
+
+
+def validate_deliver_intent(intent: Mapping[str, Any]) -> None:
+    """Fail closed when a Deliver intent is tampered with or inconsistent.
+
+    JSON Schema pins the ids-only shape and, because every object is closed,
+    already makes a path, raw command, token, or executable workflow body
+    unrepresentable (criterion 2).  These are the cross-field rules it cannot
+    express:
+
+    * the advertised ``intent_digest`` must recompute over the canonical content,
+      so it is a tamper-evident idempotency key — replaying an identical intent
+      starts the same run, and a mutated intent fails closed;
+    * the pinned ``task_ref.scoped_id`` must equal ``<prd_id>:<task_id>`` so the
+      intent binds one unambiguous task (R004).
+    """
+    try:
+        deliver_intent_contract_validator().validate(dict(intent))
+    except ValidationError as exc:
+        raise ContractValidationError(f"deliver intent is not schema valid: {exc.message}") from exc
+
+    if intent.get("intent_digest") != contract_digest("deliver-intent", intent):
+        raise ContractValidationError("deliver intent digest mismatch")
+
+    task_ref = intent.get("task_ref")
+    if not isinstance(task_ref, Mapping):
+        raise ContractValidationError("deliver intent has no typed task reference")
+    if task_ref.get("scoped_id") != f"{task_ref.get('prd_id')}:{task_ref.get('task_id')}":
+        raise ContractValidationError(f"deliver intent scoped_id does not match its reference: {task_ref.get('scoped_id')}")
+
+
+def validate_deliver_start_receipt(
+    receipt: Mapping[str, Any], intent: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail closed when a Deliver start receipt is inconsistent with its intent.
+
+    JSON Schema pins the accepted/duplicate/denied shapes (an accepted or
+    duplicate start carries a bounded run, a denied start carries a stable error
+    code and human-safe summary).  These are the cross-field rules it cannot
+    express:
+
+    * a start receipt echoes the intent's ``intent_digest`` idempotency key, so a
+      receipt can never be bound to a different intent than the one presented;
+    * when the originating intent is supplied, the receipt's ``task_ref`` scopes
+      to the same task.
+    """
+    try:
+        deliver_start_receipt_contract_validator().validate(dict(receipt))
+    except ValidationError as exc:
+        raise ContractValidationError(f"deliver start receipt is not schema valid: {exc.message}") from exc
+
+    task_ref = receipt.get("task_ref")
+    if not isinstance(task_ref, Mapping):
+        raise ContractValidationError("deliver start receipt has no typed task reference")
+    if task_ref.get("scoped_id") != f"{task_ref.get('prd_id')}:{task_ref.get('task_id')}":
+        raise ContractValidationError(
+            f"deliver start receipt scoped_id does not match its reference: {task_ref.get('scoped_id')}"
+        )
+
+    if intent is not None:
+        if receipt.get("intent_digest") != intent.get("intent_digest"):
+            raise ContractValidationError("deliver start receipt does not echo the intent idempotency key")
+        intent_ref = intent.get("task_ref")
+        if isinstance(intent_ref, Mapping) and task_ref.get("scoped_id") != intent_ref.get("scoped_id"):
+            raise ContractValidationError("deliver start receipt scopes to a different task than the intent")
 
 
 def validate_bridge_command_snapshot(

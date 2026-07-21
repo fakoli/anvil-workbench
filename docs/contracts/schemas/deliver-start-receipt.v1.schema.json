@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/deliver-start-receipt.v1.schema.json",
+  "title": "Anvil Workbench Deliver start receipt v1",
+  "description": "The typed acknowledgment the hub returns when a Deliver intent is presented. It echoes the intent's `intent_digest` idempotency key and reports one of three outcomes: `accepted` (a new run started), `duplicate` (an identical intent already started this run — the idempotent replay path), or `denied` (a fail-closed preflight refusal). An accepted or duplicate receipt carries a run block with a bounded deadline; a denied receipt carries a stable error code and a human-safe summary and no run. It is a redacted display record: no local path, raw command, credential, or transcript is representable, so the start reason can never leak an endpoint or token. All prose is untrusted task data, never control instructions. This is a hub-durable record, not a contract-digest-bearing snapshot.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "intent_digest", "status", "task_ref", "redaction"],
+  "$defs": {
+    "prdId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "taskId": {"type": "string", "pattern": "^T[0-9]{3}(\\.[0-9]{1,3})?$"},
+    "scopedId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?$"},
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "safeText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 400,
+      "pattern": "^(?!.*(?:://|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\\\|[Bb]earer\\s|\\bsk-|\\bghp_|\\bxox|authorization|api[_-]?key|secret|token\\s*[:=])).{1,400}$"
+    },
+    "taskRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prd_id", "task_id", "prd_revision", "scoped_id"],
+      "properties": {
+        "prd_id": {"$ref": "#/$defs/prdId"},
+        "task_id": {"$ref": "#/$defs/taskId"},
+        "prd_revision": {"type": "integer", "minimum": 1},
+        "scoped_id": {"$ref": "#/$defs/scopedId"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-deliver-start-receipt/v1"},
+    "intent_digest": {"$ref": "#/$defs/digest"},
+    "status": {"enum": ["accepted", "duplicate", "denied"]},
+    "task_ref": {"$ref": "#/$defs/taskRef"},
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "workflow_digest", "capability_profile_digest", "started_at", "deadline"],
+      "description": "Present on an accepted or duplicate start. Every non-read delivery run is bounded: it pins the workflow/profile digests it started under and a hard deadline.",
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^run_[a-zA-Z0-9_-]{8,128}$"},
+        "workflow_digest": {"$ref": "#/$defs/digest"},
+        "capability_profile_digest": {"$ref": "#/$defs/digest"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "deadline": {"type": "string", "format": "date-time"},
+        "traceparent": {"type": "string", "maxLength": 256}
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "safe_summary", "retryable"],
+      "description": "Present on a denied start. A stable code plus a human-safe summary, mirroring the operation-receipt refusal shape.",
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,63}$"},
+        "safe_summary": {"$ref": "#/$defs/safeText"},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["redacted", "metadata_only"]}
+      }
+    }
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"const": "accepted"}}, "required": ["status"]},
+     "then": {"required": ["run"], "not": {"required": ["error"]}}},
+    {"if": {"properties": {"status": {"const": "duplicate"}}, "required": ["status"]},
+     "then": {"required": ["run"], "not": {"required": ["error"]}}},
+    {"if": {"properties": {"status": {"const": "denied"}}, "required": ["status"]},
+     "then": {"required": ["error"], "not": {"required": ["run"]}}}
+  ]
+}
