@@ -582,3 +582,192 @@ def test_run_context_workflow_pin_is_exactly_the_snapshot_pins():
     # A non-snapshot input is refused by type.
     with pytest.raises(RunContextError, match="requires a WorkflowSnapshot"):
         RunWorkflowPin.from_snapshot({"digest": "sha256:" + "0" * 64})  # type: ignore[arg-type]
+
+
+# --- Capture and persist before bridge dispatch (T005.2) --------------------
+
+
+def test_run_context_is_persisted_before_the_bridge_dispatch_begins():
+    """Criterion 1: the run context is durably stored BEFORE dispatch runs."""
+    from workbench.run_context_store import MemoryRunContextStore, dispatch_with_run_context
+
+    store = MemoryRunContextStore()
+    dispatched: list[str] = []
+
+    def dispatch(run_context: RunContext) -> None:
+        # By the time the bridge dispatch is invoked, the context is already
+        # readable from the store — persistence strictly precedes dispatch.
+        assert store.get("project_a", run_context.run_id).as_dict() == run_context.as_dict()
+        dispatched.append(run_context.run_id)
+
+    persisted = dispatch_with_run_context(
+        store, "project_a", valid_run_context, dispatch,
+    )
+    assert dispatched == [persisted.run_id]
+    assert store.get("project_a", persisted.run_id) is persisted
+
+
+def test_unresolved_or_unpersisted_context_prevents_dispatch():
+    """Criterion 2: a resolve failure OR a persist failure blocks dispatch."""
+    from workbench.run_context_store import (
+        MemoryRunContextStore,
+        RunContextStoreError,
+        dispatch_with_run_context,
+    )
+
+    dispatched: list[str] = []
+
+    def dispatch(run_context: RunContext) -> None:
+        dispatched.append(run_context.run_id)
+
+    # Resolve failure: a build that raises RunContextError never reaches dispatch.
+    store = MemoryRunContextStore()
+
+    def build_incomplete() -> RunContext:
+        return valid_run_context(context_id="not-a-ctx-id")
+
+    with pytest.raises(RunContextError):
+        dispatch_with_run_context(store, "project_a", build_incomplete, dispatch)
+    assert dispatched == []
+    assert store.rows.contexts == {}
+
+    # Persist failure: a store that fails to persist blocks dispatch too.
+    class FailingStore(MemoryRunContextStore):
+        def capture(self, acting_project_id, run_context):  # type: ignore[override]
+            raise RunContextStoreError("persist failed")
+
+    with pytest.raises(RunContextStoreError, match="persist failed"):
+        dispatch_with_run_context(FailingStore(), "project_a", valid_run_context, dispatch)
+    assert dispatched == []
+
+
+def test_later_source_changes_do_not_rewrite_the_stored_snapshot():
+    """Criterion 3: a re-capture with different content fails closed; the stored
+    queue-time snapshot is never rewritten by a later change."""
+    from workbench.run_context_store import (
+        MemoryRunContextStore,
+        RunContextImmutableError,
+    )
+
+    store = MemoryRunContextStore()
+    original = valid_run_context()
+    store.capture("project_a", original)
+    baseline = original.as_dict()
+
+    # An identical re-capture is an idempotent retry: same stored record.
+    assert store.capture("project_a", original) is store.get("project_a", original.run_id)
+
+    # A later task/PRD change yields a DIFFERENT context for the same run; the
+    # store refuses to rewrite the immutable queue-time snapshot.
+    renamed = valid_run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=6),
+            title="Renamed after queue time",
+            acceptance_criteria=("A different criterion",),
+            work_packet_digest="sha256:" + "9" * 64,
+        ),
+    )
+    assert renamed.run_id == original.run_id
+    with pytest.raises(RunContextImmutableError, match="cannot be rewritten"):
+        store.capture("project_a", renamed)
+    # The stored snapshot is byte-identical to the queue-time capture.
+    assert store.get("project_a", original.run_id).as_dict() == baseline
+
+
+def test_run_context_store_scopes_reads_and_captures_to_the_owning_project():
+    """Cross-project capture and read fail closed with the indistinct not-found."""
+    from workbench.run_context_store import MemoryRunContextStore, UnknownRunContextError
+
+    store = MemoryRunContextStore()
+    context = valid_run_context()
+    store.capture("project_b", context)
+
+    # A read under another project scope is indistinguishable from missing.
+    with pytest.raises(UnknownRunContextError):
+        store.get("project_a", context.run_id)
+    # A genuinely missing run raises the identical error.
+    with pytest.raises(UnknownRunContextError):
+        store.get("project_b", "run_absent")
+    # project_a's namespace is never created by a foreign read.
+    assert "project_a" not in store.rows.contexts
+    # An invalid scope is rejected at the edge.
+    with pytest.raises(StoreError, match="valid acting project scope"):
+        store.get("", context.run_id)
+
+
+def test_concurrent_captures_for_one_run_admit_exactly_one_snapshot():
+    """A contended check-then-act on one (project, run) key must let exactly one
+    DIFFERENT-content capture win; the loser fails closed, never last-wins.
+
+    The check->act gap is made real and contestable by a namespace dict whose
+    ``get`` yields between the existence check and the write, so two writers can
+    only both-succeed (last-wins) if the store lock is absent. Detection power
+    was confirmed locally by unwrapping ``MemoryRunContextStore.capture`` (the
+    lock): the unsynchronized store lets both writers pass the None check and
+    stores no immutable refusal, failing the ``len(errors) == 1`` assertion.
+    """
+    import sys
+    import threading
+    import time
+
+    from workbench.run_context_store import (
+        MemoryRunContextStore,
+        RunContextImmutableError,
+        RunContextRows,
+    )
+
+    class YieldingDict(dict):
+        """A namespace whose ``get`` widens the capture check->act window."""
+
+        def get(self, key, default=None):  # noqa: D401
+            value = super().get(key, default)
+            time.sleep(0.002)  # force a preemption point inside the critical section
+            return value
+
+    original = valid_run_context()
+    variant = valid_run_context(
+        task=UntrustedTask(
+            ref=UntrustedTaskRef(prd_id="release-beta", task_id="T001", prd_revision=7),
+            title="Concurrent variant",
+            acceptance_criteria=("Variant criterion",),
+            work_packet_digest="sha256:" + "a" * 64,
+        ),
+    )
+    assert original.run_id == variant.run_id
+    assert original.as_dict() != variant.as_dict()
+
+    old_interval = sys.getswitchinterval()
+    try:
+        sys.setswitchinterval(1e-6)
+        for _ in range(15):
+            # Pre-seed the acting project's namespace with the yielding dict so
+            # the store's setdefault returns it and the get->set gap is real.
+            store = MemoryRunContextStore(RunContextRows(contexts={"project_a": YieldingDict()}))
+            start = threading.Barrier(2)
+            errors: list[Exception] = []
+            errors_lock = threading.Lock()
+
+            def worker(ctx: RunContext) -> None:
+                start.wait()
+                try:
+                    store.capture("project_a", ctx)
+                except RunContextImmutableError as exc:
+                    with errors_lock:
+                        errors.append(exc)
+
+            threads = [
+                threading.Thread(target=worker, args=(original,)),
+                threading.Thread(target=worker, args=(variant,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            # Exactly one distinct-content capture wins; the other is refused as
+            # a rewrite. Never both silently stored (last-wins).
+            stored = store.get("project_a", original.run_id).as_dict()
+            assert stored in (original.as_dict(), variant.as_dict())
+            assert len(errors) == 1, "exactly one contender must be refused as immutable"
+    finally:
+        sys.setswitchinterval(old_interval)
