@@ -167,6 +167,12 @@ export function successorTurnBody(turn, { role, mode = 'ordinary' } = {}) {
 // sends a turn, and a permission/STT failure is a non-blocking 'error' that
 // leaves the textual composer fully usable.
 
+// "connected" criterion NOTE: this push-to-talk surface is request/response STT
+// over the hub relay, NOT a persistent socket, so there is deliberately no
+// "connected" state. The acceptance word "connected" maps to `ready` (the mic
+// path is available and idle) and `listening` (a hold is actively capturing); a
+// hop is a bounded per-request call, not a held connection. This is distinct from
+// the Realtime websocket relay (VoiceDock), which is genuinely connection-based.
 export const VOICE_INPUT_STATES = Object.freeze(['ready', 'listening', 'transcribing', 'draft', 'error'])
 
 export function initialVoiceInputState() {
@@ -283,4 +289,20 @@ export function isPlaybackActiveFor(state, messageRef) {
 // available; absent a preference it stays off (never surprises the operator).
 export function shouldAutoplay(preferences) {
   return preferences?.voice_autoplay === true
+}
+
+// Adapter: extract the effective `personal.voice_autoplay` value from the REAL
+// served `/api/preferences` payload into the `{voice_autoplay: boolean}` shape
+// `shouldAutoplay` reads. The served payload is `{catalog, effective:[…]}` where
+// each effective row is `{setting_id, scope, value, source, …}` (the resolver's
+// `EffectiveValue.as_dict()`), so this finds the row whose `setting_id` is
+// `personal.voice_autoplay` and reports its resolved value. Absent row, a
+// non-boolean value, or a missing/503/unconfigured surface all default OFF — the
+// operator is never surprised by autoplay they did not opt into.
+export const VOICE_AUTOPLAY_SETTING_ID = 'personal.voice_autoplay'
+
+export function voiceAutoplayFromPreferences(payload) {
+  const rows = Array.isArray(payload?.effective) ? payload.effective : []
+  const row = rows.find((entry) => entry?.setting_id === VOICE_AUTOPLAY_SETTING_ID)
+  return { voice_autoplay: row?.value === true }
 }
