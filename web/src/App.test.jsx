@@ -10,6 +10,7 @@ import {
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
   transcribeVoice, speakMessage, fetchPreferences,
+  fetchAdvancedRoutes, runAdvancedBranch,
 } from './api'
 
 vi.mock('./api', () => ({
@@ -21,7 +22,62 @@ vi.mock('./api', () => ({
   retryTurn: vi.fn(), searchConversations: vi.fn(), sendMessage: vi.fn(), unarchiveConversation: vi.fn(),
   fetchPrdContent: vi.fn(), fetchPrdTasks: vi.fn(), fetchTaskReference: vi.fn(), fetchTaskEligibility: vi.fn(),
   transcribeVoice: vi.fn(), speakMessage: vi.fn(), fetchPreferences: vi.fn(),
+  fetchAdvancedRoutes: vi.fn(), runAdvancedBranch: vi.fn(),
+  // The panel keys its unconfigured-degrade branch off this SHARED sentinel by
+  // value equality; the mock must export the exact string api.js throws on 503.
+  ADVANCED_NOT_CONFIGURED: 'The advanced playground is not configured for this hub',
 }))
+
+// The served advanced-route allowlist shape, traceable to
+// `AdvancedRouteCapability.browser_projection()` / `control_view()`
+// (workbench/advanced_routes.py): identifiers, digests, and declared control
+// metadata (type/bounds/allowed_values/default/editable/source) ONLY. One int
+// control (temperature_milli) with bounds, one enum (reasoning_effort), and one
+// policy-owned bool the operator cannot override.
+const advancedRoutes = [
+  {
+    provider: 'anvil-serving', route_id: 'route.chat-fast', display_name: 'Chat fast',
+    route_digest: 'sha256:' + 'a'.repeat(64), profile_digest: 'sha256:' + 'b'.repeat(64),
+    serving_contract_version: '1.0.0', model_profile: 'chat-fast',
+    structured_output_supported: false, tools_supported: false,
+    controls: [
+      { name: 'temperature_milli', type: 'int', default: 300, editable: true, source: 'route_default', disabled_reason: null, bounds: { min: 0, max: 1000 } },
+      { name: 'reasoning_effort', type: 'enum', default: 'low', editable: true, source: 'route_default', disabled_reason: null, allowed_values: ['low', 'medium', 'high'] },
+      { name: 'response_streaming', type: 'bool', default: true, editable: false, source: 'policy_owned', disabled_reason: 'policy_owned' },
+    ],
+  },
+  {
+    provider: 'anvil-serving', route_id: 'route.chat-heavy', display_name: 'Chat heavy',
+    route_digest: 'sha256:' + 'c'.repeat(64), profile_digest: 'sha256:' + 'd'.repeat(64),
+    serving_contract_version: '1.0.0', model_profile: 'chat-heavy',
+    structured_output_supported: true, tools_supported: true,
+    controls: [
+      // A NARROWER int range so a temperature tuned high on fast becomes stale here.
+      { name: 'temperature_milli', type: 'int', default: 200, editable: true, source: 'route_default', disabled_reason: null, bounds: { min: 0, max: 500 } },
+      // No reasoning_effort here — a tuned reasoning_effort becomes unsupported.
+      { name: 'max_output_tokens', type: 'int', default: 1024, editable: true, source: 'route_default', disabled_reason: null, bounds: { min: 1, max: 4096 } },
+    ],
+  },
+]
+
+// The served advanced-trace.v1 record (contracts.validate_advanced_trace): ids,
+// digests, bounded counters, safe summaries, per-event digests — NO raw output.
+const advancedTrace = {
+  schema_version: 'workbench-advanced-trace/v1',
+  trace_id: 'advtrace_fast_0001',
+  branch_ref: { branch_id: 'advbranch_' + 'f'.repeat(10), conversation_id: 'conv_' + 'a'.repeat(10), turn_id: 'turn_' + 'b'.repeat(10) },
+  route_decision: { provider: 'anvil-serving', route_id: 'route.chat-fast', route_digest: 'sha256:' + 'a'.repeat(64), profile_digest: 'sha256:' + 'b'.repeat(64), model_profile: 'chat-fast', request_id: 'req_abc123' },
+  request: { content_trust: 'untrusted_task_data', redacted: true, input_chars: 42, structured_output_mode: 'text', control_values: [{ name: 'temperature_milli', value: 300 }, { name: 'reasoning_effort', value: 'high' }] },
+  events: [
+    { seq: 0, kind: 'request_start', at: '2026-07-21T10:01:00Z' },
+    { seq: 1, kind: 'tool_result', at: '2026-07-21T10:01:02Z', tool_id: 'echo_fixture', tool_kind: 'mock', output_digest: 'sha256:' + 'c'.repeat(64), output_chars: 32, safe_summary: 'mock fixture returned a bounded result' },
+    { seq: 2, kind: 'response_complete', at: '2026-07-21T10:01:05Z', usage: { input_tokens: 12, output_tokens: 20, latency_ms: 120 } },
+  ],
+  usage: { input_tokens: 12, output_tokens: 20, latency_ms: 120 },
+  status: 'complete',
+  redaction: { status: 'redacted', ruleset: 'advanced-trace-v1' },
+  created_at: '2026-07-21T10:01:00Z', completed_at: '2026-07-21T10:01:05Z',
+}
 
 const fixture = {
   actor: 'operator',
@@ -72,6 +128,10 @@ function resetChatMocks() {
   sendMessage.mockResolvedValue({ text: '', terminal: 'completed', needsRefresh: false })
   retryTurn.mockResolvedValue(assistantTurn('turn_retry', 'second answer', 'complete', 'retry'))
   branchTurn.mockResolvedValue(assistantTurn('turn_branch', 'branched answer', 'complete', 'branch'))
+  // Advanced runtime is unconfigured BY DEFAULT (503 sentinel) so the panel
+  // degrades truthfully; the advanced-flow tests opt into a configured runtime.
+  fetchAdvancedRoutes.mockRejectedValue(new Error('The advanced playground is not configured for this hub'))
+  runAdvancedBranch.mockResolvedValue({ text: 'tuned answer', terminal: 'completed', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv', branchId: 'advbranch_srv' })
 }
 
 beforeEach(() => {
@@ -401,16 +461,161 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     expect(await screen.findByText('Response cancelled')).toBeTruthy()
   })
 
-  it('preserves the transcript when Advanced mode opens and shows a truthful unavailable state', async () => {
+  it('preserves the transcript when Advanced mode opens and shows a truthful unavailable state (not-wired 503 degrade)', async () => {
+    // fetchAdvancedRoutes rejects with the not-configured sentinel by default.
     const user = await renderChat()
     await openConversation(user, [assistantTurn('turn_1', 'kept answer')])
     expect(await screen.findByText('kept answer')).toBeTruthy()
     await user.click(screen.getByRole('button', { name: 'Toggle Advanced mode' }))
     expect(screen.getByRole('region', { name: 'Advanced controls' })).toBeTruthy()
+    // Degrades truthfully: the not-configured sentinel plus the unchanged note.
+    expect(await screen.findByText('The advanced playground is not configured for this hub')).toBeTruthy()
     expect(screen.getByText(/not configured in this build/)).toBeTruthy()
     expect(screen.getByText('kept answer')).toBeTruthy() // transcript unchanged by Advanced mode
     await user.click(screen.getByRole('button', { name: 'Toggle Advanced mode' }))
     expect(screen.getByText('kept answer')).toBeTruthy()
+  })
+
+  // --- Advanced playground, wired over the REAL served route/control/branch/trace
+  // shapes (advanced-model-playground T005). The runtime is configured for these. --
+  async function openAdvanced(user, turns) {
+    fetchAdvancedRoutes.mockResolvedValue({ routes: advancedRoutes })
+    const u = user || await renderChat()
+    await openConversation(u, turns || [assistantTurn('turn_1', 'base answer')])
+    await u.click(screen.getByRole('button', { name: 'Toggle Advanced mode' }))
+    await screen.findByRole('combobox', { name: 'Advanced route' })
+    return u
+  }
+
+  it('drives visible controls from the selected route and PREVIEWS stale values before dropping them (criterion 1)', async () => {
+    const user = await openAdvanced()
+    // The fast route's declared controls are rendered from the served descriptors.
+    const temp = screen.getByRole('spinbutton', { name: 'temperature_milli' })
+    expect(temp).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: 'reasoning_effort' })).toBeTruthy()
+    // A policy-owned control is a real disabled input with a safe reason, never editable.
+    expect(screen.getByRole('checkbox', { name: 'response_streaming' }).disabled).toBe(true)
+
+    // Tune temperature to 800 (valid on fast, out of the heavy route's [0,500]).
+    fireEvent.change(temp, { target: { value: '800' } })
+    // Switch route: the panel PREVIEWS what will drop BEFORE it is removed.
+    fireEvent.change(screen.getByRole('combobox', { name: 'Advanced route' }), { target: { value: 'route.chat-heavy' } })
+    const preview = await screen.findByRole('alertdialog', { name: 'Route change preview' })
+    // The stale values are visible in the preview WITH the current value, pre-drop.
+    expect(within(preview).getByText('temperature_milli')).toBeTruthy()
+    expect(within(preview).getByText('800')).toBeTruthy() // the value is shown before removal
+    expect(within(preview).getByText(/outside this route’s allowed range/)).toBeTruthy()
+    expect(within(preview).getByText('reasoning_effort')).toBeTruthy() // unsupported on heavy
+    expect(within(preview).getAllByText(/not offered by this route/).length).toBeGreaterThan(0)
+
+    // Nothing dropped until the operator commits.
+    await user.click(within(preview).getByRole('button', { name: 'Apply route change' }))
+    // After apply, heavy's controls render and reasoning_effort is gone.
+    expect(await screen.findByRole('spinbutton', { name: 'max_output_tokens' })).toBeTruthy()
+    expect(screen.queryByRole('combobox', { name: 'reasoning_effort' })).toBeNull()
+  })
+
+  it('keeps the current route (no drop) when the preview is declined', async () => {
+    const user = await openAdvanced()
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'temperature_milli' }), { target: { value: '800' } })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Advanced route' }), { target: { value: 'route.chat-heavy' } })
+    const preview = await screen.findByRole('alertdialog', { name: 'Route change preview' })
+    await user.click(within(preview).getByRole('button', { name: 'Keep current route' }))
+    // Fast route controls remain; reasoning_effort was never dropped.
+    expect(screen.getByRole('combobox', { name: 'reasoning_effort' })).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: 'Advanced route' }).value).toBe('route.chat-fast')
+  })
+
+  it('runs an advanced branch as a sibling in the ONE transcript — no second transcript (criterion 2)', async () => {
+    const user = await openAdvanced()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'try a tuned attempt')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    // The tuned answer appears in the SAME transcript alongside the base turn.
+    expect(await screen.findByText('tuned answer')).toBeTruthy()
+    expect(screen.getByText('base answer')).toBeTruthy()
+    // Exactly ONE transcript exists — the branch did not spawn a duplicate.
+    expect(screen.getAllByRole('list', { name: 'Transcript' })).toHaveLength(1)
+    // The run request carried the closed submitted_controls, not free text.
+    const call = runAdvancedBranch.mock.calls.at(-1)[0]
+    expect(call.routeId).toBe('route.chat-fast')
+    expect(call.controls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'temperature_milli', provenance: 'declared' }),
+      expect.objectContaining({ name: 'response_streaming', provenance: 'policy_override', value: true }),
+    ]))
+  })
+
+  it('Cancel genuinely aborts an in-flight advanced run via a threaded AbortController (criterion 2)', async () => {
+    const user = await openAdvanced()
+    // A run that only settles when its signal aborts — proving the component
+    // threads a real AbortController whose signal reaches the client.
+    let sawSignal = null
+    runAdvancedBranch.mockImplementation(({ signal, onState }) => new Promise((resolve) => {
+      sawSignal = signal
+      signal.addEventListener('abort', () => {
+        const cancelled = { text: 'partial', terminal: 'cancelled', needsRefresh: false }
+        onState?.(cancelled)
+        resolve({ ...cancelled, trace: null })
+      })
+    }))
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'never resolves until cancelled')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    // The panel's Cancel is now shown (Run↔Cancel swap).
+    const cancelBtn = await screen.findByRole('button', { name: 'Cancel advanced run' })
+    expect(sawSignal).toBeTruthy()
+    expect(sawSignal.aborted).toBe(false)
+    await user.click(cancelBtn)
+    expect(sawSignal.aborted).toBe(true) // the real signal reached — not a local flip
+    expect(await screen.findByText('partial')).toBeTruthy()
+  })
+
+  it('inspects a branch trace as digests + safe summaries only — no raw output/secret (redaction gate)', async () => {
+    const user = await openAdvanced()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'inspect me')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+    await user.click(await screen.findByRole('button', { name: /Inspect/ }))
+    const inspector = await screen.findByRole('region', { name: 'Advanced trace inspector' })
+    // Digests are abbreviated sha256 tokens; the safe summary is shown.
+    expect(within(inspector).getAllByText(/^sha256:[a-f0-9]{12}…$/).length).toBeGreaterThan(0)
+    expect(within(inspector).getByText('mock fixture returned a bounded result')).toBeTruthy()
+    // The redaction note is present and no raw endpoint/secret shape appears.
+    expect(within(inspector).getByText(/Redacted digests and safe summaries only/)).toBeTruthy()
+    expect(inspector.textContent).not.toMatch(/https?:\/\//)
+    expect(inspector.textContent).not.toMatch(/Bearer\s/)
+  })
+
+  it('compares two settled branches side by side within the shell (criterion 2)', async () => {
+    const user = await openAdvanced()
+    const prompt = screen.getByRole('textbox', { name: 'Advanced prompt' })
+    await user.type(prompt, 'first')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+    // Run a second branch (a fork of the first is a new sibling run).
+    runAdvancedBranch.mockResolvedValueOnce({ text: 'second tuned answer', terminal: 'completed', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv2', branchId: 'advbranch_srv2' })
+    await user.click(screen.getByRole('button', { name: /Fork/ }))
+    await screen.findByText('second tuned answer')
+    // Select both to compare.
+    const compareButtons = screen.getAllByRole('button', { name: /Compare/ })
+    await user.click(compareButtons[0])
+    await user.click(compareButtons[1])
+    expect(await screen.findByRole('region', { name: 'Compare branches' })).toBeTruthy()
+    expect(screen.getAllByRole('article', { name: /Comparison/ })).toHaveLength(2)
+    // Still one transcript.
+    expect(screen.getAllByRole('list', { name: 'Transcript' })).toHaveLength(1)
+  })
+
+  it('saves and reopens a branch without leaving the chat shell', async () => {
+    const user = await openAdvanced()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'save me')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+    await user.click(await screen.findByRole('button', { name: /Save/ }))
+    // Saved is reflected and Reopen becomes available.
+    const reopen = await screen.findByRole('button', { name: /Reopen/ })
+    expect(reopen.disabled).toBe(false)
+    await user.click(reopen)
+    // Reopen loads the saved config back into the editor prompt.
+    expect(screen.getByRole('textbox', { name: 'Advanced prompt' }).value).toBe('save me')
   })
 
   it('keeps no-conversation, empty, error, and interrupted states distinct', async () => {

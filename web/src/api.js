@@ -293,6 +293,122 @@ function jsonPostWithSignal(path, body, signal) {
   })
 }
 
+// --- Advanced playground client (advanced-model-playground T005) -------------
+//
+// The browser half of the Advanced playground surface: the reviewed advanced-route
+// allowlist (workbench/advanced_routes.py `DiscoveredAdvancedRoutes.browser_projection`)
+// and a per-branch tuned run streamed over the SAME relay contract as ordinary
+// chat (workbench/advanced_runtime.run_advanced_stream via chat_stream). Every
+// request is actor-scoped server-side from the trusted tailnet identity, so this
+// client assembles NO actor, token, endpoint, or credential — only the safe path
+// and a CLOSED body of declared fields (route id, the submitted_controls array,
+// prompt, optional instructions). The controls are the reviewed closed set: the
+// browser never round-trips a connector host, a raw command, or a credential.
+//
+// The advanced runtime is DELIBERATELY not wired into the live bridge poll loop
+// yet; the surface fails closed with 503 until it is configured. That is surfaced
+// as this SHARED not-configured sentinel so the panel degrades truthfully
+// (unavailable) while the ordinary transcript stays fully usable — the view keys
+// its degrade branch off value equality, so a reword moves both sides together.
+export const ADVANCED_NOT_CONFIGURED = 'The advanced playground is not configured for this hub'
+
+// The reviewed advanced-route allowlist: `{routes: [browser_projection…]}` where
+// each route carries identifiers, digests, and declared control metadata ONLY
+// (control_view: type/bounds/allowed_values/default/editable/source) — never an
+// endpoint, URL, token, credential, or policy-internal field.
+export async function fetchAdvancedRoutes() {
+  const response = await fetch('/api/chat/advanced/routes')
+  if (response.status === 503) throw new Error(ADVANCED_NOT_CONFIGURED)
+  if (!response.ok) throw new Error('Advanced routes are unavailable')
+  return response.json()
+}
+
+// Stream one bounded, tuned Advanced attempt on an EXISTING conversation, forked as
+// a `mode="advanced"` sibling turn (advanced_runtime.open_advanced_branch +
+// run_advanced_stream). The response body is the SAME newline-delimited relay-frame
+// stream ordinary chat uses, folded through the SAME `reduceStreamState` reducer,
+// so a dropped frame is detected and a stale/replayed frame never duplicates the
+// attempt. The terminal frame additionally carries the settled `turn_id`,
+// `branch_id`, and the redacted `advanced-trace.v1` record for the inspector.
+//
+// Cancellation is exposed through the caller-owned `signal`: aborting tears down
+// THIS fetch — which the relay observes to settle `cancelled` upstream — and
+// settles the local state `cancelled` here without ever emitting a later
+// completion, so Cancel genuinely aborts the in-flight run (never a local flip).
+// A 503 before the stream degrades truthfully; any other transport failure throws
+// so the caller renders a failed (not merely interrupted) state.
+export async function runAdvancedBranch({
+  conversationId, parentTurnId, branchId, routeId, controls, prompt, instructions,
+  structuredOutputMode, signal, onFrame, onState,
+} = {}) {
+  const settleCancelled = (state) => {
+    const cancelled = { ...state, terminal: 'cancelled' }
+    onState?.(cancelled)
+    return cancelled
+  }
+  const body = {
+    parent_turn_id: parentTurnId, branch_id: branchId, route_id: routeId,
+    controls, prompt,
+  }
+  if (instructions) body.instructions = instructions
+  if (structuredOutputMode) body.structured_output_mode = structuredOutputMode
+
+  let response
+  try {
+    response = await jsonPostWithSignal(
+      `${CONVERSATIONS}/${encodeURIComponent(conversationId)}/advanced/run`, body, signal,
+    )
+  } catch (error) {
+    if (signal?.aborted || error?.name === 'AbortError') return settleCancelled(initialStreamState())
+    throw new Error('The advanced attempt could not be started')
+  }
+  if (response.status === 503) throw new Error(ADVANCED_NOT_CONFIGURED)
+  if (!response.ok || !response.body) throw new Error('The advanced attempt could not be started')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let state = initialStreamState()
+  let trace = null
+  let turnId = null
+  let settledBranchId = branchId
+  let buffer = ''
+
+  const applyLine = (line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return
+    let frame
+    try { frame = JSON.parse(trimmed) } catch { return }
+    // The terminal frame carries the settled ids + the redacted trace alongside
+    // the relay outcome; capture them without disturbing the shared reducer.
+    if (frame.trace) trace = frame.trace
+    if (frame.turn_id) turnId = frame.turn_id
+    if (frame.branch_id) settledBranchId = frame.branch_id
+    state = reduceStreamState(state, frame)
+    onFrame?.(frame)
+    onState?.(state)
+  }
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let index
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        applyLine(buffer.slice(0, index))
+        buffer = buffer.slice(index + 1)
+      }
+    }
+    applyLine(buffer)
+  } catch (error) {
+    if (signal?.aborted || error?.name === 'AbortError') return { ...settleCancelled(state), trace, turnId, branchId: settledBranchId }
+    throw new Error('The advanced attempt was interrupted')
+  } finally {
+    reader.releaseLock?.()
+  }
+  return { ...state, trace, turnId, branchId: settledBranchId }
+}
+
 // --- Chat voice relay client (chat-first-voice T005.2 / T005.3) ---------------
 //
 // The browser half of the STT/TTS relay (workbench/api.py build_voice_relay_router

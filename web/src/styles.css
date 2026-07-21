@@ -37,7 +37,62 @@
 .chat-route{display:flex;align-items:center;gap:7px;color:#8aa19e;font-size:10px;font-weight:700}.chat-route select{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:7px 9px;font:inherit;font-size:11px;outline:none}
 .advanced-toggle{border:1px solid #33484d;background:transparent;color:#adbec1;border-radius:6px;padding:8px 12px;font-size:10px;font-weight:800}.advanced-toggle.on{border-color:#3aa08e;background:#13342f;color:#bff5e7}
 .chat-context{display:grid;gap:6px;border:1px solid #20343a;background:#0c181c;border-radius:8px;padding:11px 13px}.chat-context.none{color:#5f757a;font-size:10px;margin:0}.context-row{display:flex;align-items:center;gap:10px}.context-label{font-size:8px;text-transform:uppercase;letter-spacing:.06em;color:#66817b;width:52px}.context-title{font-size:11px;color:#d5e4e1}.context-id{margin-left:auto}.context-id summary{font-size:9px;color:#6f858a;cursor:pointer;list-style:none}.context-id code{font-family:'DM Mono',monospace;font-size:8px;color:#8fb3ad}
-.advanced-panel{border:1px dashed #3a4d51;background:#0b171b;border-radius:8px;padding:12px 14px;display:grid;gap:9px}.advanced-panel p{margin:0;color:#8da1a4;font-size:10px}.advanced-panel label{display:grid;gap:5px;color:#7f9498;font-size:9px}.advanced-panel select,.advanced-panel input{opacity:.6}
+/* Advanced playground panel (advanced-model-playground T005). It lives inside the
+   chat shell. The layout uses NO min-width lockout and only relative/max-width
+   constraints so it stays usable at narrow widths and 200% zoom (the chat/settings
+   lesson: a fixed min-width would defeat the .chat-active reflow). A visible
+   :focus-visible ring is scoped to out-specify any control's outline:none. */
+.advanced-panel{border:1px solid #26424a;background:#0b171b;border-radius:9px;padding:13px 15px;display:grid;gap:11px;max-width:100%}
+.advanced-panel p{margin:0;color:#8da1a4;font-size:10px;line-height:1.55}.adv-muted{color:#65797d}
+.adv-unavailable{color:#d7ab60;font-size:11px;font-weight:700}
+.adv-live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.adv-route-row{display:flex;gap:10px;flex-wrap:wrap}
+.adv-route-select{display:grid;gap:5px;color:#8aa19e;font-size:10px;font-weight:700}
+.adv-route-select select,.adv-control select,.adv-control input,.adv-field textarea{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:7px 9px;font:inherit;font-size:11px;outline:none;max-width:100%}
+.adv-preview{border:1px solid #4d4022;background:#181206;border-radius:8px;padding:12px 13px;display:grid;gap:8px;outline:none}
+.adv-preview-head{margin:0;font-size:12px;color:#e7c987;letter-spacing:-.01em}
+.adv-preview p{color:#d8c6a2}
+.adv-stale-list{margin:0;padding-left:18px;display:grid;gap:4px}.adv-stale-list li{font-size:10px;color:#e5d3ab}.adv-stale-list code{font-family:'DM Mono',monospace;color:#f0d9a6}
+.adv-preview-actions{display:flex;gap:8px;flex-wrap:wrap}
+.adv-preview-actions button,.adv-run,.adv-cancel{border:0;border-radius:6px;font-size:10px;font-weight:800;padding:8px 12px}
+.adv-apply,.adv-run{background:var(--teal);color:#09211d}.adv-cancel{background:#5a2f2f;color:#f4d6d6}
+.adv-preview-actions .secondary-button{background:#203438;color:#b5cbc7}
+.adv-controls{border:1px solid #26424a;border-radius:8px;padding:10px 12px;display:grid;gap:9px;margin:0}
+.adv-controls legend{color:#8aa19e;font-size:9px;text-transform:uppercase;letter-spacing:.05em;padding:0 4px}
+.adv-controls[disabled]{opacity:.55}
+.adv-control{display:grid;gap:3px}.adv-control-label{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#b6c8c5;font-size:10px;font-weight:700}
+.adv-control-name{font-family:'DM Mono',monospace}
+.adv-control-reason{font-size:9px;color:#c79a5b}
+.adv-field{display:grid;gap:5px;color:#8aa19e;font-size:10px;font-weight:700}.adv-field textarea{resize:vertical;line-height:1.5}
+.adv-run-row{display:flex;gap:8px}
+.adv-run:disabled{opacity:.48;cursor:default}
+.adv-subhead{margin:6px 0 0;font-size:10px;color:#9be5d3;text-transform:uppercase;letter-spacing:.05em}
+.adv-branches,.adv-compare,.adv-inspector{border:1px solid #26424a;border-radius:8px;padding:11px 13px;display:grid;gap:8px}
+.adv-branch-list{list-style:none;margin:0;padding:0;display:grid;gap:7px}
+.adv-branch-row{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center;border:1px solid #1d3338;border-radius:7px;padding:8px 10px}
+.adv-branch-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.adv-branch-meta b{font-size:11px;color:#dbeae7}.adv-branch-meta small{font-family:'DM Mono',monospace;font-size:9px;color:#6f858a}
+.adv-branch-status{font-size:8px;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:20px;background:#132124;color:#8ca49b}
+.adv-branch-complete{color:#7fe2c6}.adv-branch-cancelled,.adv-branch-interrupted{color:#d7ab60}.adv-branch-failed{color:#e79a9a}.adv-branch-streaming{color:#7ec8e0}
+.adv-branch-actions{display:flex;gap:5px;flex-wrap:wrap}
+.adv-branch-actions button,.adv-close{border:1px solid #32665e;background:#13342f;color:#b9f4e5;border-radius:5px;padding:5px 8px;font-size:9px;font-weight:700}
+.adv-branch-actions button:disabled{opacity:.4;cursor:default}
+.adv-branch-actions button[aria-pressed=true]{background:#1a5951;color:#eafffb}
+.adv-pane-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.adv-pane-head h3,.adv-pane-head h4{margin:0;font-size:12px;color:#eafffb;outline:none}
+.adv-redaction-note{color:#7fbfae;font-size:9px}
+.adv-kv{display:grid;gap:4px;margin:0}.adv-kv>div{display:grid;grid-template-columns:minmax(0,120px) minmax(0,1fr);gap:8px}.adv-kv dt{font-size:9px;color:#6f858a;text-transform:uppercase;letter-spacing:.04em}.adv-kv dd{margin:0;font-size:10px;color:#c9d8d5;word-break:break-word}
+.adv-digest{font-family:'DM Mono',monospace;color:#8fb3ad}
+.adv-control-values{margin:0;padding-left:16px}.adv-control-values li{font-size:10px;color:#c9d8d5}.adv-control-values b{font-family:'DM Mono',monospace;color:#9be5d3}
+.adv-events{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.adv-event{border:1px solid #1d3338;border-radius:6px;padding:7px 9px;display:grid;gap:4px}
+.adv-event-head{display:flex;gap:8px;align-items:center}.adv-event-seq{font-family:'DM Mono',monospace;font-size:9px;color:#6f858a}.adv-event-head b{font-size:10px;color:#d5e4e1}
+.adv-event-summary{color:#a9bdb9;font-size:10px}
+.adv-event-fields{display:grid;gap:2px;margin:0}.adv-event-fields>div{display:grid;grid-template-columns:minmax(0,110px) minmax(0,1fr);gap:6px}.adv-event-fields dt{font-size:8px;color:#66817b;text-transform:uppercase}.adv-event-fields dd{margin:0;font-size:9px;color:#bacbca;word-break:break-word}
+.adv-compare-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.adv-compare-card{border:1px solid #1d3338;border-radius:7px;padding:9px 11px;display:grid;gap:6px}
+.adv-compare-head{display:flex;justify-content:space-between;align-items:center}.adv-compare-head b{font-size:11px;color:#dbeae7}
+.adv-compare-text{white-space:pre-wrap;font-size:10px;color:#c4d0d0;line-height:1.5;max-height:180px;overflow:auto}
+.advanced-panel :focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
+@media(max-width:640px){.adv-branch-row{flex-direction:column;align-items:flex-start}.adv-kv>div,.adv-event-fields>div{grid-template-columns:1fr}}
 .transcript-scroll{flex:1;overflow-y:auto;border:1px solid #1b2d32;background:#0a1417;border-radius:10px;padding:16px}
 .chat-empty{display:grid;place-content:center;gap:6px;text-align:center;min-height:220px;color:#7f9498}.chat-empty h2{margin:0;font-size:18px;letter-spacing:-.03em;color:#cadedb}.chat-empty p{margin:0;font-size:11px;max-width:340px}
 .transcript{list-style:none;margin:0;padding:0;display:grid;gap:16px}.turn{display:grid;gap:6px}.turn-head{display:flex;align-items:center;gap:8px}.turn-role{font-size:10px;font-weight:800;color:#9fb4b1}.turn-user .turn-role{color:#8ec7bd}.turn-lineage{font-size:8px;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:20px;background:#182a30;color:#9db6bb}

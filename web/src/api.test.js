@@ -553,6 +553,98 @@ describe('voice relay clients (T005.2 / T005.3)', () => {
   })
 })
 
+import { fetchAdvancedRoutes, runAdvancedBranch, ADVANCED_NOT_CONFIGURED } from './api'
+
+// The advanced playground client streams over the SAME relay-frame contract as
+// ordinary chat; the terminal frame additionally carries the settled ids + the
+// redacted advanced-trace.v1 record.
+describe('advanced playground API client (T005)', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('fetchAdvancedRoutes unwraps the {routes} allowlist and surfaces 503 as the shared not-configured sentinel', async () => {
+    const served = { routes: [{ route_id: 'route.chat-fast', display_name: 'Fast', controls: [] }] }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(served))
+    await expect(fetchAdvancedRoutes()).resolves.toEqual(served)
+    expect(fetch).toHaveBeenLastCalledWith('/api/chat/advanced/routes')
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(503))
+    expect(ADVANCED_NOT_CONFIGURED).toMatch(/not configured/i)
+    await expect(fetchAdvancedRoutes()).rejects.toThrow(ADVANCED_NOT_CONFIGURED)
+  })
+
+  it('runs a tuned branch over the streaming relay, folding deltas and capturing the terminal trace + ids', async () => {
+    const trace = { schema_version: 'workbench-advanced-trace/v1', trace_id: 'advtrace_1' }
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(ndjsonBody([
+      { seq: 1, kind: 'delta', text: 'tun' },
+      { seq: 2, kind: 'delta', text: 'ed' },
+      { seq: 3, kind: 'terminal', outcome: 'completed', turn_id: 'turn_9', branch_id: 'advbranch_9', trace },
+    ]))
+    const seen = []
+    const result = await runAdvancedBranch({
+      conversationId: 'conv_1', parentTurnId: 'turn_0', branchId: 'advbranch_local', routeId: 'route.chat-fast',
+      controls: [{ name: 'temperature_milli', value: 300, provenance: 'declared' }], prompt: 'hi',
+      onState: (state) => seen.push(state.text),
+    })
+    expect(seen).toEqual(['tun', 'tuned', 'tuned']) // incremental
+    expect(result.text).toBe('tuned')
+    expect(result.terminal).toBe('completed')
+    expect(result.trace).toEqual(trace) // the redacted trace rides the terminal frame
+    expect(result.turnId).toBe('turn_9')
+    expect(result.branchId).toBe('advbranch_9')
+  })
+
+  it('sends a CLOSED body — the submitted_controls array and prompt, never a host/command/credential', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ndjsonBody([{ seq: 1, kind: 'terminal', outcome: 'completed' }]))
+    await runAdvancedBranch({
+      conversationId: 'conv_1', parentTurnId: 'turn_0', branchId: 'advbranch_local', routeId: 'route.chat-fast',
+      controls: [{ name: 'temperature_milli', value: 300, provenance: 'declared' }], prompt: 'hi', instructions: 'be terse',
+    })
+    const [url, options] = fetch.mock.calls.at(-1)
+    expect(url).toBe('/api/conversations/conv_1/advanced/run')
+    expect(Object.keys(JSON.parse(options.body)).sort()).toEqual(['branch_id', 'controls', 'instructions', 'parent_turn_id', 'prompt', 'route_id'])
+  })
+
+  it('settles cancelled (never a later completion) when the run aborts mid-flight — the signal reaches fetch', async () => {
+    let index = 0
+    const chunks = [new TextEncoder().encode(`${JSON.stringify({ seq: 1, kind: 'delta', text: 'partial' })}\n`)]
+    let sawSignal = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, options) => {
+      sawSignal = options?.signal // proof the AbortSignal is threaded into fetch
+      return Promise.resolve({
+        ok: true,
+        body: {
+          getReader() {
+            return {
+              read: async () => {
+                if (index < chunks.length) return { done: false, value: chunks[index++] }
+                throw new DOMException('The user aborted a request.', 'AbortError')
+              },
+              releaseLock() {},
+            }
+          },
+        },
+      })
+    })
+    const controller = new AbortController()
+    const result = await runAdvancedBranch({
+      conversationId: 'conv_1', parentTurnId: 'turn_0', branchId: 'b', routeId: 'route.chat-fast',
+      controls: [], prompt: 'hi', signal: controller.signal,
+    })
+    expect(sawSignal).toBe(controller.signal) // the real signal reached the request
+    expect(result.text).toBe('partial') // partial preserved
+    expect(result.terminal).toBe('cancelled') // never 'completed'
+  })
+
+  it('surfaces a 503 before the stream as the not-configured sentinel, and any other failure distinctly', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(503))
+    await expect(runAdvancedBranch({ conversationId: 'c', branchId: 'b', routeId: 'r', controls: [], prompt: 'x' }))
+      .rejects.toThrow(ADVANCED_NOT_CONFIGURED)
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'))
+    await expect(runAdvancedBranch({ conversationId: 'c', branchId: 'b', routeId: 'r', controls: [], prompt: 'x' }))
+      .rejects.toThrow('The advanced attempt could not be started')
+  })
+})
+
 import { fetchPlugins, fetchPlugin, fetchPluginReceipt, PLUGIN_NOT_CONFIGURED } from './api'
 
 // The three GET-only plugin-surface helpers had no DIRECT tests, so a reword of
