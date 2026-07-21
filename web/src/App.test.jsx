@@ -792,3 +792,150 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     expect(document.querySelector('.app-shell').classList.contains('explorer-active')).toBe(false)
   })
 })
+
+// --- Deliver controls, setup sheet, and truthful blocked states (T006) --------
+//
+// The Deliver sheet reads the SAME merged delivery-projection GET shapes the
+// explorer proves (fetchPrdTasks → {tasks}, fetchTaskEligibility → {eligibility},
+// via the taskRef/eligibilityVerdict fixtures above), and starts through the REAL
+// wired POST /api/workflows/{id}/start (startWorkflow → {workflow, run}). There is
+// no separate Deliver route, so a drift in any of these served shapes breaks these
+// tests rather than passing against a mock's own return.
+
+describe('Deliver controls (plan-task-delivery T006)', () => {
+  const readyVerdict = (prdId, taskId) => eligibilityVerdict(prdId, taskId, {
+    eligible: true, state: 'ready',
+    reasons: [{ class: 'ready', code: 'ready.all_clear', explanation: 'All preconditions pass.' }],
+  })
+
+  async function openSheet(user) {
+    await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
+    return screen.getByRole('dialog', { name: 'Deliver next task' })
+  }
+
+  async function loadCandidate(user, prdId, { session = 'workflow_1' } = {}) {
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Deliver into session' }), session)
+    await user.type(screen.getByRole('textbox', { name: 'PRD id' }), prdId)
+    await user.click(screen.getByRole('button', { name: 'Load ranked candidate' }))
+  }
+
+  it('starts a ready candidate in one activation through the real workflow-start route and routes to the run', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' })] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    // The started run appears on reload so "routes to the run" is a rendered fact.
+    const startedRun = { id: 'run_2', project_id: 'project_1', session_id: 'session_1', task_id: 'T001', model: 'planning', status: 'queued' }
+    startWorkflow.mockResolvedValue({ workflow: {}, run: startedRun })
+    bootstrap.mockResolvedValue({ ...fixture, runs: [startedRun, ...fixture.runs] })
+    const deliver = await screen.findByRole('button', { name: /Deliver Add routed chat/ })
+    await waitFor(() => expect(deliver.disabled).toBe(false))
+    await user.click(deliver)
+    // The REAL wired route, called exactly once with the approved ids.
+    expect(startWorkflow).toHaveBeenCalledTimes(1)
+    expect(startWorkflow).toHaveBeenCalledWith('workflow_1', { task_id: 'T001', model: 'planning' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+    expect(await screen.findByRole('heading', { name: 'Task T001' })).toBeTruthy() // routed to the resulting run
+  })
+
+  it('previews exactly one State-ranked candidate and never a batch of tasks', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [
+      taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' }),
+      taskRef('release-alpha', 'T002', 'Persist retention', { status: 'ready' }),
+      taskRef('release-alpha', 'T003', 'Third candidate', { status: 'ready' }),
+    ] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    expect(await screen.findByText('Add routed chat')).toBeTruthy() // the single ranked head
+    expect(screen.queryByText('Persist retention')).toBeNull() // no batch/list
+    expect(screen.queryByText('Third candidate')).toBeNull()
+    // Eligibility is checked for the one candidate only, never the whole plan.
+    expect(fetchTaskEligibility).toHaveBeenCalledWith('project_1', 'release-alpha', 'T001')
+    expect(fetchTaskEligibility).not.toHaveBeenCalledWith('project_1', 'release-alpha', 'T002')
+  })
+
+  it('shows a blocked ranked head truthfully, disables Deliver with an accessible reason, and never skips it', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [
+      taskRef('release-alpha', 'T001', 'Blocked head', { status: 'blocked' }),
+      taskRef('release-alpha', 'T002', 'Ready later task', { status: 'ready' }),
+    ] })
+    fetchTaskEligibility.mockResolvedValue(eligibilityVerdict('release-alpha', 'T001')) // eligible:false, blocked.dependency_unmet
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    // The candidate is the blocked head, not the later ready row (no silent skip).
+    expect(await screen.findByText('Blocked head')).toBeTruthy()
+    expect(screen.queryByText('Ready later task')).toBeNull()
+    const deliver = screen.getByRole('button', { name: /Deliver Blocked head/ })
+    await waitFor(() => expect(deliver.disabled).toBe(true))
+    expect(deliver.getAttribute('aria-disabled')).toBe('true')
+    // The reason is real TEXT bound to the control (not colour alone).
+    const describedById = deliver.getAttribute('aria-describedby')
+    expect(describedById).toBeTruthy()
+    const reason = document.getElementById(describedById)
+    expect(reason.textContent).toMatch(/dependency has not merged/i)
+    expect(reason.textContent).toMatch(/blocked\.dependency_unmet/)
+    // A blocked Deliver never starts a run, even when clicked.
+    await user.click(deliver)
+    expect(startWorkflow).not.toHaveBeenCalled()
+  })
+
+  it('offers only approved session ids/titles and never asks for a path or a raw command', async () => {
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    const sessionSelect = screen.getByRole('combobox', { name: 'Deliver into session' })
+    const values = within(sessionSelect).getAllByRole('option').map((option) => option.value)
+    expect(values.filter(Boolean)).toEqual(['workflow_1']) // only an approved workflow/session id
+    // The one free-text field is the approved PRD id — no path, command, or route field.
+    expect(screen.getByRole('textbox', { name: 'PRD id' })).toBeTruthy()
+    expect(screen.queryByRole('textbox', { name: /path|command|model|route/i })).toBeNull()
+    expect(screen.queryByLabelText(/path|command/i)).toBeNull()
+  })
+
+  it('fires the Deliver call exactly once even when activated twice quickly (no double-submit)', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Add routed chat', { status: 'ready' })] })
+    fetchTaskEligibility.mockResolvedValue(readyVerdict('release-alpha', 'T001'))
+    let resolveStart
+    startWorkflow.mockImplementation(() => new Promise((resolve) => {
+      resolveStart = () => resolve({ workflow: {}, run: { id: 'run_2', session_id: 'session_1', task_id: 'T001', model: 'planning', status: 'queued' } })
+    }))
+    const user = userEvent.setup(); await renderLive()
+    await openSheet(user)
+    await loadCandidate(user, 'release-alpha')
+    const deliver = await screen.findByRole('button', { name: /Deliver Add routed chat/ })
+    await waitFor(() => expect(deliver.disabled).toBe(false))
+    await user.click(deliver)
+    await user.click(deliver) // second activation while the first start is in flight
+    expect(startWorkflow).toHaveBeenCalledTimes(1)
+    resolveStart()
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+  })
+
+  it('opens a focus-managed setup sheet closable by a visible Close and by Escape', async () => {
+    const user = userEvent.setup(); await renderLive()
+    await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
+    const dialog = screen.getByRole('dialog', { name: 'Deliver next task' })
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true)) // focus moved into the sheet
+    await user.keyboard('{Escape}') // Escape works even with focus inside the sheet
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+    expect(document.activeElement).not.toBe(document.body) // focus returned to the opener, not dropped
+    // Reopen and close via the discoverable Close control.
+    await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
+    await user.click(screen.getByRole('button', { name: 'Close Deliver next task' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
+  })
+
+  it('announces the blocked state in an updating live region', async () => {
+    fetchPrdTasks.mockResolvedValue({ tasks: [taskRef('release-alpha', 'T001', 'Blocked head', { status: 'blocked' })] })
+    fetchTaskEligibility.mockResolvedValue(eligibilityVerdict('release-alpha', 'T001'))
+    const user = userEvent.setup(); await renderLive()
+    const dialog = await openSheet(user)
+    const live = within(dialog).getByRole('status')
+    expect(live.getAttribute('aria-live')).toBe('polite')
+    await loadCandidate(user, 'release-alpha')
+    await waitFor(() => expect(live.textContent).toMatch(/blocked/i)) // start/blocked announced, not silent
+  })
+})

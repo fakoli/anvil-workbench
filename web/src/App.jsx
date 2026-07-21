@@ -9,8 +9,8 @@ import {
 } from './api'
 import { describeConversation, selectChatRoute, successorTurnBody, terminalToStatus } from './chat-api'
 import {
-  describeEligibility, describePrdContent, describeTaskReference, filterDescribedTasks,
-  freshnessLabel, progressSummaryLabel,
+  deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
+  filterDescribedTasks, freshnessLabel, nextDeliverCandidate, progressSummaryLabel,
 } from './delivery-explorer'
 
 const emptyData = {
@@ -93,7 +93,7 @@ function VoiceDock({ data, append }) {
   return <section className="voice-dock" aria-label="Voice controls"><div><b>Voice, session-bound</b><small>{configured ? 'Push to talk through the private relay; delivery actions still require the bridge.' : 'Configure a private Anvil Voice Realtime endpoint to enable push to talk.'}</small></div>{!configured ? <button disabled aria-label="Voice not configured">Voice unavailable</button> : state === 'disconnected' || state === 'connecting' ? <button onClick={connect} disabled={state === 'connecting'}>{state === 'connecting' ? 'Connecting…' : 'Connect voice'}</button> : <><button className={state === 'listening' ? 'speaking' : ''} onPointerDown={startCapture} onPointerUp={finishCapture} onPointerCancel={finishCapture} aria-label="Hold to talk">{state === 'listening' ? 'Listening… release to send' : 'Hold to talk'}</button><button className="voice-close" onClick={disconnect}>Disconnect</button></>}</section>
 }
 
-function Delivery({ data, append, onDirective, onGuide }) {
+function Delivery({ data, append, onDirective, onGuide, onDeliverNext }) {
   const project = data.projects[0]
   const run = data.runs.find((item) => ['queued', 'running'].includes(item.status)) || data.runs[0]
   const session = data.sessions.find((item) => item.id === run?.session_id) || data.sessions[0]
@@ -101,7 +101,7 @@ function Delivery({ data, append, onDirective, onGuide }) {
   const [input, setInput] = useState('')
   const submit = async (event) => { event.preventDefault(); if (!session || !input.trim()) return; const text = input.trim(); try { await onDirective(session.id, text); setInput('') } catch { append('Direction was not recorded. No future work packet was changed.') } }
   if (!project) return <main className="delivery empty-delivery"><span className="crumb">Delivery / setup required</span><h1>Start a private delivery</h1><p>Workbench has no synthetic delivery. Create a project, register its local bridge, publish reviewed skills, then create a session.</p><button className="session-action" onClick={onGuide}>Open setup guide</button></main>
-  return <main className="delivery"><header className="project-header"><div><span className="crumb">Delivery / {project.name}</span><h1>{run?.task_id ? `Task ${run.task_id}` : 'No active task'}</h1><p>PRD → State plan → local Codex run → evidence → approved PR</p></div><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'ready for session'}</Status></header>
+  return <main className="delivery"><header className="project-header"><div><span className="crumb">Delivery / {project.name}</span><h1>{run?.task_id ? `Task ${run.task_id}` : 'No active task'}</h1><p>PRD → State plan → local Codex run → evidence → approved PR</p></div><div className="project-header-actions"><button className="session-action" onClick={onDeliverNext}>Deliver next task</button><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'ready for session'}</Status></div></header>
     <section className="flow-card"><div className="flow-top"><span className="thread-avatar">A</span><div><strong>Delivery operator</strong><small>{run ? `${run.model} through Anvil Serving` : 'Waiting for a bridge-supervised run'}</small></div><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'idle'}</Status></div><ol className="steps"><li className={run ? 'complete' : 'current'}><span>{run ? '✓' : '1'}</span><div><b>{run ? 'State work packet requested' : 'Create a session'}</b><small>{run ? `${run.id} is bound to the bridge and its configured worktree.` : 'A session creates a durable workflow and lease boundary.'}</small></div></li><li className={run?.status === 'evidenced' ? 'complete' : run ? 'current' : ''}><span>{run?.status === 'evidenced' ? '✓' : '2'}</span><div><b>Bridge edits and verifies locally</b><small>Redacted transcripts and State evidence return through the bridge.</small></div></li><li className={run?.status === 'evidenced' ? 'current' : ''}><span>3</span><div><b>Review evidence and authorize a hash-bound action</b><small>GitHub remains local to the bridge and requires approval.</small></div></li></ol></section>
     <section className="conversation" aria-label="Delivery directions">{messages.length ? messages.map((message) => <article className="message human" key={message.id}><div className="message-head"><span>OP</span><b>Recorded direction</b><small>event {message.sequence}</small></div><p>{message.data?.content}</p></article>) : <p className="evidence-empty">No recorded delivery directions for this session yet.</p>}</section>
     <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!session} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={session ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!session || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form><VoiceDock data={data} append={append} />
@@ -139,6 +139,195 @@ function NewDelivery({ onClose, onCreate }) { const [name, setName] = useState('
 function NewSession({ project, skills, onClose, onCreate }) { const [title, setTitle] = useState(''); const [worktree, setWorktree] = useState('default'); const [selected, setSelected] = useState([]); const [busy, setBusy] = useState(false); const toggle = (skill) => setSelected((current) => current.includes(skill) ? current.filter((item) => item !== skill) : [...current, skill]); const submit = async (event) => { event.preventDefault(); if (!project || !title.trim() || !worktree.trim()) return; setBusy(true); try { await onCreate({ project_id: project.id, title: title.trim(), worktree_id: worktree.trim(), skills: selected }) } finally { setBusy(false) } }; return <Modal title="New concurrent session" onClose={onClose}><p>A session is a durable harness context. Its worktree id must match a local bridge configuration before delivery can start.</p><form className="modal-form" onSubmit={submit}><label>Session title<input aria-label="Session title" value={title} onChange={(event) => setTitle(event.target.value)} /></label><label>Configured worktree id<input aria-label="Configured worktree id" value={worktree} onChange={(event) => setWorktree(event.target.value)} /></label>{skills.length ? <fieldset className="skill-selector"><legend>Bridge-published skills for this session</legend>{skills.map((skill) => <label key={skill.skill_id}><input type="checkbox" checked={selected.includes(skill.skill_id)} onChange={() => toggle(skill.skill_id)} />{skill.skill_id}</label>)}</fieldset> : null}<div><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button type="submit" disabled={busy || !project || !title.trim() || !worktree.trim()}>{busy ? 'Creating…' : 'Create session'}</button></div></form></Modal> }
 
 function StartSession({ session, workflow, onClose, onStart }) { const [taskId, setTaskId] = useState(''); const [model, setModel] = useState('planning'); const [busy, setBusy] = useState(false); const submit = async (event) => { event.preventDefault(); if (!taskId.trim()) return; setBusy(true); try { await onStart(workflow.id, { task_id: taskId.trim(), model: model.trim() || 'planning' }) } finally { setBusy(false) } }; return <Modal title={`Start ${session.title}`} onClose={onClose}><p>This queues the workflow’s pinned agent step through the configured local bridge. State claims the task; the browser never selects a filesystem path.</p><form className="modal-form" onSubmit={submit}><label>State task id<input aria-label="State task id" value={taskId} onChange={(event) => setTaskId(event.target.value)} /></label><label>Requested route<input aria-label="Requested route" value={model} onChange={(event) => setModel(event.target.value)} /></label><div><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button type="submit" disabled={busy || !taskId.trim()}>{busy ? 'Starting…' : 'Start bridge delivery'}</button></div></form></Modal> }
+
+// --- Deliver controls (plan-task-delivery T006) ------------------------------
+//
+// A focus-managed setup sheet that turns a ready State task into a started run
+// in ONE activation. The candidate and its blocked/eligibility truth come from
+// the merged read-only delivery-projection GET surface (fetchPrdTasks →
+// {tasks}, fetchTaskEligibility → {eligibility}); the start itself is the REAL
+// wired POST /api/workflows/{id}/start (startWorkflow → {workflow, run}) — there
+// is no separate Deliver route (workbench/deliver.py is deliberately NOT wired),
+// so this speaks only the shapes the hub actually serves.
+//
+// The sheet previews EXACTLY ONE ranked candidate (State's plan head), never a
+// batch and never skipping past a blocked head. Every choice is an approved id
+// (a startable session by id, a PRD by id) — never a filesystem path or a raw
+// command. A blocked candidate disables Deliver with its reason IN TEXT (not
+// colour alone) and an aria-describedby binding, and a live region announces the
+// candidate / blocked / delivering / error states.
+function DeliverSheet({ project, workflows, sessions, runs, onClose, onDeliver }) {
+  const [prdInput, setPrdInput] = useState('')
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
+  const [candidate, setCandidate] = useState(null)
+  const [loadedPrdId, setLoadedPrdId] = useState('')
+  const [loadError, setLoadError] = useState(null)
+  const [eligibility, setEligibility] = useState({ status: 'idle', value: null, message: null })
+  const [announce, setAnnounce] = useState('')
+  const [busy, setBusy] = useState(false)
+  const headingRef = useRef(null)
+  const loadSeq = useRef(0)
+
+  // Only a draft workflow whose session has no active run is startable — the same
+  // gate the Sessions view uses. Options carry the session TITLE (human) with the
+  // worktree + id as secondary text; the option VALUE is the approved workflow id
+  // (never free text). This is the "approved id/title only" choice (criterion 3).
+  const startable = (workflows || [])
+    .filter((workflow) => workflow.status === 'draft'
+      && !(runs || []).some((run) => run.session_id === workflow.session_id && ['queued', 'running'].includes(run.status)))
+    .map((workflow) => ({ workflow, session: (sessions || []).find((item) => item.id === workflow.session_id) }))
+  const selectedWorkflow = startable.find((item) => item.workflow.id === selectedWorkflowId)?.workflow || null
+  const model = selectedWorkflow?.model || 'planning'
+
+  const blockReason = deliverBlockReason({ candidate, eligibility, hasSession: Boolean(selectedWorkflow) })
+
+  // Focus into the sheet on open and restore focus to the opener on close, so a
+  // keyboard user is never dropped to <body> (a11y focus management).
+  useEffect(() => {
+    const opener = document.activeElement
+    headingRef.current?.focus()
+    return () => { opener?.focus?.() }
+  }, [])
+  // Document-level Escape closes the sheet even after focus has moved among its
+  // controls (a11y): the visible Close button is the discoverable path, Escape
+  // the keyboard one.
+  useEffect(() => {
+    const onKeyDown = (event) => { if (event.key === 'Escape' && !busy) onClose() }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [busy, onClose])
+
+  const loadCandidate = async () => {
+    const prdId = prdInput.trim()
+    if (!prdId) return
+    const seq = (loadSeq.current += 1)
+    setCandidate(null); setLoadError(null); setLoadedPrdId('')
+    setEligibility({ status: 'idle', value: null, message: null })
+    setAnnounce(`Loading the ranked candidate for PRD ${prdId}…`)
+    let tasks
+    try {
+      const value = await fetchPrdTasks(project.id, prdId)
+      if (seq !== loadSeq.current) return // a newer load superseded this one
+      tasks = value.tasks || []
+    } catch (error) {
+      if (seq !== loadSeq.current) return
+      setLoadError(error.message)
+      setAnnounce(error.message || `PRD ${prdId} tasks could not be loaded.`)
+      return
+    }
+    const cand = nextDeliverCandidate(tasks)
+    setCandidate(cand); setLoadedPrdId(prdId)
+    if (!cand) { setAnnounce(`PRD ${prdId} has no ranked task to deliver.`); return }
+    setAnnounce(`Ranked candidate: ${cand.title}. Checking delivery eligibility…`)
+    setEligibility({ status: 'loading', value: null, message: null })
+    try {
+      const value = await fetchTaskEligibility(project.id, prdId, cand.taskId)
+      if (seq !== loadSeq.current) return
+      const verdict = describeEligibility(value.eligibility)
+      setEligibility({ status: 'loaded', value: verdict, message: null })
+      if (verdict && !verdict.eligible) {
+        const primary = verdict.reasons[0]
+        setAnnounce(`Delivery blocked: ${primary?.explanation || verdict.state}`)
+      } else {
+        setAnnounce(`Ranked candidate ready to deliver: ${cand.title}`)
+      }
+    } catch (error) {
+      if (seq !== loadSeq.current) return
+      setEligibility({ status: 'error', value: null, message: error.message })
+      setAnnounce(error.message || 'Delivery eligibility is unavailable for this candidate.')
+    }
+  }
+
+  // One activation starts EXACTLY ONE Deliver: the busy guard plus the disabled
+  // button mean a second click/Enter while the start is in flight cannot fire a
+  // second startWorkflow — the idempotent backend is not asked to dedupe a UI
+  // double-submit (criterion 1 / no double-fire).
+  const deliver = async () => {
+    if (busy || blockReason || !candidate || !selectedWorkflow) return
+    setBusy(true)
+    setAnnounce(`Delivering ${candidate.title}…`)
+    try {
+      await onDeliver(selectedWorkflow.id, { task_id: candidate.taskId, model })
+      // On success the app closes the sheet and routes to the resulting run.
+    } catch {
+      setBusy(false)
+      setAnnounce('Delivery could not be started. No run was launched.')
+    }
+  }
+
+  return <div className="modal-backdrop" role="presentation">
+    <section className="modal deliver-sheet" role="dialog" aria-modal="true" aria-labelledby="deliver-sheet-title">
+      <header>
+        <h2 id="deliver-sheet-title" tabIndex={-1} ref={headingRef}>Deliver next task</h2>
+        <button aria-label="Close Deliver next task" onClick={onClose} disabled={busy}>×</button>
+      </header>
+      <p>Preview State’s next ranked candidate for one PRD and start it through the local bridge in a single activation. The browser never sends a filesystem path or a raw command.</p>
+
+      <div className="deliver-choices">
+        <label>Deliver into session
+          {startable.length
+            ? <select aria-label="Deliver into session" value={selectedWorkflowId} onChange={(event) => setSelectedWorkflowId(event.target.value)}>
+                <option value="">Choose a startable session…</option>
+                {startable.map(({ workflow, session }) => <option key={workflow.id} value={workflow.id}>{session ? `${session.title} · ${session.worktree_id}` : workflow.id}</option>)}
+              </select>
+            : <p className="deliver-muted">No startable session. Create a session with a configured worktree and start it here — no path or command is entered in this browser.</p>}
+        </label>
+        <form className="deliver-open" onSubmit={(event) => { event.preventDefault(); loadCandidate() }}>
+          <label>PRD id
+            <input aria-label="PRD id" value={prdInput} onChange={(event) => setPrdInput(event.target.value)} placeholder="e.g. release-alpha" />
+          </label>
+          <button className="explorer-open-prd" type="submit" disabled={!prdInput.trim()}>Load ranked candidate</button>
+          <small className="deliver-muted">PRD enumeration is not served; open a PRD by its approved id.</small>
+        </form>
+      </div>
+
+      <section className="deliver-candidate" aria-label="Ranked candidate">
+        {loadError
+          ? <p className="explorer-degraded">{loadError}</p>
+          : candidate
+          ? <>
+              <div className="deliver-candidate-head">
+                <div>
+                  <span className="deliver-candidate-eyebrow">Next ranked candidate{loadedPrdId ? ` · ${loadedPrdId}` : ''}</span>
+                  <b className="deliver-candidate-title">{candidate.title}</b>
+                  <small className="deliver-candidate-scoped">{candidate.scopedId}</small>
+                </div>
+                <Status tone={tone(candidate.status)}>{candidate.status}</Status>
+              </div>
+              <p className="deliver-candidate-meta">Delivery: {candidate.latestDeliveryStatus} · {candidate.dependsOn.length} {candidate.dependsOn.length === 1 ? 'dependency' : 'dependencies'} · route {model}</p>
+              <DeliverEligibility eligibility={eligibility} />
+            </>
+          : <p className="deliver-muted">Load a PRD to preview its single next ranked candidate. Exactly one candidate is shown; blocked dependencies are never silently skipped.</p>}
+      </section>
+
+      {blockReason && candidate && <p id="deliver-block-reason" className="deliver-block-reason">{blockReason.text} <code>{blockReason.code}</code></p>}
+      <div className="deliver-actions">
+        <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button>
+        <button
+          type="button"
+          className="deliver-start"
+          onClick={deliver}
+          disabled={busy || Boolean(blockReason)}
+          aria-disabled={busy || Boolean(blockReason) ? 'true' : undefined}
+          aria-describedby={blockReason && candidate ? 'deliver-block-reason' : undefined}
+        >{busy ? 'Delivering…' : candidate ? `Deliver ${candidate.title}` : 'Deliver'} <span aria-hidden="true">→</span></button>
+      </div>
+      <div className="deliver-live" role="status" aria-live="polite" aria-label="Deliver status">{announce}</div>
+    </section>
+  </div>
+}
+
+function DeliverEligibility({ eligibility }) {
+  if (!eligibility || eligibility.status === 'idle') return <p className="deliver-muted">Delivery eligibility has not been checked yet.</p>
+  if (eligibility.status === 'loading') return <p className="deliver-muted">Checking delivery eligibility…</p>
+  if (eligibility.status === 'error') return <p className="explorer-degraded">{eligibility.message || 'Delivery eligibility is unavailable for this candidate.'}</p>
+  const verdict = eligibility.value
+  if (!verdict) return <p className="deliver-muted">No delivery eligibility verdict for this candidate.</p>
+  return <div className="deliver-eligibility">
+    <Status tone={verdict.eligible ? 'green' : 'amber'}>{verdict.state}</Status>
+    <ul>{verdict.reasons.map((reason) => <li key={reason.code}><b>{reason.code}</b> — {reason.explanation}</li>)}</ul>
+  </div>
+}
 
 function Onboarding({ data, onClose, setActive, onNewDelivery, onNewSession }) { const project = data.projects[0]; const steps = [{ label: 'Create a Workbench project', complete: Boolean(project), action: () => project ? setActive('Delivery') : onNewDelivery() }, { label: 'Register a project-local bridge', complete: Boolean(project?.bridge_id), action: () => setActive('Skills') }, { label: 'Publish and verify bridge skills', complete: Boolean(data.skills?.length), action: () => setActive('Skills') }, { label: 'Create a harness session', complete: Boolean(data.sessions?.length), action: () => onNewSession() }, { label: 'Run a State task through the bridge', complete: Boolean(data.runs?.length), action: () => setActive('Sessions') }, { label: 'Review evidence before an approval', complete: Boolean(data.runs?.some((run) => run.status === 'evidenced')), action: () => setActive('Evidence') }]; const current = steps.find((step) => !step.complete) || steps.at(-1); const go = () => { current.action(); onClose() }; return <Modal title="Workbench setup guide" onClose={onClose}><p>This guide reflects live hub state. It never marks a bridge, skill, run, or evidence step complete on its own.</p><ol className="onboarding-steps">{steps.map((step, index) => <li key={step.label} className={step.complete ? 'done' : ''}><span>{step.complete ? '✓' : index + 1}</span>{step.label}</li>)}</ol><button className="session-action" onClick={go}>{current.complete ? 'Review completed setup' : `Continue: ${current.label}`}</button></Modal> }
 
@@ -825,12 +1014,24 @@ function ExplorerView({ data, append }) {
 }
 
 function App() {
-  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false)
+  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false); const [deliverOpen, setDeliverOpen] = useState(false)
   const load = async () => { const value = await bootstrap(); setData({ ...emptyData, ...value, sandbox: { ...emptyData.sandbox, ...(value.sandbox || {}) }, voice: { ...emptyData.voice, ...(value.voice || {}) } }); return value }
   useEffect(() => { load().catch(() => setNotice('Workbench hub is unavailable; no local mock delivery is shown.')) }, [])
   const createDelivery = async (payload) => { try { const project = await createProject(payload); setData((current) => ({ ...current, projects: [project, ...current.projects] })); setNewDeliveryOpen(false); setNotice(`Created ${project.name}. Register its bridge locally before starting a run.`); await load() } catch { setNotice('Project could not be created. No bridge or run was started.') } }
   const createConcurrentSession = async (payload) => { try { const created = await createSession(payload); setData((current) => ({ ...current, sessions: [created.session, ...current.sessions], workflows: [created.workflow, ...current.workflows] })); setNewSessionOpen(false); setActive('Sessions'); setNotice(`Created ${created.session.title}. Start it only after its named worktree is configured on the bridge.`); await load() } catch { setNotice('Session could not be created. No bridge run was started.') } }
   const startConcurrentSession = async (workflowId, payload) => { try { const result = await startWorkflow(workflowId, payload); setStartSession(null); setActive('Delivery'); setNotice(`Started ${payload.task_id} through the local bridge. The workflow is traceable in this session.`); setData((current) => ({ ...current, runs: [result.run, ...current.runs] })); await load() } catch { setNotice('Workflow did not start. Check the project bridge, published skills, and named worktree configuration.') } }
+  // The one-activation Deliver: start the ranked candidate through the REAL wired
+  // POST /api/workflows/{id}/start, then route to the resulting run. Throws on
+  // failure so the sheet keeps itself open and announces a truthful error (it
+  // does NOT close or fabricate a started run).
+  const deliverCandidate = async (workflowId, payload) => {
+    const result = await startWorkflow(workflowId, payload)
+    setDeliverOpen(false); setActive('Delivery')
+    setData((current) => ({ ...current, runs: [result.run, ...current.runs] }))
+    setNotice(`Delivering ${payload.task_id} through the local bridge. Its run is ${result.run.id}.`)
+    await load()
+    return result.run
+  }
   const addDirection = async (sessionId, text) => { const result = await addDirective(sessionId, text); if (result.recorded && result.event) { setData((current) => ({ ...current, directives: [...current.directives, result.event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.') } else { setNotice(`Direction was not recorded (${result.outcome}). No future work packet was changed.`) } await load() }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
   const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
@@ -844,7 +1045,7 @@ function App() {
         : active === 'Explorer'
         ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} /></div>
         : <div className="main-grid">
-            {active === 'Delivery' ? <Delivery data={data} append={setNotice} onDirective={addDirection} onGuide={() => setGuideOpen(true)} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} append={setNotice} refresh={load} selectApproval={selectApproval} />}
+            {active === 'Delivery' ? <Delivery data={data} append={setNotice} onDirective={addDirection} onGuide={() => setGuideOpen(true)} onDeliverNext={() => setDeliverOpen(true)} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} append={setNotice} refresh={load} selectApproval={selectApproval} />}
             <Trace data={data} setActive={setActive} append={setNotice} refresh={load} selectedApprovalId={selectedApprovalId} clearApproval={() => setSelectedApprovalId(null)} />
           </div>}
       {notice && <div className="toast" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button></div>}
@@ -853,6 +1054,7 @@ function App() {
     {newSessionOpen && <NewSession project={data.projects[0]} skills={data.skills.filter((skill) => skill.bridge_id === data.projects[0]?.bridge_id)} onClose={() => setNewSessionOpen(false)} onCreate={createConcurrentSession} />}
     {startSession && <StartSession session={startSession.session} workflow={startSession.workflow} onClose={() => setStartSession(null)} onStart={startConcurrentSession} />}
     {guideOpen && <Onboarding data={data} onClose={() => setGuideOpen(false)} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onNewSession={() => setNewSessionOpen(true)} />}
+    {deliverOpen && <DeliverSheet project={data.projects[0]} workflows={data.workflows} sessions={data.sessions} runs={data.runs} onClose={() => setDeliverOpen(false)} onDeliver={deliverCandidate} />}
   </div>
 }
 

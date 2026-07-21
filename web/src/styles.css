@@ -112,3 +112,22 @@
 .app-shell.explorer-active .rail .brand{padding:0 12px 0 0}
 .app-shell.explorer-active .rail-footer{margin:0 0 0 auto}
 .app-shell.explorer-active .workspace{margin-left:0;width:100%}}
+
+/* Deliver controls + setup sheet (plan-task-delivery T006). A focus-managed
+   dialog over the shared modal shell: one ranked candidate preview, approved-id
+   choices, and a truthful blocked state that states WHY in text (never colour
+   alone). */
+.project-header-actions{display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+.deliver-sheet{width:min(520px,100%)}.deliver-sheet header h2{outline:none}.deliver-sheet header h2:focus-visible{outline:1px solid #3aa08e;outline-offset:4px}.deliver-sheet header button:disabled{opacity:.5;cursor:default}
+.deliver-choices{display:grid;gap:12px;margin:16px 0 4px}.deliver-choices>label{display:grid;gap:6px;color:#b6c8c5;font-size:10px;font-weight:700}
+.deliver-choices select{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:9px 10px;outline:none;font:inherit;font-size:11px}
+.deliver-open{display:grid;gap:8px;border:1px solid #20343a;background:#0c181c;border-radius:8px;padding:11px 12px}.deliver-open label{display:grid;gap:6px;color:#b6c8c5;font-size:10px;font-weight:700}.deliver-open input{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:8px 10px;outline:none;font:inherit;font-size:11px}.deliver-open .explorer-open-prd:disabled{opacity:.48;cursor:default}
+.deliver-muted{color:#61757a;font-size:10px;line-height:1.55;margin:0}
+.deliver-candidate{border:1px solid #20343a;background:#0b171b;border-radius:8px;padding:12px 13px;display:grid;gap:9px;margin:6px 0}
+.deliver-candidate-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.deliver-candidate-eyebrow{display:block;font-size:8px;text-transform:uppercase;letter-spacing:.06em;color:#66817b}.deliver-candidate-title{display:block;font-size:14px;letter-spacing:-.03em;color:#e6f1ee;margin:3px 0 2px}.deliver-candidate-scoped{display:block;font-family:'DM Mono',monospace;font-size:8px;color:#83a49d}
+.deliver-candidate-meta{margin:0;color:#8da1a4;font-size:10px}
+.deliver-eligibility{display:grid;gap:8px}.deliver-eligibility ul{list-style:none;margin:0;padding:0;display:grid;gap:6px}.deliver-eligibility li{font-size:11px;color:#c3d5d1;line-height:1.5}.deliver-eligibility b{font-family:'DM Mono',monospace;color:#9be5d3;font-size:10px}
+.deliver-block-reason{margin:4px 0 0;padding:9px 11px;border:1px solid #4d4022;border-left-width:3px;border-radius:6px;background:#1a1710;color:#e8cf96;font-size:10px;line-height:1.5}.deliver-block-reason code{font-family:'DM Mono',monospace;color:#d7ab60;font-size:9px}
+.deliver-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}.deliver-actions .secondary-button{border:0;border-radius:5px;background:#203438;color:#b5cbc7;font-size:10px;font-weight:800;padding:7px 11px}.deliver-actions .secondary-button:disabled{opacity:.5;cursor:default}
+.deliver-start{border:0;border-radius:5px;background:var(--teal);color:#09211d;font-size:10px;font-weight:800;padding:7px 13px}.deliver-start span{margin-left:8px}.deliver-start:disabled,.deliver-start[aria-disabled=true]{background:#264944;color:#8da9a3;cursor:default}
+.deliver-live{min-height:12px;margin-top:10px;font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:#7fbfb2}
