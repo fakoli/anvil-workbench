@@ -287,3 +287,50 @@ function jsonPostWithSignal(path, body, signal) {
     signal,
   })
 }
+
+// --- Delivery-projection explorer client (plan-task-delivery T003) ------------
+//
+// The browser half of the merged, read-only delivery-projection surface
+// (workbench/api.py `build_delivery_projection_router`). Every endpoint is
+// GET-only, project-scoped by the path, and redacted server-side on the last
+// hop, so this client assembles only the safe path — no actor, token, endpoint,
+// or credential — and returns the exact wrapped shape the router serves:
+// `{content}`, `{tasks}`, `{task}`, `{eligibility}`. The surface fails closed
+// with 503 until a projection store is configured (it is deliberately NOT wired
+// into the live bridge poll loop); that is surfaced as a distinct, truthful
+// "not configured" error so the UI renders an unconfigured degraded state
+// rather than a generic failure. Any other non-2xx throws a non-leaking Error.
+
+const PROJECTS = '/api/projects'
+
+function prdBase(projectId, prdId) {
+  return `${PROJECTS}/${encodeURIComponent(projectId)}/prds/${encodeURIComponent(prdId)}`
+}
+
+async function deliveryJson(response, failure) {
+  if (response.status === 503) throw new Error('Delivery projection is not configured for this hub')
+  if (!response.ok) throw new Error(failure)
+  return response.json()
+}
+
+export async function fetchPrdContent(projectId, prdId) {
+  return deliveryJson(await fetch(`${prdBase(projectId, prdId)}/content`), 'PRD content is unavailable')
+}
+
+export async function fetchPrdTasks(projectId, prdId) {
+  return deliveryJson(await fetch(`${prdBase(projectId, prdId)}/tasks`), 'PRD tasks are unavailable')
+}
+
+export async function fetchTaskReference(projectId, prdId, taskId) {
+  return deliveryJson(
+    await fetch(`${prdBase(projectId, prdId)}/tasks/${encodeURIComponent(taskId)}`),
+    'Task reference is unavailable',
+  )
+}
+
+export async function fetchTaskEligibility(projectId, prdId, taskId) {
+  return deliveryJson(
+    await fetch(`${prdBase(projectId, prdId)}/tasks/${encodeURIComponent(taskId)}/eligibility`),
+    'Task eligibility is unavailable',
+  )
+}
