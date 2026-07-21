@@ -477,6 +477,67 @@ def _reset_deliver_start_receipt_contract_validator_cache() -> None:
     _deliver_start_receipt_contract_validator_cache = None
 
 
+_OPERATION_RECEIPT_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "operation-receipt.v1.schema.json"
+)
+_operation_receipt_contract_validator_cache: Draft202012Validator | None = None
+
+
+def operation_receipt_contract_validator() -> Draft202012Validator:
+    """Load the operation-receipt contract schema once; fail closed if absent.
+
+    Shared by every receipt consumer (the durable receipt store, future receipt
+    APIs) so there is exactly one interpretation of the contract schema.  The
+    closed-root and closed-error guards refuse a schema edit that would reopen
+    the receipt or its error block to unreviewed extension fields: a receipt must
+    stay a closed, redacted record through which a secret, a raw command, a path,
+    or a provider payload can never ride in, and its error summary must keep the
+    credential-class token guard.
+    """
+    global _operation_receipt_contract_validator_cache
+    if _operation_receipt_contract_validator_cache is None:
+        try:
+            schema = json.loads(_OPERATION_RECEIPT_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "operation-receipt contract schema is unavailable; refusing to validate receipts"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "operation-receipt contract schema no longer closes its root object; "
+                "refusing to validate receipts"
+            )
+        for name in ("operation", "redaction", "error", "correlation"):
+            node = schema.get("properties", {}).get(name)
+            if not isinstance(node, dict) or node.get("additionalProperties") is not False:
+                raise ContractValidationError(
+                    f"operation-receipt contract schema no longer closes its {name} object; "
+                    "refusing to validate receipts"
+                )
+        error_summary = schema.get("properties", {}).get("error", {}).get("properties", {}).get("safe_summary", {})
+        if not isinstance(error_summary, dict) or "not" not in error_summary:
+            raise ContractValidationError(
+                "operation-receipt contract schema no longer guards its error summary "
+                "against credential-class tokens; refusing to validate receipts"
+            )
+        _operation_receipt_contract_validator_cache = Draft202012Validator(schema)
+    return _operation_receipt_contract_validator_cache
+
+
+def _reset_operation_receipt_contract_validator_cache() -> None:
+    """Test hook: force the next receipt validation to reload the on-disk schema."""
+    global _operation_receipt_contract_validator_cache
+    _operation_receipt_contract_validator_cache = None
+
+
+def validate_operation_receipt(receipt: Mapping[str, Any]) -> None:
+    """Fail closed unless a receipt payload conforms to the receipt contract."""
+    try:
+        operation_receipt_contract_validator().validate(dict(receipt))
+    except ValidationError as exc:
+        raise ContractValidationError(f"operation receipt is not schema valid: {exc.message}") from exc
+
+
 _PLUGIN_CATALOG_CONTRACT_SCHEMA_PATH = (
     Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "plugin-catalog.v1.schema.json"
 )
