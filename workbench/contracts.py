@@ -199,6 +199,97 @@ def _reset_settings_descriptor_contract_validator_cache() -> None:
     _settings_descriptor_contract_validator_cache = None
 
 
+_ADVANCED_BRANCH_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "advanced-branch.v1.schema.json"
+)
+_advanced_branch_contract_validator_cache: Draft202012Validator | None = None
+
+
+def advanced_branch_contract_validator() -> Draft202012Validator:
+    """Load the advanced-branch contract schema once; fail closed if absent.
+
+    Shared by every Advanced-branch consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root and
+    closed-control-descriptor guards refuse a schema edit that would reopen the
+    branch or a control descriptor to unreviewed extension fields: an Advanced
+    branch must stay a closed reference-and-control record, never an extensible
+    envelope through which a raw endpoint, a second conversation identity, or an
+    undeclared control could ride in.
+    """
+    global _advanced_branch_contract_validator_cache
+    if _advanced_branch_contract_validator_cache is None:
+        try:
+            schema = json.loads(_ADVANCED_BRANCH_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "advanced-branch contract schema is unavailable; refusing to validate branches"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-branch contract schema no longer closes its root object; "
+                "refusing to validate branches"
+            )
+        descriptor = schema.get("$defs", {}).get("controlDescriptor")
+        if not isinstance(descriptor, dict) or descriptor.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-branch contract schema no longer closes its control descriptor; "
+                "refusing to validate branches"
+            )
+        _advanced_branch_contract_validator_cache = Draft202012Validator(schema)
+    return _advanced_branch_contract_validator_cache
+
+
+def _reset_advanced_branch_contract_validator_cache() -> None:
+    """Test hook: force the next branch validation to reload the on-disk schema."""
+    global _advanced_branch_contract_validator_cache
+    _advanced_branch_contract_validator_cache = None
+
+
+_ADVANCED_PRESET_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "advanced-preset.v1.schema.json"
+)
+_advanced_preset_contract_validator_cache: Draft202012Validator | None = None
+
+
+def advanced_preset_contract_validator() -> Draft202012Validator:
+    """Load the advanced-preset contract schema once; fail closed if absent.
+
+    Shared by every Advanced-preset consumer so there is exactly one
+    interpretation of the contract schema.  The closed-root and closed-repair
+    guards refuse a schema edit that would reopen the preset or its repair block
+    to unreviewed extension fields: a preset must stay a closed, digest-pinned
+    record whose drift/repair state is a bounded typed enumeration, never an
+    extensible envelope that could silently substitute a route or tool.
+    """
+    global _advanced_preset_contract_validator_cache
+    if _advanced_preset_contract_validator_cache is None:
+        try:
+            schema = json.loads(_ADVANCED_PRESET_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "advanced-preset contract schema is unavailable; refusing to validate presets"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-preset contract schema no longer closes its root object; "
+                "refusing to validate presets"
+            )
+        repair = schema.get("properties", {}).get("repair", {})
+        if not isinstance(repair, dict) or repair.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-preset contract schema no longer closes its repair block; "
+                "refusing to validate presets"
+            )
+        _advanced_preset_contract_validator_cache = Draft202012Validator(schema)
+    return _advanced_preset_contract_validator_cache
+
+
+def _reset_advanced_preset_contract_validator_cache() -> None:
+    """Test hook: force the next preset validation to reload the on-disk schema."""
+    global _advanced_preset_contract_validator_cache
+    _advanced_preset_contract_validator_cache = None
+
+
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -292,6 +383,7 @@ _PREFIXES = {
     "state-snapshot": b"anvil-workbench/state-snapshot/v1\0",
     "prd-content": b"anvil-workbench/prd-content/v1\0",
     "settings-descriptor": b"anvil-workbench/settings-descriptor/v1\0",
+    "advanced-preset": b"anvil-workbench/advanced-preset/v1\0",
 }
 
 
@@ -406,6 +498,22 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
         settings = payload.get("settings")
         if isinstance(settings, list):
             payload["settings"] = sorted(copy.deepcopy(settings), key=lambda item: str(item.get("id", "")))
+    elif kind == "advanced-preset":
+        # Exclude the digest and the volatile repair block: the same preset
+        # content must hash identically regardless of the current live-drift
+        # state, so drift is detected by comparing pinned references to live
+        # digests, never by the digest changing.
+        payload = _without(value, "preset_digest", "repair")
+        control_values = payload.get("control_values")
+        if isinstance(control_values, list):
+            payload["control_values"] = sorted(
+                copy.deepcopy(control_values), key=lambda item: str(item.get("name", ""))
+            )
+        tools = payload.get("tools")
+        if isinstance(tools, list):
+            payload["tools"] = sorted(
+                copy.deepcopy(tools), key=lambda item: str(item.get("tool_id", ""))
+            )
     return payload
 
 
@@ -671,6 +779,166 @@ def _redact_settings_value(value):
     from workbench.redaction import redact_value
 
     return redact_value(value)
+
+
+def _check_advanced_control_value(descriptor: Mapping[str, Any], value: Any, name: str) -> None:
+    """Refuse a submitted control value that violates its declared descriptor."""
+    control_type = descriptor.get("type")
+    if control_type == "int":
+        bounds = descriptor.get("bounds")
+        if not isinstance(bounds, Mapping):
+            raise ContractValidationError(f"declared int control has no bounds: {name}")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ContractValidationError(f"control {name} must be an integer: {value!r}")
+        if not (bounds.get("min", value) <= value <= bounds.get("max", value)):
+            raise ContractValidationError(
+                f"control {name} is outside its declared bounds "
+                f"[{bounds.get('min')}, {bounds.get('max')}]: {value!r}"
+            )
+    elif control_type == "enum":
+        allowed = descriptor.get("allowed_values")
+        if not isinstance(allowed, (list, tuple)) or value not in allowed:
+            raise ContractValidationError(f"control {name} is not one of its declared allowed values: {value!r}")
+    elif control_type == "bool":
+        if not isinstance(value, bool):
+            raise ContractValidationError(f"control {name} must be a boolean: {value!r}")
+    else:  # pragma: no cover - schema pins the type enum
+        raise ContractValidationError(f"control {name} declares an unsupported type: {control_type!r}")
+
+
+def validate_advanced_branch(branch: Mapping[str, Any]) -> None:
+    """Fail closed when an Advanced-mode branch violates a cross-field rule.
+
+    JSON Schema pins each shape; these are the rules it cannot express and the
+    first acceptance criterion depends on:
+
+    * a submitted control MUST name a control the pinned route capability
+      declares (with a type, bounds/allowed values, and default) and stay within
+      those declared bounds — an undeclared or out-of-bounds control is refused
+      before it could ever reach a Serving request (criterion 1); the route and
+      profile digests are schema-required on ``route_capability`` so a control is
+      never submittable without them;
+    * a ``policy_owned`` control is read-only: a submitted value must carry
+      ``policy_override`` provenance and equal the declared default, so a crafted
+      request cannot override a policy-owned value (R006).
+    """
+    try:
+        advanced_branch_contract_validator().validate(dict(branch))
+    except ValidationError as exc:
+        raise ContractValidationError(f"advanced branch is not schema valid: {exc.message}") from exc
+
+    route_capability = branch.get("route_capability")
+    if not isinstance(route_capability, Mapping):
+        raise ContractValidationError("advanced branch has no route capability")
+    declared: dict[str, Mapping[str, Any]] = {}
+    for descriptor in route_capability.get("supported_controls", []):
+        if isinstance(descriptor, Mapping):
+            declared[str(descriptor.get("name"))] = descriptor
+
+    for submitted in branch.get("submitted_controls", []):
+        if not isinstance(submitted, Mapping):
+            raise ContractValidationError("submitted control is not an object")
+        name = str(submitted.get("name"))
+        descriptor = declared.get(name)
+        if descriptor is None:
+            raise ContractValidationError(
+                f"submitted control is not declared by the route capability: {name}"
+            )
+        value = submitted.get("value")
+        _check_advanced_control_value(descriptor, value, name)
+        if descriptor.get("policy_owned") is True:
+            if submitted.get("provenance") != "policy_override" or value != descriptor.get("default"):
+                raise ContractValidationError(
+                    f"policy-owned control is read-only and cannot be overridden: {name}"
+                )
+
+
+def _advanced_preset_drift(
+    preset: Mapping[str, Any], live_digests: Mapping[str, Mapping[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Return the deterministic set of drifted preset references.
+
+    A reference drifts when the live digest for its id is missing or differs
+    from the digest the preset pinned.  The key is ``(ref_kind, id)`` and the
+    value is the pinned digest, so the caller can compare it byte-for-byte with
+    the preset's declared ``repair.drifted_refs``.
+    """
+    drift: dict[tuple[str, str], str] = {}
+
+    def _check(ref_kind: str, ref_id: str, pinned: Any) -> None:
+        if not isinstance(pinned, str):
+            return
+        live_for_kind = live_digests.get(ref_kind, {})
+        live = live_for_kind.get(ref_id) if isinstance(live_for_kind, Mapping) else None
+        if live != pinned:
+            drift[(ref_kind, ref_id)] = pinned
+
+    route = preset.get("route", {})
+    if isinstance(route, Mapping):
+        route_id = str(route.get("route_id"))
+        _check("route", route_id, route.get("route_digest"))
+        _check("profile", route_id, route.get("profile_digest"))
+    for tool in preset.get("tools", []):
+        if isinstance(tool, Mapping):
+            _check("tool", str(tool.get("tool_id")), tool.get("tool_digest"))
+    response_format = preset.get("response_format", {})
+    if isinstance(response_format, Mapping) and response_format.get("mode") == "json_schema":
+        schema_ref = response_format.get("schema_ref")
+        if not isinstance(schema_ref, str) or not schema_ref:
+            # A json_schema preset MUST name a keyable schema_ref so its pinned
+            # digest is always drift-checked; an unkeyed digest is unmonitored.
+            raise ContractValidationError(
+                "a json_schema preset must reference a schema_ref so its pinned digest is drift-checked"
+            )
+        _check("response_schema", schema_ref, response_format.get("schema_digest"))
+    return drift
+
+
+def validate_advanced_preset(
+    preset: Mapping[str, Any], live_digests: Mapping[str, Mapping[str, str]],
+) -> None:
+    """Fail closed when an Advanced preset is tampered with or misreports drift.
+
+    Criterion 3: a preset pins exact route/tool digests, so drift against the
+    current live digests is deterministic.  This validator (a) recomputes the
+    tamper-evident ``preset_digest`` over the content minus the volatile repair
+    block, and (b) requires the preset's declared repair state to equal the
+    computed drift exactly — a drifted preset MUST be ``repair_required`` with
+    precisely the drifted references listed, and an undrifted preset MUST be
+    ``ready``.  The validator never chooses a substitute route or tool; a
+    drifted preset opens in repair mode instead of silently changing values.
+
+    ``live_digests`` is a mapping ``{ref_kind: {id: digest}}`` for ``route``,
+    ``profile`` (keyed by route id), ``tool`` (keyed by tool id), and
+    ``response_schema`` (keyed by schema ref).
+    """
+    try:
+        advanced_preset_contract_validator().validate(dict(preset))
+    except ValidationError as exc:
+        raise ContractValidationError(f"advanced preset is not schema valid: {exc.message}") from exc
+
+    if preset.get("preset_digest") != contract_digest("advanced-preset", preset):
+        raise ContractValidationError("advanced preset digest mismatch")
+
+    drift = _advanced_preset_drift(preset, live_digests)
+    repair = preset.get("repair", {})
+    status = repair.get("status") if isinstance(repair, Mapping) else None
+    declared: dict[tuple[str, str], str] = {}
+    for entry in repair.get("drifted_refs", []) if isinstance(repair, Mapping) else []:
+        if isinstance(entry, Mapping):
+            declared[(str(entry.get("ref_kind")), str(entry.get("id")))] = str(entry.get("pinned_digest"))
+
+    if drift:
+        if status != "repair_required":
+            raise ContractValidationError(
+                "advanced preset with drifted route/tool/profile digests must open in repair mode"
+            )
+        if declared != drift:
+            raise ContractValidationError(
+                "advanced preset repair drifted_refs do not match the computed digest drift"
+            )
+    elif status != "ready":
+        raise ContractValidationError("advanced preset without digest drift must be ready")
 
 
 def validate_bridge_command_snapshot(

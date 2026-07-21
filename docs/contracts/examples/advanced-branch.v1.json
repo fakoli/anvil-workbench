@@ -1,0 +1,103 @@
+{
+  "schema_version": "workbench-advanced-branch/v1",
+  "branch_id": "advbranch_fastheavy_0001",
+  "mode": "advanced",
+  "conversation_ref": {
+    "binding": "existing_conversation",
+    "conversation_id": "conv_advanced_playground_0001",
+    "fork_point": {
+      "parent_turn_id": "turn_userroot_0001",
+      "from_sibling_index": 0
+    }
+  },
+  "title": {
+    "content_trust": "untrusted_task_data",
+    "text": "Fast route strict-JSON experiment"
+  },
+  "instructions": {
+    "content_trust": "untrusted_task_data",
+    "role": "instructions",
+    "text": "Answer using the reviewed template. Keep system instructions separate from the user question.",
+    "template_ref": {
+      "template_id": "strict_reviewer",
+      "template_digest": "sha256:f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6"
+    }
+  },
+  "retention": {
+    "class": "durable",
+    "saved_at": "2026-07-20T10:05:00Z"
+  },
+  "route_capability": {
+    "provider": "anvil-serving",
+    "route_id": "route.chat-fast",
+    "route_digest": "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "profile_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "serving_contract_version": "1.0.0",
+    "model_profile": "chat-fast",
+    "structured_output_supported": true,
+    "tools_supported": true,
+    "supported_controls": [
+      {
+        "name": "temperature_milli",
+        "type": "int",
+        "bounds": {"min": 0, "max": 2000},
+        "default": 700
+      },
+      {
+        "name": "max_output_tokens",
+        "type": "int",
+        "bounds": {"min": 1, "max": 1000000},
+        "default": 1024
+      },
+      {
+        "name": "reasoning_effort",
+        "type": "enum",
+        "allowed_values": ["low", "medium", "high"],
+        "default": "medium"
+      },
+      {
+        "name": "response_streaming",
+        "type": "bool",
+        "default": true,
+        "policy_owned": true
+      }
+    ]
+  },
+  "submitted_controls": [
+    {"name": "temperature_milli", "value": 300, "provenance": "declared"},
+    {"name": "reasoning_effort", "value": "high", "provenance": "declared"},
+    {"name": "response_streaming", "value": true, "provenance": "policy_override"}
+  ],
+  "structured_output": {
+    "mode": "json_schema",
+    "schema_ref": "strict_json",
+    "schema_digest": "sha256:e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"
+  },
+  "tool_profile": {
+    "tools": [
+      {
+        "tool_id": "echo_fixture",
+        "kind": "mock",
+        "tool_digest": "sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+      },
+      {
+        "tool_id": "repo_reader",
+        "kind": "read_only",
+        "tool_digest": "sha256:d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+      }
+    ]
+  },
+  "budgets": {
+    "max_input_tokens": 8000,
+    "max_output_tokens": 1024,
+    "max_context_tokens": 32000,
+    "max_tool_calls": 4,
+    "max_duration_ms": 60000,
+    "max_concurrency": 2
+  },
+  "repair": {
+    "status": "ready"
+  },
+  "created_at": "2026-07-20T10:00:00Z",
+  "updated_at": "2026-07-20T10:05:00Z"
+}
