@@ -1,7 +1,7 @@
 # Workbench UI acceptance audit
 
-Date: 2026-07-19  
-Scope: `codex/workbench-release-readiness` candidate
+Date: 2026-07-21  
+Scope: `codex/workbench-release-readiness` candidate + chat-first-voice T004 chat surface
 
 This audit distinguishes a functional hub-backed control from a configuration boundary. Nothing in this UI is a synthetic delivery, a raw-provider escape hatch, or a browser-side GitHub action.
 
@@ -9,19 +9,20 @@ This audit distinguishes a functional hub-backed control from a configuration bo
 
 | Measure | Result |
 | --- | --- |
-| Main navigation surfaces covered | 8 / 8 |
+| Main navigation surfaces covered | 9 / 9 |
 | Hub-backed interactive workflows covered | 7 / 7 |
 | Utility and onboarding controls covered | 5 / 5 |
-| Web component scenarios | **8 / 8 passed** |
-| Backend and bridge contract tests | **49 / 49 passed** |
+| Web component scenarios | **50 / 50 passed** |
+| Backend and bridge contract tests | **661 / 661 passed** |
 | Production web build | passed |
 
-The component suites are [`web/src/App.test.jsx`](../web/src/App.test.jsx) and [`web/src/api.test.js`](../web/src/api.test.js). They mock only the HTTP boundary, then assert the request a real control makes; they do not rely on a delivery seed. Backend tests assert the corresponding durable commands and security checks, including exact verification-command allowlisting without a shell, typed operation inputs, atomic approval consumption plus lease renewal, session-lease-bound GitHub worktrees, PR-to-merge lease retention, and action-failure reconciliation.
+The component suites are [`web/src/App.test.jsx`](../web/src/App.test.jsx), [`web/src/api.test.js`](../web/src/api.test.js), and [`web/src/chat-api.test.js`](../web/src/chat-api.test.js). They mock only the HTTP boundary, then assert the request a real control makes; they do not rely on a delivery seed. Backend tests assert the corresponding durable commands and security checks, including exact verification-command allowlisting without a shell, typed operation inputs, atomic approval consumption plus lease renewal, session-lease-bound GitHub worktrees, PR-to-merge lease retention, and action-failure reconciliation.
 
 ## Control matrix
 
 | Surface | Control | Backed operation or boundary | Test status |
 | --- | --- | --- | --- |
+| Chat | Rail management, transcript, composer, route select, retry/branch, live region | The default surface. Actor-scoped `/api/conversations` list/search/create/rename/archive/unarchive/delete, streamed send with cancel, and retry/branch successors — each mocked at the HTTP boundary and asserted against the request a real control makes. | Component-passed; live render deferred to T006 (below) |
 | Delivery | Send delivery direction | Persists an `operator.directive` event. It is copied into the next bridge work packet for that session. | Passed |
 | Sessions | New concurrent session; Start delivery | Creates a version-pinned session workflow, then queues a leased bridge run for a State task. | Passed |
 | Runs | Refresh runs | Reloads durable hub run state. | Passed |
@@ -34,6 +35,45 @@ The component suites are [`web/src/App.test.jsx`](../web/src/App.test.jsx) and [
 | Project | New delivery | Creates only a hub project record. It never retrieves a bridge secret into the web UI after registration. | Passed |
 | Setup | Help / setup guide | Walks the operator to the next incomplete *live* setup gate; it cannot manufacture completion. | Passed |
 | Utilities | Operator menu; activity; mark viewed | Shows server-returned actor/audit metadata; “mark viewed” is browser-local read state only. | Passed |
+
+## Chat surface (chat-first-voice T004)
+
+The chat surface is the default view. Its acceptance criterion is "component AND
+rendered-browser checks." This entry records the hermetic (jsdom/component) half
+honestly and states plainly what is NOT yet done.
+
+What the jsdom/component tests prove (in `web/src/App.test.jsx`,
+`web/src/api.test.js`, `web/src/chat-api.test.js`):
+
+- **Navigation 9/9, Chat default.** Chat is first in the nav and selected on
+  load (`aria-current="page"`); Delivery and the other seven surfaces stay
+  reachable and each render their heading.
+- **Rail.** List (active/archived sections kept visibly distinct), debounced
+  latest-wins search, create, rename (rendered row title updates), archive
+  (row moves to Archived), and a two-step-confirm delete (row disappears).
+- **Transcript.** Distinct no-conversation / empty / streaming / interrupted /
+  failed / cancelled states; retry and branch render as visible successors and
+  never rewrite the prior turn.
+- **Composer.** Multiline with Enter-to-send / Shift+Enter newline, an IME
+  composition guard, and disabled send while streaming.
+- **Route.** Only the reviewed allowlist appears; an undeclared route is refused
+  before any send; changing the route preserves the transcript.
+- **Live region.** `role="status" aria-live="polite"` announces each lifecycle
+  transition (streaming / complete / cancelled / interrupted / failed).
+- **Correctness invariants.** Retry/branch post the exact `{kind:'text', text}`
+  body the server's `TurnBodyInput`/`ContentBlockInput` accept (retry → sibling
+  assistant, branch → follow-up user), with a revert-detecting body-equality
+  assertion; and a stream that settles after the operator switches conversations
+  is dropped rather than landing in — or cancelling — the wrong conversation.
+- **Console health.** The Vite production build and the vitest run complete with
+  no errors or unhandled rejections.
+
+**Deferred — live rendered-browser qualification.** A rendered interaction
+against a live hub + browser (real `/api/conversations` persistence, a real
+streamed relay frame, real console/network capture) is NOT performed here. That
+live qualification is **chat-first-voice:T006's** scope, consistent with the
+not-wired-live constraint on the rest of this run. This entry does not claim a
+browser render that was not done.
 
 ## Workflow coverage
 
