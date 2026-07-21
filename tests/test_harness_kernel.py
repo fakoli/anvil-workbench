@@ -954,6 +954,26 @@ def test_preflight_gated_operation_refuses_a_hash_that_does_not_bind_the_inputs(
     assert excinfo.value.code == "approval.hash_mismatch"
 
 
+def test_preflight_gated_operation_refuses_an_approval_action_that_differs_from_the_gate():
+    # bridge.py preflight step 6 binds the descriptor's gates.approval_action: an
+    # approval carrying a DIFFERENT action (e.g. a merge_and_accept grant replayed
+    # onto a commit_pr operation) is refused with the stable
+    # approval.action_mismatch code, BEFORE the hash bind or the one-time consume.
+    snapshot = compile_delivery_snapshot()
+    command = invoke_operation_command(
+        snapshot, operation_id="bridge.github.commit_pr", inputs=_COMMIT_INPUTS,
+        grant_id="approval_typedop_00000001", action="merge_and_accept",
+        payload_hash=approval_payload_digest(_COMMIT_INPUTS),
+    )
+    with pytest.raises(TypedOperationError) as excinfo:
+        preflight_operation_command(
+            command, catalogs=local_catalogs(), profile=capability_profile_document(),
+            lease_authority=_lease_authority(), approval_consumer=MemoryOperationApprovalStore(),
+            now=_PREFLIGHT_NOW,
+        )
+    assert excinfo.value.code == "approval.action_mismatch"
+
+
 def test_preflight_gated_operation_refuses_a_cross_bridge_grant():
     snapshot = compile_delivery_snapshot()
     command = _gated_command(snapshot)
@@ -1039,11 +1059,14 @@ def test_concurrent_same_key_attempts_execute_the_effect_exactly_once():
     """A contended check-then-act on one idempotency key must execute the effect
     exactly ONCE; the loser replays the committed receipt, never re-runs it.
 
-    The check->act gap is made real by a ``receipts`` dict whose ``get`` yields
-    between the existence check and the write.  Detection power was confirmed
-    locally by removing the store lock (making ``record_attempt`` unsynchronized):
-    both workers then passed the ``None`` check and executed, breaking the
-    ``executions == 1`` assertion.  That change was reverted, not committed.
+    The check->act gap is made real (not just asserted) by a ``receipts`` dict
+    whose ``get`` sleeps between the existence check and the write, and by driving
+    two barrier-synchronized workers at a 1e-6 thread switch interval across 15
+    rounds.  Without the store's synchronization both workers would pass the
+    ``None`` existence check and run the executor, so the committed
+    ``executions == 1`` assertion is what proves the effect is serialized; the
+    paired assertions prove both attempts resolve to the one receipt with exactly
+    one first-runner and one replayer.
     """
     import sys
     import threading

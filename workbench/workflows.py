@@ -166,7 +166,7 @@ def _validate_operation_inputs(descriptor: Any, inputs: Any) -> dict[str, Any]:
     """Validate a typed input object against the operation's pinned input schema."""
     from jsonschema.exceptions import ValidationError
 
-    from .contracts import ContractValidationError, check_operation_schema
+    from .contracts import ContractValidationError, check_operation_input_schema
     from jsonschema import Draft202012Validator
 
     if not isinstance(inputs, Mapping):
@@ -175,7 +175,7 @@ def _validate_operation_inputs(descriptor: Any, inputs: Any) -> dict[str, Any]:
     if not isinstance(input_schema, Mapping):
         raise _refuse("operation.schema_unresolvable", "the pinned operation has no object input schema")
     try:
-        check_operation_schema(input_schema)
+        check_operation_input_schema(input_schema)
     except ContractValidationError as exc:
         raise _refuse("operation.schema_unresolvable", f"the pinned operation input schema {exc}") from exc
     try:

@@ -826,7 +826,7 @@ def preflight_operation_command(
     from .contracts import (
         ContractValidationError,
         approval_payload_digest,
-        check_operation_schema,
+        check_operation_input_schema,
         validate_catalog,
     )
 
@@ -900,7 +900,7 @@ def preflight_operation_command(
         raise _op_refuse("operation.input_not_object", "the operation input must be an object")
     input_schema = operation.get("input_schema")
     try:
-        check_operation_schema(input_schema)
+        check_operation_input_schema(input_schema)
     except ContractValidationError as exc:
         raise _op_refuse("operation.schema_unresolvable", f"the local operation input schema {exc}") from exc
     try:

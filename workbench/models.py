@@ -1052,6 +1052,41 @@ def safe_receipt_summary(text: Any, limit: int = 500) -> str:
     return scrubbed
 
 
+#: The schema-valid opaque token an ``external_ref`` value collapses to when the
+#: last-hop scrub finds a credential, endpoint, or path shape inside it.  Chosen
+#: to stay within :data:`_RECEIPT_EXTERNAL_VALUE` so a redacted receipt or
+#: reconciliation record still serializes and validates.
+_REDACTED_EXTERNAL_REF_VALUE = "redacted"
+
+
+def safe_external_ref_value(key: Any, value: Any) -> str:
+    """Scrub one ``external_ref`` value with the same last-hop guard as a summary.
+
+    ``external_ref`` is a bounded opaque-token map (``owner/repo``, ``gh:1``, a
+    ``state_event`` id).  The bounded :data:`_RECEIPT_EXTERNAL_VALUE` pattern is
+    kept as a STRUCTURAL BACKSTOP -- it still refuses a space/``=``/``?``/``@``
+    free-text shape -- but it deliberately admits ``/`` and ``:`` so a legit
+    ``owner/repo`` ref survives, which means a slash-free token or a path built
+    only from ``[A-Za-z0-9._:/-]`` (``sk-proj-AbC123def456xyz789``,
+    ``/etc/anvil/secrets.env``, ``C:/Users/x/.aws/credentials``,
+    ``/home/deploy/.ssh/id_rsa``) would otherwise ride through verbatim.  So on
+    top of the backstop every value is routed through
+    :func:`redact_config_text` and the forbidden-credential-token guard, exactly
+    like :func:`safe_receipt_summary` scrubs a summary.  A value carrying any
+    credential, endpoint, or path shape collapses to
+    :data:`_REDACTED_EXTERNAL_REF_VALUE` instead of being persisted, closing the
+    asymmetry where ``safe_summary`` was scrubbed but the sibling ``external_ref``
+    on the same record was not.
+    """
+    _rc_require(bool(_RECEIPT_EXTERNAL_KEY.match(str(key))), f"external_ref key is invalid: {key!r}")
+    raw = str(value)
+    _rc_require(bool(_RECEIPT_EXTERNAL_VALUE.match(raw)), f"external_ref value is invalid: {key!r}")
+    scrubbed = redact_config_text(raw)
+    if scrubbed != raw or _RECEIPT_FORBIDDEN_SUMMARY.search(scrubbed):
+        return _REDACTED_EXTERNAL_REF_VALUE
+    return scrubbed
+
+
 @dataclass(frozen=True)
 class OperationRef:
     """A pinned operation descriptor reference (provider/id/version/digest).
@@ -1164,6 +1199,16 @@ class ResolvedOperation:
     the pinned descriptor (never from the caller), and ``inputs`` has already
     been validated against the descriptor's pinned input schema.  It carries no
     adapter, transport, command, or path -- the bridge resolves those locally.
+
+    ``gate_required`` is ADVISORY hub metadata: it is derived from the effect
+    class (``effect in {external_effect, policy_mutation}``), NOT from the
+    descriptor's ``gates.human_approval``.  It is deliberately conservative --
+    it may over-report a gate -- and exists only so the hub/browser can preview
+    that an approval is likely needed.  It is NOT the authority gate: the bridge
+    preflight (:func:`workbench.bridge.preflight_operation`) reads the pinned
+    descriptor's ``gates.human_approval`` and binds/consumes the approval there.
+    A downstream consumer must treat the bridge preflight, never this field, as
+    the gate that decides whether an approval is required.
     """
 
     operation: OperationRef
@@ -1225,9 +1270,7 @@ class OperationReceipt:
             _rc_require(bool(_RECEIPT_EVIDENCE_REF.match(str(ref))), f"receipt evidence ref is invalid: {ref!r}")
         clean_external: dict[str, str] = {}
         for key, value in dict(self.external_ref).items():
-            _rc_require(bool(_RECEIPT_EXTERNAL_KEY.match(str(key))), f"receipt external_ref key is invalid: {key!r}")
-            _rc_require(bool(_RECEIPT_EXTERNAL_VALUE.match(str(value))), f"receipt external_ref value is invalid: {key!r}")
-            clean_external[str(key)] = str(value)
+            clean_external[str(key)] = safe_external_ref_value(key, value)
         object.__setattr__(self, "external_ref", clean_external)
         if self.task_ref is not None:
             _rc_require(bool(_RECEIPT_TASK_REF.match(self.task_ref)), "receipt task_ref is invalid")
@@ -1313,9 +1356,7 @@ class ReconciliationItem:
         object.__setattr__(self, "safe_summary", safe_receipt_summary(self.safe_summary))
         clean_external: dict[str, str] = {}
         for key, value in dict(self.external_ref).items():
-            _rc_require(bool(_RECEIPT_EXTERNAL_KEY.match(str(key))), f"reconciliation external_ref key is invalid: {key!r}")
-            _rc_require(bool(_RECEIPT_EXTERNAL_VALUE.match(str(value))), f"reconciliation external_ref value is invalid: {key!r}")
-            clean_external[str(key)] = str(value)
+            clean_external[str(key)] = safe_external_ref_value(key, value)
         object.__setattr__(self, "external_ref", clean_external)
 
     def as_dict(self) -> dict[str, Any]:

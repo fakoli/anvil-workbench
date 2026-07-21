@@ -52,6 +52,7 @@ from jsonschema.exceptions import ValidationError
 from .contracts import (
     ContractValidationError,
     catalog_contract_validator,
+    check_operation_input_schema,
     check_operation_schema,
     validate_catalog,
 )
@@ -188,8 +189,12 @@ def _validated_contract_version(provider: str, operation_id: str, version: Any) 
 def _check_operation_schema(provider: str, operation_id: str, name: str, schema: Any) -> None:
     if not isinstance(schema, Mapping):
         raise ProviderCatalogError(f"{provider} operation {operation_id} has no {name} object")
+    # An operation INPUT schema must be closed (additionalProperties:false,
+    # recursively) so no undeclared field rides into a dispatch; an OUTPUT schema
+    # is deliberately left open (a provider may return extra observed fields).
+    check = check_operation_input_schema if name == "input_schema" else check_operation_schema
     try:
-        check_operation_schema(schema)
+        check(schema)
     except ContractValidationError as exc:
         raise ProviderCatalogError(
             f"{provider} operation {operation_id} {name} {exc}"
