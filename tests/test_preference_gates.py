@@ -27,7 +27,7 @@ Criteria -> tests
   T004#4   never touches Serving/State test_default_profile_selection_stays_hub_local_and_never_mutates_serving
   closure  closed bodies ........... test_closed_body_refuses_undeclared_fields, test_request_refuses_bad_scope_or_kind
   atomicity concurrency ............ test_concurrent_apply_of_one_identity_commits_exactly_once,
-                                     test_disabling_the_receipt_lock_breaks_exactly_once_then_restores
+                                     test_disabling_the_receipt_lock_lets_the_effect_run_twice_then_restores
 """
 from __future__ import annotations
 
@@ -137,6 +137,37 @@ def test_preview_is_distinct_from_perform_and_mutates_nothing():
     # ...and touches no store: no value committed, no receipt recorded.
     assert _stored_version(service, _RETENTION) == 0
     assert service.receipt(payload["idempotency_key"]) is None
+
+
+def test_personal_preview_key_matches_the_subsequent_apply_receipt_key():
+    # Wired-response fix: a PERSONAL-scope preview computes its idempotency_key with
+    # the REAL actor (not a `<actor>` placeholder), so the previewed key equals the
+    # key the subsequent apply records under -- GET /receipts/{previewed key} is a
+    # 200, not a perpetual 404.
+    service = PolicyGateService(_catalog())
+    client = _client(service)
+    body = {
+        "setting_id": "personal.appearance_density", "scope": "personal",
+        "operation": "preference.set", "op_version": 1, "value": "compact",
+    }
+    previewed_key = client.post(
+        "/api/policy-operations/preview", headers=_OWNER, json=body,
+    ).json()["idempotency_key"]
+    # The previewed key embeds the real actor, and carries no placeholder.
+    digest = service._build_operation(PolicyOperationRequest(**body)).digest
+    assert previewed_key == f"policyop:operator:{digest}"
+    assert "<actor>" not in previewed_key
+
+    _grant_for(service, body, "operator", "g")
+    applied = client.post(
+        "/api/policy-operations/apply", headers=_OWNER, json={**body, "grant_id": "g"},
+    ).json()["receipt"]
+    assert applied["status"] == "succeeded"
+    assert applied["idempotency_key"] == previewed_key  # same identity as the preview
+
+    got = client.get("/api/policy-operations/receipts/" + previewed_key, headers=_OWNER)
+    assert got.status_code == 200
+    assert got.json()["receipt"]["idempotency_key"] == previewed_key
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +389,11 @@ def test_receipt_carries_id_type_hash_scope_outcome_and_timestamps():
 
 def test_failed_hub_local_commit_preserves_value_unambiguously():
     # A stale version (the stored value moved) is an unambiguous failure that
-    # preserves the prior value and stays retriable -- never a fabricated success.
+    # preserves the prior value -- never a fabricated success.  Because op_version
+    # is part of the canonical payload (and thus the digest the approval binds), a
+    # correctly-versioned re-submit has a DIFFERENT digest and needs a NEW approval:
+    # the burned grant cannot drive a successful retry, so the refusal is honestly
+    # NOT retryable-with-same-grant (T004.3 #2 flag-fix).
     service = PolicyGateService(_catalog())
     service.preferences.seed_authority_value("policy", _RETENTION, 90)  # stored version -> 1
     client = _client(service)
@@ -367,11 +402,16 @@ def test_failed_hub_local_commit_preserves_value_unambiguously():
     receipt = client.post("/api/policy-operations/apply", headers=_OWNER, json={**body, "grant_id": "g"}).json()["receipt"]
     assert receipt["status"] == "failed"
     assert receipt["error"]["code"] == "policy.stale_version"
-    assert receipt["error"]["retryable"] is True
+    assert receipt["error"]["retryable"] is False  # same-grant retry cannot succeed
     assert service.preferences.get("policy", "policy", _RETENTION).value == 90  # preserved
-    # A failed attempt is not persisted under its key -> it stays retriable.
+    # A failed attempt is not persisted under its key -> the identity stays open.
     key = service._idempotency_key("policy", service._build_operation(PolicyOperationRequest(**body)))
     assert service.receipt(key) is None
+    # The flag is honest: the grant was burned, so a same-grant retry of the SAME
+    # (stale) identity fails closed on the approval, proving retryable=False is not
+    # a fabricated permanence -- recovery requires a new correctly-versioned grant.
+    retry = client.post("/api/policy-operations/apply", headers=_OWNER, json={**body, "grant_id": "g"}).json()["receipt"]
+    assert retry["status"] == "denied" and retry["error"]["code"] == "approval.invalid"
 
 
 def _unknown_adapter(summary: str, external_ref: dict):
@@ -401,6 +441,45 @@ def test_unknown_external_outcome_reconciles_exactly_once():
     # The hub's stored value is untouched: an unknown external effect is never
     # optimistically committed hub-side.
     assert _stored_version(declared, _ROUTE_PROFILE) == 0
+
+
+def _crashing_adapter(exc: Exception):
+    def adapter(op):
+        raise exc
+
+    return adapter
+
+
+def test_declared_adapter_generic_crash_reconciles_not_500():
+    # A DECLARED external adapter that raises a GENERIC exception (NOT
+    # UnknownOutcomeError) mid-effect -- e.g. a RuntimeError mid-push -- may have
+    # PARTIALLY landed at the provider. The served apply must convert it to the
+    # SAME unknown-outcome path (a reconciliation_required receipt + exactly one
+    # reconciliation item), never a bare HTTP 500 with zero receipt and zero
+    # reconciliation record, and the prior hub value must stay untouched.
+    body = _serving_route_body()
+    declared = PolicyGateService(
+        _catalog(),
+        external_declarations=(
+            ExternalPolicyDeclaration(
+                "anvil-serving", _ROUTE_PROFILE, "preference.set",
+                _crashing_adapter(RuntimeError("connection reset mid-push to serving:8443")),
+            ),
+        ),
+    )
+    client = _client(declared)
+    _grant_for(declared, body, "operator", "g")
+    resp = client.post("/api/policy-operations/apply", headers=_OWNER, json={**body, "grant_id": "g"})
+    assert resp.status_code == 200  # NOT a bare 500
+    receipt = resp.json()["receipt"]
+    assert receipt["status"] == "reconciliation_required"
+    recs = client.get("/api/policy-operations/reconciliations", headers=_OWNER).json()["reconciliations"]
+    assert len(recs) == 1  # exactly one reconciliation item captured the unknown outcome
+    assert recs[0]["reason"] == "interrupted"
+    assert _stored_version(declared, _ROUTE_PROFILE) == 0  # prior value preserved
+    # The raw crash text (and its embedded host:port) never reaches a served body.
+    assert "connection reset mid-push" not in resp.text
+    assert "serving:8443" not in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +512,36 @@ def test_reconciliation_retry_reuses_identity_and_consumes_no_new_approval():
     assert second["receipt_id"] == first["receipt_id"]
     assert len(declared.reconciliations()) == 1
     assert declared.approvals.grants["g"].consumed_at == consumed_at
+
+
+def test_reconciliation_retry_over_the_router_replays_and_consumes_no_new_approval():
+    # T004.3 #3 proven through the WIRED /apply endpoint (not only service.apply):
+    # a second POST of the same operation identity replays the stored
+    # reconciliation receipt, files no second reconciliation item, and re-consumes
+    # no approval -- the grant is consumed exactly once.
+    body = _serving_route_body()
+    declared = PolicyGateService(
+        _catalog(),
+        external_declarations=(
+            ExternalPolicyDeclaration(
+                "anvil-serving", _ROUTE_PROFILE, "preference.set",
+                _unknown_adapter("serving apply outcome unknown", {"route": "serving_r1"}),
+            ),
+        ),
+    )
+    client = _client(declared)
+    _grant_for(declared, body, "operator", "g")
+    first = client.post("/api/policy-operations/apply", headers=_OWNER, json={**body, "grant_id": "g"}).json()
+    assert first["receipt"]["status"] == "reconciliation_required" and first["replayed"] is False
+    consumed_at = declared.approvals.grants["g"].consumed_at
+    assert consumed_at is not None
+
+    second = client.post("/api/policy-operations/apply", headers=_OWNER, json={**body, "grant_id": "g"}).json()
+    assert second["replayed"] is True
+    assert second["receipt"]["receipt_id"] == first["receipt"]["receipt_id"]
+    recs = client.get("/api/policy-operations/reconciliations", headers=_OWNER).json()["reconciliations"]
+    assert len(recs) == 1  # no second reconciliation item
+    assert declared.approvals.grants["g"].consumed_at == consumed_at  # consumed exactly once
 
 
 # ---------------------------------------------------------------------------

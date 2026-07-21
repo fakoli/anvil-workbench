@@ -943,7 +943,7 @@ def build_policy_operations_router(
         """Preview an operation and its bound digest; mutate nothing."""
         service = gate()
         request = _request(body)
-        result = _build_or_422(service, request, lambda: service.preview(request))
+        result = _build_or_422(service, request, lambda: service.preview(request, actor))
         return scrub_config_payload(result)
 
     @router.post("/approval-binding")

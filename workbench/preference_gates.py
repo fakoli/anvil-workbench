@@ -30,11 +30,9 @@ is separately enabled.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from .contracts import preference_operation_digest
 from .models import (
     OperationRef,
     OperationRefusal,
@@ -50,6 +48,7 @@ from .store import (
     MemoryOperationReceiptStore,
     MemoryPreferenceStore,
     OperationOutcome,
+    OperationReceiptStoreError,
     PreferenceStoreError,
     StalePreferenceWriteError,
     UnknownOutcomeError,
@@ -222,13 +221,19 @@ class PolicyGateService:
 
     # -- preview (pure; cannot mutate) --------------------------------------
 
-    def preview(self, request: PolicyOperationRequest) -> dict[str, Any]:
+    def preview(self, request: PolicyOperationRequest, actor: str) -> dict[str, Any]:
         """Return a read-only preview of the operation; mutate NOTHING.
 
         Builds the typed operation (which validates the value) and a
         :class:`PolicyOperationPreview` sharing its canonical digest, so an
         approval bound to this preview commits to exactly the applied effect.
         No store is touched: previewing is distinct from requesting or performing.
+
+        The previewed ``idempotency_key`` is computed with the REAL ``actor`` (the
+        same value ``apply`` uses), so for a personal-scope operation the previewed
+        key equals the apply-time receipt key -- a status GET against it is not a
+        perpetual 404.  For a project/policy-scope operation the scope key is
+        actor-independent, so threading the actor is simply harmless.
         """
         op = self._build_operation(request)
         preview = PolicyOperationPreview(op, self._effect_summary(request, op))
@@ -237,7 +242,7 @@ class PolicyGateService:
             "target": request.provider,
             "hub_local": request.is_hub_local,
             "requires_approval": True,
-            "idempotency_key": self._idempotency_key(self._scope_key(request, "<actor>"), op),
+            "idempotency_key": self._idempotency_key(self._scope_key(request, actor), op),
         }
 
     def approval_binding(self, request: PolicyOperationRequest, actor: str) -> dict[str, Any]:
@@ -282,7 +287,11 @@ class PolicyGateService:
             #    reason so the failure leaks no oracle about which dimension missed.
             try:
                 self.approvals.consume(grant_id, op.operation, op.digest, actor, scope_key)
-            except Exception:
+            except OperationReceiptStoreError:
+                # Narrow to the approval store's typed refusal (missing / replayed /
+                # expired / payload-changed / cross-actor / cross-scope).  A genuine
+                # programming defect is NOT collapsed into a denied approval: it
+                # propagates so it surfaces instead of masquerading as fail-closed.
                 return OperationOutcome(
                     "denied",
                     error=OperationRefusal(
@@ -309,13 +318,39 @@ class PolicyGateService:
                     )
                 # Declared allowed: dispatch to the provider's hermetic adapter.
                 # An UnknownOutcomeError it raises becomes exactly one reconciliation
-                # item + a reconciliation_required receipt inside record_attempt.
-                return declaration.executor(op)
+                # item + a reconciliation_required receipt inside record_attempt.  A
+                # GENERIC exception (e.g. a RuntimeError mid-push) is ALSO an unknown
+                # outcome: the external effect may have PARTIALLY landed at the
+                # provider, so it must reach the SAME reconciliation path rather than
+                # propagating to a bare 500 with zero receipt and zero reconciliation
+                # item.  Convert it to an UnknownOutcomeError (redacted summary) so
+                # record_attempt records a reconciliation_required receipt + exactly
+                # one reconciliation item.  Fail closed: never a fabricated success.
+                try:
+                    return declaration.executor(op)
+                except UnknownOutcomeError:
+                    raise
+                except Exception as exc:
+                    raise UnknownOutcomeError(
+                        _redacted(
+                            f"{request.provider} policy adapter raised mid-effect; the "
+                            "external outcome is unknown and may be partially applied"
+                        ),
+                        external_ref=self._scope_external_ref(request),
+                        reason="interrupted",
+                    ) from exc
 
             # 3. Hub-local atomic commit through the optimistic-concurrency store.
             #    NO worktree lease is consulted: a hub-owned setting is not a bridge
-            #    effect (T004.2 #3).  A stale version preserves the prior value and
-            #    stays retriable (T004.3 #2).
+            #    effect (T004.2 #3).  A stale version preserves the prior value
+            #    (T004.3 #2), but the SAME grant cannot drive a successful retry:
+            #    ``op_version`` is part of the canonical payload (and thus the
+            #    digest the approval binds), so a correctly-versioned re-submit has a
+            #    DIFFERENT digest and requires a new approval.  ``retryable`` is the
+            #    same-grant/same-identity signal, so it is False here -- a True value
+            #    would falsely imply the burned grant can be replayed (it cannot; a
+            #    same-grant retry always fails ``approval.invalid``).  The message
+            #    states the honest recovery path.
             try:
                 self._commit_hub_local(request, op, scope_key, actor)
             except StalePreferenceWriteError:
@@ -324,8 +359,9 @@ class PolicyGateService:
                     error=OperationRefusal(
                         "policy.stale_version",
                         "the stored policy value moved since this operation was built; "
-                        "reload and retry",
-                        retryable=True,
+                        "reload, rebuild at the current op_version, and obtain a new "
+                        "approval (the prior grant is bound to the stale digest)",
+                        retryable=False,
                     ),
                 )
             except (PreferenceValidationError, PreferenceStoreError, PolicyOperationError) as exc:
