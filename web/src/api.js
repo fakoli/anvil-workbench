@@ -676,6 +676,129 @@ export async function policyApprovalBinding(request) {
   }
 }
 
+// --- Configuration export / import / reset client (preferences-configuration T006.4) --
+//
+// The browser half of the configuration-transfer surface (workbench/api.py
+// build_configuration_transfer_router at /api/configuration). Every endpoint is
+// actor-scoped server-side from the trusted tailnet identity, so this client
+// assembles NO actor, token, endpoint, or credential — only the safe path, method,
+// and a CLOSED body (an envelope of declared fields, an optional project id, an
+// optional base-version snapshot). The export it returns is already redacted and
+// closed server-side; this module holds no state, so nothing is cached.
+//
+// The distinct server outcomes stay DISTINGUISHABLE as typed results: an invalid
+// import (422 — applies nothing, repair the fields), a stale apply (409 — reload
+// and preview again), and an unavailable/unconfigured surface (503 / network)
+// each map to a separate `status`, so the workflows never collapse them together.
+
+const CONFIGURATION = '/api/configuration'
+
+async function configurationReadJson(response, failure) {
+  if (response.status === 503) throw new Error('The configuration service is not configured for this hub')
+  if (!response.ok) throw new Error(failure)
+  return response.json()
+}
+
+// The actor's CLOSED, versioned, redacted portable-settings export:
+// `{schema_version, source:{scope, actor_ref, ...}, settings:[{setting_id, scope, value}]}`.
+// `projectId` is optional; it is only needed to include project-scope settings.
+export async function fetchConfigurationExport(projectId) {
+  const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''
+  return configurationReadJson(await fetch(`${CONFIGURATION}/export${qs}`), 'The configuration export is unavailable')
+}
+
+// Classify an import/reset apply response into a typed result the UI keeps
+// distinguishable. NEVER collapses invalid/stale/unavailable together.
+async function classifyConfigurationApply(response, okStatus) {
+  if (response.ok) {
+    const body = await response.json()
+    const applied = Array.isArray(body.applied) ? body.applied : []
+    return { status: okStatus, result: body, applied, appliedCount: applied.length, scope: body.scope }
+  }
+  let body = {}
+  try { body = await response.json() } catch { /* non-JSON error body */ }
+  const detail = body?.detail
+  if (response.status === 409) {
+    const isStale = detail && typeof detail === 'object' && ('reload_required' in detail || 'current_version' in detail)
+    if (isStale) {
+      return {
+        status: 'stale',
+        reloadRequired: detail.reload_required === true,
+        currentVersion: Number.isInteger(detail.current_version) ? detail.current_version : null,
+        message: 'The stored configuration changed elsewhere. Reload and preview again before applying.',
+      }
+    }
+    return { status: 'invalid', message: typeof detail === 'string' ? detail : 'This change could not be applied.' }
+  }
+  if (response.status === 422) {
+    return { status: 'invalid', message: typeof detail === 'string' ? detail : 'This import is invalid; nothing was applied.' }
+  }
+  if (response.status === 503) return { status: 'unavailable', message: 'The configuration service is not configured for this hub.' }
+  return { status: 'unavailable', message: 'The change could not be applied.' }
+}
+
+// Preview an import as typed categories WITHOUT applying anything. Returns the
+// served typed preview (`{valid, creates, changes, resets, skipped_read_only,
+// unavailable_references, repairable, base_versions}`) or a distinct error status.
+export async function previewConfigurationImport(envelope, { projectId } = {}) {
+  const body = { envelope }
+  if (projectId) body.project_id = projectId
+  try {
+    const response = await jsonPost(`${CONFIGURATION}/import/preview`, body)
+    if (response.ok) return { status: 'previewed', preview: await response.json() }
+    let error = {}
+    try { error = await response.json() } catch { /* non-JSON */ }
+    if (response.status === 422) return { status: 'invalid', message: typeof error?.detail === 'string' ? error.detail : 'This import could not be read.' }
+    if (response.status === 503) return { status: 'unavailable', message: 'The configuration service is not configured for this hub.' }
+    return { status: 'unavailable', message: 'The import could not be previewed.' }
+  } catch {
+    return { status: 'unavailable', message: 'The configuration service could not be reached.' }
+  }
+}
+
+// Apply a previewed import. The body echoes the preview's `base_versions` so a
+// store that moved since preview fails closed (stale). Returns a typed result.
+export async function applyConfigurationImport(envelope, { projectId, baseVersions } = {}) {
+  const body = { envelope }
+  if (projectId) body.project_id = projectId
+  if (baseVersions) body.base_versions = baseVersions
+  try {
+    return classifyConfigurationApply(await jsonPost(`${CONFIGURATION}/import/apply`, body), 'applied')
+  } catch {
+    return { status: 'unavailable', message: 'The configuration service could not be reached.' }
+  }
+}
+
+// Preview the exact values + scope a scoped reset will change; mutate nothing.
+export async function previewConfigurationReset({ scope, projectId } = {}) {
+  const body = { scope }
+  if (projectId) body.project_id = projectId
+  try {
+    const response = await jsonPost(`${CONFIGURATION}/reset/preview`, body)
+    if (response.ok) return { status: 'previewed', preview: await response.json() }
+    let error = {}
+    try { error = await response.json() } catch { /* non-JSON */ }
+    if (response.status === 422) return { status: 'invalid', message: typeof error?.detail === 'string' ? error.detail : 'This reset could not be previewed.' }
+    if (response.status === 503) return { status: 'unavailable', message: 'The configuration service is not configured for this hub.' }
+    return { status: 'unavailable', message: 'The reset could not be previewed.' }
+  } catch {
+    return { status: 'unavailable', message: 'The configuration service could not be reached.' }
+  }
+}
+
+// Apply a scoped reset atomically. Echoes the preview `base_versions` for the
+// version check. Returns a typed result (`reset` on success).
+export async function applyConfigurationReset({ scope, projectId, baseVersions } = {}) {
+  const body = { scope }
+  if (projectId) body.project_id = projectId
+  if (baseVersions) body.base_versions = baseVersions
+  try {
+    return classifyConfigurationApply(await jsonPost(`${CONFIGURATION}/reset/apply`, body), 'reset')
+  } catch {
+    return { status: 'unavailable', message: 'The configuration service could not be reached.' }
+  }
+}
+
 // --- Reviewed plugin catalog + tool-dispatch receipts (reviewed-tools-plugins T006) --
 //
 // The browser half of the read-only plugin surface (workbench/api.py

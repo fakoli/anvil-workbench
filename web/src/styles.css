@@ -274,6 +274,38 @@
 .settings-search input:focus-visible,
 .setting-editor select:focus-visible,
 .setting-editor input:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
+/* Backup & transfer (configuration export/import/reset, T006.4). Flexible,
+   relative units only; NO min-width so the surface stays usable at 200% zoom /
+   narrow viewports. Focus rings match the Settings lane. */
+.configuration{width:100%}
+.configuration-inner{padding:24px clamp(16px,4vw,40px) 40px;max-width:960px}
+.configuration-header h1{margin:.2em 0}
+.configuration-intro{color:#9ab;max-width:60ch}
+.configuration-panels{display:flex;flex-direction:column;gap:20px;margin-top:18px}
+.config-panel{border:1px solid #21343a;border-radius:12px;padding:16px 18px;background:#0e1b1f}
+.config-panel h3{margin:0 0 8px}
+.config-help,.config-note{color:#9ab;font-size:14px}
+.config-exclusions{border:1px solid #2a3f46;border-radius:8px;padding:10px 12px;margin-bottom:12px;background:#0b171a}
+.config-exclusions-lead{font-weight:600;margin:.4em 0 .2em}
+.config-exclusions ul,.config-reset-list,.config-category ul{margin:.2em 0;padding-left:1.2em}
+.config-import-input{width:100%;box-sizing:border-box;font-family:'DM Mono',monospace;font-size:12px;min-height:120px;resize:vertical}
+.config-import-actions,.config-reset-actions,.config-export-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+.config-import-preview,.config-reset-preview{margin-top:14px;display:flex;flex-direction:column;gap:10px}
+.config-category h4{margin:.3em 0}
+.config-count{font-size:11px;color:#7fbfb2}
+.config-category-create h4{color:#66d9a0}
+.config-category-change h4{color:#7fc4ff}
+.config-category-reset h4{color:#f0c674}
+.config-category-skip h4,.config-category-unavailable h4{color:#9ab}
+.config-category-repair h4{color:#ff8f8f}
+.config-invalid,.config-error{color:#ff8f8f}
+.config-result-ok{color:#66d9a0}
+.config-result-error{color:#ff8f8f}
+.config-opaque,.config-export-body{font-family:'DM Mono',monospace;font-size:12px}
+.config-export-body{max-height:280px;overflow:auto;background:#0b171a;padding:10px;border-radius:8px}
+.config-download{display:inline-block;padding:8px 14px;border-radius:8px;background:#173a34;color:#8fe;text-decoration:none}
+.configuration :focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
+.configuration-live{position:fixed;bottom:14px;left:262px;font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:#7fbfb2}
 @media(max-width:900px){.settings-inner{padding:20px 16px 22px}.settings-live{left:16px}
 /* The global "hub unavailable" toast is fixed at left:252px;right:351px — sized
    for Delivery's fixed rail. On the narrow Settings layout this lane makes

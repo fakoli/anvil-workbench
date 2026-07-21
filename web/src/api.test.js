@@ -698,3 +698,65 @@ describe('reviewed plugin catalog API client (T006)', () => {
     await expect(fetchPluginReceipt('y')).rejects.toThrow('The tool receipt is unavailable')
   })
 })
+
+import {
+  fetchConfigurationExport, previewConfigurationImport, applyConfigurationImport,
+  previewConfigurationReset, applyConfigurationReset,
+} from './api'
+
+describe('configuration export / import / reset API client (T006.4)', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('fetchConfigurationExport unwraps the redacted export and surfaces 503 distinctly', async () => {
+    const served = { schema_version: 'workbench-configuration-export/v1', source: { scope: 'personal', actor_ref: 'actorref:00' }, settings: [] }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(served))
+    await expect(fetchConfigurationExport('project_1')).resolves.toEqual(served)
+    expect(fetch).toHaveBeenCalledWith('/api/configuration/export?project_id=project_1')
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(503))
+    await expect(fetchConfigurationExport()).rejects.toThrow(/not configured/i)
+  })
+
+  it('previewConfigurationImport posts a closed body and returns the typed preview', async () => {
+    const preview = { valid: true, creates: [], changes: [], resets: [], skipped_read_only: [], unavailable_references: [], repairable: [], no_ops: [], base_versions: {} }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(preview))
+    const result = await previewConfigurationImport({ schema_version: 'workbench-configuration-export/v1', settings: [] }, { projectId: 'project_1' })
+    expect(result).toEqual({ status: 'previewed', preview })
+    expect(lastBody(fetch)).toEqual({ envelope: { schema_version: 'workbench-configuration-export/v1', settings: [] }, project_id: 'project_1' })
+  })
+
+  it('previewConfigurationImport maps a 422 rejected envelope to a distinct invalid status', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(422, { detail: 'unsupported extension keys' }))
+    const result = await previewConfigurationImport({}, {})
+    expect(result.status).toBe('invalid')
+    expect(result.message).toMatch(/unsupported extension keys/)
+  })
+
+  it('applyConfigurationImport echoes base_versions and classifies applied / stale / invalid distinctly', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ applied: [{ setting_id: 'personal.time_format', scope: 'personal', op: 'set' }], creates: 1 }))
+    const applied = await applyConfigurationImport({ schema_version: 'workbench-configuration-export/v1', settings: [] }, { baseVersions: { 'personal.time_format': 0 } })
+    expect(applied.status).toBe('applied')
+    expect(applied.appliedCount).toBe(1)
+    expect(lastBody(fetch)).toEqual({ envelope: { schema_version: 'workbench-configuration-export/v1', settings: [] }, base_versions: { 'personal.time_format': 0 } })
+    // A 409 with the reload object is a distinct STALE result (not invalid).
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(409, { detail: { reload_required: true, current_version: 3 } }))
+    const stale = await applyConfigurationImport({}, {})
+    expect(stale.status).toBe('stale')
+    expect(stale.currentVersion).toBe(3)
+    // A 422 is a distinct INVALID result (applies nothing).
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(err(422, { detail: 'the import is invalid' }))
+    const invalid = await applyConfigurationImport({}, {})
+    expect(invalid.status).toBe('invalid')
+  })
+
+  it('reset preview/apply post a closed scope body and classify the reset result', async () => {
+    const fetchPrev = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ scope: 'personal', changes: [], base_versions: {} }))
+    const preview = await previewConfigurationReset({ scope: 'personal' })
+    expect(preview.status).toBe('previewed')
+    expect(lastBody(fetchPrev)).toEqual({ scope: 'personal' })
+    const fetchApply = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ scope: 'personal', applied: [{ setting_id: 'personal.time_format', scope: 'personal', op: 'reset' }] }))
+    const applied = await applyConfigurationReset({ scope: 'personal', baseVersions: { 'personal.time_format': 1 } })
+    expect(applied.status).toBe('reset')
+    expect(applied.appliedCount).toBe(1)
+    expect(lastBody(fetchApply)).toEqual({ scope: 'personal', base_versions: { 'personal.time_format': 1 } })
+  })
+})
