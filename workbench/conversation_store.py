@@ -54,6 +54,7 @@ from .conversation_models import (
     ConversationError,
     ContentBlock,
     RetentionPolicy,
+    RetentionPreview,
     TERMINAL_TURN_STATUSES,
     Turn,
     TurnAudit,
@@ -61,9 +62,11 @@ from .conversation_models import (
     TurnRedaction,
     VoiceEvent,
     conversation_audit,
+    ephemeral_retention_policy,
     make_turn,
     purge_turn_content,
     require_content_hash_key,
+    retention_preview_of,
     turn_audit,
     validate_turn_append,
 )
@@ -112,6 +115,7 @@ class ConversationRows:
 
 class ConversationStore(Protocol):
     def create_conversation(self, actor: ConversationActor, retention: RetentionPolicy, title: str | None = None) -> Conversation: ...
+    def create_ephemeral_conversation(self, actor: ConversationActor) -> Conversation: ...
     def get_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation: ...
     def list_conversations(self, actor: ConversationActor, include_archived: bool = False) -> list[Conversation]: ...
     def search_conversations(self, actor: ConversationActor, query: str, include_archived: bool = False) -> list[Conversation]: ...
@@ -148,6 +152,7 @@ class ConversationStore(Protocol):
     # without the key — the API slice must still treat audit access as
     # privileged lifecycle metadata.
     def recover_streaming_turns(self) -> tuple[TurnAudit, ...]: ...
+    def retention_preview(self, now: datetime | None = None) -> tuple[RetentionPreview, ...]: ...
     def enforce_retention(self, now: datetime | None = None) -> tuple[ConversationAudit, ...]: ...
     def list_audit(self, limit: int = 20) -> list[ConversationAuditEvent]: ...
 
@@ -272,6 +277,18 @@ class MemoryConversationStore:
             raise ConversationStoreError(str(exc)) from exc
         self.rows.turns[record.id] = []
         return self._store_conversation("conversation.created", record)
+
+    def create_ephemeral_conversation(self, actor: ConversationActor) -> Conversation:
+        """Create a one-action ephemeral chat: ``metadata_only`` for BOTH content kinds.
+
+        The single call persists a conversation under
+        :func:`~workbench.conversation_models.ephemeral_retention_policy`, so no
+        transcript content block can ever persist for either the text or the
+        voice content kind (the append gate enforces the retention mapping).
+        The record's ``is_metadata_only`` badge therefore truthfully reflects
+        the durable policy rather than an asserted label.
+        """
+        return self.create_conversation(actor, ephemeral_retention_policy(), title=None)
 
     def get_conversation(self, actor: ConversationActor, conversation_id: str) -> Conversation:
         return self._reconciled(self._owned(actor, conversation_id))
@@ -551,6 +568,37 @@ class MemoryConversationStore:
         self._store_conversation("conversation.deleted", deleted)
         return conversation_audit(deleted, self.rows.turns.get(deleted.id, []))
 
+    def retention_preview(self, now: datetime | None = None) -> tuple[RetentionPreview, ...]:
+        """OFF-READ-PATH, side-effect-free preview of what a batched pass WOULD enforce.
+
+        Returns the content-free :class:`RetentionPreview` (conversation id,
+        counts, and the created/updated/delete_after timestamps only — never a
+        title or message content) for every conversation
+        :meth:`enforce_retention` would act on at ``now``: a live conversation
+        past its ``retention.delete_after`` ceiling, or a crashed
+        ``deletion_pending`` record awaiting completion.  This method purges,
+        deletes, and mutates NOTHING — it is pure inspection, so it can never
+        become a read that initiates retention-expiry deletion.  Fails closed
+        on a naive ``now`` exactly like the enforcement pass.
+        """
+        moment = now if now is not None else now_utc()
+        if not isinstance(moment, datetime) or moment.tzinfo is None:
+            raise ConversationStoreError("retention preview requires a timezone-aware datetime")
+        previews: list[RetentionPreview] = []
+        for record in self.rows.conversations.values():
+            if record.status == "deletion_pending":
+                reason = "deletion_pending"
+            elif (
+                record.status in _LISTABLE_STATUSES
+                and record.retention.delete_after is not None
+                and record.retention.delete_after <= moment
+            ):
+                reason = "retention_expired"
+            else:
+                continue
+            previews.append(retention_preview_of(record, self.rows.turns.get(record.id, []), reason))
+        return tuple(previews)
+
     def enforce_retention(self, now: datetime | None = None) -> tuple[ConversationAudit, ...]:
         """HUB-INTERNAL sweep applying retention ceilings and finishing deletions.
 
@@ -622,6 +670,7 @@ def _synchronize_memory_store() -> None:
 
     for _name in (
         "create_conversation",
+        "create_ephemeral_conversation",
         "get_conversation",
         "list_conversations",
         "search_conversations",
@@ -634,6 +683,7 @@ def _synchronize_memory_store() -> None:
         "advance_turn_status",
         "get_conversation_with_turns",
         "delete_conversation",
+        "retention_preview",
         "enforce_retention",
         "recover_streaming_turns",
         "list_audit",

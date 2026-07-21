@@ -64,6 +64,64 @@ rewrite it as part of Workbench work without a separate review of those changes.
 - No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 - No browser-supplied worktree paths, model/tool controls on the voice relay, raw audio storage, or transcript retention without the explicit environment switch.
 
+## 2026-07-20 chat-first-voice T009 — off-read-path retention enforcement, content-free preview, one-action ephemeral chat
+
+Retention expiry is batched-only (never triggered by a read), a content-free
+preview lets an operator review the pass's scope, and a one-action ephemeral
+affordance creates a `metadata_only` conversation whose badge is the true
+durable policy. All backend + hermetic tests; no `web/src` change.
+
+- **Read-path expiry needed NO fix.** Audited `get_conversation`,
+  `list_conversations`, `search_conversations`, `get_conversation_with_turns`:
+  none expire a still-live conversation past `delete_after`. `_reconciled`
+  only completes a crashed `deletion_pending` (an already-REQUESTED deletion),
+  which is correct and preserved. Only `enforce_retention` initiates
+  retention-expiry deletion. Added regression tests locking this in.
+- **`workbench/conversation_models.py` (+~70):** new `RetentionPreview` frozen
+  dataclass (conversation_id, reason, turn/committed/interrupted counts,
+  created/updated/`delete_after` — deliberately NO title/content field) plus
+  `retention_preview_of(...)` projector; `is_metadata_only(retention)` (true
+  only when BOTH content kinds are `metadata_only`) and
+  `ephemeral_retention_policy()`; `RETENTION_PREVIEW_REASONS`,
+  `EPHEMERAL_RETENTION_POLICY_ID`.
+- **`workbench/conversation_store.py` (+~35):** `retention_preview(now)` — pure,
+  side-effect-free preview of exactly what `enforce_retention(now)` would act on
+  (expired-by-ceiling live rows + crashed `deletion_pending`), fails closed on a
+  naive `now`, mutates nothing. `create_ephemeral_conversation(actor)` — one call
+  → `metadata_only` conversation (reuses `create_conversation`; the append gate
+  then forbids any transcript block, so the badge cannot lie). Both added to the
+  Protocol and the `_synchronize` reentrant-lock list.
+- **`workbench/conversation_api.py` (+~70):** truthful `ephemeral` badge added to
+  `conversation_json` (computed from the durable policy). New actor endpoint
+  `POST /api/conversations/ephemeral` (one action, no body). New OPERATOR-ONLY
+  `build_hub_retention_router` mounted at `/api/hub/retention` — `GET /preview`
+  (content-free) and `POST /enforce` (the explicit batched pass). These are the
+  store's HUB-INTERNAL ops, so they are wired behind the hub `owner` dependency
+  and kept OFF `/api/conversations` (whose T002.4 guard test forbids any
+  retention/enforce/audit path and which must never let one actor delete across
+  actors). 503 when chat persistence is unconfigured. Wired in
+  `workbench/api.py`.
+- **Criteria → proving tests (`tests/test_retention_enforcement.py`, +11):**
+  (1) content-free preview →
+  `test_retention_preview_is_content_free_ids_counts_and_timestamps_only`,
+  `test_api_hub_preview_is_operator_only_and_content_free` (forbidden-marker
+  scan, mirrors T002.3);
+  (2) reads never expire, only the batched pass does →
+  `test_reads_do_not_expire_a_conversation_past_its_delete_after_ceiling`,
+  `test_api_read_does_not_expire_only_the_enforce_endpoint_does`, plus
+  `test_crashed_pending_deletion_still_reconciles_on_read_unlike_expiry`
+  (proves the distinct correct behavior is preserved);
+  (3) one-action ephemeral + true badge →
+  `test_create_ephemeral_conversation_is_one_action_metadata_only_with_true_badge`,
+  `test_api_ephemeral_endpoint_creates_metadata_only_in_one_action_with_true_badge`.
+- **Badge rail (pending T004.2):** the backend + API/policy shape the badge reads
+  (`conversation.ephemeral: bool`, truthful from policy) is delivered here. The
+  browser rail that RENDERS the badge is T004.2 and is not merged; no `web/src`
+  change was made in this task. When T004.2 lands, its badge should read the
+  `ephemeral` field rather than re-deriving policy.
+- **Verification:** FULL Python suite green at 441 (430 baseline + 11 new). No
+  `web/src` touched, so `npm test` was not required.
+
 ## 2026-07-20 chat-first-voice T008 — gap-detectable sequence + state-version stream metadata
 
 Added strictly-monotonic per-conversation sequence numbers and a state-version

@@ -46,10 +46,12 @@ from .conversation_models import (
     ConversationAudit,
     ConversationError,
     RetentionPolicy,
+    RetentionPreview,
     Turn,
     TurnLineage,
     TurnRedaction,
     VoiceEvent,
+    is_metadata_only,
 )
 from .conversation_store import ConversationStore, UnknownConversationError
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore, request_hash_for
@@ -189,6 +191,10 @@ def conversation_json(record: Conversation) -> dict[str, Any]:
         "id": record.id,
         "status": record.status,
         "title": record.title,
+        # Truthful ephemeral badge: computed from the durable retention policy
+        # (both content kinds metadata_only), never an asserted label, so the
+        # badge a browser rail renders always reflects the real policy.
+        "ephemeral": is_metadata_only(record.retention),
         "retention": {
             "policy_id": record.retention.policy_id,
             "transcript_text": record.retention.transcript_text,
@@ -256,6 +262,25 @@ def deletion_json(audit: ConversationAudit) -> dict[str, Any]:
         "turn_count": audit.turn_count,
         "committed_turn_count": audit.committed_turn_count,
         "interrupted_turn_count": audit.interrupted_turn_count,
+    }
+
+
+def preview_json(preview: RetentionPreview) -> dict[str, Any]:
+    """One content-free retention-preview row: ids, counts, and timestamps only.
+
+    Deliberately carries no title and no message content of any kind — the
+    preview is a scope review of the off-read-path batched pass, never a read
+    of conversation content.
+    """
+    return {
+        "conversation_id": preview.conversation_id,
+        "reason": preview.reason,
+        "turn_count": preview.turn_count,
+        "committed_turn_count": preview.committed_turn_count,
+        "interrupted_turn_count": preview.interrupted_turn_count,
+        "created_at": _iso(preview.created_at),
+        "updated_at": _iso(preview.updated_at),
+        "delete_after": _iso(preview.delete_after),
     }
 
 
@@ -352,6 +377,24 @@ def build_conversation_router(
             return conversation_json(record)
 
         return idempotent(actor, "conversations.create", idempotency_key, {"body": payload.model_dump(mode="json")}, _run)
+
+    @router.post("/ephemeral", status_code=status.HTTP_201_CREATED)
+    def create_ephemeral_conversation(
+        actor: ConversationActor = Depends(chat_actor),
+        idempotency_key: str | None = Header(default=None, alias=IDEMPOTENCY_HEADER),
+    ) -> dict[str, Any]:
+        """One action → a metadata_only conversation whose badge is the true policy.
+
+        A single POST creates the ephemeral conversation (both content kinds
+        ``metadata_only``); the response's ``ephemeral`` badge is computed from
+        that durable policy, so it cannot disagree with what was actually
+        persisted.  Takes no body — the retention policy is fixed by the
+        affordance, not caller-supplied.
+        """
+        def _run() -> dict[str, Any]:
+            return conversation_json(chat_store().create_ephemeral_conversation(actor))
+
+        return idempotent(actor, "conversations.create_ephemeral", idempotency_key, {}, _run)
 
     @router.get("")
     def list_conversations(
@@ -497,5 +540,50 @@ def build_conversation_router(
             actor, "conversations.advance_turn_status", idempotency_key,
             {"conversation_id": conversation_id, "turn_id": turn_id, "body": payload.model_dump(mode="json")}, _run,
         )
+
+    return router
+
+
+def build_hub_retention_router(
+    owner_dependency: Callable[..., str],
+    conversation_store: ConversationStore | None,
+) -> APIRouter:
+    """Operator-only hub surface for the OFF-READ-PATH batched retention pass.
+
+    These are the store's HUB-INTERNAL retention operations, wired ONLY behind
+    the hub's ``owner`` (operator) dependency and mounted OFF the actor
+    conversation surface (``/api/hub/retention`` — never ``/api/conversations``,
+    which by design exposes no retention/enforce/audit path).  A single actor
+    must never be able to preview across, or trigger deletion of, another
+    actor's records; only the hub operator can.
+
+    * ``GET /api/hub/retention/preview`` returns the content-free scope of the
+      next pass (ids, counts, timestamps only) WITHOUT deleting anything — a
+      read here never initiates expiry.
+    * ``POST /api/hub/retention/enforce`` runs the explicit batched pass; this
+      is the only actor/HTTP path that initiates retention-expiry deletion.
+
+    When ``conversation_store`` is ``None`` the hub has no content-hash key and
+    both endpoints refuse with 503, matching the actor chat surface.
+    """
+    router = APIRouter(prefix="/api/hub/retention")
+
+    def chat_store() -> ConversationStore:
+        if conversation_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="chat persistence is not configured; set WORKBENCH_CHAT_HASH_KEY",
+            )
+        return conversation_store
+
+    @router.get("/preview")
+    def retention_preview(_: str = Depends(owner_dependency)) -> dict[str, Any]:
+        previews = chat_store().retention_preview()
+        return {"preview": [preview_json(item) for item in previews]}
+
+    @router.post("/enforce")
+    def enforce_retention(_: str = Depends(owner_dependency)) -> dict[str, Any]:
+        enforced = chat_store().enforce_retention()
+        return {"enforced": [deletion_json(item) for item in enforced]}
 
     return router
