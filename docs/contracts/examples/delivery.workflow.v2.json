@@ -5,13 +5,156 @@
   "description": "A proposed full delivery template. GitHub effects remain bridge-local, profile-authorized, and approval-bound.",
   "entry": "claim",
   "steps": [
-    {"id": "claim", "kind": "operation", "operation": {"provider": "anvil-state", "id": "state.task.claim", "contract_version": "1.0.0", "operation_digest": "sha256:ec20c724a2da09f742621ad779ea3a61a106b4939e8cfb62e9426706299c9c28"}, "inputs": {"task_id": {"kind": "reference", "source": "run", "field": "task_id"}, "actor": {"kind": "reference", "source": "run", "field": "actor"}, "worktree_name": {"kind": "reference", "source": "run", "field": "worktree_name"}}, "next": ["implement"]},
-    {"id": "implement", "kind": "agent", "model_profile": "coding-local", "skills": [{"id": "anvil:execute", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"}], "next": ["evidence"]},
-    {"id": "evidence", "kind": "operation", "operation": {"provider": "anvil-state", "id": "state.evidence.submit", "contract_version": "1.0.0", "operation_digest": "sha256:613055013cf7056d88b5bfa4b73778188c2013f2e46f86916b4c4ef661f40228"}, "inputs": {"task_id": {"kind": "reference", "source": "run", "field": "task_id"}, "verification_receipt_ids": {"kind": "reference", "source": "receipt", "field": "verification.ids"}}, "next": ["pr_approval"]},
-    {"id": "pr_approval", "kind": "approval_wait", "approval_action": "commit_pr", "next": ["create_pr"]},
-    {"id": "create_pr", "kind": "operation", "operation": {"provider": "project-bridge", "id": "bridge.github.commit_pr", "contract_version": "1.0.0", "operation_digest": "sha256:8aef716c52d7bf33f19a2829b56e7ad8f19cd5f1cce6cc6d5a10320410e512c3"}, "inputs": {"diff_hash": {"kind": "reference", "source": "receipt", "field": "diff.hash"}, "branch": {"kind": "reference", "source": "work_packet", "field": "branch"}, "title": {"kind": "literal", "value": "Anvil Workbench delivery"}, "base": {"kind": "literal", "value": "main"}}, "next": ["merge_approval"]},
-    {"id": "merge_approval", "kind": "approval_wait", "approval_action": "merge_and_accept", "next": ["merge_and_accept"]},
-    {"id": "merge_and_accept", "kind": "operation", "operation": {"provider": "project-bridge", "id": "bridge.github.merge_and_accept", "contract_version": "1.0.0", "operation_digest": "sha256:0e7d2a035662c0224014ca2576c78a9b7d717812f47700b5314cc426b9896f9e"}, "inputs": {"pr": {"kind": "reference", "source": "receipt", "field": "github.pr"}, "task_id": {"kind": "reference", "source": "run", "field": "task_id"}, "expected_head_sha": {"kind": "reference", "source": "receipt", "field": "github.head_sha"}}, "next": []},
-    {"id": "reconcile", "kind": "reconcile", "next": []}
+    {
+      "id": "claim",
+      "kind": "operation",
+      "operation": {
+        "provider": "anvil-state",
+        "id": "state.task.claim",
+        "contract_version": "1.0.0",
+        "operation_digest": "sha256:29b7a2bcfd96cd4de1f27c6a226ebf03e83b6543d46ce54f822c341c84ecf597"
+      },
+      "inputs": {
+        "task_ref": {
+          "kind": "reference",
+          "source": "run",
+          "field": "task_ref"
+        },
+        "actor": {
+          "kind": "reference",
+          "source": "run",
+          "field": "actor"
+        },
+        "worktree_name": {
+          "kind": "reference",
+          "source": "run",
+          "field": "worktree_name"
+        }
+      },
+      "next": [
+        "implement"
+      ]
+    },
+    {
+      "id": "implement",
+      "kind": "agent",
+      "model_profile": "coding-local",
+      "skills": [
+        {
+          "id": "anvil:execute",
+          "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+        }
+      ],
+      "next": [
+        "evidence"
+      ]
+    },
+    {
+      "id": "evidence",
+      "kind": "operation",
+      "operation": {
+        "provider": "anvil-state",
+        "id": "state.evidence.submit",
+        "contract_version": "1.0.0",
+        "operation_digest": "sha256:40dc36beb9ee974f311134a24416936a09881c8ac4087400987026e77ae9a033"
+      },
+      "inputs": {
+        "task_ref": {
+          "kind": "reference",
+          "source": "run",
+          "field": "task_ref"
+        },
+        "verification_receipt_ids": {
+          "kind": "reference",
+          "source": "receipt",
+          "field": "verification.ids"
+        }
+      },
+      "next": [
+        "pr_approval"
+      ]
+    },
+    {
+      "id": "pr_approval",
+      "kind": "approval_wait",
+      "approval_action": "commit_pr",
+      "next": [
+        "create_pr"
+      ]
+    },
+    {
+      "id": "create_pr",
+      "kind": "operation",
+      "operation": {
+        "provider": "project-bridge",
+        "id": "bridge.github.commit_pr",
+        "contract_version": "1.0.0",
+        "operation_digest": "sha256:8aef716c52d7bf33f19a2829b56e7ad8f19cd5f1cce6cc6d5a10320410e512c3"
+      },
+      "inputs": {
+        "diff_hash": {
+          "kind": "reference",
+          "source": "receipt",
+          "field": "diff.hash"
+        },
+        "branch": {
+          "kind": "reference",
+          "source": "work_packet",
+          "field": "branch"
+        },
+        "title": {
+          "kind": "literal",
+          "value": "Anvil Workbench delivery"
+        },
+        "base": {
+          "kind": "literal",
+          "value": "main"
+        }
+      },
+      "next": [
+        "merge_approval"
+      ]
+    },
+    {
+      "id": "merge_approval",
+      "kind": "approval_wait",
+      "approval_action": "merge_and_accept",
+      "next": [
+        "merge_and_accept"
+      ]
+    },
+    {
+      "id": "merge_and_accept",
+      "kind": "operation",
+      "operation": {
+        "provider": "project-bridge",
+        "id": "bridge.github.merge_and_accept",
+        "contract_version": "1.0.0",
+        "operation_digest": "sha256:0a1c88d3200fe2771ac116de9c277e5d9b0bc8a6486ff9fa38fe05b6cad17cff"
+      },
+      "inputs": {
+        "pr": {
+          "kind": "reference",
+          "source": "receipt",
+          "field": "github.pr"
+        },
+        "task_ref": {
+          "kind": "reference",
+          "source": "run",
+          "field": "task_ref"
+        },
+        "expected_head_sha": {
+          "kind": "reference",
+          "source": "receipt",
+          "field": "github.head_sha"
+        }
+      },
+      "next": []
+    },
+    {
+      "id": "reconcile",
+      "kind": "reconcile",
+      "next": []
+    }
   ]
 }

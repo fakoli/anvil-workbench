@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .conversation_api import build_conversation_router, register_conversation_handlers
+from .conversation_store import ConversationStore, MemoryConversationStore
 from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
@@ -130,6 +132,22 @@ def _store(settings: Settings) -> WorkbenchStore:
     return store
 
 
+def _conversation_store(settings: Settings) -> ConversationStore | None:
+    """Build chat persistence only when the hub holds the content-hash key.
+
+    The key is hub configuration (``WORKBENCH_CHAT_HASH_KEY``); it is passed
+    to the store constructor and held on the instance only, never persisted
+    with the rows.  Without a key there is no store and the chat endpoints
+    fail closed with 503.  A configured-but-invalid key raises loudly here
+    instead of serving unkeyed fingerprints.
+    """
+    if not settings.chat_content_hash_key:
+        return None
+    return MemoryConversationStore(
+        content_hash_key=settings.chat_content_hash_key.encode("utf-8"), recover_on_open=True,
+    )
+
+
 def _graph(settings: Settings) -> EvidenceGraph:
     if not settings.neo4j_password:
         return NullGraph()
@@ -146,14 +164,17 @@ def create_app(
     settings: Settings | None = None,
     store: WorkbenchStore | None = None,
     graph: EvidenceGraph | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
     graph = graph or _graph(settings)
+    conversation_store = conversation_store or _conversation_store(settings)
     app = FastAPI(title="Anvil Workbench", version="0.1.0", docs_url=None, redoc_url=None)
     app.state.settings = settings
     app.state.store = store
     app.state.graph = graph
+    app.state.conversation_store = conversation_store
 
     def actor(request: Request) -> str:
         name = (request.headers.get(settings.identity_header) or "").strip()
@@ -187,6 +208,11 @@ def create_app(
     @app.exception_handler(StoreError)
     async def store_error_handler(_: Request, exc: StoreError):
         return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
+
+    # Actor-scoped chat surface (chat-first-voice T002.4): identity comes from
+    # the same trusted ``actor`` dependency; the store enforces ownership.
+    register_conversation_handlers(app)
+    app.include_router(build_conversation_router(actor, conversation_store))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:

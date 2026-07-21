@@ -1,0 +1,49 @@
+{
+  "schema_version": "workbench-advanced-trace/v1",
+  "trace_id": "advtrace_fast_0001",
+  "branch_ref": {
+    "branch_id": "advbranch_fastheavy_0001",
+    "conversation_id": "conv_advanced_playground_0001",
+    "turn_id": "turn_assistant_0002"
+  },
+  "route_decision": {
+    "provider": "anvil-serving",
+    "route_id": "route.chat-fast",
+    "route_digest": "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "profile_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "model_profile": "chat-fast",
+    "served_tier": "fast-local",
+    "request_id": "req_abc123"
+  },
+  "request": {
+    "content_trust": "untrusted_task_data",
+    "redacted": true,
+    "instructions_chars": 96,
+    "input_chars": 128,
+    "structured_output_mode": "json_schema",
+    "control_values": [
+      {"name": "temperature_milli", "value": 300},
+      {"name": "reasoning_effort", "value": "high"}
+    ]
+  },
+  "events": [
+    {"seq": 0, "kind": "request_start", "at": "2026-07-20T10:01:00Z"},
+    {"seq": 1, "kind": "tool_request", "at": "2026-07-20T10:01:01Z", "tool_id": "echo_fixture", "tool_kind": "mock", "input_digest": "sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"},
+    {"seq": 2, "kind": "tool_result", "at": "2026-07-20T10:01:02Z", "tool_id": "echo_fixture", "tool_kind": "mock", "output_digest": "sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3", "output_chars": 32, "safe_summary": "mock fixture returned a bounded result"},
+    {"seq": 3, "kind": "continuation", "at": "2026-07-20T10:01:03Z", "text_chars": 220},
+    {"seq": 4, "kind": "schema_validation", "at": "2026-07-20T10:01:04Z", "schema_valid": true},
+    {"seq": 5, "kind": "response_complete", "at": "2026-07-20T10:01:05Z", "usage": {"input_tokens": 120, "output_tokens": 200, "latency_ms": 850}}
+  ],
+  "usage": {
+    "input_tokens": 120,
+    "output_tokens": 200,
+    "latency_ms": 850
+  },
+  "status": "complete",
+  "redaction": {
+    "status": "redacted",
+    "ruleset": "advanced-trace-v1"
+  },
+  "created_at": "2026-07-20T10:01:00Z",
+  "completed_at": "2026-07-20T10:01:05Z"
+}

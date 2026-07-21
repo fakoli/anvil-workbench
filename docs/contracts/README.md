@@ -8,6 +8,12 @@ These resources are the implementation-facing companion to
 - This directory contains **proposed**, versioned shapes for the next operation
   layer. They do not create an endpoint, grant a capability, or supersede an
   owner’s own contract until code and tests adopt them.
+- The State-side read half is adopted by code: manifest discovery plus the
+  snapshot and bounded PRD-content adapters are implemented and hermetically
+  tested, but not wired into the live bridge poll loop. Their authoritative
+  description is the "State read-adapter contract" section of
+  [CONTRACTS.md](../CONTRACTS.md); live qualification stays gated on
+  fakoli/anvil#178.
 - Schemas validate payload shape. Bridge code must additionally enforce every
   semantic rule: catalog/profile authorization, worktree lease, digest match,
   approval binding, idempotency, and reconciliation.
@@ -22,7 +28,16 @@ These resources are the implementation-facing companion to
 | Improve a coding model’s next inference turn | [run context](schemas/run-context.v1.schema.json) | [run context](examples/run-context.v1.json) |
 | Validate a model’s bounded next action | [model proposal](schemas/model-proposal.v1.schema.json) | [operation request](examples/model-proposal.operation-request.v1.json) |
 | Deliver a command to a local bridge | [bridge command](schemas/bridge-command.v1.schema.json) | [bridge command](examples/bridge-command.invoke-operation.v1.json) |
-| Return evidence for an operation/effect | [operation receipt](schemas/operation-receipt.v1.schema.json) | [operation receipt](examples/operation-receipt.v1.json) |
+| Return evidence for an operation/effect | [operation receipt](schemas/operation-receipt.v1.schema.json) | [operation receipt](examples/operation-receipt.v1.json), [preflight refusal](examples/operation-receipt.refusal.v1.json) |
+| Display a project's PRD/plan/task hierarchy without touching State storage | [state snapshot](schemas/state-snapshot.v1.schema.json) | [project snapshot](examples/anvil-state.project-snapshot.v1.json) |
+| Read one PRD's bounded, redacted content for display | [PRD content](schemas/prd-content.v1.schema.json) | [PRD content read](examples/anvil-state.prd-content.v1.json) |
+| Persist one chat/voice conversation identity with display-only project/PRD/task context | [chat conversation](schemas/chat-conversation.v1.schema.json) | [conversation](examples/chat.conversation.v1.json) |
+| Append one immutable chat/voice turn with lineage, route reference, and voice events | [chat turn](schemas/chat-turn.v1.schema.json) | [user voice turn](examples/chat.turn.user-voice.v1.json), [interrupted assistant turn](examples/chat.turn.assistant-interrupted.v1.json) |
+| Declare every initial setting's type, scope, sensitivity, mutability, precedence, and typed reference defaults | [settings descriptor](schemas/settings-descriptor.v1.schema.json) | [settings descriptor catalog](examples/settings-descriptor.v1.json) |
+| Open an Advanced-mode experiment over an existing conversation with route-declared controls and mock/read-only tools | [advanced branch](schemas/advanced-branch.v1.schema.json) | [advanced branch](examples/advanced-branch.v1.json) |
+| Inspect one Advanced attempt as a normalized, redacted request/route/tool/usage trace | [advanced trace](schemas/advanced-trace.v1.schema.json) | [advanced trace](examples/advanced-trace.v1.json) |
+| Save a digest-pinned, actor-private Advanced preset that repairs on route/tool drift | [advanced preset](schemas/advanced-preset.v1.schema.json) | [advanced preset](examples/advanced-preset.v1.json) |
+| Compare two to four sibling attempts by factual metrics with no invented winner | [advanced comparison](schemas/advanced-comparison.v1.schema.json) | [advanced comparison](examples/advanced-comparison.v1.json) |
 
 ## Normative conventions
 
@@ -65,6 +80,66 @@ These resources are the implementation-facing companion to
    opaque references and short safe summaries. Never put raw transcript,
    local skill body/path, token, or unredacted provider payload in a contract
    artifact.
+10. A task reference is an object that names its owning PRD: `{prd_id,
+    task_id}` (plus `prd_revision` where a run pins a source revision). Task
+    IDs are only unique within one PRD, so two PRDs may each own a `T001` and
+    both remain unambiguous. A bare `task_id` string outside a reference
+    object (for example in receipt correlation) is display/correlation data
+    only and carries no authority; where present it should use the scoped
+    `<prd_id>:<task_id>` form.
+11. A chat conversation is one identity shared by ordinary and Advanced modes
+    and by voice; mode is a per-turn attribute and turns are append-only with
+    typed `(parent_turn_id, sibling_index)` lineage — a retry or branch is a
+    new turn, never a rewrite. Raw audio frames and hidden/encrypted model
+    reasoning are prohibited from durable chat/turn records and from every API
+    response: voice persists typed lifecycle events plus, only where the
+    conversation's retention policy permits, redacted transcript text. A turn's
+    route reference carries Anvil Serving route IDs and digests only — never a
+    provider endpoint, URL, or credential — and a conversation's context block
+    is display-only: it pins readable titles plus canonical project,
+    PRD-revision, and task IDs without implying a claim, lease, or effect
+    grant. The conversation's retention fields map normatively onto persisted
+    turn content kinds: `transcript_text` governs persisted `kind:
+    "transcript"` content blocks on text turns, and `voice_transcript_text`
+    governs persisted `kind: "transcript"` content blocks on voice-input
+    turns; a value of `metadata_only` means NO transcript content block may
+    persist for that kind — only bounded counters and metadata (for example
+    `transcript_chars` on voice events) survive. The cross-record lineage
+    invariants — exactly one null-parent root per conversation,
+    `(parent_turn_id, sibling_index)` uniqueness, parent existence in the
+    same conversation, and acyclicity — are schema-inexpressible and are
+    enforced by the Workbench hub store at append time, fail-closed: a
+    violating append is refused. Chat records are hub-durable records, not
+    bridge-verified snapshots, so they are not contract-digest-bearing.
+
+12. Advanced chat mode extends the chat contract; it never forks it. An
+    advanced branch (`advanced-branch.v1`) references an EXISTING
+    `conversation_id` and an existing parent turn, and its own turns are
+    ordinary `chat-turn.v1` records under the same `(parent_turn_id,
+    sibling_index)` lineage — the branch record carries no conversation-identity
+    field and no turns/messages/transcript array, and its `advbranch_` id is
+    grammatically disjoint from a `conv_` identity, so a branch can never mint a
+    parallel transcript. A control is submittable only when the pinned route
+    capability declares it with a type, bounds/allowed values, and a default,
+    and the capability itself carries the route and profile digests; an
+    undeclared, out-of-bounds, or policy-owned-overridden control is refused by
+    `workbench.contracts.validate_advanced_branch`. The trace/export shape
+    (`advanced-trace.v1`) is redaction-only: every object is closed and there is
+    no field for a credential, a raw header, hidden/encrypted reasoning, a
+    filesystem path, or an unredacted provider/tool payload — a tool result
+    carries a digest and character count, never raw output. A preset
+    (`advanced-preset.v1`) pins exact route/profile/tool digests and is
+    digest-bearing (`preset_digest`, excluding the volatile repair block); on a
+    live-digest drift `workbench.contracts.validate_advanced_preset` forces the
+    deterministic `repair_required` state listing exactly the drifted
+    references and never silently substitutes a route or tool. A comparison
+    (`advanced-comparison.v1`) reports factual integer metrics over 2–4 existing
+    sibling turns and can express a ranking only alongside a named declared
+    criterion, so no winner is representable without its criterion. Only
+    deterministic mock and installed read-only tool kinds are representable in
+    any Advanced resource; there is no effectful, plugin-lifecycle, generic-HTTP,
+    or arbitrary-schema tool. Advanced records are hub-durable records and carry
+    no delivery or State authority.
 
 ## Contract-extension checklist
 

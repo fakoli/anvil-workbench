@@ -1,0 +1,63 @@
+{
+  "schema_version": "workbench-advanced-comparison/v1",
+  "comparison_id": "advcompare_fastheavy_0001",
+  "conversation_id": "conv_advanced_playground_0001",
+  "fork_point": {
+    "parent_turn_id": "turn_userroot_0001"
+  },
+  "attempts": [
+    {
+      "turn_id": "turn_assistant_0002",
+      "route": {
+        "provider": "anvil-serving",
+        "route_id": "route.chat-fast",
+        "route_digest": "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "model_profile": "chat-fast"
+      },
+      "control_values": [
+        {"name": "temperature_milli", "value": 300}
+      ],
+      "status": "complete",
+      "metrics": {
+        "input_tokens": 120,
+        "output_tokens": 200,
+        "latency_ms": 850,
+        "output_chars": 640
+      },
+      "tool_path": ["echo_fixture"]
+    },
+    {
+      "turn_id": "turn_assistant_0003",
+      "route": {
+        "provider": "anvil-serving",
+        "route_id": "route.chat-heavy",
+        "route_digest": "sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+        "model_profile": "chat-heavy"
+      },
+      "control_values": [
+        {"name": "temperature_milli", "value": 300}
+      ],
+      "status": "complete",
+      "metrics": {
+        "input_tokens": 120,
+        "output_tokens": 512,
+        "latency_ms": 2600,
+        "output_chars": 1680
+      },
+      "tool_path": ["echo_fixture"]
+    }
+  ],
+  "criterion": {
+    "criterion_id": "instruction_following",
+    "label": {
+      "content_trust": "untrusted_task_data",
+      "text": "Instruction following"
+    },
+    "non_qualification": true
+  },
+  "ranking": [
+    {"turn_id": "turn_assistant_0002", "rank": 1},
+    {"turn_id": "turn_assistant_0003", "rank": 2}
+  ],
+  "created_at": "2026-07-20T10:02:00Z"
+}

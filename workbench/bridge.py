@@ -126,7 +126,9 @@ class BridgeSettings:
     router_base_url: str
     router_token_env: str
     codex_config: tuple[str, ...]
+    state_describe_command: str = "anvil describe"
     worktrees: Mapping[str, Path] = field(default_factory=dict)
+    provider_catalog_files: Mapping[str, Path] = field(default_factory=dict)
     skill_roots: tuple[Path, ...] = ()
     verification_commands: tuple[str, ...] = ()
 
@@ -254,7 +256,7 @@ class StateReader:
     ) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             args, cwd=worktree_root or self.settings.project_root,
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()[:500]
@@ -281,7 +283,7 @@ class StateReader:
     def _current_branch(worktree_root: Path) -> str:
         completed = subprocess.run(
             ["git", "branch", "--show-current"], cwd=worktree_root,
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
         branch = completed.stdout.strip() if completed.returncode == 0 else ""
         if not branch:
@@ -652,7 +654,7 @@ class ApprovedActionRunner:
 
     def _run(self, *args: str, environment: Mapping[str, str] | None = None) -> str:
         completed = subprocess.run(
-            args, cwd=self.worktree_root, capture_output=True, text=True,
+            args, cwd=self.worktree_root, capture_output=True, text=True, encoding="utf-8", errors="replace",
             check=False, env=environment,
         )
         if completed.returncode != 0:
@@ -963,6 +965,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-events", type=Path, help="canonical State events.jsonl; resolves through State CLI when omitted")
     parser.add_argument("--cursor-file", type=Path)
     parser.add_argument("--state-status-command", default="anvil status")
+    parser.add_argument(
+        "--state-describe-command", default="anvil describe",
+        help="State CLI manifest command used to discover and pin read-operation descriptors",
+    )
     parser.add_argument("--state-claim-command", default="anvil claim {task_id} --actor {actor} --json")
     parser.add_argument("--state-work-packet-command", default="anvil packet {task_id} --format json")
     parser.add_argument("--state-hook-command", default="anvil hook capture-evidence")
@@ -973,6 +979,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--router-token-env", default="ANVIL_ROUTER_TOKEN")
     parser.add_argument("--codex-config", action="append", default=[])
     parser.add_argument("--worktree", action="append", default=[], metavar="ID=PATH", help="allow a named local worktree for concurrent sessions")
+    parser.add_argument(
+        "--provider-catalog", action="append", default=[], metavar="PROVIDER=PATH",
+        help="allow one reviewed local operation-catalog JSON file for a named provider",
+    )
     parser.add_argument("--skills-root", action="append", default=[], type=Path, help="allow explicit local SKILL.md roots for this bridge")
     parser.add_argument("--verification-command", action="append", default=[], help="allow one exact State verification command; it runs without a shell")
     parser.add_argument("--interval", type=float, default=3.0)
@@ -993,12 +1003,24 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--worktree must use ID=PATH")
         if worktree_id.strip() == "default":
             raise SystemExit("default is reserved for --project-root")
+        if worktree_id.strip() in worktrees:
+            raise SystemExit(f"duplicate --worktree id: {worktree_id.strip()}")
         worktrees[worktree_id.strip()] = Path(raw_path.strip()).resolve()
+    provider_catalog_files: dict[str, Path] = {}
+    for item in args.provider_catalog:
+        provider, separator, raw_path = item.partition("=")
+        if not separator or not provider.strip() or not raw_path.strip():
+            raise SystemExit("--provider-catalog must use PROVIDER=PATH")
+        provider = provider.strip()
+        if provider in provider_catalog_files:
+            raise SystemExit(f"duplicate --provider-catalog provider: {provider}")
+        provider_catalog_files[provider] = Path(raw_path.strip()).resolve()
     settings = BridgeSettings(
         hub=args.hub, bridge_id=args.bridge_id, token=token, project_root=root, project_id=args.project_id,
         state_events=args.state_events,
         cursor_file=args.cursor_file or root / ".workbench" / "state-events.cursor",
         state_status_command=args.state_status_command,
+        state_describe_command=args.state_describe_command,
         state_claim_command=args.state_claim_command,
         state_work_packet_command=args.state_work_packet_command,
         state_hook_command=args.state_hook_command,
@@ -1006,7 +1028,8 @@ def main(argv: list[str] | None = None) -> int:
         state_apply_command=args.state_apply_command,
         codex_binary=args.codex_binary, router_base_url=args.router_base_url,
         router_token_env=args.router_token_env, codex_config=tuple(args.codex_config),
-        worktrees=worktrees, skill_roots=tuple(path.resolve() for path in args.skills_root),
+        worktrees=worktrees, provider_catalog_files=provider_catalog_files,
+        skill_roots=tuple(path.resolve() for path in args.skills_root),
         verification_commands=tuple(args.verification_command),
     )
     bridge = Bridge(settings)

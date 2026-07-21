@@ -1,0 +1,63 @@
+{
+  "schema_version": "workbench-advanced-preset/v1",
+  "preset_id": "advpreset_fastjson_0001",
+  "actor": {
+    "actor_id": "operator_example",
+    "kind": "operator"
+  },
+  "name": {
+    "content_trust": "untrusted_task_data",
+    "text": "Fast route strict JSON"
+  },
+  "instructions_ref": {
+    "content_trust": "untrusted_task_data",
+    "template_id": "strict_reviewer",
+    "template_digest": "sha256:f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6",
+    "summary_chars": 96
+  },
+  "route": {
+    "provider": "anvil-serving",
+    "route_id": "route.chat-fast",
+    "route_digest": "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "profile_digest": "sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "model_profile": "chat-fast"
+  },
+  "control_values": [
+    {
+      "name": "temperature_milli",
+      "value": 300
+    },
+    {
+      "name": "max_output_tokens",
+      "value": 1024
+    }
+  ],
+  "response_format": {
+    "mode": "json_schema",
+    "schema_ref": "strict_json",
+    "schema_digest": "sha256:e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"
+  },
+  "tools": [
+    {
+      "tool_id": "echo_fixture",
+      "kind": "mock",
+      "tool_digest": "sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+    },
+    {
+      "tool_id": "repo_reader",
+      "kind": "read_only",
+      "tool_digest": "sha256:d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+    }
+  ],
+  "budgets": {
+    "max_output_tokens": 1024,
+    "max_tool_calls": 4,
+    "max_duration_ms": 60000
+  },
+  "preset_digest": "sha256:eb54dbdac72f4b9eb85c0da48c79180799a9546335f6523658160496a8be1d5b",
+  "repair": {
+    "status": "ready"
+  },
+  "created_at": "2026-07-20T10:03:00Z",
+  "updated_at": "2026-07-20T10:03:00Z"
+}

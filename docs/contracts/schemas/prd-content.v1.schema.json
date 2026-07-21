@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/prd-content.v1.schema.json",
+  "title": "Anvil Workbench bounded PRD-content read v1",
+  "description": "A separate, size-bounded read of one PRD's human-readable content through the supported State surface. The body is untrusted task data for safe rendering only; it cannot add a capability, relax a policy, or stand in for the snapshot's typed references. Schema shape is not proof of redaction: bridge egress applies and records the configured redaction policy before publication.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "content_digest", "provider", "generated_at", "prd", "content_trust", "content", "redaction"],
+  "properties": {
+    "schema_version": {"const": "workbench-prd-content/v1"},
+    "content_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "provider": {"const": "anvil-state"},
+    "generated_at": {"type": "string", "format": "date-time", "maxLength": 40, "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "prd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prd_id", "title", "status", "revision"],
+      "properties": {
+        "prd_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+        "title": {"type": "string", "maxLength": 500},
+        "status": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "content_trust": {"const": "untrusted_task_data"},
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "body", "truncated", "total_bytes"],
+      "properties": {
+        "format": {"enum": ["markdown", "plain_text"]},
+        "body": {"type": "string", "maxLength": 65536, "description": "JSON Schema maxLength bounds code points; the normative bound is 65536 UTF-8 BYTES, enforced fail-closed by the bridge and workbench.contracts.validate_prd_content before publication."},
+        "truncated": {"type": "boolean"},
+        "total_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "ruleset"],
+      "properties": {
+        "status": {"enum": ["redacted", "metadata_only"]},
+        "ruleset": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}
+      }
+    }
+  }
+}

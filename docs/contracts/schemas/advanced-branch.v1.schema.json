@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/advanced-branch.v1.schema.json",
+  "title": "Anvil Workbench advanced chat branch v1",
+  "description": "One Advanced-mode experiment branch over an EXISTING Chat conversation. A branch is a reference and a control snapshot, never a transcript: it names the owning conversation_id and the existing parent turn it forks from, and its turns are ordinary chat-turn.v1 records appended under that lineage. The record carries no conversation-identity field, no turns/messages/transcript array, and its branch_id grammar (advbranch_) structurally cannot match the conv_ conversation identity, so a branch can never mint a parallel transcript identity. Advanced mode is a versioned per-branch marker; a temporary branch declares an ephemeral retention and expiry, a saved branch declares a durable retention. The route capability descriptor pins the Anvil Serving route/profile digests and the declared-supported control schemas (each control declares its type, bounds/allowed values, and default); a submitted control value must name a declared control and stay within its declared bounds, and a policy-owned control is read-only. Only mock and read-only tool profiles are representable. All prose fields are untrusted task data, never control instructions. This is a hub-durable record, not a bridge-verified snapshot, so the branch itself is not contract-digest-bearing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "branch_id", "mode", "conversation_ref", "retention", "route_capability", "created_at"],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "controlName": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+    "controlValue": {"type": ["boolean", "integer", "string"]},
+    "controlDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "default"],
+      "description": "One declared-supported tunable. Criterion 1: a control is representable only when it declares a type, its bounds (int) or allowed values (enum), and a default; the enclosing route_capability supplies the route/profile digest.",
+      "properties": {
+        "name": {"$ref": "#/$defs/controlName"},
+        "type": {"enum": ["int", "enum", "bool"]},
+        "bounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["min", "max"],
+          "properties": {"min": {"type": "integer"}, "max": {"type": "integer"}}
+        },
+        "allowed_values": {
+          "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 64}
+        },
+        "default": {"$ref": "#/$defs/controlValue"},
+        "policy_owned": {"type": "boolean"}
+      },
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "int"}}, "required": ["type"]},
+         "then": {"required": ["bounds"], "properties": {"default": {"type": "integer"}}}},
+        {"if": {"properties": {"type": {"const": "enum"}}, "required": ["type"]},
+         "then": {"required": ["allowed_values"], "properties": {"default": {"type": "string"}}}},
+        {"if": {"properties": {"type": {"const": "bool"}}, "required": ["type"]},
+         "then": {"properties": {"default": {"type": "boolean"}}}}
+      ]
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-advanced-branch/v1"},
+    "branch_id": {"type": "string", "pattern": "^advbranch_[a-zA-Z0-9_-]{8,128}$"},
+    "mode": {
+      "const": "advanced",
+      "description": "Versioned Advanced-mode marker. Mode is a per-turn/per-branch attribute; it never forks conversation identity."
+    },
+    "conversation_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding", "conversation_id", "fork_point"],
+      "description": "Criterion 4: the branch references an EXISTING conversation and turn lineage. There is deliberately no field able to carry a new conversation identity or a transcript.",
+      "properties": {
+        "binding": {
+          "const": "existing_conversation",
+          "description": "Normative: this names an existing conversation. It never creates a conversation, transcript, or turn store."
+        },
+        "conversation_id": {"type": "string", "pattern": "^conv_[a-zA-Z0-9_-]{8,128}$"},
+        "fork_point": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["parent_turn_id"],
+          "properties": {
+            "parent_turn_id": {
+              "type": "string",
+              "pattern": "^turn_[a-zA-Z0-9_-]{8,128}$",
+              "description": "An existing turn in the same conversation. The branch's turns append under this parent via the chat-turn.v1 (parent_turn_id, sibling_index) DAG."
+            },
+            "from_sibling_index": {"type": "integer", "minimum": 0, "maximum": 4096}
+          }
+        }
+      }
+    },
+    "title": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "text"],
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "text": {"type": "string", "maxLength": 200}
+      }
+    },
+    "instructions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "role", "text"],
+      "description": "The Advanced-mode instruction field, kept separate from user input (R003). Role and order are explicit; there is no hidden prompt injection field.",
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "role": {"const": "instructions"},
+        "text": {"type": "string", "maxLength": 20000},
+        "template_ref": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["template_id", "template_digest"],
+          "properties": {
+            "template_id": {"$ref": "#/$defs/controlName"},
+            "template_digest": {"$ref": "#/$defs/digest"}
+          }
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class"],
+      "description": "R002: a temporary branch is ephemeral and must not survive its declared retention unless saved; a saved branch is durable. Transcript content itself persists only through chat-turn.v1 records under the conversation's own retention policy.",
+      "properties": {
+        "class": {"enum": ["ephemeral", "durable"]},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "saved_at": {"type": "string", "format": "date-time"}
+      },
+      "allOf": [
+        {"if": {"properties": {"class": {"const": "ephemeral"}}, "required": ["class"]},
+         "then": {"required": ["expires_at"], "not": {"required": ["saved_at"]}}},
+        {"if": {"properties": {"class": {"const": "durable"}}, "required": ["class"]},
+         "then": {"required": ["saved_at"], "not": {"required": ["expires_at"]}}}
+      ]
+    },
+    "route_capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "route_id", "route_digest", "profile_digest", "serving_contract_version", "model_profile", "supported_controls"],
+      "description": "The pinned Anvil Serving route/profile plus its declared-supported control schemas. Identifiers and digests only: no endpoint, URL, token, or credential field is representable, mirroring chat-turn.v1's route reference.",
+      "properties": {
+        "provider": {"const": "anvil-serving"},
+        "route_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+        "route_digest": {"$ref": "#/$defs/digest"},
+        "profile_digest": {"$ref": "#/$defs/digest"},
+        "serving_contract_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "model_profile": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"},
+        "supported_controls": {
+          "type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/controlDescriptor"}
+        },
+        "structured_output_supported": {"type": "boolean"},
+        "tools_supported": {"type": "boolean"}
+      }
+    },
+    "submitted_controls": {
+      "type": "array",
+      "maxItems": 32,
+      "description": "The tunables applied to this branch. Each names a declared control and carries its effective-value provenance. The reference validator refuses a name absent from supported_controls or a value outside its declared bounds (criterion 1).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value", "provenance"],
+        "properties": {
+          "name": {"$ref": "#/$defs/controlName"},
+          "value": {"$ref": "#/$defs/controlValue"},
+          "provenance": {
+            "enum": ["declared", "observed", "policy_override"],
+            "description": "declared: actor-set within bounds. observed: reported back by Serving. policy_override: a policy-owned value that cannot be actor-overridden."
+          }
+        }
+      }
+    },
+    "structured_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "description": "R007: plain text or a validated JSON-schema structured-output mode. The output schema is referenced by digest, never embedded raw, to keep the record bounded.",
+      "properties": {
+        "mode": {"enum": ["text", "json_schema"]},
+        "schema_ref": {"$ref": "#/$defs/controlName"},
+        "schema_digest": {"$ref": "#/$defs/digest"}
+      },
+      "allOf": [
+        {"if": {"properties": {"mode": {"const": "json_schema"}}, "required": ["mode"]},
+         "then": {"required": ["schema_digest"]}}
+      ]
+    },
+    "tool_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools"],
+      "description": "R008: only deterministic mock tools and installed read-only tools are representable. No effectful, plugin-lifecycle, or arbitrary-schema tool kind exists in this contract.",
+      "properties": {
+        "tools": {
+          "type": "array", "maxItems": 16, "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tool_id", "kind", "tool_digest"],
+            "properties": {
+              "tool_id": {"$ref": "#/$defs/controlName"},
+              "kind": {"enum": ["mock", "read_only"]},
+              "tool_digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "R013: every execution is bounded. All values are integers so the record never carries a floating-point sampling knob.",
+      "properties": {
+        "max_input_tokens": {"type": "integer", "minimum": 1, "maximum": 100000000},
+        "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "max_context_tokens": {"type": "integer", "minimum": 1, "maximum": 100000000},
+        "max_tool_calls": {"type": "integer", "minimum": 0, "maximum": 256},
+        "max_duration_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
+        "max_concurrency": {"type": "integer", "minimum": 1, "maximum": 4}
+      }
+    },
+    "repair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "description": "Branch-level repair marker. On a pinned route/profile/tool digest drift the branch opens in repair_required and never silently substitutes a capability.",
+      "properties": {
+        "status": {"enum": ["ready", "repair_required"]},
+        "reasons": {
+          "type": "array", "maxItems": 16, "uniqueItems": true,
+          "items": {"enum": ["route_digest_drift", "profile_digest_drift", "tool_digest_drift", "control_unsupported", "output_schema_drift"]}
+        }
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  }
+}

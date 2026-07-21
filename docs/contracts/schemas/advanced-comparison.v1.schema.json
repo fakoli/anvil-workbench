@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/advanced-comparison.v1.schema.json",
+  "title": "Anvil Workbench advanced chat comparison v1",
+  "description": "A factual side-by-side comparison of two to four attempts forked from the same point in ONE existing conversation (R011, R016). Each attempt is an ordinary sibling turn under a shared parent — the comparison references existing conversation and turn ids and never creates a transcript identity or merges outputs into one unattributed answer. Metrics are factual integer counters only. A ranking or winner is representable ONLY alongside a named declared criterion: without a criterion object no ranking may appear, so the schema cannot express an invented winner. All prose is untrusted task data, never control instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "comparison_id", "conversation_id", "fork_point", "attempts", "created_at"],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "token": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+    "turnId": {"type": "string", "pattern": "^turn_[a-zA-Z0-9_-]{8,128}$"}
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-advanced-comparison/v1"},
+    "comparison_id": {"type": "string", "pattern": "^advcompare_[a-zA-Z0-9_-]{8,128}$"},
+    "conversation_id": {"type": "string", "pattern": "^conv_[a-zA-Z0-9_-]{8,128}$"},
+    "fork_point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parent_turn_id"],
+      "properties": {
+        "parent_turn_id": {"$ref": "#/$defs/turnId"}
+      }
+    },
+    "attempts": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 4,
+      "description": "Each attempt is an existing sibling assistant turn with its own route, controls, status, and factual metrics. There is no merge or synthesizer field.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["turn_id", "route", "status", "metrics"],
+        "properties": {
+          "turn_id": {"$ref": "#/$defs/turnId"},
+          "route": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider", "route_id", "route_digest"],
+            "properties": {
+              "provider": {"const": "anvil-serving"},
+              "route_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+              "route_digest": {"$ref": "#/$defs/digest"},
+              "model_profile": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"}
+            }
+          },
+          "control_values": {
+            "type": "array", "maxItems": 32,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "value"],
+              "properties": {
+                "name": {"$ref": "#/$defs/token"},
+                "value": {"type": ["boolean", "integer", "string"]}
+              }
+            }
+          },
+          "status": {"enum": ["complete", "cancelled", "timed_out", "failed", "interrupted", "streaming"]},
+          "metrics": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "input_tokens": {"type": "integer", "minimum": 0, "maximum": 100000000},
+              "output_tokens": {"type": "integer", "minimum": 0, "maximum": 100000000},
+              "latency_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},
+              "output_chars": {"type": "integer", "minimum": 0, "maximum": 100000}
+            }
+          },
+          "tool_path": {
+            "type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/token"}
+          }
+        }
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criterion_id", "label", "non_qualification"],
+      "description": "R018: a named declared evaluation criterion. A ranking is only meaningful with one, and every aggregate is labelled informal preference evidence, never model qualification or delivery evidence.",
+      "properties": {
+        "criterion_id": {"$ref": "#/$defs/token"},
+        "label": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["content_trust", "text"],
+          "properties": {
+            "content_trust": {"const": "untrusted_task_data"},
+            "text": {"type": "string", "maxLength": 200}
+          }
+        },
+        "non_qualification": {
+          "const": true,
+          "description": "Normative: comparison preference is informal evidence only; it is never model qualification or delivery evidence."
+        }
+      }
+    },
+    "ranking": {
+      "type": "array",
+      "maxItems": 4,
+      "description": "An ordered preference over the compared turns. It may appear ONLY when a declared criterion is present (enforced by the root allOf), so no winner can be shown without its criterion.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["turn_id", "rank"],
+        "properties": {
+          "turn_id": {"$ref": "#/$defs/turnId"},
+          "rank": {"type": "integer", "minimum": 1, "maximum": 4}
+        }
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "$comment": "No ranking (no winner) without a declared criterion.",
+      "if": {"required": ["ranking"]},
+      "then": {"required": ["criterion"]}
+    }
+  ]
+}

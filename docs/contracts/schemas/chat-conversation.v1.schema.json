@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/chat-conversation.v1.schema.json",
+  "title": "Anvil Workbench chat conversation v1",
+  "description": "One durable hub-owned conversation identity shared by ordinary and Advanced chat and by voice. The record deliberately carries no mode discriminator: modes differ per turn, never per conversation, so switching modes can never fork identity or lineage. The optional context block is display-only: it pins readable titles plus canonical project, PRD-revision, and task references and grants no claim, lease, approval, or effect. Raw audio frames and hidden/encrypted model reasoning are prohibited from this record, from every turn record, and from every API response; there is no field able to carry them. This is a hub-durable record, not a bridge-verified snapshot, so it is not contract-digest-bearing. All prose fields are untrusted task data, never control instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "conversation_id", "actor", "retention", "status", "created_at", "updated_at"],
+  "$defs": {
+    "prdId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "taskId": {"type": "string", "pattern": "^T[0-9]{3}(\\.[0-9]{1,3})?$"},
+    "token": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$"}
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-chat-conversation/v1"},
+    "conversation_id": {"type": "string", "pattern": "^conv_[a-zA-Z0-9_-]{8,128}$"},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_id", "kind"],
+      "properties": {
+        "actor_id": {"type": "string", "pattern": "^[a-zA-Z0-9._-]{1,128}$"},
+        "kind": {"enum": ["operator"]}
+      }
+    },
+    "title": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "text"],
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "text": {"type": "string", "maxLength": 200}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding", "content_trust", "project"],
+      "dependentRequired": {"tasks": ["prd"]},
+      "properties": {
+        "binding": {
+          "const": "display_only",
+          "description": "Normative: this context names what the conversation is about. It never implies a claim, worktree lease, capability, approval, or effect grant."
+        },
+        "content_trust": {"const": "untrusted_task_data"},
+        "project": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["project_id", "name"],
+          "properties": {
+            "project_id": {"type": "string", "pattern": "^[a-zA-Z0-9._-]{1,128}$"},
+            "name": {"type": "string", "maxLength": 200}
+          }
+        },
+        "prd": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["prd_id", "prd_revision", "title"],
+          "properties": {
+            "prd_id": {"$ref": "#/$defs/prdId"},
+            "prd_revision": {"type": "integer", "minimum": 1},
+            "title": {"type": "string", "maxLength": 500}
+          }
+        },
+        "tasks": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ref", "scoped_id", "title"],
+            "properties": {
+              "ref": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["prd_id", "task_id"],
+                "properties": {
+                  "prd_id": {"$ref": "#/$defs/prdId"},
+                  "task_id": {"$ref": "#/$defs/taskId"}
+                }
+              },
+              "scoped_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}:T[0-9]{3}(\\.[0-9]{1,3})?$"},
+              "title": {"type": "string", "maxLength": 500}
+            }
+          }
+        }
+      }
+    },
+    "capability_refs": {
+      "type": "array",
+      "maxItems": 16,
+      "description": "Forward references to declared capabilities a future Advanced turn may select from an approved profile. Reference only: presence here grants nothing; authorization always re-derives from the pinned capability profile at selection time.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["binding", "kind", "id"],
+        "properties": {
+          "binding": {"const": "reference_only"},
+          "kind": {"enum": ["operation", "skill", "workflow"]},
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$"},
+          "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "transcript_text", "voice_transcript_text"],
+      "description": "Retention is declared per conversation and applies to redacted text only; raw audio and hidden reasoning are never retained under any policy value.",
+      "properties": {
+        "policy_id": {"$ref": "#/$defs/token"},
+        "transcript_text": {"enum": ["retained_redacted", "metadata_only"]},
+        "voice_transcript_text": {"enum": ["retained_redacted", "metadata_only"]},
+        "delete_after": {"type": "string", "format": "date-time"}
+      }
+    },
+    "status": {"enum": ["active", "archived", "deletion_pending", "deleted"]},
+    "deletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested_at", "mode"],
+      "description": "Deletion purges all turn content blocks and voice transcript text. purge_content_keep_tombstone leaves this identity row plus turn counts for audit; purge_all_records removes the conversation and its turns entirely. Deletion never rewrites surviving lineage: remaining records keep their original ids.",
+      "properties": {
+        "requested_at": {"type": "string", "format": "date-time"},
+        "completed_at": {"type": "string", "format": "date-time"},
+        "mode": {"enum": ["purge_content_keep_tombstone", "purge_all_records"]}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  },
+  "if": {"properties": {"status": {"enum": ["deletion_pending", "deleted"]}}, "required": ["status"]},
+  "then": {"required": ["deletion"]},
+  "else": {"not": {"required": ["deletion"]}}
+}
