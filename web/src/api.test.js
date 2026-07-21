@@ -6,6 +6,10 @@ import {
   createSession,
   deleteConversation,
   fetchChatRoutes,
+  fetchPrdContent,
+  fetchPrdTasks,
+  fetchTaskEligibility,
+  fetchTaskReference,
   getConversation,
   listConversations,
   renameConversation,
@@ -233,6 +237,46 @@ describe('conversation API client (T004.1)', () => {
     const value = await fetchChatRoutes()
     expect(value.routes).toHaveLength(1)
     expect(value.routes[0].route_id).toBe('route.fast')
+  })
+})
+
+describe('delivery-projection explorer client (T003)', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('reads PRD content, tasks, one task, and eligibility from the scoped GET paths', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ ok: true }))
+    await fetchPrdContent('project_1', 'release-alpha')
+    expect(fetch).toHaveBeenLastCalledWith('/api/projects/project_1/prds/release-alpha/content')
+    await fetchPrdTasks('project_1', 'release-alpha')
+    expect(fetch).toHaveBeenLastCalledWith('/api/projects/project_1/prds/release-alpha/tasks')
+    await fetchTaskReference('project_1', 'release-alpha', 'T001')
+    expect(fetch).toHaveBeenLastCalledWith('/api/projects/project_1/prds/release-alpha/tasks/T001')
+    await fetchTaskEligibility('project_1', 'release-alpha', 'T001')
+    expect(fetch).toHaveBeenLastCalledWith('/api/projects/project_1/prds/release-alpha/tasks/T001/eligibility')
+  })
+
+  it('returns the exact wrapped shape the router serves', async () => {
+    const served = { content: { prd: { prd_id: 'release-alpha', title: 'PRD' } } }
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok(served))
+    await expect(fetchPrdContent('project_1', 'release-alpha')).resolves.toEqual(served)
+  })
+
+  it('encodes ids that need escaping in the scoped path', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({}))
+    await fetchPrdContent('a/b', 'p/q')
+    expect(fetch).toHaveBeenLastCalledWith('/api/projects/a%2Fb/prds/p%2Fq/content')
+  })
+
+  it('surfaces a 503 as a distinct not-configured degraded error (fail-closed surface)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 503, json: async () => ({}) })
+    await expect(fetchPrdContent('project_1', 'release-alpha')).rejects.toThrow('not configured')
+    await expect(fetchTaskEligibility('project_1', 'release-alpha', 'T001')).rejects.toThrow('not configured')
+  })
+
+  it('throws a distinct non-leaking failure for any other non-2xx', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 404, json: async () => ({}) })
+    await expect(fetchPrdTasks('project_1', 'release-alpha')).rejects.toThrow('PRD tasks are unavailable')
+    await expect(fetchTaskReference('project_1', 'release-alpha', 'T001')).rejects.toThrow('Task reference is unavailable')
   })
 })
 
