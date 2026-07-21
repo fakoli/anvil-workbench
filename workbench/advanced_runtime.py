@@ -52,7 +52,6 @@ from .chat_stream import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     MAX_PROMPT_CHARS,
     CancellationToken,
-    ChatStreamError,
     ChatStreamRelay,
     ServingStreamTransport,
     ServingStreamUnavailable,
