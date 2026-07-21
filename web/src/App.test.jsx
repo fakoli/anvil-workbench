@@ -71,6 +71,9 @@ function resetChatMocks() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // The explorer writes window.location.hash; jsdom persists it across tests in a
+  // file, so reset it here (suite NOTE #4) to keep hash assertions independent.
+  window.location.hash = ''
   bootstrap.mockResolvedValue(fixture)
   approve.mockResolvedValue({ status: 'approved' })
   addDirective.mockResolvedValue({ outcome: 'directive.queued_pending', recorded: true, event: { id: 'event_2', session_id: 'session_1', sequence: 4, kind: 'operator.directive', data: { content: 'Check route evidence.' } } })
@@ -563,7 +566,9 @@ async function renderExplorer() {
 }
 
 async function openPrd(user, prdId) {
-  const input = screen.getByRole('textbox', { name: 'PRD id' })
+  // Input is named by its wrapping <label> visible text (a11y #10): no aria-label
+  // override, so the accessible name IS the visible label "Open a PRD by id".
+  const input = screen.getByRole('textbox', { name: 'Open a PRD by id' })
   await waitFor(() => expect(input.disabled).toBe(false))
   await user.type(input, prdId)
   await user.click(screen.getByRole('button', { name: 'Open PRD' }))
@@ -582,6 +587,9 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     expect(within(card).getByText('r5')).toBeTruthy() // served prd.revision
     expect(within(card).getByText('approved')).toBeTruthy() // State status
     expect(within(card).getByText(/source as of 2026-07-19/)).toBeTruthy() // freshness
+    // Progress summary is rendered and asserted (acceptance #8): one task, none at
+    // accepted delivery. Deleting the progress <dd> now fails here, not silently.
+    expect(within(card).getByText('0/1 tasks at accepted delivery')).toBeTruthy()
     // Title leads; the scoped id is muted secondary disclosure (criterion 1).
     expect(within(card).getByText('Add routed chat')).toBeTruthy()
     const scoped = within(card).getByText('release-alpha:T001')
@@ -596,17 +604,24 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     await openPrd(user, 'release-beta')
     await screen.findByRole('article', { name: 'PRD State context and operations' })
     // Both T001 rows exist and are addressed by their SCOPED id, never a bare number.
-    expect(screen.getByRole('button', { name: 'Open task release-alpha:T001' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Open task release-beta:T001' })).toBeTruthy()
+    // The row's accessible name now comes from content (no aria-label override,
+    // a11y #1), so it carries BOTH the scoped id and the title.
+    expect(screen.getByRole('button', { name: /release-alpha:T001/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /release-beta:T001/ })).toBeTruthy()
+    // Revert-detection (a11y #1): the name is title-first, so a regression back to
+    // an id-only `aria-label` (which drops the title from the accessible name)
+    // fails these two — the row would announce only "Open task <scoped id>".
+    expect(screen.getByRole('button', { name: /Add routed chat/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Persist retention/ })).toBeTruthy()
     // Open alpha's T001: detail shows its distinct title, scoped state, and URL.
-    await user.click(screen.getByRole('button', { name: 'Open task release-alpha:T001' }))
-    const detailA = await screen.findByRole('region', { name: 'Task release-alpha:T001' })
+    await user.click(screen.getByRole('button', { name: /release-alpha:T001/ }))
+    const detailA = await screen.findByRole('region', { name: /release-alpha:T001/ })
     expect(within(detailA).getByRole('heading', { name: 'Add routed chat' })).toBeTruthy()
     expect(detailA.getAttribute('data-scoped-id')).toBe('release-alpha:T001')
     expect(window.location.hash).toContain('release-alpha:T001')
     // Open beta's T001: a DIFFERENT title, scoped state, and URL — no collapse.
-    await user.click(screen.getByRole('button', { name: 'Open task release-beta:T001' }))
-    const detailB = await screen.findByRole('region', { name: 'Task release-beta:T001' })
+    await user.click(screen.getByRole('button', { name: /release-beta:T001/ }))
+    const detailB = await screen.findByRole('region', { name: /release-beta:T001/ })
     expect(within(detailB).getByRole('heading', { name: 'Persist retention' })).toBeTruthy()
     expect(detailB.getAttribute('data-scoped-id')).toBe('release-beta:T001')
     expect(window.location.hash).toContain('release-beta:T001')
@@ -617,8 +632,8 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     setupTwoPrds()
     const user = await renderExplorer()
     await openPrd(user, 'release-alpha')
-    await user.click(await screen.findByRole('button', { name: 'Open task release-alpha:T001' }))
-    const detail = await screen.findByRole('region', { name: 'Task release-alpha:T001' })
+    await user.click(await screen.findByRole('button', { name: /release-alpha:T001/ }))
+    const detail = await screen.findByRole('region', { name: /release-alpha:T001/ })
     expect(within(detail).getByText(/release-alpha:T000/)).toBeTruthy() // dependency, scoped
     expect(within(detail).getByText('3 acceptance criteria')).toBeTruthy()
     expect(within(detail).getByText(/automated verification defined/)).toBeTruthy()
@@ -647,12 +662,12 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     fetchTaskEligibility.mockResolvedValue(eligibilityVerdict('release-alpha', 'T001'))
     const user = await renderExplorer()
     await openPrd(user, 'release-alpha')
-    expect(await screen.findByRole('button', { name: 'Open task release-alpha:T001' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Open task release-alpha:T002' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: /release-alpha:T001/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /release-alpha:T002/ })).toBeTruthy()
     await user.type(screen.getByRole('searchbox', { name: 'Filter tasks' }), 'routed')
     // Real render assertion: the non-matching row is removed, not merely a call.
-    expect(screen.getByRole('button', { name: 'Open task release-alpha:T001' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Open task release-alpha:T002' })).toBeNull()
+    expect(screen.getByRole('button', { name: /release-alpha:T001/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /release-alpha:T002/ })).toBeNull()
   })
 
   it('announces lifecycle in a live region and moves focus to detail, with Escape returning focus to the rail', async () => {
@@ -662,12 +677,12 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     expect(live.getAttribute('aria-live')).toBe('polite')
     await openPrd(user, 'release-alpha')
     expect(await screen.findByText(/Loaded PRD Chat-first Workbench/)).toBeTruthy() // live region updated
-    await user.click(await screen.findByRole('button', { name: 'Open task release-alpha:T001' }))
+    await user.click(await screen.findByRole('button', { name: /release-alpha:T001/ }))
     const heading = await screen.findByRole('heading', { name: 'Add routed chat' })
     await waitFor(() => expect(document.activeElement).toBe(heading)) // focus not dropped to <body>
     expect(screen.getByText(/Opened task release-alpha:T001/)).toBeTruthy() // announced
     await user.keyboard('{Escape}')
-    await waitFor(() => expect(screen.queryByRole('region', { name: 'Task release-alpha:T001' })).toBeNull())
+    await waitFor(() => expect(screen.queryByRole('region', { name: /release-alpha:T001/ })).toBeNull())
     expect(document.activeElement).not.toBe(document.body) // focus returned to the rail
   })
 
@@ -689,6 +704,91 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     render(<App />)
     await user.click(await screen.findByRole('button', { name: 'Explorer' }))
     expect(await screen.findByText(/No projects yet/)).toBeTruthy()
-    expect(screen.getByRole('textbox', { name: 'PRD id' }).disabled).toBe(true)
+    expect(screen.getByRole('textbox', { name: 'Open a PRD by id' }).disabled).toBe(true)
+  })
+
+  it('drops a stale out-of-order eligibility fetch so the open task shows its own verdict (#2)', async () => {
+    // Reproduces the T001-vs-T001 hazard: alpha's eligibility resolves SLOWLY,
+    // beta's resolves immediately. Open alpha then beta. Without the latest-wins
+    // guard, alpha's late resolve overwrites beta's verdict under beta's pane.
+    let resolveAlpha
+    fetchPrdContent.mockImplementation((_p, prdId) => Promise.resolve(prdId === 'release-alpha'
+      ? prdContent('release-alpha', 'Chat-first Workbench')
+      : prdContent('release-beta', 'State context and operations')))
+    fetchPrdTasks.mockImplementation((_p, prdId) => Promise.resolve(prdId === 'release-alpha'
+      ? { tasks: [taskRef('release-alpha', 'T001', 'Add routed chat')] }
+      : { tasks: [taskRef('release-beta', 'T001', 'Persist retention')] }))
+    fetchTaskEligibility.mockImplementation((_p, prdId) => prdId === 'release-alpha'
+      ? new Promise((resolve) => { resolveAlpha = () => resolve(eligibilityVerdict('release-alpha', 'T001', { reasons: [{ class: 'blocked', code: 'blocked.alpha_stale', explanation: 'Alpha resolved late.' }] })) })
+      : Promise.resolve(eligibilityVerdict('release-beta', 'T001', { eligible: true, state: 'ready', reasons: [{ class: 'ready', code: 'ready.beta_current', explanation: 'Beta is current.' }] })))
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    await screen.findByRole('article', { name: 'PRD Chat-first Workbench' })
+    await openPrd(user, 'release-beta')
+    await screen.findByRole('article', { name: 'PRD State context and operations' })
+    // Open alpha (eligibility pending), then beta (eligibility resolves at once).
+    await user.click(screen.getByRole('button', { name: /release-alpha:T001/ }))
+    await user.click(screen.getByRole('button', { name: /release-beta:T001/ }))
+    const detailB = await screen.findByRole('region', { name: /release-beta:T001/ })
+    expect(await within(detailB).findByText('ready.beta_current')).toBeTruthy()
+    // Now alpha's late fetch resolves. It must NOT repaint beta's open pane.
+    await act(async () => { resolveAlpha(); await Promise.resolve() })
+    expect(within(detailB).queryByText('blocked.alpha_stale')).toBeNull() // stale verdict dropped
+    expect(within(detailB).getByText('ready.beta_current')).toBeTruthy() // beta's own verdict stands
+  })
+
+  it('closes the detail with a visible Close button, returns focus to the rail, and clears the hash (#3/#4)', async () => {
+    setupTwoPrds()
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    await user.click(await screen.findByRole('button', { name: /release-alpha:T001/ }))
+    await screen.findByRole('region', { name: /release-alpha:T001/ })
+    expect(window.location.hash).toContain('release-alpha:T001')
+    const close = screen.getByRole('button', { name: 'Close' }) // a real, discoverable control
+    await user.click(close)
+    await waitFor(() => expect(screen.queryByRole('region', { name: /release-alpha:T001/ })).toBeNull())
+    expect(document.activeElement).not.toBe(document.body) // focus not dropped
+    expect(window.location.hash).not.toContain('release-alpha') // stale hash cleared, no longer lies
+  })
+
+  it('announces a truthful partial failure when the PRD loads but its tasks fail (#6)', async () => {
+    fetchPrdContent.mockResolvedValue(prdContent('release-alpha', 'Chat-first Workbench'))
+    fetchPrdTasks.mockRejectedValue(new Error('tasks projection unavailable'))
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    expect(await screen.findByText(/tasks failed to load/)).toBeTruthy()
+    expect(screen.queryByText(/with 0 tasks/)).toBeNull() // never the misleading healthy-empty line
+  })
+
+  it('announces the filter result in the live region on filter change (#7)', async () => {
+    fetchPrdContent.mockResolvedValue(prdContent('release-alpha', 'Chat-first Workbench'))
+    fetchPrdTasks.mockResolvedValue({ tasks: [
+      taskRef('release-alpha', 'T001', 'Add routed chat'),
+      taskRef('release-alpha', 'T002', 'Persist retention'),
+    ] })
+    fetchTaskEligibility.mockResolvedValue(eligibilityVerdict('release-alpha', 'T001'))
+    const user = await renderExplorer()
+    await openPrd(user, 'release-alpha')
+    await screen.findByRole('button', { name: /release-alpha:T001/ })
+    const live = screen.getByRole('status')
+    await user.type(screen.getByRole('searchbox', { name: 'Filter tasks' }), 'routed')
+    await waitFor(() => expect(live.textContent).toMatch(/1 task\b/)) // one match announced
+    await user.clear(screen.getByRole('searchbox', { name: 'Filter tasks' }))
+    await user.type(screen.getByRole('searchbox', { name: 'Filter tasks' }), 'zzz')
+    await waitFor(() => expect(live.textContent).toMatch(/No tasks match/)) // empty result announced
+  })
+
+  it('applies the narrow-posture shell class on the Explorer route and drops it off-route (#5)', async () => {
+    setupTwoPrds()
+    const user = await renderExplorer()
+    const shell = document.querySelector('.app-shell')
+    // The Explorer route stamps `explorer-active`: the ≤900px rule unfixes the nav
+    // rail under this class so it cannot pin a narrow column or let the live region
+    // paint over the rail buttons. The class is scoped, so it drops off-route.
+    expect(shell.classList.contains('explorer-active')).toBe(true)
+    expect(shell.classList.contains('chat-active')).toBe(false)
+    await user.click(screen.getByRole('button', { name: 'Delivery' }))
+    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    expect(document.querySelector('.app-shell').classList.contains('explorer-active')).toBe(false)
   })
 })

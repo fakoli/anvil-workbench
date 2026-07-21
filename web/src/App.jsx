@@ -545,8 +545,14 @@ function ExplorerEligibility({ eligibility }) {
 }
 
 function ExplorerTaskRow({ task, selected, onOpen }) {
+  // No aria-label here (a11y #1): a button role makes its children presentational
+  // for name computation, so an `aria-label` of just the scoped id would REPLACE
+  // the visible content and a screen-reader user would hear only the bare id —
+  // inverting criterion 1 (title/lineage lead, scoped id is secondary). Letting
+  // the accessible name come from content keeps title, State status, delivery
+  // status, and scoped id all in the announced name, title-first.
   return <li className={`explorer-task ${selected ? 'selected' : ''}`}>
-    <button aria-label={`Open task ${task.scopedId}`} aria-current={selected ? 'true' : undefined} onClick={() => onOpen(task)}>
+    <button data-explorer-task={task.scopedId} aria-current={selected ? 'true' : undefined} onClick={() => onOpen(task)}>
       <span className="explorer-task-title">{task.title}</span>
       <span className="explorer-task-meta">
         <Status tone={tone(task.status)}>{task.status}</Status>
@@ -590,12 +596,14 @@ function ExplorerPrdCard({ entry, filter, selectedScopedId, onReadPrd, onOpenTas
 }
 
 function ExplorerDetail({ selection, reading, eligibility, detailRef, onClose }) {
-  const onKeyDown = (event) => { if (event.key === 'Escape') onClose() }
   if (selection) {
     const task = selection.task
     const lineage = [task.prdTitle, task.featureId, task.scopedId].filter(Boolean).join(' / ')
-    return <section className="explorer-detail-pane" aria-label={`Task ${task.scopedId}`} data-scoped-id={task.scopedId} onKeyDown={onKeyDown}>
-      <span className="crumb">{lineage}</span>
+    // Region name is title-first (a11y #10): `<title> (<scoped id>)` keeps the
+    // human title as the primary label and the scoped id as disambiguating
+    // secondary disclosure, matching criterion 1.
+    return <section className="explorer-detail-pane" aria-label={`${task.title} (${task.scopedId})`} data-scoped-id={task.scopedId}>
+      <div className="explorer-detail-topbar"><span className="crumb">{lineage}</span><button className="explorer-close" aria-label="Close" onClick={onClose}>Close</button></div>
       <h2 className="explorer-detail-title" tabIndex={-1} ref={detailRef}>{task.title}</h2>
       <div className="explorer-detail-badges">
         <Status tone={tone(task.status)}>{task.status}</Status>
@@ -631,8 +639,8 @@ function ExplorerDetail({ selection, reading, eligibility, detailRef, onClose })
   }
   if (reading) {
     const prd = reading.prd
-    return <section className="explorer-detail-pane" aria-label={`PRD ${prd ? prd.title : reading.prdId}`} onKeyDown={onKeyDown}>
-      <span className="crumb">PRD content / {prd?.redactionStatus || 'redacted'}</span>
+    return <section className="explorer-detail-pane" aria-label={`PRD ${prd ? prd.title : reading.prdId}`}>
+      <div className="explorer-detail-topbar"><span className="crumb">PRD content / {prd?.redactionStatus || 'redacted'}</span><button className="explorer-close" aria-label="Close" onClick={onClose}>Close</button></div>
       <h2 className="explorer-detail-title" tabIndex={-1} ref={detailRef}>{prd ? prd.title : reading.prdId}</h2>
       {prd ? <>
         <dl className="explorer-prd-meta">
@@ -664,6 +672,14 @@ function ExplorerView({ data, append }) {
   const [announce, setAnnounce] = useState('')
   const detailRef = useRef(null)
   const railRef = useRef(null)
+  // Latest-wins guard for the per-task eligibility fetch (a11y + suite #2),
+  // mirroring the chat rail's listSeqRef: every fetch claims a monotonic ticket
+  // and applies its result only if it is still the newest. Without it, opening
+  // alpha:T001 (slow) then beta:T001 (fast) lets alpha's late resolve overwrite
+  // beta's verdict — showing the WRONG eligibility under beta, the exact
+  // T001-vs-T001 confusion this explorer exists to prevent. closeDetail also
+  // bumps it so a stale in-flight fetch cannot repaint a closed pane.
+  const eligibilitySeqRef = useRef(0)
 
   useEffect(() => { if (!selectedProjectId && projects[0]) setSelectedProjectId(projects[0].id) }, [projects, selectedProjectId])
   // Move focus to the opened detail heading so a view switch / detail open never
@@ -672,11 +688,14 @@ function ExplorerView({ data, append }) {
   useEffect(() => { if (selection || reading) detailRef.current?.focus() }, [selection?.scopedId, reading?.key])
 
   const loadEligibility = async (entry, task) => {
+    const seq = (eligibilitySeqRef.current += 1)
     setEligibility({ status: 'loading', value: null, message: null })
     try {
       const value = await fetchTaskEligibility(entry.projectId, entry.prdId, task.taskId)
+      if (seq !== eligibilitySeqRef.current) return // a newer task open superseded this fetch
       setEligibility({ status: 'loaded', value: describeEligibility(value.eligibility), message: null })
     } catch (error) {
+      if (seq !== eligibilitySeqRef.current) return // superseded fetch failed late; do not repaint
       setEligibility({ status: 'error', value: null, message: error.message })
     }
   }
@@ -700,8 +719,14 @@ function ExplorerView({ data, append }) {
     }
     setEntries((current) => [entry, ...current.filter((item) => item.key !== key)])
     setPrdInput('')
-    if (entry.prd) setAnnounce(`Loaded PRD ${entry.prd.title} with ${entry.tasks.length} tasks`)
-    else { setAnnounce(entry.prdError || `PRD ${prdId} could not be loaded`); append?.(entry.prdError || `PRD ${prdId} could not be loaded`) }
+    // Announce the truthful outcome (a11y #6): when the PRD content loads but the
+    // task projection fails, say so — never "…with 0 tasks", which reads as an
+    // empty-but-healthy PRD and hides the failure (which is otherwise visual-only).
+    if (entry.prd) {
+      setAnnounce(entry.tasksError
+        ? `Loaded PRD ${entry.prd.title}; tasks failed to load`
+        : `Loaded PRD ${entry.prd.title} with ${entry.tasks.length} tasks`)
+    } else { setAnnounce(entry.prdError || `PRD ${prdId} could not be loaded`); append?.(entry.prdError || `PRD ${prdId} could not be loaded`) }
   }
 
   const readPrd = (entry) => {
@@ -721,15 +746,55 @@ function ExplorerView({ data, append }) {
   }
 
   const closeDetail = () => {
+    const invokedScopedId = selection?.scopedId || null
     const had = selection || reading
     setSelection(null)
     setReading(null)
     setEligibility({ status: 'idle', value: null, message: null })
+    eligibilitySeqRef.current += 1 // drop any in-flight eligibility fetch (a11y #2)
+    // Clear the write-only URL hash so it stops lying once the pane is closed
+    // (a11y + suite #4): the hash reflects an OPEN task, so a closed detail must
+    // not leave a stale `#explorer/<scoped id>` in the address bar.
+    if (window.location.hash.startsWith('#explorer/')) window.location.hash = ''
     if (had) {
       setAnnounce('Closed detail')
-      railRef.current?.querySelector('.explorer-open-prd, input, button')?.focus()
+      // Return focus to the invoking task row (a11y #9), not the first project
+      // button in document order — a keyboard user deep in a second PRD is not
+      // teleported to the top. Fall back to the first focusable rail control.
+      const invoker = invokedScopedId && railRef.current?.querySelector(`[data-explorer-task="${invokedScopedId}"]`)
+      const target = invoker || railRef.current?.querySelector('.explorer-open-prd, input, button')
+      target?.focus()
     }
   }
+
+  // Document-level Escape closes the detail while it is open (a11y #3), so it
+  // works even after focus has left the pane (in PRD-read mode the pane has no
+  // tabbable elements, so one Tab exits and a pane-scoped handler would go dead).
+  useEffect(() => {
+    if (!selection && !reading) return undefined
+    const onDocKeyDown = (event) => { if (event.key === 'Escape') closeDetail() }
+    document.addEventListener('keydown', onDocKeyDown)
+    return () => document.removeEventListener('keydown', onDocKeyDown)
+  }, [selection, reading])
+
+  // Clear the URL hash when the Explorer view unmounts (a11y + suite #4): leaving
+  // the Explorer route must not leave a stale `#explorer/<scoped id>` behind.
+  useEffect(() => () => { if (window.location.hash.startsWith('#explorer/')) window.location.hash = '' }, [])
+
+  // Announce the filter result in the live region on filter change (a11y #7):
+  // filtering is named in the criterion-4 SR smoke but otherwise gives a
+  // screen-reader user no feedback. An empty filter makes no announcement (it is
+  // the resting state, and openPrd already owns the load announcement).
+  useEffect(() => {
+    const needle = filter.trim()
+    if (!needle) return
+    const total = entries.reduce(
+      (sum, entry) => sum + filterDescribedTasks((entry.tasks || []).map(describeTaskReference), filter).length,
+      0,
+    )
+    setAnnounce(total ? `Filter shows ${total} task${total === 1 ? '' : 's'}` : `No tasks match "${needle}"`)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fire on filter edits only
+  }, [filter])
 
   return <main className="explorer" aria-label="Delivery explorer">
     <aside className="explorer-rail" ref={railRef}>
@@ -743,7 +808,7 @@ function ExplorerView({ data, append }) {
           : <p className="explorer-muted">No projects yet. Create one from Delivery.</p>}
       </section>
       <form className="explorer-open" onSubmit={(event) => { event.preventDefault(); openPrd() }}>
-        <label>Open a PRD by id<input aria-label="PRD id" value={prdInput} onChange={(event) => setPrdInput(event.target.value)} placeholder="e.g. release-alpha" disabled={!selectedProjectId} /></label>
+        <label>Open a PRD by id<input value={prdInput} onChange={(event) => setPrdInput(event.target.value)} placeholder="e.g. release-alpha" disabled={!selectedProjectId} /></label>
         <button className="explorer-open-prd" type="submit" disabled={!selectedProjectId || !prdInput.trim()}>Open PRD</button>
         <small className="explorer-muted">PRD enumeration is not served by the projection; open a PRD by its id.</small>
       </form>
@@ -769,7 +834,7 @@ function App() {
   const addDirection = async (sessionId, text) => { const result = await addDirective(sessionId, text); if (result.recorded && result.event) { setData((current) => ({ ...current, directives: [...current.directives, result.event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.') } else { setNotice(`Direction was not recorded (${result.outcome}). No future work packet was changed.`) } await load() }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
   const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
-  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}`}>
+  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}`}>
     <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
     <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
