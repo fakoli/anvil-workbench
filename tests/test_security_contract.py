@@ -259,6 +259,8 @@ def test_project_context_browser_response_exposes_no_state_path_credential_or_pa
 # BOTH the descriptor safety (T003.1) and the audit's no-mutation claim (T008
 # criterion 2, "proven by the same fixtures that guard T003"). --------------
 
+from conftest import SYSTEM_HEALTH_DESCRIPTOR_FIELDS
+
 from workbench.config import Settings as _SHSettings
 from workbench.system_health import (
     INTEGRATION_IDS as _SH_INTEGRATION_IDS,
@@ -279,11 +281,9 @@ _SH_FORBIDDEN_FIELD_MARKERS = (
 
 #: The exact closed field set a descriptor may serialize. A field added outside
 #: this set (leak-by-addition) must fail, so the assertion is not a tautology.
-_SH_ALLOWED_DESCRIPTOR_FIELDS = frozenset({
-    "configured", "dependencies", "digest", "integration_id", "non_canonical",
-    "owner", "remediation", "schema_version", "state", "title",
-    "version", "detail", "last_checked_at",
-})
+#: Imported from ``conftest`` so this list and its twin in ``test_api.py`` cannot
+#: drift apart (a single source of truth for the closed shape).
+_SH_ALLOWED_DESCRIPTOR_FIELDS = SYSTEM_HEALTH_DESCRIPTOR_FIELDS
 #: The six things T003.1 requires every descriptor to expose, always present.
 _SH_REQUIRED_DESCRIPTOR_FIELDS = frozenset({
     "state", "configured", "digest", "last_checked_at", "owner",
@@ -325,14 +325,70 @@ def test_system_health_descriptor_exposes_the_required_closed_field_set():
                 assert marker not in lowered, f"descriptor field {key!r} looks like a {marker!r} surface"
 
 
+_BS = chr(92)  # a single backslash, kept out of the f-strings below.
+
+#: The full adversarial redaction corpus (three-lens finding 1): one probe per
+#: proven-leaking shape across all four declared classes. Each entry is
+#: ``(fragment, [tokens that must be gone], expected marker)``. Every fragment is
+#: a shape a NARROWED scrub returned unchanged, so each is an independent
+#: negative assertion -- reverting ``redact_config_text`` to the old patterns
+#: must make at least one of these fail.
+_SH_REDACTION_CORPUS = (
+    # --- credentials / secrets ---
+    ("AKIAIOSFODNN7EXAMPLE", ["AKIAIOSFODNN7EXAMPLE"], "[REDACTED]"),
+    ("aws_secret_access_key=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+     ["wJalrXUtnFEMI", "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"], "[REDACTED]"),
+    ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dozjgNryP4J3jVmNHl0w",
+     ["eyJhbGci", "eyJzdWIi"], "[REDACTED]"),
+    ("-----BEGIN RSA PRIVATE KEY-----MIIEpQIBAAKCAQ-----END RSA PRIVATE KEY-----",
+     ["MIIEpQIBAAKCAQ", "BEGIN RSA PRIVATE KEY"], "[REDACTED]"),
+    # --- sensitive raw URLs / endpoints ---
+    ("reach it at 100.64.0.5:8443 today", ["100.64.0.5"], "[REDACTED-URL]"),
+    ("bolt db.tail1234.ts.net:7687", ["tail1234", "7687", "ts.net"], "[REDACTED-URL]"),
+    ("serving.tail1234.ts.net", ["serving.tail1234", "ts.net"], "[REDACTED-URL]"),
+    ("jump to //internalhost/admin now", ["//internalhost"], "[REDACTED-URL]"),
+    ("Server=db.internal;Password=hunter2;", ["db.internal", "hunter2"], "[REDACTED-URL]"),
+    ("https://100.87.34.66:8000/v1", ["100.87.34.66", "://"], "[REDACTED-URL]"),
+    # --- local paths ---
+    ("path=/etc/anvil/secret.conf", ["/etc/anvil"], "[REDACTED-PATH]"),
+    ("file:/var/lib/secrets/key", ["/var/lib/secrets"], "[REDACTED-PATH]"),
+    ("see (/opt/anvil/private) here", ["/opt/anvil"], "[REDACTED-PATH]"),
+    (_BS + _BS + "fileserver" + _BS + "secrets", ["fileserver"], "[REDACTED-PATH]"),
+    ("C:" + _BS + "Users" + _BS + "me" + _BS + "creds.json", ["Users" + _BS + "me"], "[REDACTED-PATH]"),
+    ("key at ~/.ssh/id_rsa here", ["~/.ssh", "id_rsa"], "[REDACTED-PATH]"),
+    ("load deploy/.env please", ["deploy/.env"], "[REDACTED-PATH]"),
+    ("certs/server.pem", ["certs/server.pem"], "[REDACTED-PATH]"),
+    ("prod.env", ["prod.env"], "[REDACTED-PATH]"),
+    ("backup.pem", ["backup.pem"], "[REDACTED-PATH]"),
+    ("/home/operator/private/key", ["/home/operator"], "[REDACTED-PATH]"),
+)
+
+
 def test_system_health_descriptor_scrubs_seeded_credential_url_and_path_on_construction():
-    # T003.1 criterion 2: the redaction layer removes secrets/credentials,
-    # sensitive raw URLs, AND local paths. Seed one of EACH class into the prose
-    # and prove each specific token is gone and its marker present -- the scan
-    # claims exactly what it proves.
+    # T003.1 criterion 2: the redaction layer removes ENTIRE declared classes --
+    # secrets/credentials, sensitive raw URLs/endpoints, AND local paths. Seed
+    # every proven-leaking shape (finding 1 corpus) into descriptor prose, one at
+    # a time, and prove each specific token is gone and its class marker present.
+    for fragment, gone_tokens, marker in _SH_REDACTION_CORPUS:
+        seeded = f"remediation prose {fragment} tail text"
+        descriptor = _SHDescriptor(
+            integration_id="anvil_serving", title="Anvil Serving model plane",
+            state="disabled", configured=False, owner="anvil-serving", remediation=seeded,
+        )
+        blob = json.dumps(descriptor.as_dict())
+        for token in gone_tokens:
+            assert token not in blob, f"{fragment!r}: leaked {token!r} -> {descriptor.remediation!r}"
+        assert marker in blob, f"{fragment!r}: expected {marker} -> {descriptor.remediation!r}"
+        # The digest commits to the scrubbed content, so it too is leak-free.
+        for token in gone_tokens:
+            assert token not in descriptor.digest
+        # Readable prose survives around the scrubbed shape.
+        assert "remediation prose" in descriptor.remediation and "tail text" in descriptor.remediation
+
+    # A single descriptor carrying one of every class at once is fully scrubbed.
     seeded = (
         "token=supersecretvalue reach it at https://100.87.34.66:8000/v1 "
-        "win C:" + chr(92) + "Users" + chr(92) + "me" + chr(92) + "creds.json "
+        "win C:" + _BS + "Users" + _BS + "me" + _BS + "creds.json "
         "posix /home/operator/private/key"
     )
     descriptor = _SHDescriptor(
@@ -340,16 +396,9 @@ def test_system_health_descriptor_scrubs_seeded_credential_url_and_path_on_const
         state="disabled", configured=False, owner="anvil-serving", remediation=seeded,
     )
     blob = json.dumps(descriptor.as_dict())
-    # Credential scrub.
-    assert "supersecretvalue" not in blob and "token=supersecret" not in blob
-    assert "[REDACTED]" in blob
-    # Raw URL scrub (the endpoint host must not survive).
-    assert "100.87.34.66" not in blob and "://" not in blob
-    assert "[REDACTED-URL]" in blob
-    # Local path scrub (both Windows and POSIX).
-    assert "Users" + chr(92) + "me" not in blob and "/home/operator" not in blob
-    assert "[REDACTED-PATH]" in blob
-    # The digest commits to the scrubbed content, so it too is secret-free.
+    assert "supersecretvalue" not in blob and "[REDACTED]" in blob
+    assert "100.87.34.66" not in blob and "://" not in blob and "[REDACTED-URL]" in blob
+    assert "Users" + _BS + "me" not in blob and "/home/operator" not in blob and "[REDACTED-PATH]" in blob
     assert "supersecretvalue" not in descriptor.digest
 
 
@@ -415,7 +464,14 @@ def test_posture_audit_is_deterministic_with_stable_ids_and_no_secret_or_path():
 
 def test_posture_check_rejects_a_smuggled_execution_shaped_id():
     # T008: a check id is a stable observational label, not a command name; the
-    # grammar refuses anything but a dotted lowercase id, so a finding can never
-    # smuggle an executable/approval token through its identifier.
-    with pytest.raises(ValueError, match="check_id is invalid"):
-        _SHCheck(check_id="run_codex --now", title="x", status="ok", severity="info", remediation="x")
+    # grammar requires the dotted ``posture.<segment>`` form, so a finding can
+    # never smuggle an executable/approval token through its identifier. A
+    # command with an argument, AND a bare command-shaped id with no dotted
+    # ``posture.`` prefix, are both refused (the grammar is genuinely dotted-only,
+    # not merely space-free).
+    for smuggled in ("run_codex --now", "run_codex", "merge_and_accept", "posture"):
+        with pytest.raises(ValueError, match="check_id is invalid"):
+            _SHCheck(check_id=smuggled, title="x", status="ok", severity="info", remediation="x")
+    # The real dotted ids the audit emits stay valid.
+    for good in ("posture.integration.anvil_serving", "posture.security.insecure_dev_actor"):
+        assert _SHCheck(check_id=good, title="x", status="ok", severity="info", remediation="x").check_id == good

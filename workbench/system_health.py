@@ -18,10 +18,15 @@ observation.
 
 Redaction (T003.1 criterion 2): every readable prose field (title, owner,
 remediation, detail) is scrubbed on construction through
-:func:`workbench.redaction.redact_config_text`, which removes credentials, raw
-``scheme://`` URLs, and Windows/POSIX absolute paths.  Identifier, version, and
-timestamp fields are strict-pattern validated instead of scrubbed, so a secret
-cannot ride in through them either.
+:func:`workbench.redaction.redact_config_text`, which removes all four declared
+classes -- secrets/credentials, sensitive raw URLs/endpoints, and local paths
+(see that function for the exact shapes).  Identifier, version, and timestamp
+fields are strict-pattern validated instead of scrubbed, so a secret cannot ride
+in through them either.  Construction-time scrubbing keeps the digest a
+commitment to safe content and protects the CLI render path; the browser-facing
+guarantee is additionally enforced at the API boundary, where
+:func:`workbench.redaction.scrub_config_payload` scrubs the serialized response
+so even a rogue service that bypassed construction cannot leak through the hub.
 
 Determinism (T008 criterion 1): a descriptor's ``digest`` is computed over its
 stable content *excluding* the volatile ``last_checked_at`` observation time, so
@@ -381,7 +386,11 @@ POSTURE_SCHEMA_VERSION = "workbench-posture/v1"
 POSTURE_STATUSES = frozenset({"ok", "attention", "disabled"})
 POSTURE_SEVERITIES = frozenset({"info", "warn"})
 
-_CHECK_ID = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
+#: A check id is a stable ``posture.<segment>[.<segment>…]`` dotted label, never
+#: a command name.  Requiring the ``posture.`` prefix and at least one dotted
+#: segment means a bare command-shaped token (``run_codex``) can never pass, so a
+#: finding cannot smuggle an executable/approval name through its identifier.
+_CHECK_ID = re.compile(r"^posture(?:\.[a-z][a-z0-9_]{0,31}){1,5}$")
 
 
 @dataclass(frozen=True)

@@ -26,6 +26,7 @@ from .graph import EvidenceGraph, Neo4jEvidenceGraph, NullGraph
 from .models import as_json
 from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
+from .redaction import scrub_config_payload
 from .store import PostgresStore, StoreError, WorkbenchStore
 from .system_health import SystemHealthService, UnknownIntegrationError
 from .voice import relay_realtime
@@ -261,6 +262,16 @@ def build_system_health_router(
     sets structurally cannot carry a credential, a raw endpoint URL, a local
     path, an approval, or an execution surface.
 
+    Redaction guarantee (T003.1 criterion 2, security lens): the browser-facing
+    scrub is enforced here, at the serialized API boundary, by
+    :func:`~workbench.redaction.scrub_config_payload` over every response body --
+    not only field-by-field at descriptor construction.  Construction-time
+    scrubbing still runs (so the digest commits to safe content and the CLI is
+    protected), but a rogue or duck-typed ``health_service`` whose ``as_dict()``
+    bypassed it cannot make this router emit a secret/endpoint/path: the last hop
+    scrubs whatever it returns.  Delimiter-anchored patterns leave the content
+    digest, schema version, and timestamp intact.
+
     This router is deliberately read-only: it registers only ``GET`` routes and
     exposes no mutation, execution, or approval path (T003.2 criterion 3 /
     T008).  Unlike the project-context projection it has no unconfigured-503
@@ -273,7 +284,9 @@ def build_system_health_router(
     @router.get("/health")
     def system_health(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
         """Every declared integration's observational descriptor."""
-        return {"integrations": [descriptor.as_dict() for descriptor in health_service.descriptors()]}
+        return scrub_config_payload(
+            {"integrations": [descriptor.as_dict() for descriptor in health_service.descriptors()]}
+        )
 
     @router.get("/health/{integration_id}")
     def system_health_integration(
@@ -281,12 +294,12 @@ def build_system_health_router(
         _actor: str = Depends(actor_dependency),
     ) -> dict[str, Any]:
         """One declared integration's descriptor; an unknown id is a plain 404."""
-        return {"integration": health_service.get(integration_id).as_dict()}
+        return scrub_config_payload({"integration": health_service.get(integration_id).as_dict()})
 
     @router.get("/posture")
     def system_posture(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
         """The deterministic observational posture audit (same runner as the CLI)."""
-        return health_service.posture().as_dict()
+        return scrub_config_payload(health_service.posture().as_dict())
 
     return router
 
