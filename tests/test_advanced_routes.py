@@ -251,6 +251,38 @@ def test_c3_ready_when_no_drift():
     assert route_capability_repair(pinned, discovered) == {"status": "ready"}
 
 
+def test_c3_repair_required_when_route_vanished_without_digests():
+    # Drift must invalidate, never silently pass (crit 3). A pin naming a route
+    # absent from the live catalog -- even with NO digests to compare -- must fail
+    # closed as repair_required, not fail OPEN to {"status": "ready"}.
+    discovered = _discovered()
+    gone = {"route_id": "route.deleted"}  # not in the catalog, no pinned digests
+    repair = route_capability_repair(gone, discovered)
+    assert repair["status"] == "repair_required"
+    assert {ref["ref_kind"] for ref in repair["drifted_refs"]} == {"route", "profile"}
+
+
+def test_c3_repair_required_when_pinned_digest_is_not_a_valid_digest_string():
+    # A pinned ref that is missing or a non-string / malformed digest cannot be
+    # verified against the live catalog; it must fail closed as repair_required,
+    # never be skipped into a silent "ready".
+    discovered = _discovered()
+    # Non-string route_digest (profile matches live).
+    non_string = {"route_id": "route.chat-fast", "route_digest": 12345, "profile_digest": _PROFILE_DIGEST}
+    repair = route_capability_repair(non_string, discovered)
+    assert repair["status"] == "repair_required"
+    assert any(ref["ref_kind"] == "route" for ref in repair["drifted_refs"])
+
+    # Missing route_digest entirely (present live route) also fails closed.
+    missing = {"route_id": "route.chat-fast", "profile_digest": _PROFILE_DIGEST}
+    assert route_capability_repair(missing, discovered)["status"] == "repair_required"
+
+    # A malformed (non-sha256) digest string is likewise unverifiable -> repair.
+    malformed = {"route_id": "route.chat-fast", "route_digest": "not-a-digest",
+                 "profile_digest": _PROFILE_DIGEST}
+    assert route_capability_repair(malformed, discovered)["status"] == "repair_required"
+
+
 # --- Criterion 4: browser metadata identifies source + disabled reason -------
 
 

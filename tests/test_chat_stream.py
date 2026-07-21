@@ -471,3 +471,35 @@ def test_output_char_bound_is_enforced():
     relay = ChatStreamRelay(_selection(), "hi", transport)
     _drain(relay)
     assert relay.outcome is StreamOutcome.serving_unavailable
+
+
+def test_for_prepared_request_takes_a_prevalidated_bounded_request():
+    # CONTRACT (pinned directly): ``for_prepared_request`` builds a relay over an
+    # ALREADY-assembled bounded request. It performs no control validation of its
+    # own -- the caller is responsible for having bounded every value first (the
+    # WIRED Advanced path re-validates via AdvancedRouteSelection before it calls
+    # this). It reuses the exact same stream state machine as the normal
+    # constructor: same distinct outcomes, same cancellation/teardown.
+    prepared = {
+        "model": "chat-heavy",
+        "route_id": "chat.heavy",
+        "input": "hi",
+        "stream": True,
+        "max_output_tokens": 256,
+    }
+    transport = ScriptedTransport([_delta("Hel"), _delta("lo"), _COMPLETED])
+    relay = ChatStreamRelay.for_prepared_request(prepared, transport)
+    events = _drain(relay)
+    assert relay.outcome is StreamOutcome.completed
+    assert relay.partial_text == "Hello"
+    assert relay.terminal_turn_status() == "complete"
+    assert events[-1].outcome is StreamOutcome.completed
+    # The request the relay opens upstream is exactly the prepared mapping (copied,
+    # not mutated); this constructor does not re-bound or re-shape it.
+    assert transport.opened_request == prepared
+    assert relay.request == prepared
+    assert relay.request is not prepared
+
+    # A non-mapping prepared request is refused (the one shape check it does make).
+    with pytest.raises(ChatStreamError, match="mapping"):
+        ChatStreamRelay.for_prepared_request(["not", "a", "mapping"], transport)  # type: ignore[arg-type]

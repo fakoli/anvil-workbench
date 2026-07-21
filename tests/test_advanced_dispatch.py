@@ -44,7 +44,7 @@ from workbench.conversation_models import (
     TurnRedaction,
 )
 from workbench.conversation_store import MemoryConversationStore
-from workbench.response_lifecycle_store import MemoryResponseLifecycleStore
+from workbench.response_lifecycle_store import MemoryResponseLifecycleStore, SafeUsage
 
 ACTOR = ConversationActor("operator")
 KEY = b"advanced-dispatch-content-hash-1"
@@ -162,6 +162,38 @@ def test_c1_each_attempt_is_an_isolated_sibling_turn():
         assert a.result.turn_id == a.turn_id
         assert a.result.trace["branch_ref"]["turn_id"] == a.turn_id
         assert a.error is None
+
+
+def test_c1_each_attempt_carries_its_own_distinct_usage():
+    # Each parallel attempt is an ordinary sibling turn with its OWN usage metadata
+    # (crit 1). Usage is plumbed per-dispatch, so distinct per-attempt usage must
+    # survive into each attempt's own result and its own trace -- never collapsed
+    # to a single shared/default SafeUsage.
+    store, conversation, root = _conversation()
+    lifecycle = MemoryResponseLifecycleStore()
+    dispatches = [
+        _dispatch("route.chat-fast", "req_a", ScriptedTransport([_delta("A"), _COMPLETED]),
+                  usage=SafeUsage(input_tokens=1, output_tokens=10)),
+        _dispatch("route.chat-heavy", "req_b", ScriptedTransport([_delta("B"), _COMPLETED]),
+                  usage=SafeUsage(input_tokens=2, output_tokens=20)),
+        _dispatch("route.chat-mini", "req_c", ScriptedTransport([_delta("C"), _COMPLETED]),
+                  usage=SafeUsage(input_tokens=3, output_tokens=30)),
+    ]
+    result = dispatch_parallel(
+        store=store, actor=ACTOR, conversation_id=conversation.id, parent_turn_id=root.id,
+        dispatches=dispatches, discovered=_routes(), lifecycle_store=lifecycle,
+        budget=DispatchBudget(max_concurrency=3),
+    )
+    by_req = {a.request_id: a for a in result.attempts}
+    # Each attempt kept its own distinct usage on its own result.
+    assert by_req["req_a"].result.usage.output_tokens == 10
+    assert by_req["req_b"].result.usage.output_tokens == 20
+    assert by_req["req_c"].result.usage.output_tokens == 30
+    outputs = {a.result.usage.output_tokens for a in result.attempts}
+    assert outputs == {10, 20, 30}  # genuinely distinct, not a shared default
+    # And the distinct usage is persisted into each attempt's own redacted trace.
+    assert by_req["req_a"].result.trace["usage"]["output_tokens"] == 10
+    assert by_req["req_c"].result.trace["usage"]["input_tokens"] == 3
 
 
 # --- Criterion 2: isolation under failure/cancel/timeout + real concurrency ---

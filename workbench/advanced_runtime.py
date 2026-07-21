@@ -61,10 +61,7 @@ from .contracts import validate_advanced_trace
 from .conversation_models import ConversationActor, TurnRedaction
 from .models import new_id, now_utc
 from .redaction import redact_config_text
-from .response_lifecycle_store import (
-    LIFECYCLE_STATE_FOR_OUTCOME,
-    SafeUsage,
-)
+from .response_lifecycle_store import SafeUsage
 
 #: A per-attempt advanced trace is preference/experiment evidence only, never a
 #: model qualification or a delivery claim.  This module refuses to let one cross
@@ -116,9 +113,26 @@ _TRACE_STATUS_FOR_STATE: dict[AdvancedState, str] = {
     AdvancedState.serving_unavailable: "serving_unavailable",
 }
 
-#: The relay ``StreamOutcome`` -> lifecycle terminal (reused from the store) so a
-#: cancelled/timed-out/failed stream persists the same durable terminal the chat
-#: runtime does, never a fabricated completion.
+#: The durable reconnect-safe lifecycle terminal each REFINED advanced state maps
+#: to.  This is keyed on the settled :class:`AdvancedState`, NOT on the raw relay
+#: ``StreamOutcome``: a schema-invalid attempt settles from a ``completed`` relay
+#: outcome, but it did not truly complete, so its durable terminal must be
+#: ``interrupted`` -- never ``completed``.  Only a genuine ``complete``/``streamed``
+#: state reaches the ``completed`` lifecycle terminal, so a reconnecting client
+#: (the store is the documented resync surface) can never see ``completed`` for a
+#: non-completed attempt.  Every value is a member of the store's
+#: ``TERMINAL_LIFECYCLE_STATES``.
+_LIFECYCLE_STATE_FOR_STATE: dict[AdvancedState, str] = {
+    AdvancedState.complete: "completed",
+    AdvancedState.streamed: "completed",
+    AdvancedState.cancelled: "cancelled",
+    AdvancedState.timed_out: "timed_out",
+    AdvancedState.schema_invalid: "interrupted",
+    AdvancedState.malformed_stream: "interrupted",
+    AdvancedState.serving_unavailable: "interrupted",
+}
+
+#: The terminal error code for each failure/interruption state.
 _TERMINAL_ERROR_CODE: dict[AdvancedState, str] = {
     AdvancedState.timed_out: "serving_timeout",
     AdvancedState.schema_invalid: "output_schema_invalid",
@@ -303,7 +317,11 @@ def run_advanced_stream(
             if not structured_valid:
                 state = AdvancedState.schema_invalid
 
-    lifecycle_state = LIFECYCLE_STATE_FOR_OUTCOME[outcome.value]
+    # The durable terminal reflects the REFINED advanced state, not the raw relay
+    # outcome: a schema-invalid attempt completes at the relay but did NOT truly
+    # complete, so it persists ``interrupted`` and a reconnecting client never sees
+    # ``completed`` for a settled-failed attempt (T003 criterion 1).
+    lifecycle_state = _LIFECYCLE_STATE_FOR_STATE[state]
     settled_usage = usage if usage is not None else SafeUsage()
     lifecycle_store.advance(
         actor, request_id, lifecycle_state, usage=settled_usage, seq=terminal_seq,
@@ -315,6 +333,7 @@ def run_advanced_stream(
         conversation_id=conversation_id,
         turn_id=turn_id,
         state=state,
+        prompt=prompt,
         partial_text=relay.partial_text,
         streamed=streamed,
         structured_output_mode=structured_output_mode,
@@ -357,6 +376,7 @@ def build_advanced_trace(
     conversation_id: str,
     turn_id: str,
     state: AdvancedState,
+    prompt: str,
     partial_text: str,
     streamed: bool,
     structured_output_mode: str,
@@ -390,7 +410,9 @@ def build_advanced_trace(
     request: dict[str, Any] = {
         "content_trust": "untrusted_task_data",
         "redacted": True,
-        "input_chars": 0 if partial_text is None else min(len(partial_text), 100_000),
+        # The request card reports the PROMPT (input) length, not the response
+        # length; the streamed delta event below carries the output text_chars.
+        "input_chars": min(len(prompt), 100_000),
         "structured_output_mode": structured_output_mode,
         "control_values": control_values,
     }
@@ -464,9 +486,16 @@ def _terminal_event(
 #: all -- it is replaced by the fixed marker -- so the served ``safe_summary`` is
 #: always both scrubbed and schema-valid, and a leak can never fail the whole
 #: trace nor ride out.
+#: The dotless ``label:port`` shape (``serving:8443``, ``redis:6379``) is a bare
+#: schemeless single-label endpoint that ``redact_config_text`` (which anchors on a
+#: dotted host or IPv4) misses.  The alternative is LOWERCASE-ANCHORED on purpose:
+#: an uppercase-``T`` ISO timestamp (``...T10:01:00Z``) and a ``sha256:``-hex digest
+#: do not start a lowercase label immediately before the colon+digits, so neither
+#: matches -- only a real schemeless host:port does.
 _SAFE_SUMMARY_RE = re.compile(
     r"^(?!.*(?:://|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\|[Bb]earer\s|\bsk-|"
-    r"\bghp_|\bxox|authorization|api[_-]?key|secret|token\s*[:=])).{0,200}$"
+    r"\bghp_|\bxox|authorization|api[_-]?key|secret|token\s*[:=]|"
+    r"\b[a-z][a-z0-9-]*:\d{2,5}\b)).{0,200}$"
 )
 _SAFE_SUMMARY_FALLBACK = "[redacted summary]"
 
@@ -563,24 +592,42 @@ def settle_advanced_branch(
 def refuse_advanced_evidence(record: Any) -> None:
     """Fail closed if an advanced record is being used as authoritative evidence.
 
-    An advanced turn, trace, or result is preference/experiment evidence only
-    (R016/R018): it can never be submitted as State acceptance evidence or
-    attached to a delivery run as authoritative proof.  This is the guard the
-    evidence boundary calls; it refuses anything advanced-shaped.
+    An advanced turn, trace, result, per-attempt sibling, or parallel-dispatch
+    aggregate is preference/experiment evidence only (R016/R018): it can never be
+    submitted as State acceptance evidence or attached to a delivery run as
+    authoritative proof.  This is the guard the evidence boundary calls; it refuses
+    anything advanced-shaped.
+
+    Detection is not purely marker-based: besides the ``AdvancedTurnResult`` and
+    the schema-version/``mode`` markers on a Mapping, it fails closed on ANY object
+    that self-identifies as non-authoritative (``authoritative is False`` -- the
+    :class:`AdvancedTurnResult`, the T008 ``ParallelDispatchResult`` aggregate, and
+    any future advanced aggregate), and on a per-attempt ``SiblingAttempt``, so a
+    self-ID-stripped advanced record is still refused.
     """
-    mode: str | None = None
-    if isinstance(record, AdvancedTurnResult):
-        mode = "advanced"
-    elif isinstance(record, Mapping):
-        version = str(record.get("schema_version", ""))
-        if version.startswith("workbench-advanced-"):
-            mode = "advanced"
-        elif record.get("mode") == "advanced":
-            mode = "advanced"
-    elif getattr(record, "mode", None) == "advanced":
-        mode = "advanced"
-    if mode == "advanced":
+    if _is_advanced_evidence(record):
         raise AdvancedRuntimeError(
             "advanced-mode traffic is non-authoritative; it cannot be submitted as State "
             "evidence or attached to a delivery run as authoritative proof"
         )
+
+
+def _is_advanced_evidence(record: Any) -> bool:
+    """True if ``record`` is any advanced-shaped, non-authoritative record."""
+    if isinstance(record, AdvancedTurnResult):
+        return True
+    if isinstance(record, Mapping):
+        version = str(record.get("schema_version", ""))
+        if version.startswith("workbench-advanced-"):
+            return True
+        return record.get("mode") == "advanced"
+    # Any object that self-identifies as non-authoritative -- the
+    # ParallelDispatchResult aggregate and any future advanced aggregate -- is
+    # refused even if its schema_version marker was stripped.
+    if getattr(record, "authoritative", None) is False:
+        return True
+    # A per-attempt SiblingAttempt (T008); identified structurally to avoid an
+    # import cycle with workbench.advanced_dispatch.
+    if type(record).__name__ == "SiblingAttempt":
+        return True
+    return getattr(record, "mode", None) == "advanced"

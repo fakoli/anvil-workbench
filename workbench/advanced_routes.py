@@ -552,11 +552,13 @@ def route_capability_repair(
     """Deterministically compute the drift/repair state for a pinned route.
 
     ``pinned`` names a ``route_id`` and the ``route_digest``/``profile_digest`` a
-    branch or preset pinned.  When the live discovered route is gone or either
-    pinned digest no longer matches the live catalog, the result is
-    ``repair_required`` listing exactly the drifted references -- never a
-    substituted route (criterion 3).  When every pinned digest matches live, the
-    result is ``ready``.
+    branch or preset pinned.  The result is ``repair_required`` -- listing exactly
+    the drifted references, never a substituted route (criterion 3) -- when the
+    live discovered route is gone, when a pinned digest is missing or is not a
+    valid digest string (an unverifiable pin cannot silently pass), or when a
+    pinned digest no longer matches the live catalog.  It is ``ready`` only when
+    every pinned digest is a valid string that matches the live route: drift, or an
+    unverifiable pin, must invalidate and never fail open.
     """
     if not isinstance(discovered, DiscoveredAdvancedRoutes):
         raise AdvancedRouteError(
@@ -574,7 +576,16 @@ def route_capability_repair(
         ("profile", "profile_digest", getattr(live, "profile_digest", None)),
     ):
         pinned_digest = pinned.get(pinned_key)
-        if not isinstance(pinned_digest, str):
+        pinned_repr = pinned_digest if isinstance(pinned_digest, str) else ""
+        if live is None:
+            # The pinned route vanished from the live catalog: every ref is
+            # unverifiable -> repair_required, never substituted.
+            drifted.append({"ref_kind": ref_kind, "id": route_id, "pinned_digest": pinned_repr})
+            continue
+        if not isinstance(pinned_digest, str) or not _DIGEST.match(pinned_digest):
+            # A missing or non-string/malformed pin cannot be verified against the
+            # live catalog -- fail closed rather than silently pass.
+            drifted.append({"ref_kind": ref_kind, "id": route_id, "pinned_digest": pinned_repr})
             continue
         if live_value != pinned_digest:
             drifted.append({"ref_kind": ref_kind, "id": route_id, "pinned_digest": pinned_digest})

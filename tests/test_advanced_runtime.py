@@ -265,6 +265,55 @@ def test_c1_lifecycle_is_durable_and_terminal():
     assert cancel_lifecycle.snapshot(ACTOR, "req_adv_2").state == "cancelled"
 
 
+def test_c1_schema_invalid_durable_lifecycle_is_not_completed():
+    # THE headline: a schema-invalid attempt completes at the RELAY (a completed
+    # stream), but its output failed validation, so the DURABLE reconnect-safe
+    # lifecycle terminal must NOT be "completed" -- a reconnecting client (the store
+    # is the documented resync surface) must never see "completed" for a
+    # settled-failed attempt (T003 criterion 1).
+    result, lifecycle = _run(
+        ScriptedTransport([_delta("not json at all"), _COMPLETED]),
+        structured_output_mode="json_schema",
+    )
+    assert result.state is AdvancedState.schema_invalid
+    assert result.turn_status == "failed"
+    snapshot = lifecycle.snapshot(ACTOR, "req_adv_1")
+    assert snapshot.is_terminal is True
+    assert snapshot.state != "completed"       # the bug: it used to persist "completed"
+    assert snapshot.state == "interrupted"
+    assert result.lifecycle_state == "interrupted"
+
+
+def test_c1_durable_lifecycle_completed_iff_truly_complete():
+    # For EACH of the seven states, the persisted durable lifecycle terminal is
+    # "completed" if and only if the attempt genuinely completed; every
+    # interrupted/failed/cancelled/timed-out attempt persists a non-completed
+    # terminal, so a reconnect can never render a non-completion as complete.
+    cases = {
+        "complete": (ScriptedTransport([_COMPLETED]), "text", AdvancedState.complete, "completed"),
+        "streamed": (ScriptedTransport([_delta("a"), _COMPLETED]), "text",
+                     AdvancedState.streamed, "completed"),
+        "cancelled": (ScriptedTransport([_delta("a"), _COMPLETED], cancel_after=1), "text",
+                      AdvancedState.cancelled, "cancelled"),
+        "timed_out": (ScriptedTransport([_delta("a")], raise_at=1, error=ServingStreamTimeout("x")),
+                      "text", AdvancedState.timed_out, "timed_out"),
+        "schema_invalid": (ScriptedTransport([_delta("nope"), _COMPLETED]), "json_schema",
+                           AdvancedState.schema_invalid, "interrupted"),
+        "malformed_stream": (ScriptedTransport([_delta("x"), "not-a-mapping"]), "text",
+                             AdvancedState.malformed_stream, "interrupted"),
+        "serving_unavailable": (ScriptedTransport([_delta("x")], raise_at=1,
+                                                   error=ServingStreamUnavailable("503")),
+                                "text", AdvancedState.serving_unavailable, "interrupted"),
+    }
+    for i, (name, (transport, mode, expected_state, expected_lifecycle)) in enumerate(cases.items()):
+        result, lifecycle = _run(transport, structured_output_mode=mode, request_id=f"req_durable_{i}")
+        assert result.state is expected_state, name
+        snapshot = lifecycle.snapshot(ACTOR, f"req_durable_{i}")
+        assert snapshot.state == expected_lifecycle, name
+        # completed durable terminal iff the attempt truly completed.
+        assert (snapshot.state == "completed") == result.is_complete, name
+
+
 # --- Criterion 2: forking under a shared parent, no mutation of prior turns ---
 
 
@@ -360,6 +409,41 @@ def test_c4_ordinary_record_is_not_refused():
     refuse_advanced_evidence(root)  # an ordinary user turn
 
 
+def test_c4_refuse_advanced_evidence_on_parallel_aggregate_and_sibling():
+    # The T008 aggregate (ParallelDispatchResult) is NOT a Mapping/AdvancedTurnResult
+    # and has no .mode, yet it is preference evidence only -- it must be refused via
+    # its non-authoritative marker. Its per-attempt SiblingAttempt is refused too.
+    from workbench.advanced_dispatch import ParallelDispatchResult, SiblingAttempt
+
+    aggregate = ParallelDispatchResult(attempts=())
+    assert aggregate.authoritative is False
+    with pytest.raises(AdvancedRuntimeError, match="non-authoritative"):
+        refuse_advanced_evidence(aggregate)
+
+    sibling = SiblingAttempt(
+        index=0, route_id="route.chat-fast", request_id="req_x", turn_id="turn_x",
+        sibling_index=0, state=None, turn_status="failed", result=None, error=None,
+    )
+    with pytest.raises(AdvancedRuntimeError, match="non-authoritative"):
+        refuse_advanced_evidence(sibling)
+
+
+def test_c4_refuse_advanced_evidence_on_self_id_stripped_record():
+    # Detection is not purely marker-based: an advanced record whose schema_version
+    # / mode marker was stripped but which still declares ``authoritative is False``
+    # is still refused via the generic gate.
+    class _StrippedAdvanced:
+        authoritative = False  # the only surviving self-ID
+
+    with pytest.raises(AdvancedRuntimeError, match="non-authoritative"):
+        refuse_advanced_evidence(_StrippedAdvanced())
+    # A record that is genuinely authoritative (True) is NOT refused.
+    class _Authoritative:
+        authoritative = True
+
+    refuse_advanced_evidence(_Authoritative())
+
+
 # --- Redaction gate ----------------------------------------------------------
 
 
@@ -380,6 +464,7 @@ def test_served_trace_scrubs_the_adversarial_corpus():
         "AKIA1234567890ABCDEF aws_secret_access_key=deadbeef "
         "eyJhbGciOiJIUzI1NiJ9.body.sig authorization: Bearer sk-proj-xyz "
         "db.tail1234.ts.net:7687 100.64.0.5:8443 path=/etc/anvil/state.db "
+        "serving:8443 redis:6379 "  # dotless single-label host:port class
         "postgres://user:pw@host/db ghp_tokenvalue C:/Users/op/.anvil/state.db"
     )
     result, _ = _run(
@@ -391,8 +476,51 @@ def test_served_trace_scrubs_the_adversarial_corpus():
     served = repr(trace).lower()
     for leak in ("akia1234567890abcdef", "aws_secret_access_key=deadbeef", "eyjhbg",
                  "bearer sk-proj", "ghp_tokenvalue", ".ts.net:7687", "100.64.0.5:8443",
+                 "serving:8443", "redis:6379",
                  "/etc/anvil", "postgres://", "c:/users/op"):
         assert leak not in served, leak
+
+
+def test_served_trace_scrubs_dotless_host_port():
+    # The dotless single-label host:port class (serving:8443, redis:6379) that
+    # redact_config_text misses (it anchors on a dotted host / IPv4) must still be
+    # scrubbed by the advanced-trace safe_summary guard in the SERVED, schema-valid
+    # trace -- the RTP-lane class, closed here for the advanced trace too.
+    for dotless in ("upstream serving:8443 refused", "redis:6379 backend unreachable"):
+        result, _ = _run(
+            ScriptedTransport([_delta("x")], raise_at=1, error=ServingStreamUnavailable("boom")),
+            summary=dotless,
+        )
+        trace = result.trace
+        validate_advanced_trace(trace)
+        served = repr(trace).lower()
+        assert "serving:8443" not in served
+        assert "redis:6379" not in served
+        # The residual falls back to the fixed safe marker (fail-safe), so the whole
+        # served trace still schema-validates.
+        assert trace["events"][-1]["safe_summary"] == art._SAFE_SUMMARY_FALLBACK
+
+
+def test_trace_input_chars_tracks_the_prompt_not_the_output():
+    # The request card reports the PROMPT (input) length; the streamed delta event
+    # carries the OUTPUT length. A 1-char prompt with an 8-char reply -> input_chars
+    # == 1, delta text_chars == 8 (they must not be conflated).
+    trace = build_advanced_trace(
+        selection=_selection(),
+        branch_id="advbranch_runtime_0001",
+        conversation_id="conv_advanced_playground_0001",
+        turn_id="turn_assistant_0002",
+        state=AdvancedState.streamed,
+        prompt="x",
+        partial_text="reply123",
+        streamed=True,
+        structured_output_mode="text",
+        structured_valid=None,
+        usage=SafeUsage(),
+    )
+    assert trace["request"]["input_chars"] == 1
+    delta = next(e for e in trace["events"] if e["kind"] == "response_delta_meta")
+    assert delta["text_chars"] == 8
 
 
 def test_build_advanced_request_is_bounded_and_carries_no_endpoint():
