@@ -884,8 +884,13 @@ def _advanced_preset_drift(
     response_format = preset.get("response_format", {})
     if isinstance(response_format, Mapping) and response_format.get("mode") == "json_schema":
         schema_ref = response_format.get("schema_ref")
-        if isinstance(schema_ref, str):
-            _check("response_schema", schema_ref, response_format.get("schema_digest"))
+        if not isinstance(schema_ref, str) or not schema_ref:
+            # A json_schema preset MUST name a keyable schema_ref so its pinned
+            # digest is always drift-checked; an unkeyed digest is unmonitored.
+            raise ContractValidationError(
+                "a json_schema preset must reference a schema_ref so its pinned digest is drift-checked"
+            )
+        _check("response_schema", schema_ref, response_format.get("schema_digest"))
     return drift
 
 

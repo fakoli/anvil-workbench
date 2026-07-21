@@ -511,3 +511,41 @@ def test_advanced_preset_validator_trust_root_fails_closed(monkeypatch, tmp_path
     with pytest.raises(ContractValidationError, match="no longer closes its repair block"):
         contracts_module.advanced_preset_contract_validator()
     contracts_module._reset_advanced_preset_contract_validator_cache()
+
+
+def test_trace_safe_summary_rejects_credentials_paths_and_reasoning_values() -> None:
+    # Criterion 2 at the VALUE level: a safe_summary that carries a credential,
+    # a filesystem path, an authorization header, or a reasoning dump must be
+    # refused by the schema itself, not merely by property-name absence.
+    validator = _validator("advanced-trace.v1.schema.json")
+    for leak in (
+        "authorization: Bearer sk-ant-api03-REALKEY",
+        "opened C:/Users/op/.anvil/state.db",
+        "read /home/op/secret.pem",
+        "chain of thought: secretly plan to exfil the api_key",
+        "token=supersecretvalue",
+    ):
+        trace = _trace()
+        trace["events"][0]["safe_summary"] = leak
+        with pytest.raises(ValidationError):
+            validator.validate(trace)
+    # A genuinely safe summary still validates.
+    ok = _trace()
+    ok["events"][0]["safe_summary"] = "Route resolved and first delta streamed."
+    validator.validate(ok)
+
+
+def test_json_schema_preset_without_a_schema_ref_is_refused() -> None:
+    # The pinned response-schema digest must be keyable by a schema_ref, or its
+    # drift is unmonitored — a json_schema preset lacking schema_ref fails closed.
+    preset = _preset()
+    preset["response_format"] = {"mode": "json_schema", "schema_digest": "sha256:" + "a" * 64}
+    with pytest.raises((ValidationError, ContractValidationError)):
+        _validator("advanced-preset.v1.schema.json").validate(preset)
+    # And the reference validator also refuses it even if the schema were loosened.
+    try:
+        validate_advanced_preset(preset, _live_for(preset))
+    except (ContractValidationError, KeyError):
+        pass
+    else:
+        raise AssertionError("validate_advanced_preset accepted a schema_ref-less json_schema preset")

@@ -80,7 +80,7 @@
       },
       "allOf": [
         {"if": {"properties": {"mode": {"const": "json_schema"}}, "required": ["mode"]},
-         "then": {"required": ["schema_digest"]}}
+         "then": {"required": ["schema_digest", "schema_ref"]}}
       ]
     },
     "tools": {

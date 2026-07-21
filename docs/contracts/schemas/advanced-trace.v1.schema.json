@@ -25,7 +25,7 @@
       "required": ["code", "retryable"],
       "properties": {
         "code": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,63}$"},
-        "safe_summary": {"type": "string", "maxLength": 200},
+        "safe_summary": {"type": "string", "maxLength": 200, "pattern": "^(?!.*(?:://|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\\\|[Bb]earer\\s|\\bsk-|\\bghp_|\\bxox|authorization|api[_-]?key|secret|token\\s*[:=])).{0,200}$"},
         "retryable": {"type": "boolean"}
       }
     }
@@ -112,7 +112,7 @@
           "input_digest": {"$ref": "#/$defs/digest"},
           "output_digest": {"$ref": "#/$defs/digest"},
           "output_chars": {"type": "integer", "minimum": 0, "maximum": 100000},
-          "safe_summary": {"type": "string", "maxLength": 200},
+          "safe_summary": {"type": "string", "maxLength": 200, "pattern": "^(?!.*(?:://|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\\\|[Bb]earer\\s|\\bsk-|\\bghp_|\\bxox|authorization|api[_-]?key|secret|token\\s*[:=])).{0,200}$"},
           "schema_valid": {"type": "boolean"},
           "parse_error_code": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,63}$"},
           "usage": {"$ref": "#/$defs/usage"},
