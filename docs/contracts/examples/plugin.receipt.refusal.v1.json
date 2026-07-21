@@ -1,0 +1,24 @@
+{
+  "schema_version": "workbench-plugin-receipt/v1",
+  "receipt_id": "plugrcpt_installnotifier01",
+  "request_digest": "sha256:ee32abd10f6f88ed1482c80cee9ea0c5dafdf546f85a445a3f4b4882ec5a69b5",
+  "kind": "install",
+  "plugin": {
+    "plugin_id": "deploy-notifier",
+    "plugin_digest": "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+  },
+  "status": "denied",
+  "effect": "plugin_lifecycle",
+  "credential_use": {
+    "requirement": "none"
+  },
+  "error": {
+    "code": "approval.digest_drift",
+    "safe_summary": "The install approval no longer binds the current plugin digest; re-review is required.",
+    "retryable": false
+  },
+  "redaction": {
+    "status": "metadata_only"
+  },
+  "completed_at": "2026-07-20T12:00:02Z"
+}

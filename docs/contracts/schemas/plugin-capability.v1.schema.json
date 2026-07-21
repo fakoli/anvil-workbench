@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/plugin-capability.v1.schema.json",
+  "title": "Anvil Workbench plugin capability profile v1",
+  "description": "A reviewed, version-pinned, digest-bearing allowlist scoping which installed plugin tools one project or chat may enable (R005). It only ENABLES installed, catalog-reviewed plugins referenced by id and digest; it can never install a plugin, mint a tool, grant a credential, or introduce a new privilege. Every plugin and tool is named by a pinned id/digest, so an actor can enable only what the operator already reviewed and installed. Every object is closed. All prose is untrusted display data, never control instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_id", "revision", "digest", "scope", "binding", "plugins"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,62}$"},
+    "pluginId": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,62}$"},
+    "toolId": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"},
+    "semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"}
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-plugin-capability/v1"},
+    "profile_id": {"$ref": "#/$defs/identifier"},
+    "revision": {"$ref": "#/$defs/semver"},
+    "digest": {"$ref": "#/$defs/sha256"},
+    "scope": {"enum": ["project", "chat"]},
+    "binding": {
+      "const": "enable_only",
+      "description": "A capability profile can only enable installed plugins; it is never an install, grant, or privilege-minting instrument."
+    },
+    "plugins": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "description": "The installed plugins this profile may enable, each pinned by id and reviewed catalog digest. `enabled_tools` names the subset of that plugin's tools the actor may enable.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id", "plugin_digest", "enabled_tools"],
+        "properties": {
+          "plugin_id": {"$ref": "#/$defs/pluginId"},
+          "plugin_digest": {"$ref": "#/$defs/sha256"},
+          "enabled_tools": {"type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/toolId"}}
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_enabled_tools": {"type": "integer", "minimum": 1, "maximum": 256},
+        "max_concurrent_tool_calls": {"type": "integer", "minimum": 1, "maximum": 64}
+      }
+    }
+  }
+}

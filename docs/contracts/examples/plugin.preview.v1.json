@@ -1,0 +1,34 @@
+{
+  "schema_version": "workbench-plugin-preview/v1",
+  "preview_id": "plugprev_installnotifier01",
+  "request_digest": "sha256:ee32abd10f6f88ed1482c80cee9ea0c5dafdf546f85a445a3f4b4882ec5a69b5",
+  "kind": "install",
+  "plugin": {
+    "plugin_id": "deploy-notifier",
+    "plugin_digest": "sha256:5474ca8eb2d41d767772c8a5ba33a1e90f5cb57017c4c8ab6487bd8ee6ba8dbb"
+  },
+  "effect": "plugin_lifecycle",
+  "summary": "Install deploy-notifier version 1.0.0 and grant its declared host-mediated channel scope.",
+  "changes": [
+    {
+      "change_kind": "version_change",
+      "detail": "Install deploy-notifier at version 1.0.0."
+    },
+    {
+      "change_kind": "host_scope",
+      "detail": "Grant the host-mediated deploy-channel egress scope."
+    },
+    {
+      "change_kind": "credential_binding",
+      "detail": "Bind the connector-host-owned deploy-channel-ref reference; no credential value is stored by Workbench."
+    }
+  ],
+  "approval": {
+    "required": true,
+    "action": "install_plugin",
+    "payload_hash": "sha256:58784b94dabd06c239d9b19841e39c9e0f9a0fef412bd10bc94812df5ca8838f"
+  },
+  "redaction": {
+    "status": "redacted"
+  }
+}
