@@ -228,3 +228,32 @@ Decisions. Signed proof records live in the anvil workspace `proofs/` dir.
    `tests/test_chat_stream.py` is hermetic (scripted SSE transport, no
    network), and the relay is stateless: persistence stays in the store, not
    yet wired to a browser endpoint or the turn-append path.
+   The reconnect-safe response lifecycle store (T003.3) now exists too:
+   `workbench/response_lifecycle_store.py` is a hermetic row-backed
+   `MemoryResponseLifecycleStore` (in the `MemoryConversationStore`/`MemoryStore`
+   idiom — frozen values, restart-simulating rows handed to a fresh instance, a
+   reentrant lock wrapping every public method, typed `ResponseLifecycleError`/
+   `UnknownResponseError` subclasses) that persists one actor-owned,
+   conversation-scoped response-request lifecycle keyed by `(actor_id,
+   request_id)` (disjoint per-actor namespaces, so a cross-actor probe can never
+   become an existence oracle). The state machine is `begin` -> `in_progress`
+   then `advance` to exactly one terminal (`completed`/`cancelled`/`timed_out`/
+   `interrupted`), after which the record is immutable; `reconnect` returns the
+   last committed in-progress or terminal state and never mutates, restarts, or
+   re-streams (criteria 1-2). Lifecycle is monotonic — `in_progress -> terminal`
+   is allowed once, `terminal -> anything` fails closed, and the instance lock
+   makes a terminal stable under a race (criterion 3, proven by a two-thread
+   advance race). `recover_interrupted` (bindable via `recover_on_open`) flips a
+   post-restart `in_progress` record to `interrupted`, never a silent
+   completion, mirroring the conversation store's streaming -> `interrupted`
+   reload recovery. Only bounded SAFE usage is persisted — a `SafeUsage` of
+   non-negative bounded integer token counts plus an optional duration; there is
+   no free-form string field on any persisted row, so no credential/bearer/
+   authorization is representable (criterion 4, proven by an auth-marker scan and
+   a closed-field-set assertion). `LIFECYCLE_STATE_FOR_OUTCOME` bridges the
+   relay's settled `StreamOutcome` values to lifecycle terminals
+   (`serving_unavailable` -> `interrupted`) without importing the relay.
+   `tests/test_response_lifecycle_store.py` is hermetic (25 tests). Implemented
+   as a persistence slice; the production Postgres backend is still pending and
+   it is not yet wired into `create_app`, a browser endpoint, or the relay's
+   turn-append path.
