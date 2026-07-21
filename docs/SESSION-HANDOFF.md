@@ -64,6 +64,43 @@ rewrite it as part of Workbench work without a separate review of those changes.
 - No bridge-inherited Codex plugins, apps, MCP servers, browser tools, hosted web search, or user/project rule files.
 - No browser-supplied worktree paths, model/tool controls on the voice relay, raw audio storage, or transcript retention without the explicit environment switch.
 
+## 2026-07-20 chat-first-voice T007 — idempotency keys on side-effecting chat APIs
+
+Delivered actor-scoped idempotency keys for the side-effecting chat endpoints.
+New `workbench/idempotency_store.py` adds a hermetic row-backed
+`MemoryIdempotencyStore` in the `MemoryResponseLifecycleStore`/`MemoryStore`
+idiom (frozen `IdempotencyRecord`, restart-simulating rows, a reentrant lock
+wrapping the one public `run` method). It reuses the delivery-path discipline,
+not a parallel one: dedup identity is the triple `(actor_id, operation, key)`
+and the stored result is bound to the canonical `workbench.store.payload_hash`
+(sorted-key SHA-256) of the material request, compared in constant time with
+`secrets.compare_digest` exactly like approval consume. `run` executes the
+caller's operation INSIDE the lock, so two concurrent same-key requests resolve
+to exactly one record (verified: with the lock disabled the race double-executes
+14/20 trials; with it, always one). A failed execution stores nothing and stays
+retriable. The result is deep-copied in and out so a persisted record cannot be
+mutated through a returned reference.
+
+Wiring is thin: every side-effecting `/api/conversations` POST (create, rename,
+archive, unarchive, delete, append_turn, retry, branch, advance_turn_status)
+now honours an OPTIONAL `Idempotency-Key` header. Without a key the endpoint
+executes normally (no dedup) — so the 399-test baseline is unchanged; with a
+key it deduplicates per `(actor, operation, key)`, replays the identical stored
+response on a same-payload retry, and refuses a same-key/different-payload reuse
+with a 409 `IdempotencyConflictError` (a `StoreError`, mapped to 409 by the
+existing app-level handler). Cross-actor reuse lands in a disjoint scope and
+executes fresh — one actor can never read or replay another's result. The store
+is threaded through `create_app`/`build_conversation_router` (injectable for
+tests; a fresh in-memory store when not injected).
+
+Files: `workbench/idempotency_store.py` (+215), `workbench/conversation_api.py`
+(+~90 net over the 9 endpoints + helper), `workbench/api.py` (+4),
+`tests/test_chat_idempotency.py` (+~300, 14 tests). Verification: the three
+named suites (62), the new suite (14), and the FULL suite all green at 413
+(399 baseline + 14). Implemented as a hermetic hub slice; the durable Postgres
+projection (a unique constraint on the triple + a row lock) lands with the
+production API store, and the keys are not yet surfaced in the browser client.
+
 ## 2026-07-20 preferences-configuration T001 — settings descriptor contract
 
 Delivered the first `preferences-configuration` (milestone-4, F001) task: a
