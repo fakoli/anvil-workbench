@@ -185,6 +185,25 @@ export function deliverBlockReason({ candidate, eligibility, hasSession } = {}) 
   return null
 }
 
+// The route a workflow's first run will actually use (plan-task-delivery T006
+// SHOULD #2). The served Workflow shape has NO top-level `model` field; the hub
+// pins the run's model from the ENTRY agent step of the version-pinned
+// `definition` (workbench/store.py start path: `step.get("model")`), and the
+// browser receives the whole `definition` (models.py `as_json` = `asdict`). So
+// this reads that real source — the entry step's `model` — rather than a
+// non-existent `workflow.model`. Returns null when the definition, its entry
+// step, or that step's model is not reliably present, so the caller shows a
+// truthful default label instead of claiming a derived route.
+export function workflowEntryModel(workflow) {
+  const definition = workflow?.definition
+  if (!definition || typeof definition !== 'object') return null
+  const entryId = definition.entry
+  const steps = Array.isArray(definition.steps) ? definition.steps : []
+  const entry = steps.find((step) => step && step.id === entryId)
+  if (!entry || entry.kind !== 'agent') return null
+  return typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : null
+}
+
 // Filter already-described task rows by a case-insensitive query over the
 // human-visible fields (title, scoped id, status, delivery status). An empty
 // query returns the rows unchanged.

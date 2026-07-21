@@ -10,6 +10,7 @@ import {
   progressSummaryLabel,
   scopedTaskId,
   summarizeProgress,
+  workflowEntryModel,
 } from './delivery-explorer'
 
 // A task reference exactly as the router serves it (task-reference.v1), so these
@@ -168,7 +169,11 @@ describe('nextDeliverCandidate (T006 criterion 2)', () => {
 
 describe('deliverBlockReason (T006 criteria 2 + 4)', () => {
   const candidate = describeTaskReference(taskRef('release-alpha', 'T001'))
-  const ready = { status: 'loaded', value: describeEligibility({ eligible: true, state: 'ready', reasons: [{ class: 'ready', code: 'ready.all_clear', explanation: 'All clear.' }] }), message: null }
+  // The ONLY contract-valid eligible verdict: state 'eligible' with an info.ready
+  // reason (delivery-eligibility.v1 enums + the derived-state cross-check). The
+  // old {state:'ready', class:'ready', code:'ready.all_clear'} shape is one the
+  // server can never serve, so it must not appear even in a fixture.
+  const ready = { status: 'loaded', value: describeEligibility({ eligible: true, state: 'eligible', reasons: [{ class: 'info', code: 'info.ready', explanation: 'All clear.' }] }), message: null }
 
   it('requires a startable session first', () => {
     expect(deliverBlockReason({ candidate, eligibility: ready, hasSession: false })).toMatchObject({ code: 'deliver.no_session' })
@@ -190,6 +195,25 @@ describe('deliverBlockReason (T006 criteria 2 + 4)', () => {
 
   it('returns null (deliverable) only when session, candidate, and an eligible verdict all hold', () => {
     expect(deliverBlockReason({ candidate, eligibility: ready, hasSession: true })).toBeNull()
+  })
+})
+
+describe('workflowEntryModel (T006 SHOULD #2)', () => {
+  const withDefinition = (model) => ({
+    id: 'workflow_1', session_id: 'session_1', status: 'draft',
+    definition: { entry: 'implement', steps: [{ id: 'implement', kind: 'agent', model, skills: [], next: ['review'] }, { id: 'review', kind: 'approval_wait', next: [] }] },
+  })
+
+  it('reads the model off the entry agent step of the version-pinned definition', () => {
+    expect(workflowEntryModel(withDefinition('heavy-local'))).toBe('heavy-local')
+  })
+
+  it('is null (truthful default) when the definition, entry step, or model is missing', () => {
+    expect(workflowEntryModel({ id: 'workflow_1', status: 'draft' })).toBeNull() // the served shape with no definition
+    expect(workflowEntryModel(withDefinition(''))).toBeNull() // entry step pins no model
+    expect(workflowEntryModel(undefined)).toBeNull()
+    // A non-agent entry step never yields a route (v1 requires an agent entry).
+    expect(workflowEntryModel({ definition: { entry: 'x', steps: [{ id: 'x', kind: 'reconcile' }] } })).toBeNull()
   })
 })
 

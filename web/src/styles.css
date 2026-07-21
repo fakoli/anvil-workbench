@@ -118,7 +118,7 @@
    choices, and a truthful blocked state that states WHY in text (never colour
    alone). */
 .project-header-actions{display:flex;flex-direction:column;align-items:flex-end;gap:8px}
-.deliver-sheet{width:min(520px,100%)}.deliver-sheet header h2{outline:none}.deliver-sheet header h2:focus-visible{outline:1px solid #3aa08e;outline-offset:4px}.deliver-sheet header button:disabled{opacity:.5;cursor:default}
+.deliver-sheet{width:min(520px,100%);max-height:calc(100vh - 48px);overflow:auto}.deliver-sheet header h2{outline:none}.deliver-sheet header h2:focus-visible{outline:1px solid #3aa08e;outline-offset:4px}.deliver-sheet header button:disabled{opacity:.5;cursor:default}
 .deliver-choices{display:grid;gap:12px;margin:16px 0 4px}.deliver-choices>label{display:grid;gap:6px;color:#b6c8c5;font-size:10px;font-weight:700}
 .deliver-choices select{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:9px 10px;outline:none;font:inherit;font-size:11px}
 .deliver-open{display:grid;gap:8px;border:1px solid #20343a;background:#0c181c;border-radius:8px;padding:11px 12px}.deliver-open label{display:grid;gap:6px;color:#b6c8c5;font-size:10px;font-weight:700}.deliver-open input{border:1px solid #315050;border-radius:6px;background:#081316;color:#e2efec;padding:8px 10px;outline:none;font:inherit;font-size:11px}.deliver-open .explorer-open-prd:disabled{opacity:.48;cursor:default}

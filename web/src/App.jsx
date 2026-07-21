@@ -11,6 +11,7 @@ import { describeConversation, selectChatRoute, successorTurnBody, terminalToSta
 import {
   deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
   filterDescribedTasks, freshnessLabel, nextDeliverCandidate, progressSummaryLabel,
+  workflowEntryModel,
 } from './delivery-explorer'
 
 const emptyData = {
@@ -167,6 +168,13 @@ function DeliverSheet({ project, workflows, sessions, runs, onClose, onDeliver }
   const [busy, setBusy] = useState(false)
   const headingRef = useRef(null)
   const loadSeq = useRef(0)
+  const sheetRef = useRef(null)
+  const startAbortRef = useRef(null)
+  // Guards a state update after the sheet unmounts: a dismissal during busy
+  // tears the sheet down while the start promise may still settle, and neither
+  // its success nor its abort must poke React state on the gone component.
+  const mountedRef = useRef(true)
+  useEffect(() => () => { mountedRef.current = false }, [])
 
   // Only a draft workflow whose session has no active run is startable — the same
   // gate the Sessions view uses. Options carry the session TITLE (human) with the
@@ -177,9 +185,23 @@ function DeliverSheet({ project, workflows, sessions, runs, onClose, onDeliver }
       && !(runs || []).some((run) => run.session_id === workflow.session_id && ['queued', 'running'].includes(run.status)))
     .map((workflow) => ({ workflow, session: (sessions || []).find((item) => item.id === workflow.session_id) }))
   const selectedWorkflow = startable.find((item) => item.workflow.id === selectedWorkflowId)?.workflow || null
-  const model = selectedWorkflow?.model || 'planning'
+  // The real route the hub will pin comes from the workflow's entry agent step
+  // (SHOULD #2), not a non-existent `workflow.model`. When the definition does
+  // not pin one, fall back to the hub's own default ('planning') and label the
+  // displayed route as the default so the text never claims a derived route it
+  // did not derive.
+  const derivedModel = workflowEntryModel(selectedWorkflow)
+  const model = derivedModel || 'planning'
 
   const blockReason = deliverBlockReason({ candidate, eligibility, hasSession: Boolean(selectedWorkflow) })
+
+  // A single dismissal path (Close, Cancel, Escape). While busy it aborts the
+  // in-flight start so a hung bridge POST cannot trap the user (a11y #4), then
+  // closes. When idle it just closes.
+  const dismiss = () => {
+    if (busy) startAbortRef.current?.abort()
+    onClose()
+  }
 
   // Focus into the sheet on open and restore focus to the opener on close, so a
   // keyboard user is never dropped to <body> (a11y focus management).
@@ -190,12 +212,39 @@ function DeliverSheet({ project, workflows, sessions, runs, onClose, onDeliver }
   }, [])
   // Document-level Escape closes the sheet even after focus has moved among its
   // controls (a11y): the visible Close button is the discoverable path, Escape
-  // the keyboard one.
+  // the keyboard one. It dismisses even while busy so a hung Deliver is never a
+  // trap (#4). But it honours an inner control that already handled Escape
+  // (#5): if the event was defaultPrevented, or it targets an open native
+  // <select> (whose own Escape dismisses its listbox), the sheet stays open so
+  // Escape does not discard the loaded candidate/eligibility out from under a
+  // dropdown dismissal.
   useEffect(() => {
-    const onKeyDown = (event) => { if (event.key === 'Escape' && !busy) onClose() }
+    const onKeyDown = (event) => {
+      if (event.key !== 'Escape') return
+      if (event.defaultPrevented) return
+      if (event.target && event.target.tagName === 'SELECT') return
+      dismiss()
+    }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
   }, [busy, onClose])
+
+  // Keep Tab focus inside the sheet (a11y #7): with aria-modal the background is
+  // occluded, so Tab/Shift+Tab must cycle within the dialog rather than reach an
+  // aria-hidden background control. Wrap at the first/last enabled focusable.
+  const onTrapKeyDown = (event) => {
+    if (event.key !== 'Tab') return
+    const root = sheetRef.current
+    if (!root) return
+    const focusables = Array.from(
+      root.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'),
+    ).filter((el) => !el.disabled && el.getAttribute('aria-hidden') !== 'true')
+    if (!focusables.length) return
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+  }
 
   const loadCandidate = async () => {
     const prdId = prdInput.trim()
@@ -244,22 +293,28 @@ function DeliverSheet({ project, workflows, sessions, runs, onClose, onDeliver }
   // double-submit (criterion 1 / no double-fire).
   const deliver = async () => {
     if (busy || blockReason || !candidate || !selectedWorkflow) return
+    const controller = new AbortController()
+    startAbortRef.current = controller
     setBusy(true)
     setAnnounce(`Delivering ${candidate.title}…`)
     try {
-      await onDeliver(selectedWorkflow.id, { task_id: candidate.taskId, model })
+      await onDeliver(selectedWorkflow.id, { task_id: candidate.taskId, model }, controller.signal)
       // On success the app closes the sheet and routes to the resulting run.
     } catch {
+      // A dismissal during busy unmounts the sheet (and may abort this start);
+      // do not poke state on the gone component.
+      if (!mountedRef.current || controller.signal.aborted) return
       setBusy(false)
       setAnnounce('Delivery could not be started. No run was launched.')
     }
   }
 
   return <div className="modal-backdrop" role="presentation">
-    <section className="modal deliver-sheet" role="dialog" aria-modal="true" aria-labelledby="deliver-sheet-title">
+    <section className="modal deliver-sheet" role="dialog" aria-modal="true" aria-labelledby="deliver-sheet-title" ref={sheetRef} onKeyDown={onTrapKeyDown}>
       <header>
         <h2 id="deliver-sheet-title" tabIndex={-1} ref={headingRef}>Deliver next task</h2>
-        <button aria-label="Close Deliver next task" onClick={onClose} disabled={busy}>×</button>
+        {/* Close stays enabled while busy so a hung Deliver is never a trap (#4). */}
+        <button aria-label="Close Deliver next task" onClick={dismiss}>×</button>
       </header>
       <p>Preview State’s next ranked candidate for one PRD and start it through the local bridge in a single activation. The browser never sends a filesystem path or a raw command.</p>
 
@@ -294,22 +349,26 @@ function DeliverSheet({ project, workflows, sessions, runs, onClose, onDeliver }
                 </div>
                 <Status tone={tone(candidate.status)}>{candidate.status}</Status>
               </div>
-              <p className="deliver-candidate-meta">Delivery: {candidate.latestDeliveryStatus} · {candidate.dependsOn.length} {candidate.dependsOn.length === 1 ? 'dependency' : 'dependencies'} · route {model}</p>
+              <p className="deliver-candidate-meta">Delivery: {candidate.latestDeliveryStatus} · {candidate.dependsOn.length} {candidate.dependsOn.length === 1 ? 'dependency' : 'dependencies'} · route {model}{derivedModel ? '' : ' (default)'}</p>
               <DeliverEligibility eligibility={eligibility} />
             </>
           : <p className="deliver-muted">Load a PRD to preview its single next ranked candidate. Exactly one candidate is shown; blocked dependencies are never silently skipped.</p>}
       </section>
 
-      {blockReason && candidate && <p id="deliver-block-reason" className="deliver-block-reason">{blockReason.text} <code>{blockReason.code}</code></p>}
+      {/* The disabled Deliver always states WHY in bound text — in EVERY disabled
+          state, including the pre-load no-session / no-candidate ones, not only
+          when a candidate is loaded (#6). */}
+      {blockReason && <p id="deliver-block-reason" className="deliver-block-reason">{blockReason.text} <code>{blockReason.code}</code></p>}
       <div className="deliver-actions">
-        <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button>
+        {/* Cancel stays enabled while busy so a hung Deliver is never a trap (#4). */}
+        <button type="button" className="secondary-button" onClick={dismiss}>Cancel</button>
         <button
           type="button"
           className="deliver-start"
           onClick={deliver}
           disabled={busy || Boolean(blockReason)}
           aria-disabled={busy || Boolean(blockReason) ? 'true' : undefined}
-          aria-describedby={blockReason && candidate ? 'deliver-block-reason' : undefined}
+          aria-describedby={blockReason ? 'deliver-block-reason' : undefined}
         >{busy ? 'Delivering…' : candidate ? `Deliver ${candidate.title}` : 'Deliver'} <span aria-hidden="true">→</span></button>
       </div>
       <div className="deliver-live" role="status" aria-live="polite" aria-label="Deliver status">{announce}</div>
@@ -1024,8 +1083,8 @@ function App() {
   // POST /api/workflows/{id}/start, then route to the resulting run. Throws on
   // failure so the sheet keeps itself open and announces a truthful error (it
   // does NOT close or fabricate a started run).
-  const deliverCandidate = async (workflowId, payload) => {
-    const result = await startWorkflow(workflowId, payload)
+  const deliverCandidate = async (workflowId, payload, signal) => {
+    const result = await startWorkflow(workflowId, payload, { signal })
     setDeliverOpen(false); setActive('Delivery')
     setData((current) => ({ ...current, runs: [result.run, ...current.runs] }))
     setNotice(`Delivering ${payload.task_id} through the local bridge. Its run is ${result.run.id}.`)
