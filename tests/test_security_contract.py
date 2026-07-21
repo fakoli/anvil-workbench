@@ -1942,3 +1942,109 @@ def test_t008_adoption_surface_fails_closed_when_unconfigured() -> None:
     with TestClient(app) as client:
         assert client.get("/api/skill-adoptions", headers={"X-Workbench-Actor": "operator"}).status_code == 503
         assert client.get("/api/skill-adoptions/anvil:execute", headers={"X-Workbench-Actor": "operator"}).status_code == 503
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T010: the conversation-search tool is never a cross-actor
+# existence oracle. A query that would match ONLY a foreign actor's conversation
+# returns a BYTE-IDENTICAL response to a query that matches nothing -- no
+# 404-vs-empty distinction, no shape/timing/content signal.
+# =========================================================================== #
+
+from workbench.conversation_models import (
+    ConversationActor as _T010S_Actor,
+    RetentionPolicy as _T010S_Retention,
+)
+from workbench.conversation_store import (
+    ConversationSearchService as _T010S_Search,
+    MemoryConversationStore as _T010S_Store,
+)
+
+_T010S_KEY = b"s" * 32
+
+
+def _t010s_retention() -> _T010S_Retention:
+    return _T010S_Retention(
+        policy_id="p", transcript_text="retained_redacted",
+        voice_transcript_text="retained_redacted", delete_after=None,
+    )
+
+
+def _t010s_signal_surface(envelope: dict) -> dict:
+    # The existence-signal-bearing surface (everything but the intrinsically
+    # random per-call receipt id/timestamps).
+    return {k: v for k, v in envelope.items() if k != "receipt"}
+
+
+def test_t010_foreign_match_is_byte_identical_to_a_nonexistent_query() -> None:
+    store = _T010S_Store(content_hash_key=_T010S_KEY)
+    bob = _T010S_Actor(actor_id="bob")
+    alice = _T010S_Actor(actor_id="alice")
+    # Bob owns a private conversation whose title contains "merger".
+    store.create_conversation(bob, _t010s_retention(), title="merger due diligence")
+    svc = _T010S_Search(store)
+
+    # Alice searches the term that matches ONLY Bob's private conversation...
+    foreign = svc.search(alice, "merger")
+    # ...and searches a term that matches nothing anywhere.
+    absent = svc.search(alice, "no-such-term-anywhere")
+
+    # The existence-signal surface is byte-identical: Alice cannot tell that a
+    # "merger" conversation exists for someone else.
+    assert _t010s_signal_surface(foreign) == _t010s_signal_surface(absent)
+    assert foreign["result_count"] == 0
+    assert foreign["payload_json"] == "[]"
+    # The receipt carries no external_ref match detail either (no leak channel).
+    assert foreign["receipt"].get("external_ref", {}) == {}
+
+
+def test_t010_wired_search_surface_is_not_an_existence_oracle() -> None:
+    from fastapi.testclient import TestClient
+
+    from workbench.api import create_app
+    from workbench.config import Settings
+    from workbench.conversation_models import ConversationActor
+    from workbench.conversation_store import ConversationSearchService, MemoryConversationStore
+
+    store = MemoryConversationStore(content_hash_key=_T010S_KEY)
+    # An OPERATOR-owned private conversation (the authenticated actor is the owner
+    # "operator"); we probe with a DIFFERENT owner's conversation to prove no leak.
+    other = ConversationActor(actor_id="someone-else")
+    store.create_conversation(other, _t010s_retention(), title="acquisition target list")
+    svc = ConversationSearchService(store)
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    app = create_app(settings=settings, store=MemoryStore(), graph=NullGraph(), conversation_search_service=svc)
+    headers = {"X-Workbench-Actor": "operator"}
+    with TestClient(app) as client:
+        foreign = client.get("/api/conversation-search?query=acquisition", headers=headers)
+        absent = client.get("/api/conversation-search?query=totally-absent-xyz", headers=headers)
+
+    # Always 200 (never a 404-vs-empty distinction), and the signal surface is
+    # byte-identical for the foreign-match probe and the nonexistent probe.
+    assert foreign.status_code == 200 and absent.status_code == 200
+    assert _t010s_signal_surface(foreign.json()) == _t010s_signal_surface(absent.json())
+    # And the foreign conversation's title never appears in the operator's results.
+    assert "acquisition target list" not in json.dumps(foreign.json())
+
+
+def test_t010_wired_search_fails_closed_when_unconfigured() -> None:
+    from fastapi.testclient import TestClient
+
+    from workbench.api import create_app
+    from workbench.config import Settings
+
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    app = create_app(settings=settings, store=MemoryStore(), graph=NullGraph())
+    with TestClient(app) as client:
+        r = client.get("/api/conversation-search?query=x", headers={"X-Workbench-Actor": "operator"})
+        assert r.status_code == 503

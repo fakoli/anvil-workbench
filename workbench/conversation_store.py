@@ -70,8 +70,9 @@ from .conversation_models import (
     turn_audit,
     validate_turn_append,
 )
-from .models import new_id, now_utc
-from .store import StoreError
+from .conversation_models import is_metadata_only
+from .models import OperationRef, new_id, now_utc
+from .store import MemoryOperationReceiptStore, OperationOutcome, StoreError
 
 _LISTABLE_STATUSES = frozenset({"active", "archived"})
 _UNKNOWN_CONVERSATION = "unknown conversation"
@@ -791,3 +792,167 @@ def _synchronize_memory_store() -> None:
 
 
 _synchronize_memory_store()
+
+
+# --------------------------------------------------------------------------- #
+# First-party read-only conversation-search tool (reviewed-tools-plugins T010).
+# --------------------------------------------------------------------------- #
+
+import hashlib as _cs_hashlib
+
+from .advanced_tools import delimit_untrusted_output
+
+#: The reviewed first-party (hub-owned, NOT a plugin) search tool identity.  It
+#: is a fixed, reviewed operation reference so its typed receipt names a stable
+#: descriptor; the digest is a domain-separated constant, not a live input.
+CONVERSATION_SEARCH_PROVIDER = "workbench-conversation-search"
+CONVERSATION_SEARCH_TOOL_ID = "conversations.search"
+CONVERSATION_SEARCH_CONTRACT_VERSION = "1.0.0"
+_CONVERSATION_SEARCH_DIGEST = "sha256:" + _cs_hashlib.sha256(
+    b"anvil-workbench/first-party/conversations.search/v1"
+).hexdigest()
+_CONVERSATION_SEARCH_OPERATION = OperationRef(
+    provider=CONVERSATION_SEARCH_PROVIDER,
+    id=CONVERSATION_SEARCH_TOOL_ID,
+    contract_version=CONVERSATION_SEARCH_CONTRACT_VERSION,
+    operation_digest=_CONVERSATION_SEARCH_DIGEST,
+)
+
+_SEARCH_RESULT_LIMIT = 50
+_SEARCH_QUERY_MAX = 200
+
+
+@dataclass(frozen=True)
+class ConversationSearchResult:
+    """One matched conversation projected as SAFE, metadata-only display data.
+
+    Carries only owner-set organization metadata (id, title, pin/tag/folder,
+    status, and the metadata-only badge) and the update timestamp.  It never
+    carries a turn's transcript content: the underlying search is title-only and
+    never scans :class:`~workbench.conversation_models.Turn` content, so
+    metadata-only, purged, or deleted transcript content cannot appear here.
+    """
+
+    conversation_id: str
+    title: str
+    pinned: bool
+    tags: tuple[str, ...]
+    folder: str | None
+    status: str
+    metadata_only: bool
+    updated_at: datetime
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "conversation_id": self.conversation_id,
+            "title": self.title,
+            "pinned": self.pinned,
+            "tags": list(self.tags),
+            "folder": self.folder,
+            "status": self.status,
+            "metadata_only": self.metadata_only,
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+class ConversationSearchService:
+    """First-party read-only "search my conversations" tool (T010).
+
+    Scoped to the requesting conversation's actor BY CONSTRUCTION: it delegates
+    to the store's actor-scoped title search, so a foreign actor's conversations
+    are never in the universe searched.  A cross-actor probe and a nonexistent
+    query therefore return the BYTE-IDENTICAL empty result envelope -- there is
+    no 404-vs-empty distinction and no shape/existence signal by which a caller
+    could learn that a matching conversation exists for someone else.
+
+    Results are DELIMITED UNTRUSTED DATA: every match is projected to safe
+    metadata (never turn content), the whole result list is wrapped through
+    :func:`~workbench.advanced_tools.delimit_untrusted_output` (JSON-stringified,
+    ``content_trust=untrusted_task_data``), so a conversation title carrying an
+    injection or a fake capability profile is inert text incapable of selecting a
+    tool or widening a profile.  Every search records a TYPED read receipt through
+    the reused :class:`~workbench.store.MemoryOperationReceiptStore` spine, so the
+    read is an idempotent, redacted, typed operation -- never a profile mutation.
+
+    Metadata-only, purged, and deleted content never appears: the delegated
+    search is title-only (it never reads a purged content block), and deleted /
+    deletion-pending conversations are excluded from the searchable set by the
+    store ``_LISTABLE_STATUSES`` filter.
+    """
+
+    def __init__(
+        self,
+        conversation_store: "ConversationStore",
+        *,
+        receipt_store: MemoryOperationReceiptStore | None = None,
+    ) -> None:
+        self._store = conversation_store
+        self._receipts = receipt_store if receipt_store is not None else MemoryOperationReceiptStore()
+
+    @property
+    def receipts(self) -> MemoryOperationReceiptStore:
+        return self._receipts
+
+    def _project(self, conversation: Conversation) -> ConversationSearchResult:
+        return ConversationSearchResult(
+            conversation_id=conversation.id,
+            # A matched title is only reached when it is non-None (the store title
+            # search filters None titles), so the empty-string fallback is
+            # defensive only.
+            title=conversation.title or "",
+            pinned=bool(conversation.pinned),
+            tags=tuple(conversation.tags),
+            folder=conversation.folder,
+            status=conversation.status,
+            metadata_only=is_metadata_only(conversation.retention),
+            updated_at=conversation.updated_at,
+        )
+
+    def _idempotency_key(self, actor: ConversationActor, query: str) -> str:
+        # Bound to the actor AND the exact query so an identical repeat replays the
+        # same typed receipt; domain-separated + hashed so neither the actor id nor
+        # the raw query text is echoed into the receipt key.
+        material = f"{actor.actor_id}\x00{query}".encode("utf-8")
+        return "cs:" + _cs_hashlib.sha256(b"anvil-workbench/conversation-search/v1\x00" + material).hexdigest()
+
+    def search(
+        self, actor: ConversationActor, query: str, *, request_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return delimited untrusted search results + a typed read receipt.
+
+        The returned envelope existence-signal surface -- ``content_trust``,
+        ``delimited``, ``payload_json``, and ``result_count`` -- is byte-identical
+        for a query that would match only a foreign actor conversation and a
+        query that matches nothing at all, so the tool is never a cross-actor
+        existence oracle.
+        """
+        if not isinstance(actor, ConversationActor):
+            raise ConversationStoreError("a conversation search requires the acting ConversationActor")
+        if not isinstance(query, str) or not query.strip():
+            raise ConversationStoreError("search query must be a non-empty string")
+        if len(query) > _SEARCH_QUERY_MAX:
+            raise ConversationStoreError("search query is too long")
+        # Actor-scoped BY CONSTRUCTION: the store search only ever ranges over
+        # conversations owned by this actor.  include_archived surfaces the
+        # actor own archived rows; deleted/deletion-pending rows are excluded by
+        # the store listable-status filter, so purged/deleted content is
+        # unreachable here.
+        matches = self._store.search_conversations(actor, query, include_archived=True)
+        results = [self._project(record).as_dict() for record in matches[:_SEARCH_RESULT_LIMIT]]
+        envelope = delimit_untrusted_output(results)
+        envelope["result_count"] = len(results)
+        # A typed, idempotent, redacted read receipt through the reused spine: the
+        # executor returns a plain ``succeeded`` outcome with NO external_ref, so
+        # the receipt carries no match detail and cannot leak a foreign existence
+        # signal, and -- being an operation receipt -- it cannot alter a profile.
+        key = self._idempotency_key(actor, query)
+        receipt, _replayed = self._receipts.record_attempt(
+            run_id=f"conversation_search_{actor.actor_id}"[:120],
+            command_id=key,
+            operation=_CONVERSATION_SEARCH_OPERATION,
+            idempotency_key=key,
+            executor=lambda: OperationOutcome("succeeded"),
+            request_id=request_id,
+        )
+        envelope["receipt"] = receipt
+        return envelope

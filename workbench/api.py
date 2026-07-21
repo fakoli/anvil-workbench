@@ -12,7 +12,7 @@ import hashlib
 import uuid
 from typing import Any, Callable, Mapping
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, WebSocket, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Query, Request, WebSocket, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -23,9 +23,15 @@ from .contracts import settings_actor_view
 from .conversation_api import (
     build_conversation_router,
     build_hub_retention_router,
+    conversation_actor,
     register_conversation_handlers,
 )
-from .conversation_store import ConversationStore, MemoryConversationStore
+from .conversation_store import (
+    ConversationSearchService,
+    ConversationStore,
+    ConversationStoreError,
+    MemoryConversationStore,
+)
 from .delivery_projection import (
     DeliveryProjectionStore,
     UnknownDeliveryRecordError,
@@ -772,6 +778,64 @@ def build_chat_tools_router(
     return router
 
 
+def build_conversation_search_router(
+    actor_dependency: Callable[..., str],
+    conversation_search_service: "ConversationSearchService | None",
+) -> APIRouter:
+    """Build the first-party read-only conversation-search browser surface (T010).
+
+    The search is scoped to the requesting actor BY CONSTRUCTION: the trusted
+    ``actor`` dependency is mapped to the owning
+    :class:`~workbench.conversation_models.ConversationActor` with
+    :func:`~workbench.conversation_api.conversation_actor`, and the service only
+    ever ranges over that actor's own conversations -- a client cannot name
+    another actor, so a cross-actor read is structurally impossible.  A query
+    that would match only a foreign actor's conversation and a query that matches
+    nothing return the BYTE-IDENTICAL empty envelope (always 200, never a
+    404-vs-empty distinction), so the surface is never a cross-actor existence
+    oracle.
+
+    Results are DELIMITED UNTRUSTED DATA (``content_trust=untrusted_task_data``,
+    the result list JSON-stringified into an inert ``payload_json``) carrying a
+    typed read receipt; the search reads title metadata only, so metadata-only,
+    purged, or deleted transcript content never appears.  Every response body is
+    scrubbed at this last hop with
+    :func:`~workbench.redaction.scrub_config_payload`.  The surface is READ-ONLY
+    (a single ``GET``) and refuses with 503 until a service is injected.
+    """
+    router = APIRouter(prefix="/api/conversation-search")
+
+    def service() -> "ConversationSearchService":
+        if conversation_search_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="conversation search is not configured",
+            )
+        return conversation_search_service
+
+    @router.get("")
+    def search(
+        query: str = Query(min_length=1, max_length=_SEARCH_QUERY_MAX_CHARS),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Delimited, actor-scoped conversation-search results + a typed receipt."""
+        try:
+            envelope = service().search(conversation_actor(actor), query)
+        except ConversationStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        return scrub_config_payload(envelope)
+
+    return router
+
+
+#: The query bound the first-party conversation-search surface accepts, matching
+#: the service-side ``_SEARCH_QUERY_MAX`` so an over-length query is refused at
+#: the edge before it reaches the store.
+_SEARCH_QUERY_MAX_CHARS = 200
+
+
 #: A base64 body big enough to hold ``MAX_STT_INPUT_BYTES`` of audio, plus slack
 #: for padding.  A larger encoded body is refused at the edge BEFORE it is
 #: decoded, so an oversized blob never allocates its decoded form.
@@ -1276,6 +1340,7 @@ def create_app(
     plugin_host_service: "PluginHostService | None" = None,
     chat_tool_dispatch_service: "ChatToolDispatchService | None" = None,
     skill_adoption_store: MemorySkillAdoptionStore | None = None,
+    conversation_search_service: "ConversationSearchService | None" = None,
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
@@ -1332,6 +1397,10 @@ def create_app(
     # ``None`` unless a store is injected, so the browser surface fails closed
     # (503). An acknowledgment is an owner decision at the service/hub layer.
     app.state.skill_adoption_store = skill_adoption_store
+    # The first-party conversation-search tool is a hub-side supervision read-model
+    # that is deliberately NOT auto-wired into the live poll loop; it stays ``None``
+    # unless a service is injected, so the browser surface fails closed (503).
+    app.state.conversation_search_service = conversation_search_service
     # The scoped preference store is a hub-side supervision read/write model that
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless injected, so the browser surface fails closed (503).
@@ -1492,6 +1561,13 @@ def create_app(
     # acknowledgment ledger's digest + safe-metadata projection; a skill body or
     # local path is never accepted from nor returned to the browser.
     app.include_router(build_skill_adoptions_router(actor, skill_adoption_store))
+    # First-party read-only conversation-search surface (reviewed-tools-plugins
+    # T010): authenticated by the same trusted ``actor`` dependency, scoped to the
+    # actor's own conversations by construction, GET-only, and fail-closed (503)
+    # until a service is injected. Returns delimited untrusted results + a typed
+    # receipt; a cross-actor probe is byte-identical to a nonexistent one, and
+    # metadata-only / purged / deleted transcript content never appears.
+    app.include_router(build_conversation_search_router(actor, conversation_search_service))
     # Actor-scoped preference read/write surface (preferences-configuration
     # T002.3): authenticated by the same trusted ``actor`` dependency, personal
     # namespace bound to the authenticated actor, and fail-closed (503) until a
