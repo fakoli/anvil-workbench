@@ -499,6 +499,15 @@ _SAFE_SUMMARY_RE = re.compile(
 )
 _SAFE_SUMMARY_FALLBACK = "[redacted summary]"
 
+#: PUBLIC, stable aliases of the ``safe_summary`` scrub primitives so another
+#: module (advanced_tools) can reuse the exact SERVED-schema last-line defence
+#: without importing a private name.  The private ``_SAFE_SUMMARY_RE`` /
+#: ``_SAFE_SUMMARY_FALLBACK`` remain this module's own single source of truth
+#: (its ``_safe_summary`` still uses them), so a rename stays a one-line change
+#: here and the public surface tracks it.
+SAFE_SUMMARY_RE = _SAFE_SUMMARY_RE
+SAFE_SUMMARY_FALLBACK = _SAFE_SUMMARY_FALLBACK
+
 
 def _safe_summary(summary: str) -> str:
     """Scrub and bound one untrusted free-text summary for the served trace.
