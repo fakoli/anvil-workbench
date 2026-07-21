@@ -18,6 +18,29 @@
       "description": "A declared, named access scope. The pattern forbids '://', ':', and '/', so an arbitrary URL, endpoint, or filesystem path can never masquerade as a declared scope.",
       "pattern": "^[a-z][a-z0-9._-]{1,62}$"
     },
+    "preferenceField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "scope", "default"],
+      "description": "R004 (UserValves analog): one NON-SECRET, actor-selectable plugin preference field. It carries a type, optional bounds/allowed values, a safe default, and the actor-selectable scope it resolves at (per_turn/actor/project). It has NO value/secret/token/host field, so a credential or a connector-host endpoint is not representable here; the catalog validator additionally REJECTS any field marked (sensitivity=secret / path_like) or DETECTED (a credential/host-shaped name or a secret/endpoint/path-shaped default) as secret-bearing, so a secret can never be actor-selectable. The 'name' pattern forbids ':' and '/', so a host:port or a URL/path cannot masquerade as a field name.",
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,47}$"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "description": {"type": "string", "minLength": 1, "maxLength": 500},
+        "type": {"enum": ["bool", "int", "enum", "string"]},
+        "scope": {"enum": ["per_turn", "actor", "project"]},
+        "sensitivity": {"enum": ["normal", "secret"]},
+        "path_like": {"type": "boolean"},
+        "bounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"min": {"type": "integer"}, "max": {"type": "integer"}}
+        },
+        "allowed_values": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": ["boolean", "integer", "string"]}},
+        "default": {"type": ["boolean", "integer", "string"]},
+        "max_length": {"type": "integer", "minimum": 1, "maximum": 200}
+      }
+    },
     "dataScope": {"enum": ["none", "read_project_metadata", "read_task_context", "read_conversation_context", "write_conversation_annotation"]},
     "hostAccess": {
       "type": "object",
@@ -91,6 +114,7 @@
           "description": "R012: how an in-flight external call behaves when the plugin is disabled or removed. `unknown_outcome` routes to reconciliation rather than a false success."
         },
         "receipts": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}},
+        "preference_fields": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/preferenceField"}},
         "idempotency": {
           "type": "object",
           "additionalProperties": false,

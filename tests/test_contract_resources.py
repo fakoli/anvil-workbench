@@ -948,3 +948,117 @@ def test_t009_config_openapi_source_is_local_only_never_a_url():
     for url in ("https://x/y.json", "//host/y.json", "http://10.0.0.7/api"):
         with pytest.raises(ValueError, match="local path"):
             _t009_source(url)
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T011: non-secret plugin preference fields.
+#
+# Declared fields carry type/bounds/default/scope and resolve through the
+# standard precedence (per_turn -> actor -> project -> safe default). Catalog
+# validation REJECTS any actor-selectable field marked OR detected as secret/
+# credential-bearing.
+# =========================================================================== #
+
+from workbench.contracts import (
+    plugin_preference_actor_view as _t011_actor_view,
+    validate_plugin_catalog as _t011_validate,
+    validate_plugin_preference_value as _t011_value,
+)
+from workbench.store import resolve_plugin_tool_preferences as _t011_resolve
+
+_T011_EX = ROOT / "docs" / "contracts" / "examples"
+
+
+def _t011_catalog(fields):
+    catalog = json.loads((_T011_EX / "plugin.catalog.v1.json").read_text(encoding="utf-8"))
+    plugin = next(p for p in catalog["plugins"] if p["id"] == "anvil-tasks-viewer")
+    tool = next(t for t in plugin["tools"] if t["tool_id"] == "tasks.list")
+    tool["preference_fields"] = fields
+    for p in catalog["plugins"]:
+        p["plugin_digest"] = contract_digest("plugin", p)
+    catalog["catalog_digest"] = contract_digest("plugin-catalog", catalog)
+    return catalog
+
+
+def _t011_tool(catalog):
+    plugin = next(p for p in catalog["plugins"] if p["id"] == "anvil-tasks-viewer")
+    return next(t for t in plugin["tools"] if t["tool_id"] == "tasks.list")
+
+
+def test_t011_non_secret_fields_validate_and_carry_type_bounds_default_scope():
+    catalog = _t011_catalog([
+        {"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}, "default": 25},
+        {"name": "sort", "type": "enum", "scope": "per_turn", "allowed_values": ["newest", "oldest"], "default": "newest"},
+        {"name": "compact", "type": "bool", "scope": "project", "default": False},
+    ])
+    _t011_validate(catalog)
+    field = _t011_tool(catalog)["preference_fields"][0]
+    assert field["type"] == "int" and field["scope"] == "actor" and field["default"] == 25
+    assert field["bounds"] == {"min": 1, "max": 100}
+
+
+def test_t011_marked_secret_or_path_like_field_is_rejected():
+    for marker in ({"sensitivity": "secret"}, {"path_like": True}):
+        catalog = _t011_catalog([dict({"name": "page_size", "type": "int", "scope": "actor", "default": 25}, **marker)])
+        with pytest.raises(ContractValidationError, match="secret or path-like"):
+            _t011_validate(catalog)
+
+
+def test_t011_detected_secret_field_by_name_is_rejected():
+    for hostile_name in ("api_token", "auth_bearer", "connector_host", "backend_url", "db_password"):
+        catalog = _t011_catalog([{"name": hostile_name, "type": "string", "scope": "actor", "default": "x"}])
+        with pytest.raises(ContractValidationError, match="secret/credential-bearing"):
+            _t011_validate(catalog)
+
+
+def test_t011_detected_secret_field_by_default_shape_is_rejected():
+    # A field whose DEFAULT carries a secret/endpoint/host/path shape is detected
+    # via the shared redaction corpus and refused (a benign name is not enough).
+    for hostile_default in (
+        "serving:8443", "AKIAIOSFODNN7EXAMPLE", "eyJhbGciOiJIUzI1NiJ9.a.b",
+        "ghp_secretsecretsecret1234567890", "postgresql://u:p@db/x", "/etc/passwd", "C:/creds/store",
+    ):
+        catalog = _t011_catalog([{"name": "note", "type": "string", "scope": "actor", "default": hostile_default}])
+        with pytest.raises(ContractValidationError, match="secret/credential-bearing"):
+            _t011_validate(catalog)
+
+
+def test_t011_enum_default_must_be_one_of_allowed_values():
+    catalog = _t011_catalog([{"name": "sort", "type": "enum", "scope": "actor",
+                              "allowed_values": ["newest", "oldest"], "default": "sideways"}])
+    with pytest.raises(ContractValidationError, match="default is invalid"):
+        _t011_validate(catalog)
+
+
+def test_t011_resolution_follows_standard_precedence():
+    fields = [{"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}, "default": 25}]
+    assert _t011_resolve(fields) == {"page_size": 25}                                   # safe default
+    assert _t011_resolve(fields, project={"page_size": 50}) == {"page_size": 50}         # project over default
+    assert _t011_resolve(fields, actor={"page_size": 10}, project={"page_size": 50}) == {"page_size": 10}  # actor over project
+    assert _t011_resolve(fields, per_turn={"page_size": 5}, actor={"page_size": 10}) == {"page_size": 5}   # per_turn wins
+    # An out-of-bounds stored value falls back to the safe default (never dispatched).
+    assert _t011_resolve(fields, actor={"page_size": 9999}) == {"page_size": 25}
+
+
+def test_t011_value_validation_reuses_typed_checks():
+    field = {"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}}
+    _t011_value(field, 10)
+    with pytest.raises(ContractValidationError):
+        _t011_value(field, 999)
+    with pytest.raises(ContractValidationError):
+        _t011_value(field, "not-an-int")
+
+
+def test_t011_preference_field_schema_tripwire_fails_closed(monkeypatch, tmp_path):
+    import workbench.contracts as _cm
+    _cm._reset_plugin_catalog_contract_validator_cache()
+    try:
+        base = json.loads((SCHEMAS / "plugin-catalog.v1.schema.json").read_text(encoding="utf-8"))
+        del base["$defs"]["preferenceField"]["additionalProperties"]
+        drifted = tmp_path / "drifted-preffield.schema.json"
+        drifted.write_text(json.dumps(base), encoding="utf-8")
+        monkeypatch.setattr(_cm, "_PLUGIN_CATALOG_CONTRACT_SCHEMA_PATH", drifted)
+        with pytest.raises(ContractValidationError, match="no longer closes its preferenceField object"):
+            _cm.plugin_catalog_contract_validator()
+    finally:
+        _cm._reset_plugin_catalog_contract_validator_cache()

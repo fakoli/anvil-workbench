@@ -56,8 +56,9 @@ from .retrieval import AnvilPurposeRetrieval
 from .router import RouterError, route_decisions, sandbox_response
 from .redaction import scrub_config_payload
 from .store import (
-    MemoryPreferenceStore, MemorySkillAdoptionStore, PostgresStore, PreferenceStoreError,
-    StalePreferenceWriteError, StoreError, UnknownPreferenceError, WorkbenchStore,
+    MemoryPluginPreferenceService, MemoryPreferenceStore, MemorySkillAdoptionStore, PluginPreferenceStoreError,
+    PostgresStore, PreferenceStoreError, StalePreferenceWriteError, StoreError,
+    UnknownPreferenceError, WorkbenchStore,
 )
 from .system_health import SystemHealthService, UnknownIntegrationError
 from .voice import (
@@ -835,6 +836,57 @@ def build_conversation_search_router(
 #: the edge before it reaches the store.
 _SEARCH_QUERY_MAX_CHARS = 200
 
+#: The fixed 404 body an unknown plugin/tool preference lookup returns, so the
+#: surface is never an existence oracle for an unknown plugin/tool.
+_UNKNOWN_PLUGIN_PREF_DETAIL = "unknown plugin tool"
+_TOOL_ID_PATTERN = r"^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"
+
+
+def build_plugin_preferences_router(
+    actor_dependency: Callable[..., str],
+    plugin_preference_service: "MemoryPluginPreferenceService | None",
+) -> APIRouter:
+    """Build the read-only NON-SECRET plugin-preference browser surface (T011).
+
+    Serves only a tool's actor-selectable preference field DESCRIPTORS (type,
+    bounds, allowed values, safe default, scope) and the resolved effective values
+    for the AUTHENTICATED actor -- resolved through the standard ``per_turn ->
+    actor -> project -> default`` precedence with the actor's own namespace keyed
+    by the trusted identity.  Because the catalog validator refuses any
+    secret/credential/host-bearing field, only non-secret fields exist here: a
+    connector-host configuration value is never accepted from nor returned to the
+    browser (it never round-trips).  Every response body is scrubbed at this last
+    hop with :func:`~workbench.redaction.scrub_config_payload`.  The surface is
+    READ-ONLY (a single ``GET``) and refuses with 503 until a service is injected.
+    """
+    router = APIRouter(prefix="/api/plugin-preferences")
+
+    def service() -> "MemoryPluginPreferenceService":
+        if plugin_preference_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="plugin preferences are not configured",
+            )
+        return plugin_preference_service
+
+    @router.get("/{plugin_id}/{tool_id}")
+    def effective_preferences(
+        plugin_id: str = Path(pattern=_PLUGIN_ID_PATTERN),
+        tool_id: str = Path(pattern=_TOOL_ID_PATTERN),
+        project_id: str | None = None,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The actor's resolved effective preference values + the field descriptors."""
+        try:
+            result = service().effective(plugin_id, tool_id, actor=actor, project_id=project_id)
+        except PluginPreferenceStoreError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=_UNKNOWN_PLUGIN_PREF_DETAIL
+            ) from exc
+        return scrub_config_payload(result)
+
+    return router
+
 
 #: A base64 body big enough to hold ``MAX_STT_INPUT_BYTES`` of audio, plus slack
 #: for padding.  A larger encoded body is refused at the edge BEFORE it is
@@ -1341,6 +1393,7 @@ def create_app(
     chat_tool_dispatch_service: "ChatToolDispatchService | None" = None,
     skill_adoption_store: MemorySkillAdoptionStore | None = None,
     conversation_search_service: "ConversationSearchService | None" = None,
+    plugin_preference_service: MemoryPluginPreferenceService | None = None,
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
@@ -1401,6 +1454,11 @@ def create_app(
     # that is deliberately NOT auto-wired into the live poll loop; it stays ``None``
     # unless a service is injected, so the browser surface fails closed (503).
     app.state.conversation_search_service = conversation_search_service
+    # The non-secret plugin-preference service is a hub-side supervision read-model
+    # that is deliberately NOT auto-wired into the live poll loop; it stays ``None``
+    # unless a service is injected, so the browser surface fails closed (503). It
+    # never accepts nor returns a connector-host configuration value.
+    app.state.plugin_preference_service = plugin_preference_service
     # The scoped preference store is a hub-side supervision read/write model that
     # is deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless injected, so the browser surface fails closed (503).
@@ -1568,6 +1626,12 @@ def create_app(
     # receipt; a cross-actor probe is byte-identical to a nonexistent one, and
     # metadata-only / purged / deleted transcript content never appears.
     app.include_router(build_conversation_search_router(actor, conversation_search_service))
+    # Read-only non-secret plugin-preference surface (reviewed-tools-plugins T011):
+    # authenticated by the same trusted ``actor`` dependency, GET-only, and
+    # fail-closed (503) until a service is injected. Serves only actor-selectable
+    # non-secret field descriptors + the actor's resolved effective values; a
+    # connector-host configuration value never round-trips through the browser.
+    app.include_router(build_plugin_preferences_router(actor, plugin_preference_service))
     # Actor-scoped preference read/write surface (preferences-configuration
     # T002.3): authenticated by the same trusted ``actor`` dependency, personal
     # namespace bound to the authenticated actor, and fail-closed (503) until a

@@ -2174,3 +2174,86 @@ def test_t009_compilation_refuses_a_smuggled_open_output_projection():
             retention="none", docs="docs/CONTRACTS.md#reviewed-tools-and-plugins-proposed",
             compiled_at="2026-07-21T00:00:00Z", tool_reviews=hostile_reviews,
         )
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T011: catalog validation REJECTS any actor-selectable
+# preference field marked OR detected as secret/credential-bearing (the standard
+# corpus), and dispatch uses ONLY resolved values (a browser-supplied value can
+# never inject a connector-host config under an undeclared field).
+# =========================================================================== #
+
+import json as _t011s_json
+from pathlib import Path as _T011S_Path
+
+from workbench.contracts import (
+    ContractValidationError as _T011S_ContractError,
+    contract_digest as _t011s_digest,
+    validate_plugin_catalog as _t011s_validate,
+)
+from workbench.store import resolve_plugin_tool_preferences as _t011s_resolve
+
+_T011S_EX = _T011S_Path(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
+
+
+def _t011s_catalog(fields):
+    catalog = _t011s_json.loads((_T011S_EX / "plugin.catalog.v1.json").read_text(encoding="utf-8"))
+    plugin = next(p for p in catalog["plugins"] if p["id"] == "anvil-tasks-viewer")
+    tool = next(t for t in plugin["tools"] if t["tool_id"] == "tasks.list")
+    tool["preference_fields"] = fields
+    for p in catalog["plugins"]:
+        p["plugin_digest"] = _t011s_digest("plugin", p)
+    catalog["catalog_digest"] = _t011s_digest("plugin-catalog", catalog)
+    return catalog
+
+
+def test_t011_secret_field_rejection_marked_and_detected_over_the_full_corpus():
+    # Marked secret / path-like.
+    for marker in ({"sensitivity": "secret"}, {"path_like": True}):
+        with pytest.raises(_T011S_ContractError):
+            _t011s_validate(_t011s_catalog([dict({"name": "opt", "type": "string", "scope": "actor", "default": "x"}, **marker)]))
+    # Detected by a credential/host-shaped NAME.
+    for name in ("api_key", "bearer_token", "connector_host", "server_port", "webhook_url"):
+        with pytest.raises(_T011S_ContractError, match="secret/credential-bearing"):
+            _t011s_validate(_t011s_catalog([{"name": name, "type": "string", "scope": "actor", "default": "x"}]))
+    # Detected by a secret/endpoint/path-shaped DEFAULT -- the standard corpus,
+    # including the dotless host:port that slipped the shared scrubber before.
+    for hostile in (
+        "serving:8443", "neo4j:7687",                       # dotless host:port
+        "AKIAIOSFODNN7EXAMPLE",                             # AWS key id, no separator
+        "eyJhbGciOiJIUzI1NiJ9.payload.sig",                # JWT
+        "-----BEGIN RSA PRIVATE KEY-----",                 # PEM
+        "postgresql://user:pass@db.internal:5432/app",     # DB URL
+        "/etc/shadow", "C:/Users/op/secrets.env",          # POSIX + Windows path
+        "ghp_secretsecretsecret1234567890",                # GitHub PAT
+        "sk-ant-api03-REALKEYMATERIALHERE",                # provider key
+    ):
+        with pytest.raises(_T011S_ContractError, match="secret/credential-bearing"):
+            _t011s_validate(_t011s_catalog([{"name": "note", "type": "string", "scope": "actor", "default": hostile}]))
+
+
+def test_t011_dispatch_uses_only_resolved_values_never_an_injected_field():
+    fields = [{"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}, "default": 25}]
+    # A browser/attacker-supplied stored blob carrying an UNDECLARED connector-host
+    # config key is ignored by construction -- only declared fields resolve.
+    hostile_stored = {"page_size": 40, "connector_host": "serving:8443", "auth_token": "ghp_x"}
+    resolved = _t011s_resolve(fields, actor=hostile_stored)
+    assert resolved == {"page_size": 40}          # ONLY the declared field resolved
+    assert "connector_host" not in resolved
+    assert "auth_token" not in resolved
+    # An out-of-bounds declared value falls back to the safe default (never dispatched).
+    assert _t011s_resolve(fields, actor={"page_size": 10 ** 9}) == {"page_size": 25}
+
+
+def test_t011_actor_view_default_is_scrubbed_at_projection_last_hop():
+    # Even if a mis-declared field somehow reached the actor view, a string default
+    # carrying a leak shape is scrubbed by plugin_preference_actor_view. Here we
+    # use a benign field and assert no leak marker survives the projection.
+    from workbench.contracts import plugin_preference_actor_view as _view
+    catalog = _t011s_catalog([{"name": "label", "type": "string", "scope": "actor", "default": "release notes"}])
+    plugin = next(p for p in catalog["plugins"] if p["id"] == "anvil-tasks-viewer")
+    tool = next(t for t in plugin["tools"] if t["tool_id"] == "tasks.list")
+    view = _view(tool)
+    blob = _t011s_json.dumps(view)
+    for marker in ("://", "ghp_", "AKIA", "serving:8443", "/etc", "C:/"):
+        assert marker not in blob

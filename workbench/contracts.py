@@ -637,7 +637,7 @@ def plugin_catalog_contract_validator() -> Draft202012Validator:
                 "refusing to validate catalogs"
             )
         defs = schema.get("$defs", {})
-        for name in ("plugin", "tool", "gates", "credential", "hostAccess"):
+        for name in ("plugin", "tool", "gates", "credential", "hostAccess", "preferenceField"):
             node = defs.get(name)
             if not isinstance(node, dict) or node.get("additionalProperties") is not False:
                 raise ContractValidationError(
@@ -2186,6 +2186,12 @@ def validate_plugin_catalog(catalog: Mapping[str, Any]) -> None:
                         f"read plugin tool must be ungated: {plugin_id}:{tool_id}"
                     )
 
+            # T011: every declared preference field must be a NON-SECRET,
+            # actor-selectable, type-coherent field -- a marked or detected
+            # secret/credential/host-bearing field is refused here at review time.
+            for pref_field in tool.get("preference_fields", []) or []:
+                _validate_plugin_preference_field(plugin_id, tool_id, pref_field)
+
             if tool.get("tool_kind") == "read_only_connector":
                 if effect != "read":
                     raise ContractValidationError(
@@ -2730,3 +2736,140 @@ def assert_connector_document_current(
         raise ContractValidationError(
             "the connector's reviewed OpenAPI document digest has drifted; dispatch refused as drift"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Non-secret plugin preference fields (reviewed-tools-plugins T011 / R004).
+#
+# A plugin tool MAY declare NON-SECRET, actor-selectable preference fields (a
+# type, optional bounds/allowed values, a safe default, and the actor-selectable
+# scope they resolve at: per_turn/actor/project).  Catalog validation REJECTS any
+# such field marked (sensitivity=secret / path_like) OR detected (a credential/
+# host-shaped name, or a secret/endpoint/path-shaped default) as secret-bearing,
+# so a secret can never be actor-selectable and the connector-host configuration
+# never round-trips through a preference field.  A field value resolves through
+# the standard precedence (per_turn -> actor -> project -> safe default), reusing
+# the redaction corpus for the secret-shape detection and the advanced-control
+# value check for typed value validation.
+# --------------------------------------------------------------------------- #
+
+_PLUGIN_PREF_ACTOR_SCOPES = ("per_turn", "actor", "project")
+#: A field NAME (or a stored value) whose text names one of these classes is a
+#: credential/host/endpoint by construction and can never be an actor-selectable
+#: preference: the field is refused at catalog validation.
+_PLUGIN_PREF_SECRET_NAME_RE = re.compile(
+    r"(?i)(?:^|_)(?:token|secret|password|passwd|pwd|credential|apikey|api_key|"
+    r"auth|bearer|host|hostname|port|url|uri|endpoint|dsn|conn|connection|server|origin|key)(?:$|_)"
+)
+_PLUGIN_PREF_MAX_STRING = 200
+
+
+def _plugin_preference_default_is_secret_shaped(default: Any) -> bool:
+    """True when a string default carries a secret/endpoint/path shape.
+
+    Reuses the shared configuration scrubber: if scrubbing the default changes
+    it, the default contained a credential, a raw URL/endpoint (including a
+    dotless ``host:port``), or a filesystem path -- exactly the corpus a
+    non-secret preference default must never carry.
+    """
+    from .redaction import redact_config_text
+
+    if not isinstance(default, str):
+        return False
+    return redact_config_text(default) != default
+
+
+def _looks_like_secret_preference(name: str, default: Any) -> bool:
+    """Detect a secret/credential-bearing field by its name OR its default shape."""
+    if _PLUGIN_PREF_SECRET_NAME_RE.search(str(name)):
+        return True
+    return _plugin_preference_default_is_secret_shaped(default)
+
+
+def validate_plugin_preference_value(field: Mapping[str, Any], value: Any) -> None:
+    """Fail closed unless ``value`` conforms to a preference field descriptor.
+
+    Reuses :func:`_check_advanced_control_value` for the int/enum/bool cases and
+    adds the bounded-string case, so a stored or proposed value is typed-checked
+    exactly like an Advanced-mode control before it can be resolved for dispatch.
+    """
+    field_type = field.get("type")
+    name = str(field.get("name"))
+    if field_type == "string":
+        if not isinstance(value, str):
+            raise ContractValidationError(f"preference {name} must be a string: {value!r}")
+        limit = field.get("max_length", _PLUGIN_PREF_MAX_STRING)
+        if not isinstance(limit, int) or len(value) > limit:
+            raise ContractValidationError(f"preference {name} exceeds its max length")
+        return
+    # int/enum/bool share the Advanced-control descriptor grammar (type + bounds/
+    # allowed_values), so the exact same value check applies.
+    _check_advanced_control_value(field, value, name)
+
+
+def _validate_plugin_preference_field(plugin_id: str, tool_id: str, field: Any) -> None:
+    """Fail closed when a tool preference field is unsafe or incoherent (T011)."""
+    if not isinstance(field, Mapping):
+        raise ContractValidationError(f"plugin tool preference field is not an object: {plugin_id}:{tool_id}")
+    name = str(field.get("name"))
+    scope = field.get("scope")
+    if scope not in _PLUGIN_PREF_ACTOR_SCOPES:
+        raise ContractValidationError(
+            f"plugin preference field must be actor-selectable (per_turn/actor/project): {plugin_id}:{tool_id}:{name}"
+        )
+    # REJECT a marked-secret / path-like field: an actor-selectable preference is
+    # non-secret by contract.
+    if field.get("sensitivity") == "secret" or field.get("path_like") is True:
+        raise ContractValidationError(
+            f"an actor-selectable plugin preference field cannot be secret or path-like: {plugin_id}:{tool_id}:{name}"
+        )
+    # REJECT a DETECTED secret/credential/host-bearing field (name or default shape).
+    if _looks_like_secret_preference(name, field.get("default")):
+        raise ContractValidationError(
+            f"plugin preference field is detected as secret/credential-bearing and cannot be actor-selectable: "
+            f"{plugin_id}:{tool_id}:{name}"
+        )
+    if field.get("type") == "enum" and not isinstance(field.get("allowed_values"), list):
+        raise ContractValidationError(
+            f"enum plugin preference field must declare allowed_values: {plugin_id}:{tool_id}:{name}"
+        )
+    # The declared default must itself be a valid value for the field.
+    try:
+        validate_plugin_preference_value(field, field.get("default"))
+    except ContractValidationError as exc:
+        raise ContractValidationError(
+            f"plugin preference field default is invalid: {plugin_id}:{tool_id}:{name}: {exc}"
+        ) from exc
+
+
+_PLUGIN_PREF_ACTOR_VIEW_FIELDS = frozenset(
+    {"name", "title", "description", "type", "scope", "bounds", "allowed_values", "default", "max_length"}
+)
+
+
+def plugin_preference_actor_view(tool: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Project a tool's actor-selectable preference field descriptors for the browser.
+
+    Serializes only the declared NON-SECRET fields (the catalog validator already
+    refused any secret one) and, defence-in-depth, scrubs a string default through
+    the shared redactor before it can reach a browser -- so a connector-host
+    endpoint or a credential can never round-trip through this projection.
+    """
+    from .redaction import redact_value
+
+    view: list[dict[str, Any]] = []
+    for field in tool.get("preference_fields", []) or []:
+        if not isinstance(field, Mapping):
+            continue
+        # Defence-in-depth: never project a field that (mis-)declares itself secret.
+        if field.get("sensitivity") == "secret" or field.get("path_like") is True:
+            continue
+        if _looks_like_secret_preference(str(field.get("name")), field.get("default")):
+            continue
+        projected: dict[str, Any] = {}
+        for key, item in field.items():
+            if key not in _PLUGIN_PREF_ACTOR_VIEW_FIELDS:
+                continue
+            projected[key] = redact_value(copy.deepcopy(item)) if key in ("default", "allowed_values", "title", "description") else copy.deepcopy(item)
+        view.append(projected)
+    return view

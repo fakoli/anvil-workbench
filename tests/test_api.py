@@ -1803,3 +1803,88 @@ def test_t009_chat_tools_surface_ingests_no_openapi():
     client = TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph()))
     r = client.post("/api/chat/tools", json={"openapi": "3.0.3"}, headers=_PL_ACTOR)
     assert r.status_code in (404, 405)
+
+
+# =========================================================================== #
+# reviewed-tools-plugins T011: the wired non-secret plugin-preference surface.
+# Serves actor-selectable field descriptors + the actor's resolved effective
+# values; a connector-host configuration value never round-trips; fail-closed 503.
+# =========================================================================== #
+
+from workbench.contracts import contract_digest as _t011a_digest
+from workbench.store import MemoryPluginPreferenceService as _T011A_Service
+
+
+def _t011a_catalog_with_fields():
+    catalog = _pl_load("plugin.catalog.v1.json")
+    plugin = next(p for p in catalog["plugins"] if p["id"] == "anvil-tasks-viewer")
+    tool = next(t for t in plugin["tools"] if t["tool_id"] == "tasks.list")
+    tool["preference_fields"] = [
+        {"name": "page_size", "type": "int", "scope": "actor", "bounds": {"min": 1, "max": 100}, "default": 25},
+        {"name": "sort", "type": "enum", "scope": "per_turn", "allowed_values": ["newest", "oldest"], "default": "newest"},
+    ]
+    for p in catalog["plugins"]:
+        p["plugin_digest"] = _t011a_digest("plugin", p)
+    catalog["catalog_digest"] = _t011a_digest("plugin-catalog", catalog)
+    return catalog
+
+
+def _t011a_client(service):
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), plugin_preference_service=service,
+    ))
+
+
+def test_t011_preference_surface_fails_closed_when_unconfigured():
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    client = TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph()))
+    r = client.get("/api/plugin-preferences/anvil-tasks-viewer/tasks.list", headers=_PL_ACTOR)
+    assert r.status_code == 503
+
+
+def test_t011_preference_surface_serves_actor_view_and_resolved_values():
+    service = _T011A_Service(_t011a_catalog_with_fields())
+    service.set_value("actor", "operator", "anvil-tasks-viewer", "tasks.list", "page_size", 40)
+    client = _t011a_client(service)
+    r = client.get("/api/plugin-preferences/anvil-tasks-viewer/tasks.list", headers=_PL_ACTOR)
+    assert r.status_code == 200
+    body = r.json()
+    assert {f["name"] for f in body["fields"]} == {"page_size", "sort"}
+    # The actor's own stored value resolves; the untouched field falls to default.
+    assert body["effective"] == {"page_size": 40, "sort": "newest"}
+
+
+def test_t011_preference_read_is_actor_scoped_and_not_an_oracle():
+    service = _T011A_Service(_t011a_catalog_with_fields())
+    # Another actor's stored value never surfaces for the operator.
+    service.set_value("actor", "reviewer", "anvil-tasks-viewer", "tasks.list", "page_size", 99)
+    client = _t011a_client(service)
+    r = client.get("/api/plugin-preferences/anvil-tasks-viewer/tasks.list", headers=_PL_ACTOR)
+    assert r.json()["effective"]["page_size"] == 25  # operator sees the default, not 99
+    # An unknown tool is a plain 404, never an existence oracle.
+    assert client.get("/api/plugin-preferences/anvil-tasks-viewer/tasks.delete", headers=_PL_ACTOR).status_code == 404
+
+
+def test_t011_browser_never_round_trips_connector_host_config():
+    service = _T011A_Service(_t011a_catalog_with_fields())
+    client = _t011a_client(service)
+    body = client.get("/api/plugin-preferences/anvil-tasks-viewer/tasks.list", headers=_PL_ACTOR).json()
+    blob = _pl_json.dumps(body)
+    # The projection carries only declared non-secret fields; no host/endpoint/
+    # credential key or value round-trips.
+    for marker in ("host", "endpoint", "url", "://", "token", "secret", "password", "credential"):
+        assert marker not in blob.lower()
+    # And the surface is GET-only: no write path to round-trip a host config in.
+    assert client.post("/api/plugin-preferences/anvil-tasks-viewer/tasks.list", json={"host": "x"}, headers=_PL_ACTOR).status_code in (404, 405)
+    assert client.put("/api/plugin-preferences/anvil-tasks-viewer/tasks.list", json={"host": "x"}, headers=_PL_ACTOR).status_code in (404, 405)
