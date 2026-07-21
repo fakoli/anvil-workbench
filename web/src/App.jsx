@@ -7,6 +7,7 @@ import {
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
   transcribeVoice, speakMessage, fetchPreferences,
+  fetchAdvancedRoutes, runAdvancedBranch, ADVANCED_NOT_CONFIGURED,
 } from './api'
 import {
   describeConversation, selectChatRoute, successorTurnBody, terminalToStatus,
@@ -14,8 +15,10 @@ import {
   initialPlaybackState, playbackReducer, playbackLabel, isPlaybackActiveFor, shouldAutoplay,
   voiceAutoplayFromPreferences,
 } from './chat-api'
+import { submittedControls } from './advanced-chat'
 import SettingsView from './settings-view'
 import PluginCatalogView from './plugin-catalog-view'
+import AdvancedPanel from './advanced-chat-view'
 import {
   deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
   filterDescribedTasks, freshnessLabel, nextDeliverCandidate, progressSummaryLabel,
@@ -513,23 +516,20 @@ function DeliveryContext({ context }) {
   </section>
 }
 
-function AdvancedPanel() {
-  return <section className="advanced-panel" aria-label="Advanced controls">
-    <p>Advanced controls are not configured in this build. The transcript and its route are unchanged.</p>
-    <label>Reasoning effort<select aria-label="Reasoning effort" disabled><option>not configured</option></select></label>
-    <label>Temperature<input aria-label="Temperature" type="range" min="0" max="2" step="0.1" disabled /></label>
-  </section>
-}
-
 function TurnView({ turn, onRetry, onBranch, streamActive, conversationId, autoplayPreference }) {
   const text = turnText(turn)
   const streaming = turn.status === 'streaming'
   const distinct = !streaming && turn.status !== 'complete'
   const lineage = turn.lineage?.kind && turn.lineage.kind !== 'initial' ? turn.lineage.kind : null
+  // A tuned Advanced run is a sibling branch turn; surface its `mode:'advanced'`
+  // as a distinct badge alongside the lineage chip so it is distinguishable from
+  // an ordinary branch turn (S4).
+  const advancedMode = turn.mode === 'advanced'
   return <li className={`turn turn-${turn.role} turn-${turn.status}`}>
     <div className="turn-head">
       <span className="turn-role">{turn.role === 'user' ? 'You' : 'Assistant'}</span>
       {lineage && <span className="turn-lineage">{lineage}</span>}
+      {advancedMode && <span className="turn-advanced" aria-label="Advanced tuned run">advanced</span>}
       {streaming && <span className="turn-status streaming">streaming…</span>}
       {distinct && <span className={`turn-status turn-status-${turn.status}`}>{turn.status}</span>}
     </div>
@@ -837,6 +837,16 @@ function ChatView({ append }) {
   const [routes, setRoutes] = useState([])
   const [routeId, setRouteId] = useState('')
   const [advanced, setAdvanced] = useState(false)
+  // Advanced playground state (advanced-model-playground T005). Routes are the
+  // reviewed advanced-route allowlist; a 503/unconfigured surface degrades
+  // truthfully to `advUnavailable` and the ordinary transcript stays usable. A
+  // branch is a settled `mode="advanced"` SIBLING turn in the SAME transcript —
+  // never a second transcript — plus its redacted trace for the inspector.
+  const [advRoutes, setAdvRoutes] = useState([])
+  const [advUnavailable, setAdvUnavailable] = useState('')
+  const [advBranches, setAdvBranches] = useState([])
+  const [advInspectingId, setAdvInspectingId] = useState(null)
+  const [advCompareIds, setAdvCompareIds] = useState([])
   const [draft, setDraft] = useState('')
   const [streamingTurn, setStreamingTurn] = useState(null)
   const [lifecycle, setLifecycle] = useState('')
@@ -895,6 +905,23 @@ function ChatView({ append }) {
     fetchPreferences()
       .then((payload) => setVoicePreferences(voiceAutoplayFromPreferences(payload)))
       .catch(() => setVoicePreferences({ voice_autoplay: false }))
+  }, [])
+  // Load the reviewed advanced-route allowlist. NOTE (S6): the advanced HTTP
+  // surface — GET /api/chat/advanced/routes and POST
+  // /api/conversations/{id}/advanced/run, served by `build_advanced_router` — is
+  // NOT yet wired server-side. T005 is proven at the COMPONENT level over the
+  // merged serializer shapes (route/control/branch/advanced-trace.v1), and the
+  // live path degrades to `advUnavailable` (503 → the shared not-configured
+  // sentinel) pending that backend wiring under AMP:T007 (live qualification). So
+  // a 503 or any failure sets a truthful unavailable state — the panel degrades
+  // and the ordinary transcript is never blocked.
+  useEffect(() => {
+    fetchAdvancedRoutes()
+      .then((value) => { setAdvRoutes(value.routes || []); setAdvUnavailable('') })
+      .catch((error) => {
+        setAdvRoutes([])
+        setAdvUnavailable(error?.message === ADVANCED_NOT_CONFIGURED ? ADVANCED_NOT_CONFIGURED : 'Advanced controls are unavailable for this hub.')
+      })
   }, [])
 
   // Focus a sensible target after a row leaves the rail (a11y #6): the first
@@ -983,6 +1010,80 @@ function ChatView({ append }) {
   }
   const cancel = () => { abortRef.current?.abort() }
 
+  // Run one tuned Advanced attempt. It forks a `mode="advanced"` SIBLING into the
+  // SAME transcript (the shared `turns` / `streamingTurn` slot) — never a second
+  // transcript — and streams through `runAdvancedBranch` with a real
+  // AbortController threaded to the fetch, so the panel's Cancel genuinely aborts
+  // the in-flight request. On settle it records the branch + its redacted trace for
+  // inspect/compare/save/reopen.
+  const runAdvancedFromConfig = async ({ route, routeId: advRouteId, values, prompt, instructions, label }) => {
+    if (!selectedId || streamingTurn || !route) return
+    const conversationId = selectedId
+    const isCurrent = () => selectedIdRef.current === conversationId
+    const ordinal = (seqRef.current += 1)
+    const branchLocalId = `advbranch-${ordinal}`
+    // The panel's Run does not name a branch; give every branch a stable, readable
+    // default label so its row + per-branch control names are meaningful (never
+    // "undefined"). A rerun/fork carries the originating label forward.
+    const branchLabel = label || `Branch ${ordinal}`
+    const parentTurnId = turns.length ? turns[turns.length - 1].id : null
+    const controls = submittedControls(route, values)
+    const userTurn = { id: `local-adv-user-${ordinal}`, role: 'user', status: 'complete', content: [{ text: prompt }], lineage: { kind: 'branch' }, mode: 'advanced' }
+    setTurns((current) => [...current, userTurn])
+    const assistant = { id: `local-adv-${ordinal}`, role: 'assistant', status: 'streaming', content: [{ text: '' }], lineage: { kind: 'branch' }, mode: 'advanced' }
+    setStreamingTurn(assistant); setLifecycle('Advanced branch streaming')
+    setAdvBranches((current) => [...current, { id: branchLocalId, label: branchLabel, routeId: advRouteId, controlsValues: values, prompt, instructions, status: 'streaming', text: '', trace: null, saved: false }])
+    const controller = new AbortController(); abortRef.current = controller
+    let capturedTrace = null
+    try {
+      const state = await runAdvancedBranch({
+        conversationId, parentTurnId, branchId: branchLocalId, routeId: advRouteId, controls, prompt, instructions,
+        signal: controller.signal,
+        onFrame: (frame) => { if (frame.trace) capturedTrace = frame.trace },
+        onState: (streamState) => { if (!isCurrent()) return; setStreamingTurn((current) => (current ? {
+          ...current, content: [{ text: streamState.text }],
+          status: streamState.terminal ? terminalToStatus(streamState.terminal) : 'streaming',
+        } : current)) },
+      })
+      if (!isCurrent()) return
+      const status = terminalToStatus(state.terminal)
+      const trace = state.trace || capturedTrace
+      const settledTurn = { ...assistant, content: [{ text: state.text }], status, fresh: true }
+      setTurns((current) => [...current, settledTurn]); setStreamingTurn(null)
+      setLifecycle(`Advanced branch ${status}`)
+      setAdvBranches((current) => current.map((branch) => (branch.id === branchLocalId
+        ? { ...branch, status, text: state.text, trace, turnId: settledTurn.id, branchId: state.branchId || branchLocalId }
+        : branch)))
+    } catch {
+      if (!isCurrent()) return
+      setStreamingTurn(null)
+      setTurns((current) => [...current, { ...assistant, status: 'failed', content: [{ text: '' }] }])
+      setLifecycle('Advanced branch failed')
+      setAdvBranches((current) => current.map((branch) => (branch.id === branchLocalId ? { ...branch, status: 'failed' } : branch)))
+      append('The advanced branch failed. No partial attempt was recorded as complete.')
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null
+    }
+  }
+  // Retry re-runs an identical attempt; fork runs a variant from the same config —
+  // both are new sibling turns in the one transcript (no duplicate transcript).
+  const rerunAdvanced = (branch, mode) => {
+    const route = advRoutes.find((item) => item.route_id === branch.routeId)
+    if (!route) { append('That advanced route is no longer in the reviewed allowlist.'); return }
+    runAdvancedFromConfig({
+      route, routeId: branch.routeId, values: branch.controlsValues, prompt: branch.prompt,
+      instructions: branch.instructions, label: `${branch.label} · ${mode}`,
+    })
+  }
+  const saveAdvancedBranch = (branch) => setAdvBranches((current) => current.map((item) => (item.id === branch.id ? { ...item, saved: true } : item)))
+  const reopenAdvancedBranch = (branch) => setAdvBranches((current) => current.map((item) => (item.id === branch.id ? { ...item, saved: true } : item)))
+  const toggleAdvancedCompare = (branchId) => {
+    if (branchId === null) { setAdvCompareIds([]); return }
+    setAdvCompareIds((current) => current.includes(branchId)
+      ? current.filter((id) => id !== branchId)
+      : [...current, branchId].slice(-2))
+  }
+
   // Retry/branch post ONLY the `{kind:'text', text}` slice the server accepts and
   // pick the role the server's turn tree expects (#1): retry appends a sibling
   // ASSISTANT regeneration; branch opens a follow-up USER turn. Reposting a
@@ -1016,7 +1117,12 @@ function ChatView({ append }) {
         </div>
       </header>
       <DeliveryContext context={selected?.context} />
-      {advanced && <AdvancedPanel />}
+      {advanced && <AdvancedPanel
+        unavailable={advUnavailable} routes={advRoutes} streaming={streaming}
+        branches={advBranches} onRun={runAdvancedFromConfig} onRerun={rerunAdvanced} onCancel={cancel}
+        onInspect={setAdvInspectingId} inspectingId={advInspectingId}
+        onSave={saveAdvancedBranch} onReopen={reopenAdvancedBranch}
+        onToggleCompare={toggleAdvancedCompare} compareIds={advCompareIds} />}
       <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} conversationId={selectedId} autoplayPreference={voicePreferences} /></div>
       <div className="chat-live" role="status" aria-live="polite">{lifecycle}</div>
       {/* Push-to-talk drops an EDITABLE transcript into the composer; a turn is
