@@ -6,10 +6,15 @@ bridge credential.  An identity-aware tailnet proxy should set
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import uuid
 from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Request, WebSocket, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,7 +54,14 @@ from .store import (
     StoreError, UnknownPreferenceError, WorkbenchStore,
 )
 from .system_health import SystemHealthService, UnknownIntegrationError
-from .voice import relay_realtime
+from .voice import (
+    MAX_STT_INPUT_BYTES,
+    STT_INPUT_FORMATS,
+    TTS_OUTPUT_FORMATS,
+    VoiceRelayService,
+    VoiceRequestError,
+    relay_realtime,
+)
 
 
 def default_delivery_workflow(skills: list[str] | None = None) -> dict[str, Any]:
@@ -705,6 +717,135 @@ def build_chat_tools_router(
     return router
 
 
+#: A base64 body big enough to hold ``MAX_STT_INPUT_BYTES`` of audio, plus slack
+#: for padding.  A larger encoded body is refused at the edge BEFORE it is
+#: decoded, so an oversized blob never allocates its decoded form.
+_MAX_STT_B64_CHARS = ((MAX_STT_INPUT_BYTES + 2) // 3) * 4 + 16
+
+#: Every ``/api/chat/voice/*`` endpoint shares this path prefix.  It is the branch
+#: key the pre-endpoint request-validation handler uses to scrub a voice 422 while
+#: leaving all other endpoints' 422 bodies byte-identical to FastAPI's default.
+_VOICE_PATH_PREFIX = "/api/chat/voice/"
+
+#: The FIXED, non-leaking detail returned for ANY malformed voice request that
+#: fails pydantic validation BEFORE the endpoint runs (oversized ``audio_base64``,
+#: a wrong-type audio field, an over-length TTS ``text``, a missing/non-string
+#: field).  FastAPI's default ``RequestValidationError`` body echoes the offending
+#: ``input`` verbatim -- for these endpoints that ``input`` IS the raw audio/text,
+#: which a tailnet proxy that logs 4xx bodies would then persist.  This constant
+#: omits ``input``/``ctx`` entirely so raw audio/text can never leak through the
+#: pre-endpoint validation path (the in-endpoint ``VoiceRequestError`` path already
+#: scrubs to a fixed detail; this closes the uncovered edge before it).
+_VOICE_INVALID_REQUEST_DETAIL = "voice request is invalid"
+
+
+class VoiceTranscribeInput(BaseModel):
+    """A bounded push-to-talk transcription request.  Closed field set.
+
+    The audio is a base64 chunk held only for the length of this request; it is
+    relayed to Serving and dropped.  No turn is created and nothing here is
+    persisted (only a content-free lifecycle event is).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str = Field(min_length=1, max_length=256)
+    audio_base64: str = Field(min_length=1, max_length=_MAX_STT_B64_CHARS)
+    audio_format: str = Field(min_length=1, max_length=32)
+    is_final: bool = False
+    duration_ms: int | None = Field(default=None, ge=0, le=120_000)
+
+
+class VoiceSpeakInput(BaseModel):
+    """A bounded read-aloud request.  Closed field set.
+
+    ``message_ref`` names the already-rendered message the actor asked to hear;
+    ``text`` is its visible text.  Producing audio mutates no message state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str = Field(min_length=1, max_length=256)
+    message_ref: str = Field(min_length=1, max_length=256)
+    text: str = Field(min_length=1, max_length=20_000)
+    output_format: str = Field(default="mp3", min_length=1, max_length=32)
+
+
+def build_voice_relay_router(
+    actor_dependency: Callable[..., str],
+    voice_relay_service: "VoiceRelayService | None",
+) -> APIRouter:
+    """Build the chat push-to-talk (STT) + read-aloud (TTS) relay surface.
+
+    Both endpoints relay in-memory audio through Anvil Serving ONLY (the injected
+    :class:`VoiceRelayService` transport); a raw provider is never reached.  The
+    security contract is enforced at the service: an unauthorized actor or invalid
+    chat scope fails closed BEFORE the provider call; format/bytes/duration are
+    bounded; and the ONLY durable trace is a content-free lifecycle event.  Raw
+    input audio (the request body) and synthesized output audio (the response
+    body) are transient — never written to the store, logs, audit, or graph.
+
+    When ``voice_relay_service`` is ``None`` the lane is not configured (it is
+    deliberately NOT wired into ``create_app`` by default) and every endpoint
+    refuses with 503, mirroring the other injected hub services.  Every voice
+    ``VoiceRequestError`` maps to its fixed status + fixed, non-leaking detail.
+    """
+    router = APIRouter(prefix="/api/chat/voice")
+
+    def service() -> "VoiceRelayService":
+        if voice_relay_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="voice relay is not configured",
+            )
+        return voice_relay_service
+
+    @router.post("/transcribe")
+    def transcribe(payload: VoiceTranscribeInput, actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        relay = service()
+        if payload.audio_format not in STT_INPUT_FORMATS:
+            # A fixed 422 at the edge; the closed-set check also lives in the
+            # service, but refusing here avoids decoding an unusable body.
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="voice input format is not accepted")
+        try:
+            audio = base64.b64decode(payload.audio_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="voice input audio is not valid base64") from None
+        try:
+            draft = relay.transcribe(
+                actor=actor, conversation_id=payload.conversation_id,
+                correlation_id=uuid.uuid4().hex, audio=audio,
+                audio_format=payload.audio_format, is_final=payload.is_final,
+                duration_ms=payload.duration_ms,
+            )
+        except VoiceRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.public_detail) from None
+        # The draft is returned for the actor to EDIT and then explicitly submit;
+        # no turn was created and no audio is echoed back.
+        return {"draft": {"text": draft.text, "is_final": draft.is_final, "duration_ms": draft.duration_ms}}
+
+    @router.post("/speak")
+    def speak(payload: VoiceSpeakInput, actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        relay = service()
+        try:
+            synthesized = relay.synthesize(
+                actor=actor, conversation_id=payload.conversation_id,
+                correlation_id=uuid.uuid4().hex, message_ref=payload.message_ref,
+                text=payload.text, output_format=payload.output_format,
+            )
+        except VoiceRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.public_detail) from None
+        # Transient playback audio: streamed to the browser and dropped.  It is
+        # NOT persisted and producing it mutated no message state.
+        return {
+            "audio_base64": base64.b64encode(synthesized.audio).decode("ascii"),
+            "audio_format": synthesized.audio_format,
+            "sample_rate": synthesized.sample_rate,
+        }
+
+    return router
+
+
 #: The setting-id path grammar, mirrored from the settings-descriptor
 #: ``settingId`` definition, so a malformed id is rejected at the edge (422)
 #: before it reaches the store as a distinguishable lookup.
@@ -1082,6 +1223,7 @@ def create_app(
     preference_store: MemoryPreferenceStore | None = None,
     live_valid_refs_provider: Callable[[], Mapping[str, Any]] | None = None,
     policy_gate_service: PolicyGateService | None = None,
+    voice_relay_service: VoiceRelayService | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
@@ -1139,6 +1281,12 @@ def create_app(
     # wired into the live bridge poll loop; it stays ``None`` unless injected, so
     # the browser surface fails closed (503).
     app.state.policy_gate_service = policy_gate_service
+    # The chat push-to-talk / read-aloud voice relay is a hub-side supervision
+    # surface that is deliberately NOT wired into the live poll loop; it stays
+    # ``None`` unless a service is injected, so the browser surface fails closed
+    # (503). The live STT/TTS provider path (Anvil Serving audio) is qualified
+    # under chat-first-voice:T005/T004/T006 (BLOCKED-LIVE), out of scope here.
+    app.state.voice_relay_service = voice_relay_service
 
     def actor(request: Request) -> str:
         name = (request.headers.get(settings.identity_header) or "").strip()
@@ -1172,6 +1320,23 @@ def create_app(
     @app.exception_handler(StoreError)
     async def store_error_handler(_: Request, exc: StoreError):
         return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
+
+    # Pre-endpoint request-validation scrub for the voice lane ONLY. FastAPI's
+    # default ``RequestValidationError`` fires BEFORE the endpoint and echoes the
+    # offending ``input`` verbatim; for ``/api/chat/voice/*`` that ``input`` is the
+    # raw base64 audio (oversized/wrong-type) or the raw TTS text (over-length), so
+    # the default body would leak exactly the payload this slice promises never to
+    # persist. For a voice path we return a FIXED detail with no ``input``/``ctx``;
+    # for EVERY other path we delegate to FastAPI's default handler unchanged, so
+    # non-voice 422 bodies stay byte-identical (branch is on ``request.url.path``).
+    @app.exception_handler(RequestValidationError)
+    async def voice_scrubbed_validation_handler(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith(_VOICE_PATH_PREFIX):
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                content={"detail": _VOICE_INVALID_REQUEST_DETAIL},
+            )
+        return await request_validation_exception_handler(request, exc)
 
     # A missing projection and another project's projection raise the same
     # ``UnknownProjectionError``; both render the identical fixed 404 body so the
@@ -1271,6 +1436,12 @@ def create_app(
     # T004.3): preview, approval-binding, apply, and browser-safe receipt /
     # reconciliation status. Fails closed (503) until a gate service is injected.
     app.include_router(build_policy_operations_router(actor, policy_gate_service))
+    # Chat push-to-talk (STT) + read-aloud (TTS) relay (chat-first-voice T005):
+    # authenticated by the same trusted ``actor`` dependency, relaying in-memory
+    # audio through Anvil Serving ONLY, and fail-closed (503) until a relay
+    # service is injected. Raw input and synthesized audio are transient; the only
+    # durable trace is a content-free lifecycle event.
+    app.include_router(build_voice_relay_router(actor, voice_relay_service))
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:

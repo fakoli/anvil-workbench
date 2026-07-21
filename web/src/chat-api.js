@@ -156,3 +156,153 @@ export function toTurnContent(blocks) {
 export function successorTurnBody(turn, { role, mode = 'ordinary' } = {}) {
   return { role, status: 'complete', mode, content: toTurnContent(turn?.content) }
 }
+
+// --- Voice push-to-talk state machine (chat-first-voice T005.2) ---------------
+//
+// Pure record/draft logic, kept here (not in App.jsx) so it stays real when a
+// component test mocks the network. The invariant the machine encodes: capturing
+// audio produces an EDITABLE DRAFT and NEVER a sent turn. Recording moves
+// ready → listening → transcribing → draft; the draft is then editable text the
+// actor must EXPLICITLY submit through the ordinary composer. No transition here
+// sends a turn, and a permission/STT failure is a non-blocking 'error' that
+// leaves the textual composer fully usable.
+
+// "connected" criterion NOTE: this push-to-talk surface is request/response STT
+// over the hub relay, NOT a persistent socket, so there is deliberately no
+// "connected" state. The acceptance word "connected" maps to `ready` (the mic
+// path is available and idle) and `listening` (a hold is actively capturing); a
+// hop is a bounded per-request call, not a held connection. This is distinct from
+// the Realtime websocket relay (VoiceDock), which is genuinely connection-based.
+export const VOICE_INPUT_STATES = Object.freeze(['ready', 'listening', 'transcribing', 'draft', 'error'])
+
+export function initialVoiceInputState() {
+  return { status: 'ready', interim: '', draft: '', isFinal: false, error: '' }
+}
+
+export function voiceInputReducer(state, action) {
+  switch (action?.type) {
+    case 'press':
+      // Hold-to-talk begins: a fresh capture, clearing any prior draft/error.
+      return { status: 'listening', interim: '', draft: '', isFinal: false, error: '' }
+    case 'interim':
+      // Interim captions only render while listening; they are not a committable
+      // draft and never a turn.
+      return state.status === 'listening' ? { ...state, interim: String(action.text ?? '') } : state
+    case 'release':
+      // Release ends capture and awaits the final transcript.
+      return state.status === 'listening' ? { ...state, status: 'transcribing', interim: state.interim } : state
+    case 'final':
+      // The interim captions settle into an EDITABLE final draft. Still no turn.
+      return { ...state, status: 'draft', draft: String(action.text ?? ''), interim: '', isFinal: true, error: '' }
+    case 'edit':
+      // The actor edits the reviewed draft before deciding to submit.
+      return state.status === 'draft' ? { ...state, draft: String(action.text ?? '') } : state
+    case 'error':
+      // Permission denial or an STT failure is non-blocking: surfaced as text,
+      // the textual composer stays usable.
+      return { ...initialVoiceInputState(), status: 'error', error: String(action.message ?? 'Voice input failed.') }
+    case 'reset':
+      return initialVoiceInputState()
+    default:
+      return state
+  }
+}
+
+// Human-readable, closed-set live-region label for each voice-input status.
+export function voiceInputLabel(state) {
+  switch (state?.status) {
+    case 'listening': return 'Listening — release to review your transcript'
+    case 'transcribing': return 'Transcribing your recording…'
+    case 'draft': return 'Transcript ready to review, edit, and send'
+    case 'error': return state.error || 'Voice input failed.'
+    default: return 'Voice input ready'
+  }
+}
+
+// True only when a reviewed final draft exists to submit. A turn is sent through
+// the ordinary composer path; this never sends one itself.
+export function voiceDraftReady(state) {
+  return state?.status === 'draft' && typeof state.draft === 'string' && state.draft.trim().length > 0
+}
+
+// --- Voice read-aloud (TTS) playback state machine (chat-first-voice T005.3) --
+//
+// Pure playback logic. The invariant: playback and captions NEVER change message
+// or conversation state — this machine tracks only transient audio status keyed
+// to a message ref. start / pause / resume / stop / replay / interrupt all move
+// only playback status; none touches a turn.
+
+export const PLAYBACK_STATES = Object.freeze(['idle', 'loading', 'playing', 'paused', 'stopped', 'error'])
+
+export function initialPlaybackState() {
+  return { status: 'idle', messageRef: null, error: '' }
+}
+
+export function playbackReducer(state, action) {
+  switch (action?.type) {
+    case 'load':
+      // Begin fetching audio for one message. Switching messages interrupts any
+      // prior playback cleanly.
+      return { status: 'loading', messageRef: action.messageRef ?? null, error: '' }
+    case 'play':
+      return { ...state, status: 'playing', error: '' }
+    case 'pause':
+      return state.status === 'playing' ? { ...state, status: 'paused' } : state
+    case 'resume':
+      return state.status === 'paused' ? { ...state, status: 'playing' } : state
+    case 'stop':
+      return state.status === 'idle' ? state : { ...state, status: 'stopped' }
+    case 'ended':
+      // Natural completion returns to idle so the same message can replay.
+      return { ...state, status: 'idle' }
+    case 'replay':
+      return { status: 'playing', messageRef: action.messageRef ?? state.messageRef, error: '' }
+    case 'interrupt':
+      // A hard interrupt (new playback, navigation) resets cleanly.
+      return initialPlaybackState()
+    case 'error':
+      return { ...state, status: 'error', error: String(action.message ?? 'Audio playback failed.') }
+    default:
+      return state
+  }
+}
+
+// Closed-set live-region label for playback status.
+export function playbackLabel(state) {
+  switch (state?.status) {
+    case 'loading': return 'Preparing audio…'
+    case 'playing': return 'Playing audio'
+    case 'paused': return 'Audio paused'
+    case 'stopped': return 'Audio stopped'
+    case 'error': return state.error || 'Audio playback failed.'
+    default: return 'Audio idle'
+  }
+}
+
+// Whether a given message is the one currently loading/playing/paused.
+export function isPlaybackActiveFor(state, messageRef) {
+  return Boolean(messageRef) && state?.messageRef === messageRef
+    && ['loading', 'playing', 'paused'].includes(state.status)
+}
+
+// Autoplay is OPTIONAL and follows the operator's saved preference when one is
+// available; absent a preference it stays off (never surprises the operator).
+export function shouldAutoplay(preferences) {
+  return preferences?.voice_autoplay === true
+}
+
+// Adapter: extract the effective `personal.voice_autoplay` value from the REAL
+// served `/api/preferences` payload into the `{voice_autoplay: boolean}` shape
+// `shouldAutoplay` reads. The served payload is `{catalog, effective:[…]}` where
+// each effective row is `{setting_id, scope, value, source, …}` (the resolver's
+// `EffectiveValue.as_dict()`), so this finds the row whose `setting_id` is
+// `personal.voice_autoplay` and reports its resolved value. Absent row, a
+// non-boolean value, or a missing/503/unconfigured surface all default OFF — the
+// operator is never surprised by autoplay they did not opt into.
+export const VOICE_AUTOPLAY_SETTING_ID = 'personal.voice_autoplay'
+
+export function voiceAutoplayFromPreferences(payload) {
+  const rows = Array.isArray(payload?.effective) ? payload.effective : []
+  const row = rows.find((entry) => entry?.setting_id === VOICE_AUTOPLAY_SETTING_ID)
+  return { voice_autoplay: row?.value === true }
+}

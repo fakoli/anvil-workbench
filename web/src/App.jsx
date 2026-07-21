@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import {
   addDirective, approve, bootstrap, createProject, createSession, fetchRoutes, probeSkills,
   runSandbox, searchEvidence, startWorkflow, taskLineage, voiceSocketUrl,
@@ -6,8 +6,14 @@ import {
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
+  transcribeVoice, speakMessage, fetchPreferences,
 } from './api'
-import { describeConversation, selectChatRoute, successorTurnBody, terminalToStatus } from './chat-api'
+import {
+  describeConversation, selectChatRoute, successorTurnBody, terminalToStatus,
+  initialVoiceInputState, voiceInputReducer, voiceInputLabel, voiceDraftReady,
+  initialPlaybackState, playbackReducer, playbackLabel, isPlaybackActiveFor, shouldAutoplay,
+  voiceAutoplayFromPreferences,
+} from './chat-api'
 import SettingsView from './settings-view'
 import {
   deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
@@ -514,7 +520,7 @@ function AdvancedPanel() {
   </section>
 }
 
-function TurnView({ turn, onRetry, onBranch, streamActive }) {
+function TurnView({ turn, onRetry, onBranch, streamActive, conversationId, autoplayPreference }) {
   const text = turnText(turn)
   const streaming = turn.status === 'streaming'
   const distinct = !streaming && turn.status !== 'complete'
@@ -526,22 +532,25 @@ function TurnView({ turn, onRetry, onBranch, streamActive }) {
       {streaming && <span className="turn-status streaming">streaming…</span>}
       {distinct && <span className={`turn-status turn-status-${turn.status}`}>{turn.status}</span>}
     </div>
+    {/* The text stays available before/during/after any audio playback. */}
     <p className="turn-text">{text || (streaming ? '…' : '')}</p>
     {/* Successor actions are disabled while a stream is in flight (a11y #12): a
         retry/branch cannot be issued against history that is still settling. */}
     {turn.role === 'assistant' && !streaming && <div className="turn-actions">
       <button aria-label="Retry this response" disabled={streamActive} onClick={() => onRetry(turn)}>Retry</button>
       <button aria-label="Branch from this response" disabled={streamActive} onClick={() => onBranch(turn)}>Branch</button>
+      {/* Read-aloud is transient playback that never mutates this message. */}
+      {text.trim() && conversationId && <ReadAloud conversationId={conversationId} turn={turn} autoplayPreference={autoplayPreference} />}
     </div>}
   </li>
 }
 
-function Transcript({ selected, turns, streamingTurn, onRetry, onBranch }) {
+function Transcript({ selected, turns, streamingTurn, onRetry, onBranch, conversationId, autoplayPreference }) {
   if (!selected) return <div className="chat-empty" role="region" aria-label="No conversation selected"><h2>Select or start a conversation</h2><p>Your conversations are private to you and stay on the tailnet.</p></div>
   const rendered = streamingTurn ? [...turns, streamingTurn] : turns
   if (rendered.length === 0) return <div className="chat-empty" role="region" aria-label="Empty conversation"><h2>No messages yet</h2><p>Send the first message to start this conversation.</p></div>
   const streamActive = Boolean(streamingTurn)
-  return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} streamActive={streamActive} />)}</ol>
+  return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} streamActive={streamActive} conversationId={conversationId} autoplayPreference={autoplayPreference} />)}</ol>
 }
 
 function Composer({ draft, setDraft, onSend, onCancel, streaming, disabled, canSend }) {
@@ -585,8 +594,241 @@ function RouteSelect({ routes, routeId, onChange }) {
   </label>
 }
 
+// --- Voice push-to-talk + read-aloud (chat-first-voice T005.2 / T005.3) -------
+//
+// The IMPURE edges of the voice slice: microphone capture and audio playback.
+// The record/draft and playback STATE lives in the pure reducers in chat-api.js;
+// these components only wire the browser media APIs to those reducers. Both
+// degrade truthfully when the relay is unconfigured (a 503 becomes textual error
+// state) and NEVER block the textual chat.
+
+async function blobToBase64(blob) {
+  const buffer = await blob.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
+  return window.btoa(binary)
+}
+
+// Push-to-talk: hold to record, release to transcribe into an EDITABLE draft
+// dropped into the composer. It NEVER sends a turn — the actor reviews, edits,
+// and submits through the ordinary composer. Permission denial or an STT failure
+// is a non-blocking textual error; the composer stays usable throughout.
+function PushToTalk({ conversationId, onDraft, disabled }) {
+  const [state, dispatch] = useReducer(voiceInputReducer, undefined, initialVoiceInputState)
+  const recorderRef = useRef(null)
+  const chunksRef = useRef([])
+  const streamRef = useRef(null)
+  const mountedRef = useRef(true)
+  // True only during the hold (press→release). An interim transcription is
+  // emitted ONLY while this is set, so a chunk delivered on stop cannot fire a
+  // stray interim after release, and the reducer's own `listening`-guard is a
+  // second backstop against an out-of-order interim landing on a settled draft.
+  const recordingRef = useRef(false)
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; recordingRef.current = false; stopTracks() } }, [])
+
+  const stopTracks = () => {
+    streamRef.current?.getTracks?.().forEach((track) => { try { track.stop() } catch { /* already stopped */ } })
+    streamRef.current = null
+  }
+
+  // Provisional caption: transcribe the audio captured SO FAR as a non-final
+  // (`isFinal:false`) draft and render it live while the actor still holds. It is
+  // NOT a committable draft and NEVER a turn; the reducer keeps it only while
+  // `listening`, and the release-time final pass supersedes it. A failed interim
+  // is silent — the final pass still runs and textual chat is never blocked.
+  const emitInterim = async () => {
+    if (!recordingRef.current || !chunksRef.current.length) return
+    try {
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      const audioBase64 = await blobToBase64(blob)
+      const value = await transcribeVoice({ conversationId, audioBase64, audioFormat: 'webm_opus', isFinal: false })
+      if (!mountedRef.current || !recordingRef.current) return
+      dispatch({ type: 'interim', text: value?.draft?.text || '' })
+    } catch {
+      /* a provisional caption failure is non-blocking; the final pass still runs */
+    }
+  }
+
+  const finish = async () => {
+    try {
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      const audioBase64 = await blobToBase64(blob)
+      const value = await transcribeVoice({ conversationId, audioBase64, audioFormat: 'webm_opus', isFinal: true })
+      if (!mountedRef.current) return
+      const text = value?.draft?.text || ''
+      // The interim caption settles into the EDITABLE final draft in the composer.
+      dispatch({ type: 'final', text })
+      onDraft?.(text) // populate the EDITABLE composer; no turn is sent here
+    } catch (error) {
+      if (mountedRef.current) dispatch({ type: 'error', message: error?.message || 'Your recording could not be transcribed.' })
+    } finally {
+      chunksRef.current = []
+      stopTracks()
+    }
+  }
+
+  const start = async () => {
+    if (disabled || !conversationId || state.status === 'listening') return
+    if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === 'undefined') {
+      dispatch({ type: 'error', message: 'This browser cannot capture audio. You can still type your message.' })
+      return
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      const recorder = new window.MediaRecorder(stream)
+      chunksRef.current = []
+      recordingRef.current = true
+      // A chunk delivered DURING the hold drives a live interim caption; a chunk
+      // delivered on stop (recordingRef already false) only accumulates for final.
+      recorder.ondataavailable = (event) => {
+        if (event?.data && event.data.size) chunksRef.current.push(event.data)
+        if (recordingRef.current) emitInterim()
+      }
+      recorder.onstop = () => { finish() }
+      recorderRef.current = recorder
+      // A timeslice makes the recorder emit periodic chunks while held, so an
+      // interim caption can render before release (the relay is request/response,
+      // not a socket — each chunk is a bounded non-final transcription).
+      recorder.start(1200)
+      dispatch({ type: 'press' })
+    } catch {
+      // Permission denial is non-blocking: no audio left this browser.
+      recordingRef.current = false
+      dispatch({ type: 'error', message: 'Microphone access was not granted. You can still type your message.' })
+      stopTracks()
+    }
+  }
+
+  const stop = () => {
+    if (state.status !== 'listening') return
+    // Clear the hold flag BEFORE stopping so the final chunk delivered by stop()
+    // does not fire a stray interim after release.
+    recordingRef.current = false
+    dispatch({ type: 'release' })
+    try { recorderRef.current?.stop() } catch { finish() }
+  }
+
+  const listening = state.status === 'listening'
+  return <div className="voice-ptt">
+    <button type="button" className={`ptt-button ${listening ? 'listening' : ''}`}
+      aria-label="Hold to talk" aria-pressed={listening} disabled={disabled || !conversationId}
+      onPointerDown={start} onPointerUp={stop} onPointerCancel={stop} onPointerLeave={stop}
+      onKeyDown={(event) => { if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) { event.preventDefault(); start() } }}
+      onKeyUp={(event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); stop() } }}>
+      {listening ? 'Listening… release to review' : 'Hold to talk'}
+    </button>
+    {/* Live provisional caption while holding: rendered as its own aria-live
+        region, superseded by the editable final draft in the composer on release. */}
+    {state.interim && <span className="voice-ptt-caption" role="status" aria-live="polite" aria-label="Interim transcript">{state.interim}</span>}
+    <span className="voice-ptt-status" role="status" aria-live="polite">{voiceInputLabel(state)}</span>
+  </div>
+}
+
+// Singleton playback registry: at most ONE ReadAloud may play at a time. Each
+// message renders its own <audio>, so without this a second Play would layer over
+// the first (overlapping audio). Claiming playback interrupts whoever held it —
+// pausing that audio and dispatching `interrupt` to reset its reducer — so message
+// B supersedes message A cleanly. Interrupt changes ONLY transient playback state;
+// no message or conversation state is touched (the no-mutation guarantee holds).
+let _activePlayback = null
+function claimPlayback(entry) {
+  if (_activePlayback && _activePlayback !== entry) _activePlayback.interrupt()
+  _activePlayback = entry
+}
+function releasePlayback(entry) {
+  if (_activePlayback === entry) _activePlayback = null
+}
+
+// Read-aloud: transient TTS playback for one assistant response. Playback moves
+// only local audio status — it NEVER changes the message or conversation. The
+// text stays available before/during/after audio. Autoplay is OPTIONAL and only
+// fires when the operator's saved preference opts in.
+function ReadAloud({ conversationId, turn, autoplayPreference }) {
+  const [state, dispatch] = useReducer(playbackReducer, undefined, initialPlaybackState)
+  const audioRef = useRef(null)
+  const mountedRef = useRef(true)
+  // Stable registry entry for the singleton. `interrupt` stops THIS component's
+  // audio and resets its reducer when another message supersedes it. Refs it
+  // reads (audioRef, dispatch, mountedRef) are stable, so capturing once is safe.
+  const entryRef = useRef(null)
+  if (!entryRef.current) {
+    entryRef.current = {
+      interrupt: () => {
+        try { audioRef.current?.pause() } catch { /* nothing playing */ }
+        if (mountedRef.current) dispatch({ type: 'interrupt' })
+      },
+    }
+  }
+
+  const teardown = () => {
+    const audio = audioRef.current
+    if (audio) { try { audio.pause() } catch { /* nothing playing */ } audioRef.current = null }
+  }
+
+  const play = async () => {
+    const text = turnText(turn)
+    if (!text.trim() || !conversationId) return
+    dispatch({ type: 'load', messageRef: turn.id })
+    try {
+      const value = await speakMessage({ conversationId, messageRef: turn.id, text })
+      if (!mountedRef.current) return
+      teardown()
+      const audio = new window.Audio(`data:audio/${value?.audio_format || 'mp3'};base64,${value?.audio_base64 || ''}`)
+      audioRef.current = audio
+      audio.onended = () => { if (mountedRef.current) dispatch({ type: 'ended' }); releasePlayback(entryRef.current) }
+      audio.onerror = () => { if (mountedRef.current) dispatch({ type: 'error', message: 'Audio playback failed.' }); releasePlayback(entryRef.current) }
+      // Claim the singleton BEFORE starting: this interrupts any other message's
+      // in-progress playback so the two never overlap.
+      claimPlayback(entryRef.current)
+      const started = audio.play?.()
+      if (started?.catch) started.catch(() => { if (mountedRef.current) dispatch({ type: 'error', message: 'Audio playback failed.' }) })
+      dispatch({ type: 'play' })
+    } catch (error) {
+      if (mountedRef.current) dispatch({ type: 'error', message: error?.message || 'Read-aloud could not be produced.' })
+    }
+  }
+
+  const pause = () => { try { audioRef.current?.pause() } catch { /* nothing playing */ } dispatch({ type: 'pause' }) }
+  const resume = () => { const started = audioRef.current?.play?.(); started?.catch?.(() => {}); claimPlayback(entryRef.current); dispatch({ type: 'resume' }) }
+  const stop = () => { const audio = audioRef.current; if (audio) { try { audio.pause(); audio.currentTime = 0 } catch { /* noop */ } } releasePlayback(entryRef.current); dispatch({ type: 'stop' }) }
+  const replay = () => { const audio = audioRef.current; if (audio) { try { audio.currentTime = 0; audio.play?.() } catch { /* noop */ } } if (audioRef.current) { claimPlayback(entryRef.current); dispatch({ type: 'replay', messageRef: turn.id }) } else { play() } }
+
+  useEffect(() => {
+    mountedRef.current = true
+    // Optional autoplay: only when the saved preference opts in, and only for a
+    // FRESHLY-ARRIVED completed assistant response (`turn.fresh`) — never for the
+    // historical turns that mount when a conversation is opened, which would
+    // otherwise autoplay every past message at once. A new response arriving is
+    // the one moment autoplay is expected.
+    if (shouldAutoplay(autoplayPreference) && turn.fresh && turn.role === 'assistant' && turn.status === 'complete') play()
+    const entry = entryRef.current
+    return () => { mountedRef.current = false; teardown(); releasePlayback(entry) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const active = isPlaybackActiveFor(state, turn.id)
+  return <span className="read-aloud">
+    {!active
+      ? <button type="button" aria-label="Read this response aloud" onClick={play}>Play audio</button>
+      : <>
+          {state.status === 'playing' && <button type="button" aria-label="Pause audio" onClick={pause}>Pause</button>}
+          {state.status === 'paused' && <button type="button" aria-label="Resume audio" onClick={resume}>Resume</button>}
+          {(state.status === 'playing' || state.status === 'paused') && <button type="button" aria-label="Stop audio" onClick={stop}>Stop</button>}
+        </>}
+    <button type="button" aria-label="Replay audio" onClick={replay} disabled={state.status === 'loading'}>Replay</button>
+    <span className="read-aloud-status" role="status" aria-live="polite">{playbackLabel(state)}</span>
+  </span>
+}
+
 function ChatView({ append }) {
   const [conversations, setConversations] = useState([])
+  // Saved read-aloud autoplay preference, loaded from the REAL served
+  // `/api/preferences` surface and adapted into the `{voice_autoplay}` shape
+  // `shouldAutoplay` reads. Default OFF until it resolves, and OFF if the surface
+  // is 503/absent — autoplay never fires on a preference the operator did not set.
+  const [voicePreferences, setVoicePreferences] = useState({ voice_autoplay: false })
   const [includeArchived, setIncludeArchived] = useState(false)
   const [query, setQuery] = useState('')
   const [selectedId, setSelectedId] = useState(null)
@@ -644,6 +886,14 @@ function ChatView({ append }) {
     fetchChatRoutes()
       .then((value) => { const list = value.routes || []; setRoutes(list); setRouteId((current) => current || list[0]?.route_id || '') })
       .catch(() => setRoutes([]))
+  }, [])
+  // Load the saved read-aloud autoplay preference from the served
+  // `/api/preferences` payload via the adapter. Tolerant of a 503/absent surface:
+  // any failure keeps the default-OFF state so autoplay is never surprising.
+  useEffect(() => {
+    fetchPreferences()
+      .then((payload) => setVoicePreferences(voiceAutoplayFromPreferences(payload)))
+      .catch(() => setVoicePreferences({ voice_autoplay: false }))
   }, [])
 
   // Focus a sensible target after a row leaves the rail (a11y #6): the first
@@ -709,7 +959,9 @@ function ChatView({ append }) {
       })
       if (!isCurrent()) return // switched away mid-stream: drop this settle entirely
       const status = terminalToStatus(state.terminal)
-      setTurns((current) => [...current, { ...assistant, content: [{ text: state.text }], status }])
+      // `fresh` marks this as a newly-arrived response so ReadAloud may autoplay
+      // it (when the saved preference opts in); historical turns never carry it.
+      setTurns((current) => [...current, { ...assistant, content: [{ text: state.text }], status, fresh: true }])
       setStreamingTurn(null)
       setLifecycle(LIFECYCLE[status] || LIFECYCLE.complete)
       if (state.needsRefresh) {
@@ -764,8 +1016,11 @@ function ChatView({ append }) {
       </header>
       <DeliveryContext context={selected?.context} />
       {advanced && <AdvancedPanel />}
-      <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} /></div>
+      <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} conversationId={selectedId} autoplayPreference={voicePreferences} /></div>
       <div className="chat-live" role="status" aria-live="polite">{lifecycle}</div>
+      {/* Push-to-talk drops an EDITABLE transcript into the composer; a turn is
+          sent only when the actor explicitly submits it below. */}
+      <PushToTalk conversationId={selectedId} onDraft={setDraft} disabled={!selectedId || streaming} />
       <Composer draft={draft} setDraft={setDraft} onSend={send} onCancel={cancel} streaming={streaming} disabled={!selectedId} canSend={canSend} />
     </section>
   </main>

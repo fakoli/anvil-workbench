@@ -293,6 +293,45 @@ function jsonPostWithSignal(path, body, signal) {
   })
 }
 
+// --- Chat voice relay client (chat-first-voice T005.2 / T005.3) ---------------
+//
+// The browser half of the STT/TTS relay (workbench/api.py build_voice_relay_router
+// at /api/chat/voice). Every request is actor-scoped server-side from the trusted
+// tailnet identity, so this client assembles NO actor, token, endpoint, provider
+// key, or credential — only the safe path and a CLOSED body. The relay reaches
+// Anvil Serving only; the browser never talks to a provider.
+//
+// The audio a request carries (STT input) and the audio a response returns (TTS
+// playback) are transient: this module holds no state and nothing is cached, so
+// no audio is ever written to localStorage or a browser cache by this client.
+// The surface fails closed with 503 until the relay is configured; that is
+// surfaced as a distinct, truthful "not configured" Error so the UI degrades
+// truthfully while the textual chat stays fully usable.
+
+// Transcribe one in-memory audio chunk into an EDITABLE draft. It returns
+// `{draft: {text, is_final, duration_ms}}` and creates NO turn — the caller
+// places the draft into the composer for the actor to review, edit, and submit.
+export async function transcribeVoice({ conversationId, audioBase64, audioFormat, isFinal = false, durationMs } = {}) {
+  const body = { conversation_id: conversationId, audio_base64: audioBase64, audio_format: audioFormat, is_final: Boolean(isFinal) }
+  if (durationMs != null) body.duration_ms = durationMs
+  const response = await jsonPost('/api/chat/voice/transcribe', body)
+  if (response.status === 503) throw new Error('Voice input is not configured for this hub')
+  if (!response.ok) throw new Error('Your recording could not be transcribed')
+  return response.json()
+}
+
+// Synthesize transient playback audio for one already-rendered message. It
+// returns `{audio_base64, audio_format, sample_rate}` and mutates NO message
+// state — producing audio changes nothing about the conversation.
+export async function speakMessage({ conversationId, messageRef, text, outputFormat = 'mp3' } = {}) {
+  const body = { conversation_id: conversationId, message_ref: messageRef, text }
+  if (outputFormat) body.output_format = outputFormat
+  const response = await jsonPost('/api/chat/voice/speak', body)
+  if (response.status === 503) throw new Error('Read-aloud is not configured for this hub')
+  if (!response.ok) throw new Error('Read-aloud could not be produced')
+  return response.json()
+}
+
 // --- Delivery-projection explorer client (plan-task-delivery T003) ------------
 //
 // The browser half of the merged, read-only delivery-projection surface
