@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/plugin-catalog.v1.schema.json",
+  "title": "Anvil Workbench reviewed plugin catalog v1",
+  "description": "A reviewed, version-pinned, operator-deployed registry projection of the plugins Workbench may orchestrate. It is not a live marketplace and not a command manifest: every object is closed (additionalProperties:false) and there is no field able to carry a raw shell command, an arbitrary URL/endpoint, a local filesystem path, a generic code/executable body, or a credential value. Each plugin is signed by the operator/owner key as the sole trusted signer and is tamper-evident through `plugin_digest`/`catalog_digest`. Every tool declares a mandatory, machine-checkable effect class and gate set, typed input/output schemas, an opaque host-owned credential reference, and explicitly declared data and host access scopes — an undeclared scope is unrepresentable. A `tool_kind` discriminator gives plugin tools an explicit type that is non-equivalent to an Anvil provider operation (which carries `execution`/`operation_digest`) or a bridge skill (which carries a digest-pinned local body). All prose is untrusted display data, never control instructions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "registry_id", "revision", "catalog_digest", "provenance", "plugins"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,62}$"},
+    "pluginId": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,62}$"},
+    "toolId": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"},
+    "semver": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "rfc3339": {"type": "string", "format": "date-time", "maxLength": 40, "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "scopeName": {
+      "type": "string",
+      "description": "A declared, named access scope. The pattern forbids '://', ':', and '/', so an arbitrary URL, endpoint, or filesystem path can never masquerade as a declared scope.",
+      "pattern": "^[a-z][a-z0-9._-]{1,62}$"
+    },
+    "dataScope": {"enum": ["none", "read_project_metadata", "read_task_context", "read_conversation_context", "write_conversation_annotation"]},
+    "hostAccess": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope_id", "egress"],
+      "description": "A declared, named host-access scope. Egress is either none or mediated wholly by the plugin host; there is deliberately no URL, endpoint, host, or port field, so an arbitrary-URL fetch is unrepresentable.",
+      "properties": {
+        "scope_id": {"$ref": "#/$defs/scopeName"},
+        "egress": {"enum": ["none", "host_mediated"]}
+      }
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement"],
+      "description": "Credential handling is reference-only. A plugin never carries a credential value; when it needs one, it names an owning connector/credential host and opaque references. There is no value, token, key, or password field anywhere.",
+      "properties": {
+        "requirement": {"enum": ["none", "host_owned"]},
+        "owner_host": {"$ref": "#/$defs/identifier"},
+        "credential_refs": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"$ref": "#/$defs/identifier"}}
+      },
+      "allOf": [
+        {"if": {"properties": {"requirement": {"const": "host_owned"}}, "required": ["requirement"]},
+         "then": {"required": ["owner_host", "credential_refs"]}},
+        {"if": {"properties": {"requirement": {"const": "none"}}, "required": ["requirement"]},
+         "then": {"not": {"anyOf": [{"required": ["owner_host"]}, {"required": ["credential_refs"]}]}}}
+      ]
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preview", "confirmation", "human_approval"],
+      "description": "Mandatory, machine-checkable gate set for every tool (criterion 2).",
+      "properties": {
+        "preview": {"enum": ["not_supported", "optional", "required"]},
+        "confirmation": {"enum": ["not_required", "required"]},
+        "human_approval": {"enum": ["not_required", "required"]},
+        "approval_action": {"type": ["string", "null"], "enum": ["invoke_effect_tool", "install_plugin", "upgrade_plugin", "downgrade_plugin", null]}
+      },
+      "allOf": [
+        {"if": {"properties": {"human_approval": {"const": "required"}}, "required": ["human_approval"]},
+         "then": {"required": ["approval_action"], "properties": {"approval_action": {"type": "string"}}}},
+        {"if": {"properties": {"human_approval": {"const": "not_required"}}, "required": ["human_approval"]},
+         "then": {"properties": {"approval_action": {"const": null}}}}
+      ]
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_kind", "tool_id", "title", "summary", "effect", "gates", "input_schema", "output_schema", "data_access", "host_access", "receipts", "idempotency", "docs"],
+      "description": "One reviewed plugin tool. `tool_kind` is the explicit type discriminator (criterion 3): a plugin tool is not an Anvil provider operation and not a bridge skill. The closed object has no execution/bridge_adapter/operation_digest field (which would make it an operation) and no skill body/path field (which would make it a skill).",
+      "properties": {
+        "tool_kind": {
+          "enum": ["plugin_tool", "read_only_connector"],
+          "description": "criterion 3: the non-equivalent type. `read_only_connector` marks a tool compiled from a digest-pinned OpenAPI document at review time (R016) and is constrained to the read effect class."
+        },
+        "tool_id": {"$ref": "#/$defs/toolId"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "effect": {
+          "enum": ["read", "external_effect", "state_mutation"],
+          "description": "Mandatory effect class (criterion 2). There is deliberately no policy_mutation, code_execution, or bounded_execution class: a plugin tool can never change policy or run generic code."
+        },
+        "gates": {"$ref": "#/$defs/gates"},
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object"},
+        "data_access": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"$ref": "#/$defs/dataScope"}},
+        "host_access": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/hostAccess"}},
+        "cancellation": {
+          "enum": ["not_applicable", "cooperative", "unknown_outcome"],
+          "description": "R012: how an in-flight external call behaves when the plugin is disabled or removed. `unknown_outcome` routes to reconciliation rather than a false success."
+        },
+        "receipts": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}},
+        "idempotency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key_scope", "replay", "max_attempts"],
+          "properties": {
+            "key_scope": {"enum": ["tool_call", "approval_payload"]},
+            "replay": {"enum": ["return_prior_receipt", "reconcile", "not_supported"]},
+            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 5}
+          }
+        },
+        "docs": {"type": "string", "minLength": 1, "maxLength": 500}
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "version", "plugin_digest", "publisher", "description", "runtime", "support_status", "credential", "data_access", "host_access", "retention", "tools", "docs"],
+      "properties": {
+        "id": {"$ref": "#/$defs/pluginId"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "version": {"$ref": "#/$defs/semver"},
+        "plugin_digest": {"$ref": "#/$defs/sha256"},
+        "publisher": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "kind"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1, "maxLength": 160},
+            "kind": {"enum": ["first_party", "reviewed_third_party"]}
+          }
+        },
+        "description": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "api_version", "min_host_version"],
+          "description": "R002: the declared runtime and version window. An unsupported runtime version fails a downstream host compatibility check machine-checkably.",
+          "properties": {
+            "kind": {"enum": ["connector", "mcp_server", "native_tool"]},
+            "api_version": {"$ref": "#/$defs/semver"},
+            "min_host_version": {"$ref": "#/$defs/semver"}
+          }
+        },
+        "support_status": {"enum": ["supported", "deprecated", "end_of_life"]},
+        "credential": {"$ref": "#/$defs/credential"},
+        "data_access": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"$ref": "#/$defs/dataScope"}},
+        "host_access": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/hostAccess"}},
+        "retention": {"enum": ["none", "ephemeral", "host_retained"]},
+        "openapi_source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["document_digest", "compiled_at"],
+          "description": "R016: provenance that this plugin's read-only connector tools were compiled from a digest-pinned OpenAPI document at review time. It carries the reviewed document's digest only — never a live URL or the document body.",
+          "properties": {
+            "document_digest": {"$ref": "#/$defs/sha256"},
+            "compiled_at": {"$ref": "#/$defs/rfc3339"}
+          }
+        },
+        "tools": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/tool"}},
+        "docs": {"type": "string", "minLength": 1, "maxLength": 500}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-plugin-catalog/v1"},
+    "registry_id": {"$ref": "#/$defs/identifier"},
+    "revision": {"$ref": "#/$defs/semver"},
+    "catalog_digest": {"$ref": "#/$defs/sha256"},
+    "generated_at": {"$ref": "#/$defs/rfc3339"},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signer_kind", "key_id", "reviewed_at"],
+      "description": "R001: the operator/owner key is the sole trusted signer. `signer_kind` is const-pinned so a browser- or hub-supplied catalog signed by any other authority is unrepresentable. Signatures are intentionally deferred (see DIGESTING.md); the operator's configured local catalog bytes and this reviewed provenance are the trust root, and the digest is the tamper-evidence.",
+      "properties": {
+        "signer_kind": {"const": "operator_owner_key"},
+        "key_id": {"$ref": "#/$defs/identifier"},
+        "reviewed_at": {"$ref": "#/$defs/rfc3339"}
+      }
+    },
+    "plugins": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"$ref": "#/$defs/plugin"}}
+  }
+}

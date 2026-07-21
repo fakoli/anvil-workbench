@@ -42,6 +42,11 @@ These resources are the implementation-facing companion to
 | State whether a scoped task may enter a Deliver flow, with stable blocked/stale codes and human-safe explanations | [delivery eligibility](schemas/delivery-eligibility.v1.schema.json) | [delivery eligibility](examples/delivery-eligibility.v1.json) |
 | Start delivering a scoped task with an idempotent, ids-only Deliver intent | [deliver intent](schemas/deliver-intent.v1.schema.json) | [deliver intent](examples/deliver-intent.v1.json) |
 | Acknowledge a Deliver intent with a typed accepted/duplicate/denied start receipt | [deliver start receipt](schemas/deliver-start-receipt.v1.schema.json) | [start receipt](examples/deliver-start-receipt.v1.json), [start refusal](examples/deliver-start-receipt.refusal.v1.json) |
+| Publish a reviewed, operator-signed registry of installable plugins with typed tools, effect classes, gates, and reference-only credentials | [plugin catalog](schemas/plugin-catalog.v1.schema.json) | [plugin catalog](examples/plugin.catalog.v1.json) |
+| Scope which installed plugin tools one project or chat may enable, by pinned id/digest | [plugin capability](schemas/plugin-capability.v1.schema.json) | [plugin capability](examples/plugin.capability.v1.json) |
+| Invoke a plugin tool or run a lifecycle action with an idempotent, ids-only request | [plugin request](schemas/plugin-request.v1.schema.json) | [tool call](examples/plugin.request.tool-call.v1.json), [install](examples/plugin.request.install.v1.json) |
+| Show the redacted, hash-bound effect an owner approves before a gated plugin action | [plugin preview](schemas/plugin-preview.v1.schema.json) | [install preview](examples/plugin.preview.v1.json) |
+| Return the typed, redacted evidence for one plugin request with reference-only credential use | [plugin receipt](schemas/plugin-receipt.v1.schema.json) | [tool receipt](examples/plugin.receipt.v1.json), [refusal receipt](examples/plugin.receipt.refusal.v1.json) |
 
 ## Normative conventions
 
@@ -144,6 +149,37 @@ These resources are the implementation-facing companion to
     any Advanced resource; there is no effectful, plugin-lifecycle, generic-HTTP,
     or arbitrary-schema tool. Advanced records are hub-durable records and carry
     no delivery or State authority.
+
+13. A plugin catalog (`plugin-catalog.v1`) is a reviewed, operator-signed,
+    version-pinned registry projection — there is no live remote marketplace.
+    Every object is closed, so a raw shell command, an arbitrary URL/endpoint, a
+    local path, a generic code/executable body, or a credential value is
+    unrepresentable; host and data access are declared named scopes, never URLs,
+    and an undeclared scope cannot ride in. A credential is a host-owned opaque
+    reference, never a value. Each tool declares a mandatory, machine-checkable
+    effect class (`read`, `external_effect`, or `state_mutation` — never
+    `policy_mutation` or code execution) and gate set, and a `tool_kind`
+    discriminator that gives a plugin tool an explicit type non-equivalent to an
+    Anvil provider operation (which carries `execution`/`operation_digest`) or a
+    bridge skill (which carries a digest-pinned local body). Every plugin and the
+    catalog are tamper-evident (`plugin_digest`/`catalog_digest`);
+    `workbench.contracts.validate_plugin_catalog` recomputes both and enforces
+    that an effect-capable tool is preview/approval-shaped, a read tool is
+    ungated, and a `read_only_connector` tool stays read-only and pins its
+    reviewed OpenAPI document digest (R016). A plugin capability profile
+    (`plugin-capability.v1`) is a digest-bound `enable_only` allowlist that can
+    only enable installed, pinned plugin tools — never install one or grant a new
+    privilege. A plugin request (`plugin-request.v1`) is an ids/typed-inputs-only
+    record whose `request_digest` is the idempotency key; an `install`,
+    `upgrade`, or `downgrade` always carries a hash-bound owner approval binding
+    its exact plugin/version subject (the R003 floor), and a `tool_call`'s typed
+    inputs validate against the reviewed tool schema at the host. A preview
+    (`plugin-preview.v1`) is the redacted, hash-bound artifact an owner reviews
+    before consuming that approval; a receipt (`plugin-receipt.v1`) is the typed,
+    redacted, audit-preserving outcome whose credential use is reported by opaque
+    reference only (R004) and whose `reconcile` status carries an in-flight
+    external effect's unknown outcome to reconciliation (R012). Plugin records
+    carry no delivery or State authority.
 
 ## Contract-extension checklist
 

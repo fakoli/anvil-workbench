@@ -58,6 +58,13 @@ SCHEMA_FOR_EXAMPLE = {
     "deliver-intent.v1.json": "deliver-intent.v1.schema.json",
     "deliver-start-receipt.v1.json": "deliver-start-receipt.v1.schema.json",
     "deliver-start-receipt.refusal.v1.json": "deliver-start-receipt.v1.schema.json",
+    "plugin.catalog.v1.json": "plugin-catalog.v1.schema.json",
+    "plugin.capability.v1.json": "plugin-capability.v1.schema.json",
+    "plugin.request.tool-call.v1.json": "plugin-request.v1.schema.json",
+    "plugin.request.install.v1.json": "plugin-request.v1.schema.json",
+    "plugin.preview.v1.json": "plugin-preview.v1.schema.json",
+    "plugin.receipt.v1.json": "plugin-receipt.v1.schema.json",
+    "plugin.receipt.refusal.v1.json": "plugin-receipt.v1.schema.json",
 }
 
 

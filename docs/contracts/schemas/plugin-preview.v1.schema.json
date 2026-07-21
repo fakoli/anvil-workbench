@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/plugin-preview.v1.schema.json",
+  "title": "Anvil Workbench plugin preview v1",
+  "description": "The typed, redacted preview the plugin host returns before an effect-capable plugin request is authorized. It echoes the previewed request's `request_digest`, enumerates the bounded changes the effect would make, and carries the hash-bound approval binding for a gated action. An `install`, `upgrade`, or `downgrade` preview always declares approval required with a `payload_hash` that binds the exact request subject (R003 floor). Every object is closed and every human-readable field is a bounded, non-leaking safe string: no local path, raw command, URL/endpoint, credential, or unredacted payload is representable. It grants nothing on its own — it is the reviewable artifact an owner inspects before consuming a one-time approval. All prose is untrusted display data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "preview_id", "request_digest", "kind", "plugin", "effect", "summary", "changes", "approval", "redaction"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "pluginId": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,62}$"},
+    "toolId": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"},
+    "safeText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 400,
+      "description": "A bounded, human-safe string. The negative lookahead refuses a URL, host path, backslash, or credential shape so a preview line can never carry a raw endpoint, path, or token into the UI.",
+      "pattern": "^(?!.*(?:://|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\\\|[Bb]earer\\s|\\bsk-|\\bghp_|\\bxox|authorization|api[_-]?key|secret|token\\s*[:=])).{1,400}$"
+    },
+    "pluginRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plugin_id", "plugin_digest"],
+      "properties": {
+        "plugin_id": {"$ref": "#/$defs/pluginId"},
+        "plugin_digest": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-plugin-preview/v1"},
+    "preview_id": {"type": "string", "pattern": "^plugprev_[a-zA-Z0-9_-]{8,128}$"},
+    "request_digest": {"$ref": "#/$defs/sha256"},
+    "kind": {"enum": ["tool_call", "install", "upgrade", "downgrade", "disable", "remove"]},
+    "plugin": {"$ref": "#/$defs/pluginRef"},
+    "tool_id": {"$ref": "#/$defs/toolId"},
+    "effect": {"enum": ["read", "external_effect", "state_mutation", "plugin_lifecycle"]},
+    "summary": {"$ref": "#/$defs/safeText"},
+    "changes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "description": "The bounded, typed set of changes the effect would make, so an owner reviews a precise diff rather than a prose claim.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["change_kind", "detail"],
+        "properties": {
+          "change_kind": {"enum": ["version_change", "permission_grant", "data_scope", "host_scope", "tool_added", "tool_removed", "credential_binding", "external_call"]},
+          "detail": {"$ref": "#/$defs/safeText"}
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required"],
+      "description": "The hash-bound approval binding. When required, `payload_hash` binds the exact typed subject of the previewed request and `action` names the catalog approval action. workbench.contracts.validate_plugin_preview enforces the R003 floor: an install/upgrade/downgrade preview must declare approval required with a bound payload hash.",
+      "properties": {
+        "required": {"type": "boolean"},
+        "action": {"enum": ["invoke_effect_tool", "install_plugin", "upgrade_plugin", "downgrade_plugin"]},
+        "payload_hash": {"$ref": "#/$defs/sha256"}
+      },
+      "allOf": [
+        {"if": {"properties": {"required": {"const": true}}, "required": ["required"]},
+         "then": {"required": ["action", "payload_hash"]}}
+      ]
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["redacted", "metadata_only"]}
+      }
+    }
+  }
+}

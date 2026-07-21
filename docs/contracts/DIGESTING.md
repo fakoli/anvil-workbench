@@ -32,6 +32,10 @@ render it as lowercase `sha256:<64 hex>`.
 | Settings descriptor catalog | `anvil-workbench/settings-descriptor/v1\0` | Omit `catalog_digest`; sort `settings` by `id`. Preserve `scope_precedence` order (it encodes the total precedence, not a set). |
 | Advanced preset | `anvil-workbench/advanced-preset/v1\0` | Omit `preset_digest` and the volatile `repair` block; sort `control_values` by `name` and `tools` by `tool_id`. Drift is detected by comparing the preset's pinned route/profile/tool digests to live digests, never by the digest changing. |
 | Deliver intent | `anvil-workbench/deliver-intent/v1\0` | Omit `intent_digest`; sort `selections.catalogs` by `provider` and `selections.skills` by `(id, digest)`. The digest is the hub's idempotency key: replaying an identical intent starts the same run, and a mutated intent recomputes to a different key. |
+| Plugin | `anvil-workbench/plugin/v1\0` | Omit its `plugin_digest`. A plugin's own `tools` order is preserved: reordering a plugin's tools is a content change to that plugin and legitimately changes its `plugin_digest`. |
+| Plugin catalog | `anvil-workbench/plugin-catalog/v1\0` | Omit `catalog_digest` and volatile `generated_at`; sort `plugins` by `(id, plugin_digest)`. The catalog includes each checked plugin digest, mirroring the provider-catalog/operation relationship. |
+| Plugin capability profile | `anvil-workbench/plugin-capability/v1\0` | Omit `digest`; sort the `plugins` allowlist by `(plugin_id, plugin_digest)` and each entry's `enabled_tools` lexicographically. |
+| Plugin request | `anvil-workbench/plugin-request/v1\0` | Omit `request_digest`; the tool-call `inputs` are an object, so canonical JSON already sorts their keys. The digest is the hub's idempotency key: replaying an identical request is the same action, and a mutated request recomputes to a different key. A lifecycle approval binds the request's exact typed subject through `approval-payload/v1`, not the whole request. |
 
 All documented sort rules use plain code-point lexicographic string
 comparison — no numeric, locale, or case-insensitive collation (so `T002.10`

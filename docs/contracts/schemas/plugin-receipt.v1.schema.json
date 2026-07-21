@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/plugin-receipt.v1.schema.json",
+  "title": "Anvil Workbench plugin receipt v1",
+  "description": "The typed, redacted receipt the plugin host returns for one plugin request (a tool call or a lifecycle action). It echoes the request's `request_digest` and reports one outcome: `accepted` (the effect completed), `duplicate` (an idempotent replay of an already-completed request), `denied` (a fail-closed preflight refusal), or `reconcile` (an unknown outcome for an in-flight external effect, per the declared cancellation policy — R012). It is an audit-preserving record: every object is closed, credential use is reported by opaque host-owned reference only (never a value — R004), and every human-readable field is a bounded non-leaking safe string, so no endpoint, path, credential, or unredacted tool payload is representable. All prose is untrusted display data. This is a hub-durable audit record, not a contract-digest-bearing snapshot.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "receipt_id", "request_digest", "kind", "plugin", "status", "effect", "redaction"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,62}$"},
+    "pluginId": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,62}$"},
+    "toolId": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._][a-z0-9]+)*$"},
+    "rfc3339": {"type": "string", "format": "date-time", "maxLength": 40, "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "safeText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 400,
+      "pattern": "^(?!.*(?:://|[A-Za-z]:[\\/]|/(?:home|users|etc|var|tmp)/|\\\\|[Bb]earer\\s|\\bsk-|\\bghp_|\\bxox|authorization|api[_-]?key|secret|token\\s*[:=])).{1,400}$"
+    },
+    "pluginRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plugin_id", "plugin_digest"],
+      "properties": {
+        "plugin_id": {"$ref": "#/$defs/pluginId"},
+        "plugin_digest": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-plugin-receipt/v1"},
+    "receipt_id": {"type": "string", "pattern": "^plugrcpt_[a-zA-Z0-9_-]{8,128}$"},
+    "request_digest": {"$ref": "#/$defs/sha256"},
+    "kind": {"enum": ["tool_call", "install", "upgrade", "downgrade", "disable", "remove"]},
+    "plugin": {"$ref": "#/$defs/pluginRef"},
+    "tool_id": {"$ref": "#/$defs/toolId"},
+    "status": {"enum": ["accepted", "duplicate", "denied", "reconcile"]},
+    "effect": {"enum": ["read", "external_effect", "state_mutation", "plugin_lifecycle"]},
+    "credential_use": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement"],
+      "description": "R004: credential use is reported by opaque host-owned reference only. There is no value, token, key, or password field; the browser and model never receive credential material.",
+      "properties": {
+        "requirement": {"enum": ["none", "host_owned"]},
+        "owner_host": {"$ref": "#/$defs/identifier"},
+        "credential_refs": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"$ref": "#/$defs/identifier"}}
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["output_digest"],
+      "description": "Present on accepted/duplicate. The tool output is reduced to an opaque digest plus a bounded safe summary; the raw payload never enters the receipt.",
+      "properties": {
+        "output_digest": {"$ref": "#/$defs/sha256"},
+        "output_summary": {"$ref": "#/$defs/safeText"},
+        "produced_receipts": {"type": "array", "maxItems": 16, "items": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{1,127}$"}}
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "safe_summary", "retryable"],
+      "description": "Present on denied. A stable code plus a human-safe summary.",
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,63}$"},
+        "safe_summary": {"$ref": "#/$defs/safeText"},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "safe_summary"],
+      "description": "Present on reconcile (R012): an in-flight external effect with an unknown outcome, routed to reconciliation rather than reported as a false success.",
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,63}$"},
+        "safe_summary": {"$ref": "#/$defs/safeText"}
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["redacted", "metadata_only"]}
+      }
+    },
+    "completed_at": {"$ref": "#/$defs/rfc3339"}
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"const": "accepted"}}, "required": ["status"]},
+     "then": {"required": ["result"], "not": {"anyOf": [{"required": ["error"]}, {"required": ["reconciliation"]}]}}},
+    {"if": {"properties": {"status": {"const": "duplicate"}}, "required": ["status"]},
+     "then": {"required": ["result"], "not": {"anyOf": [{"required": ["error"]}, {"required": ["reconciliation"]}]}}},
+    {"if": {"properties": {"status": {"const": "denied"}}, "required": ["status"]},
+     "then": {"required": ["error"], "not": {"anyOf": [{"required": ["result"]}, {"required": ["reconciliation"]}]}}},
+    {"if": {"properties": {"status": {"const": "reconcile"}}, "required": ["status"]},
+     "then": {"required": ["reconciliation"], "not": {"anyOf": [{"required": ["result"]}, {"required": ["error"]}]}}}
+  ]
+}
