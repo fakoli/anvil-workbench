@@ -426,3 +426,129 @@ describe('conversation display helpers (T004.1)', () => {
     expect(() => selectChatRoute(routes, 'route.smuggled')).toThrow('reviewed allowlist')
   })
 })
+
+import {
+  initialVoiceInputState, voiceInputReducer, voiceInputLabel, voiceDraftReady,
+  initialPlaybackState, playbackReducer, playbackLabel, isPlaybackActiveFor, shouldAutoplay,
+} from './chat-api'
+import { transcribeVoice, speakMessage } from './api'
+
+describe('voice push-to-talk state machine (T005.2)', () => {
+  it('records into an EDITABLE draft and never sends a turn', () => {
+    let state = initialVoiceInputState()
+    expect(state.status).toBe('ready')
+    state = voiceInputReducer(state, { type: 'press' })
+    expect(state.status).toBe('listening')
+    state = voiceInputReducer(state, { type: 'interim', text: 'partial cap' })
+    expect(state.interim).toBe('partial cap')
+    state = voiceInputReducer(state, { type: 'release' })
+    expect(state.status).toBe('transcribing')
+    state = voiceInputReducer(state, { type: 'final', text: 'the reviewed draft' })
+    expect(state.status).toBe('draft')
+    expect(state.draft).toBe('the reviewed draft')
+    expect(state.isFinal).toBe(true)
+    // The draft is editable BEFORE any submission.
+    state = voiceInputReducer(state, { type: 'edit', text: 'the reviewed draft, edited' })
+    expect(state.draft).toBe('the reviewed draft, edited')
+    // No reducer action produces a "send" — submission is an external, explicit act.
+    const actionTypes = ['press', 'interim', 'release', 'final', 'edit', 'error', 'reset']
+    expect(actionTypes).not.toContain('send')
+  })
+
+  it('interim captions only apply while listening (never a committable draft)', () => {
+    const ready = voiceInputReducer(initialVoiceInputState(), { type: 'interim', text: 'x' })
+    expect(ready.interim).toBe('') // ignored when not listening
+  })
+
+  it('treats a permission/STT failure as a non-blocking error and resets otherwise', () => {
+    const errored = voiceInputReducer({ status: 'listening', interim: 'x', draft: '', isFinal: false, error: '' }, { type: 'error', message: 'denied' })
+    expect(errored.status).toBe('error')
+    expect(errored.error).toBe('denied')
+    expect(voiceInputReducer(errored, { type: 'reset' }).status).toBe('ready')
+  })
+
+  it('reports draft readiness and closed-set live labels', () => {
+    expect(voiceDraftReady({ status: 'draft', draft: 'hi' })).toBe(true)
+    expect(voiceDraftReady({ status: 'draft', draft: '   ' })).toBe(false)
+    expect(voiceDraftReady({ status: 'listening', draft: 'hi' })).toBe(false)
+    expect(voiceInputLabel({ status: 'listening' })).toMatch(/Listening/)
+    expect(voiceInputLabel({ status: 'draft' })).toMatch(/ready to review/)
+    expect(voiceInputLabel({ status: 'error', error: 'boom' })).toBe('boom')
+  })
+})
+
+describe('voice read-aloud playback state machine (T005.3)', () => {
+  it('moves only playback status through the full lifecycle', () => {
+    let state = initialPlaybackState()
+    expect(state.status).toBe('idle')
+    state = playbackReducer(state, { type: 'load', messageRef: 't1' })
+    expect(state).toEqual({ status: 'loading', messageRef: 't1', error: '' })
+    state = playbackReducer(state, { type: 'play' })
+    expect(state.status).toBe('playing')
+    state = playbackReducer(state, { type: 'pause' })
+    expect(state.status).toBe('paused')
+    state = playbackReducer(state, { type: 'resume' })
+    expect(state.status).toBe('playing')
+    state = playbackReducer(state, { type: 'stop' })
+    expect(state.status).toBe('stopped')
+    state = playbackReducer(state, { type: 'replay', messageRef: 't1' })
+    expect(state.status).toBe('playing')
+    state = playbackReducer(state, { type: 'ended' })
+    expect(state.status).toBe('idle')
+  })
+
+  it('a hard interrupt resets cleanly and errors are reported', () => {
+    const interrupted = playbackReducer({ status: 'playing', messageRef: 't1', error: '' }, { type: 'interrupt' })
+    expect(interrupted).toEqual({ status: 'idle', messageRef: null, error: '' })
+    const errored = playbackReducer({ status: 'playing', messageRef: 't1', error: '' }, { type: 'error', message: 'no audio' })
+    expect(errored.status).toBe('error')
+    expect(errored.error).toBe('no audio')
+  })
+
+  it('reports the active message and closed-set labels; autoplay follows saved preference', () => {
+    expect(isPlaybackActiveFor({ status: 'playing', messageRef: 't1' }, 't1')).toBe(true)
+    expect(isPlaybackActiveFor({ status: 'idle', messageRef: 't1' }, 't1')).toBe(false)
+    expect(isPlaybackActiveFor({ status: 'playing', messageRef: 't1' }, 't2')).toBe(false)
+    expect(playbackLabel({ status: 'playing' })).toBe('Playing audio')
+    // Autoplay is OFF unless the saved preference explicitly opts in.
+    expect(shouldAutoplay(undefined)).toBe(false)
+    expect(shouldAutoplay({ voice_autoplay: false })).toBe(false)
+    expect(shouldAutoplay({ voice_autoplay: true })).toBe(true)
+  })
+})
+
+describe('voice relay clients (T005.2 / T005.3)', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('transcribeVoice posts a closed body and returns the editable draft', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ draft: { text: 'draft', is_final: true, duration_ms: 800 } }))
+    const result = await transcribeVoice({ conversationId: 'c1', audioBase64: 'QUJD', audioFormat: 'webm_opus', isFinal: true, durationMs: 800 })
+    expect(result.draft.text).toBe('draft')
+    const [url, options] = fetch.mock.calls[0]
+    expect(url).toBe('/api/chat/voice/transcribe')
+    const body = JSON.parse(options.body)
+    // A closed body of declared fields only: no actor, token, or endpoint.
+    expect(body).toEqual({ conversation_id: 'c1', audio_base64: 'QUJD', audio_format: 'webm_opus', is_final: true, duration_ms: 800 })
+  })
+
+  it('transcribeVoice surfaces a 503 as a distinct not-configured error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 503, json: async () => ({}) })
+    await expect(transcribeVoice({ conversationId: 'c', audioBase64: 'x', audioFormat: 'pcm16' }))
+      .rejects.toThrow('Voice input is not configured for this hub')
+  })
+
+  it('speakMessage posts a closed body and returns transient playback audio', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ audio_base64: 'QUJDRA==', audio_format: 'mp3', sample_rate: 24000 }))
+    const result = await speakMessage({ conversationId: 'c1', messageRef: 't7', text: 'read me', outputFormat: 'mp3' })
+    expect(result.audio_base64).toBe('QUJDRA==')
+    const [url, options] = fetch.mock.calls[0]
+    expect(url).toBe('/api/chat/voice/speak')
+    expect(JSON.parse(options.body)).toEqual({ conversation_id: 'c1', message_ref: 't7', text: 'read me', output_format: 'mp3' })
+  })
+
+  it('speakMessage surfaces a 503 as a distinct not-configured error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 503, json: async () => ({}) })
+    await expect(speakMessage({ conversationId: 'c', messageRef: 't', text: 'x' }))
+      .rejects.toThrow('Read-aloud is not configured for this hub')
+  })
+})

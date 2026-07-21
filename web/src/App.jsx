@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import {
   addDirective, approve, bootstrap, createProject, createSession, fetchRoutes, probeSkills,
   runSandbox, searchEvidence, startWorkflow, taskLineage, voiceSocketUrl,
@@ -6,8 +6,13 @@ import {
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
+  transcribeVoice, speakMessage,
 } from './api'
-import { describeConversation, selectChatRoute, successorTurnBody, terminalToStatus } from './chat-api'
+import {
+  describeConversation, selectChatRoute, successorTurnBody, terminalToStatus,
+  initialVoiceInputState, voiceInputReducer, voiceInputLabel, voiceDraftReady,
+  initialPlaybackState, playbackReducer, playbackLabel, isPlaybackActiveFor, shouldAutoplay,
+} from './chat-api'
 import SettingsView from './settings-view'
 import {
   deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
@@ -514,7 +519,7 @@ function AdvancedPanel() {
   </section>
 }
 
-function TurnView({ turn, onRetry, onBranch, streamActive }) {
+function TurnView({ turn, onRetry, onBranch, streamActive, conversationId, autoplayPreference }) {
   const text = turnText(turn)
   const streaming = turn.status === 'streaming'
   const distinct = !streaming && turn.status !== 'complete'
@@ -526,22 +531,25 @@ function TurnView({ turn, onRetry, onBranch, streamActive }) {
       {streaming && <span className="turn-status streaming">streaming…</span>}
       {distinct && <span className={`turn-status turn-status-${turn.status}`}>{turn.status}</span>}
     </div>
+    {/* The text stays available before/during/after any audio playback. */}
     <p className="turn-text">{text || (streaming ? '…' : '')}</p>
     {/* Successor actions are disabled while a stream is in flight (a11y #12): a
         retry/branch cannot be issued against history that is still settling. */}
     {turn.role === 'assistant' && !streaming && <div className="turn-actions">
       <button aria-label="Retry this response" disabled={streamActive} onClick={() => onRetry(turn)}>Retry</button>
       <button aria-label="Branch from this response" disabled={streamActive} onClick={() => onBranch(turn)}>Branch</button>
+      {/* Read-aloud is transient playback that never mutates this message. */}
+      {text.trim() && conversationId && <ReadAloud conversationId={conversationId} turn={turn} autoplayPreference={autoplayPreference} />}
     </div>}
   </li>
 }
 
-function Transcript({ selected, turns, streamingTurn, onRetry, onBranch }) {
+function Transcript({ selected, turns, streamingTurn, onRetry, onBranch, conversationId, autoplayPreference }) {
   if (!selected) return <div className="chat-empty" role="region" aria-label="No conversation selected"><h2>Select or start a conversation</h2><p>Your conversations are private to you and stay on the tailnet.</p></div>
   const rendered = streamingTurn ? [...turns, streamingTurn] : turns
   if (rendered.length === 0) return <div className="chat-empty" role="region" aria-label="Empty conversation"><h2>No messages yet</h2><p>Send the first message to start this conversation.</p></div>
   const streamActive = Boolean(streamingTurn)
-  return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} streamActive={streamActive} />)}</ol>
+  return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} streamActive={streamActive} conversationId={conversationId} autoplayPreference={autoplayPreference} />)}</ol>
 }
 
 function Composer({ draft, setDraft, onSend, onCancel, streaming, disabled, canSend }) {
@@ -585,7 +593,161 @@ function RouteSelect({ routes, routeId, onChange }) {
   </label>
 }
 
-function ChatView({ append }) {
+// --- Voice push-to-talk + read-aloud (chat-first-voice T005.2 / T005.3) -------
+//
+// The IMPURE edges of the voice slice: microphone capture and audio playback.
+// The record/draft and playback STATE lives in the pure reducers in chat-api.js;
+// these components only wire the browser media APIs to those reducers. Both
+// degrade truthfully when the relay is unconfigured (a 503 becomes textual error
+// state) and NEVER block the textual chat.
+
+async function blobToBase64(blob) {
+  const buffer = await blob.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
+  return window.btoa(binary)
+}
+
+// Push-to-talk: hold to record, release to transcribe into an EDITABLE draft
+// dropped into the composer. It NEVER sends a turn — the actor reviews, edits,
+// and submits through the ordinary composer. Permission denial or an STT failure
+// is a non-blocking textual error; the composer stays usable throughout.
+function PushToTalk({ conversationId, onDraft, disabled }) {
+  const [state, dispatch] = useReducer(voiceInputReducer, undefined, initialVoiceInputState)
+  const recorderRef = useRef(null)
+  const chunksRef = useRef([])
+  const streamRef = useRef(null)
+  const mountedRef = useRef(true)
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; stopTracks() } }, [])
+
+  const stopTracks = () => {
+    streamRef.current?.getTracks?.().forEach((track) => { try { track.stop() } catch { /* already stopped */ } })
+    streamRef.current = null
+  }
+
+  const finish = async () => {
+    try {
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      const audioBase64 = await blobToBase64(blob)
+      const value = await transcribeVoice({ conversationId, audioBase64, audioFormat: 'webm_opus', isFinal: true })
+      if (!mountedRef.current) return
+      const text = value?.draft?.text || ''
+      dispatch({ type: 'final', text })
+      onDraft?.(text) // populate the EDITABLE composer; no turn is sent here
+    } catch (error) {
+      if (mountedRef.current) dispatch({ type: 'error', message: error?.message || 'Your recording could not be transcribed.' })
+    } finally {
+      chunksRef.current = []
+      stopTracks()
+    }
+  }
+
+  const start = async () => {
+    if (disabled || !conversationId || state.status === 'listening') return
+    if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === 'undefined') {
+      dispatch({ type: 'error', message: 'This browser cannot capture audio. You can still type your message.' })
+      return
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+      const recorder = new window.MediaRecorder(stream)
+      chunksRef.current = []
+      recorder.ondataavailable = (event) => { if (event?.data && event.data.size) chunksRef.current.push(event.data) }
+      recorder.onstop = () => { finish() }
+      recorderRef.current = recorder
+      recorder.start()
+      dispatch({ type: 'press' })
+    } catch {
+      // Permission denial is non-blocking: no audio left this browser.
+      dispatch({ type: 'error', message: 'Microphone access was not granted. You can still type your message.' })
+      stopTracks()
+    }
+  }
+
+  const stop = () => {
+    if (state.status !== 'listening') return
+    dispatch({ type: 'release' })
+    try { recorderRef.current?.stop() } catch { finish() }
+  }
+
+  const listening = state.status === 'listening'
+  return <div className="voice-ptt">
+    <button type="button" className={`ptt-button ${listening ? 'listening' : ''}`}
+      aria-label="Hold to talk" aria-pressed={listening} disabled={disabled || !conversationId}
+      onPointerDown={start} onPointerUp={stop} onPointerCancel={stop} onPointerLeave={stop}
+      onKeyDown={(event) => { if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) { event.preventDefault(); start() } }}
+      onKeyUp={(event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); stop() } }}>
+      {listening ? 'Listening… release to review' : 'Hold to talk'}
+    </button>
+    <span className="voice-ptt-status" role="status" aria-live="polite">{voiceInputLabel(state)}</span>
+  </div>
+}
+
+// Read-aloud: transient TTS playback for one assistant response. Playback moves
+// only local audio status — it NEVER changes the message or conversation. The
+// text stays available before/during/after audio. Autoplay is OPTIONAL and only
+// fires when the operator's saved preference opts in.
+function ReadAloud({ conversationId, turn, autoplayPreference }) {
+  const [state, dispatch] = useReducer(playbackReducer, undefined, initialPlaybackState)
+  const audioRef = useRef(null)
+  const mountedRef = useRef(true)
+
+  const teardown = () => {
+    const audio = audioRef.current
+    if (audio) { try { audio.pause() } catch { /* nothing playing */ } audioRef.current = null }
+  }
+
+  const play = async () => {
+    const text = turnText(turn)
+    if (!text.trim() || !conversationId) return
+    dispatch({ type: 'load', messageRef: turn.id })
+    try {
+      const value = await speakMessage({ conversationId, messageRef: turn.id, text })
+      if (!mountedRef.current) return
+      teardown()
+      const audio = new window.Audio(`data:audio/${value?.audio_format || 'mp3'};base64,${value?.audio_base64 || ''}`)
+      audioRef.current = audio
+      audio.onended = () => { if (mountedRef.current) dispatch({ type: 'ended' }) }
+      audio.onerror = () => { if (mountedRef.current) dispatch({ type: 'error', message: 'Audio playback failed.' }) }
+      const started = audio.play?.()
+      if (started?.catch) started.catch(() => { if (mountedRef.current) dispatch({ type: 'error', message: 'Audio playback failed.' }) })
+      dispatch({ type: 'play' })
+    } catch (error) {
+      if (mountedRef.current) dispatch({ type: 'error', message: error?.message || 'Read-aloud could not be produced.' })
+    }
+  }
+
+  const pause = () => { try { audioRef.current?.pause() } catch { /* nothing playing */ } dispatch({ type: 'pause' }) }
+  const resume = () => { const started = audioRef.current?.play?.(); started?.catch?.(() => {}); dispatch({ type: 'resume' }) }
+  const stop = () => { const audio = audioRef.current; if (audio) { try { audio.pause(); audio.currentTime = 0 } catch { /* noop */ } } dispatch({ type: 'stop' }) }
+  const replay = () => { const audio = audioRef.current; if (audio) { try { audio.currentTime = 0; audio.play?.() } catch { /* noop */ } } if (audioRef.current) { dispatch({ type: 'replay', messageRef: turn.id }) } else { play() } }
+
+  useEffect(() => {
+    mountedRef.current = true
+    // Optional autoplay: only when the saved preference opts in, and only for a
+    // completed assistant response.
+    if (shouldAutoplay(autoplayPreference) && turn.role === 'assistant' && turn.status === 'complete') play()
+    return () => { mountedRef.current = false; teardown() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const active = isPlaybackActiveFor(state, turn.id)
+  return <span className="read-aloud">
+    {!active
+      ? <button type="button" aria-label="Read this response aloud" onClick={play}>Play audio</button>
+      : <>
+          {state.status === 'playing' && <button type="button" aria-label="Pause audio" onClick={pause}>Pause</button>}
+          {state.status === 'paused' && <button type="button" aria-label="Resume audio" onClick={resume}>Resume</button>}
+          {(state.status === 'playing' || state.status === 'paused') && <button type="button" aria-label="Stop audio" onClick={stop}>Stop</button>}
+        </>}
+    <button type="button" aria-label="Replay audio" onClick={replay} disabled={state.status === 'loading'}>Replay</button>
+    <span className="read-aloud-status" role="status" aria-live="polite">{playbackLabel(state)}</span>
+  </span>
+}
+
+function ChatView({ append, voicePreferences }) {
   const [conversations, setConversations] = useState([])
   const [includeArchived, setIncludeArchived] = useState(false)
   const [query, setQuery] = useState('')
@@ -764,8 +926,11 @@ function ChatView({ append }) {
       </header>
       <DeliveryContext context={selected?.context} />
       {advanced && <AdvancedPanel />}
-      <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} /></div>
+      <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} conversationId={selectedId} autoplayPreference={voicePreferences} /></div>
       <div className="chat-live" role="status" aria-live="polite">{lifecycle}</div>
+      {/* Push-to-talk drops an EDITABLE transcript into the composer; a turn is
+          sent only when the actor explicitly submits it below. */}
+      <PushToTalk conversationId={selectedId} onDraft={setDraft} disabled={!selectedId || streaming} />
       <Composer draft={draft} setDraft={setDraft} onSend={send} onCancel={cancel} streaming={streaming} disabled={!selectedId} canSend={canSend} />
     </section>
   </main>

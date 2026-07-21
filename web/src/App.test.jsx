@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
@@ -9,6 +9,7 @@ import {
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
+  transcribeVoice, speakMessage,
 } from './api'
 
 vi.mock('./api', () => ({
@@ -19,6 +20,7 @@ vi.mock('./api', () => ({
   fetchChatRoutes: vi.fn(), getConversation: vi.fn(), listConversations: vi.fn(), renameConversation: vi.fn(),
   retryTurn: vi.fn(), searchConversations: vi.fn(), sendMessage: vi.fn(), unarchiveConversation: vi.fn(),
   fetchPrdContent: vi.fn(), fetchPrdTasks: vi.fn(), fetchTaskReference: vi.fn(), fetchTaskEligibility: vi.fn(),
+  transcribeVoice: vi.fn(), speakMessage: vi.fn(),
 }))
 
 const fixture = {
@@ -477,12 +479,181 @@ describe('Chat routing, navigation, and accessibility (T004.4)', () => {
     const composer = screen.getByRole('textbox', { name: 'Message composer' })
     composer.focus()
     expect(document.activeElement).toBe(composer) // composer is keyboard-focusable
-    const live = screen.getByRole('status')
+    // The lifecycle live region (voice controls add their own status regions, so
+    // target this one specifically rather than assuming a single status role).
+    const live = document.querySelector('.chat-live')
+    expect(live.getAttribute('role')).toBe('status')
     expect(live.getAttribute('aria-live')).toBe('polite')
     sendMessage.mockResolvedValueOnce({ text: 'done', terminal: 'completed', needsRefresh: false })
     await user.type(composer, 'announce this')
     await user.keyboard('{Enter}')
     expect(await screen.findByText('Response complete')).toBeTruthy() // lifecycle announced in the live region
+  })
+})
+
+// --- Voice push-to-talk + read-aloud (chat-first-voice T005.2 / T005.3 / T005.4)
+//
+// The voice controls are exercised through the RENDERED chat component with the
+// network client mocked, and the browser media APIs stubbed. The invariants they
+// prove: push-to-talk yields an EDITABLE draft and sends NO turn until explicit
+// submission; read-aloud playback NEVER mutates message state; both degrade
+// truthfully (a 503 becomes textual error state) and never block textual chat.
+
+class _FakeMediaRecorder {
+  constructor(stream) { this.stream = stream; this.ondataavailable = null; this.onstop = null }
+  start() {}
+  stop() {
+    this.ondataavailable?.({ data: new Blob([new Uint8Array([1, 2, 3, 4])]) })
+    this.onstop?.()
+  }
+}
+
+class _FakeAudio {
+  constructor(src) { this.src = src; this.currentTime = 0; this.onended = null; this.onerror = null; _FakeAudio.last = this }
+  play() { return Promise.resolve() }
+  pause() {}
+}
+
+describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () => {
+  let originalMediaDevices
+  let originalMediaRecorder
+  let originalAudio
+
+  beforeEach(() => {
+    transcribeVoice.mockResolvedValue({ draft: { text: 'dictated draft words', is_final: true, duration_ms: 900 } })
+    speakMessage.mockResolvedValue({ audio_base64: 'QUJDRA==', audio_format: 'mp3', sample_rate: 24000 })
+    originalMediaDevices = navigator.mediaDevices
+    originalMediaRecorder = window.MediaRecorder
+    originalAudio = window.Audio
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] }) },
+    })
+    window.MediaRecorder = _FakeMediaRecorder
+    global.MediaRecorder = _FakeMediaRecorder
+    window.Audio = _FakeAudio
+    global.Audio = _FakeAudio
+  })
+
+  afterEach(() => {
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: originalMediaDevices })
+    window.MediaRecorder = originalMediaRecorder
+    global.MediaRecorder = originalMediaRecorder
+    window.Audio = originalAudio
+    global.Audio = originalAudio
+  })
+
+  it('offers a keyboard-operable hold-to-talk control with an announced live region', async () => {
+    const user = await renderChat()
+    await openConversation(user, [])
+    const ptt = screen.getByRole('button', { name: 'Hold to talk' })
+    expect(ptt.tagName).toBe('BUTTON') // a real, focusable button
+    expect(ptt.getAttribute('aria-pressed')).toBe('false')
+    const status = ptt.parentElement.querySelector('.voice-ptt-status')
+    expect(status.getAttribute('role')).toBe('status')
+    expect(status.getAttribute('aria-live')).toBe('polite')
+    expect(status.textContent).toMatch(/ready/i)
+  })
+
+  it('drops an EDITABLE transcript into the composer and sends NO turn until submit', async () => {
+    const user = await renderChat()
+    await openConversation(user, [])
+    const ptt = screen.getByRole('button', { name: 'Hold to talk' })
+    fireEvent.pointerDown(ptt)
+    // Capture start awaits getUserMedia, so wait for the listening state.
+    await waitFor(() => expect(ptt.getAttribute('aria-pressed')).toBe('true'))
+    expect(screen.getByText(/release to review your transcript/)).toBeTruthy() // live-region announcement
+    fireEvent.pointerUp(ptt)
+    await waitFor(() => expect(transcribeVoice).toHaveBeenCalledTimes(1))
+    // The draft becomes editable composer text the actor reviews.
+    const composer = screen.getByRole('textbox', { name: 'Message composer' })
+    await waitFor(() => expect(composer.value).toBe('dictated draft words'))
+    await screen.findByText(/Transcript ready to review/)
+    // CRUCIAL (T005.2 / T005.4): capturing audio created NO turn.
+    expect(sendMessage).not.toHaveBeenCalled()
+    // The actor can edit the draft, then explicitly submit -> now a turn is sent.
+    await user.type(composer, ' edited')
+    expect(composer.value).toBe('dictated draft words edited')
+    sendMessage.mockResolvedValueOnce({ text: 'ok', terminal: 'completed', needsRefresh: false })
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1))
+    expect(sendMessage.mock.calls[0][0].prompt).toBe('dictated draft words edited')
+  })
+
+  it('keeps textual chat usable when microphone permission is denied', async () => {
+    navigator.mediaDevices.getUserMedia.mockRejectedValueOnce(new Error('denied'))
+    const user = await renderChat()
+    await openConversation(user, [])
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Hold to talk' }))
+    await screen.findByText(/Microphone access was not granted/)
+    // The textual composer is fully usable; no audio left the browser.
+    const composer = screen.getByRole('textbox', { name: 'Message composer' })
+    await user.type(composer, 'typed instead')
+    expect(composer.value).toBe('typed instead')
+    expect(transcribeVoice).not.toHaveBeenCalled()
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('degrades truthfully when the voice relay is not configured (503)', async () => {
+    transcribeVoice.mockRejectedValueOnce(new Error('Voice input is not configured for this hub'))
+    const user = await renderChat()
+    await openConversation(user, [])
+    const ptt = screen.getByRole('button', { name: 'Hold to talk' })
+    fireEvent.pointerDown(ptt)
+    await waitFor(() => expect(ptt.getAttribute('aria-pressed')).toBe('true'))
+    fireEvent.pointerUp(ptt)
+    await screen.findByText('Voice input is not configured for this hub')
+    // The textual composer still works.
+    const composer = screen.getByRole('textbox', { name: 'Message composer' })
+    await user.type(composer, 'fallback text')
+    expect(composer.value).toBe('fallback text')
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('reads a response aloud without mutating any message state', async () => {
+    const user = await renderChat()
+    await openConversation(user, [assistantTurn('t1', 'the assistant answer')])
+    // The text is available before any audio.
+    expect(screen.getByText('the assistant answer')).toBeTruthy()
+    const play = screen.getByRole('button', { name: 'Read this response aloud' })
+    await user.click(play)
+    await waitFor(() => expect(speakMessage).toHaveBeenCalledTimes(1))
+    expect(speakMessage.mock.calls[0][0]).toMatchObject({ messageRef: 't1', text: 'the assistant answer' })
+    await screen.findByText('Playing audio')
+    // The text stays available DURING audio, and no message-state mutation fired.
+    expect(screen.getByText('the assistant answer')).toBeTruthy()
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(retryTurn).not.toHaveBeenCalled()
+    expect(branchTurn).not.toHaveBeenCalled()
+    expect(getConversation).toHaveBeenCalledTimes(1) // only the initial open; playback re-read nothing
+  })
+
+  it('pauses, stops, and replays playback without changing the conversation', async () => {
+    const user = await renderChat()
+    await openConversation(user, [assistantTurn('t1', 'answer to hear')])
+    await user.click(screen.getByRole('button', { name: 'Read this response aloud' }))
+    await screen.findByText('Playing audio')
+    await user.click(screen.getByRole('button', { name: 'Pause audio' }))
+    await screen.findByText('Audio paused')
+    await user.click(screen.getByRole('button', { name: 'Stop audio' }))
+    await screen.findByText('Audio stopped')
+    // The text remains available after audio stops, and nothing mutated.
+    expect(screen.getByText('answer to hear')).toBeTruthy()
+    expect(sendMessage).not.toHaveBeenCalled()
+    // Replay restarts the already-fetched audio without touching message state.
+    await user.click(screen.getByRole('button', { name: 'Replay audio' }))
+    await screen.findByText('Playing audio')
+    expect(screen.getByText('answer to hear')).toBeTruthy()
+    expect(retryTurn).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a read-aloud failure truthfully without blocking the text', async () => {
+    speakMessage.mockRejectedValueOnce(new Error('Read-aloud is not configured for this hub'))
+    const user = await renderChat()
+    await openConversation(user, [assistantTurn('t1', 'still readable text')])
+    await user.click(screen.getByRole('button', { name: 'Read this response aloud' }))
+    await screen.findByText('Read-aloud is not configured for this hub')
+    expect(screen.getByText('still readable text')).toBeTruthy() // text always available
   })
 })
 
