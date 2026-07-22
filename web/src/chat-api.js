@@ -220,7 +220,7 @@ export function successorTurnBody(turn, { role, mode = 'ordinary' } = {}) {
 // "connected" state. The acceptance word "connected" maps to `ready` (the mic
 // path is available and idle) and `listening` (a hold is actively capturing); a
 // hop is a bounded per-request call, not a held connection. This is distinct from
-// the Realtime websocket relay (VoiceDock), which is genuinely connection-based.
+// the Realtime websocket relay (RealtimeVoice), which is genuinely connection-based.
 export const VOICE_INPUT_STATES = Object.freeze(['ready', 'listening', 'transcribing', 'draft', 'error'])
 
 export function initialVoiceInputState() {

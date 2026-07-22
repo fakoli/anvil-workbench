@@ -291,8 +291,13 @@ describe('Workbench delivery cockpit', () => {
     await user.click(screen.getByRole('button', { name: 'Authorize selected action' })); expect(approve).toHaveBeenCalledWith('approval_1'); expect(approve).not.toHaveBeenCalledWith('approval_decoy')
   })
 
-  it('does not offer voice capture without a configured private relay', async () => {
-    await renderLive(); expect(screen.getByRole('button', { name: 'Voice not configured' }).disabled).toBe(true); expect(screen.getByText(/Configure a private Anvil Voice Realtime endpoint/)).toBeTruthy()
+  it('does not offer voice capture without a configured private relay, in its own labeled area', async () => {
+    await renderLive()
+    // The realtime speech-to-speech surface is its own labeled region, even when
+    // unconfigured — not a cramped inline dock.
+    const region = screen.getByRole('region', { name: /realtime voice/i })
+    expect(within(region).getByRole('button', { name: 'Voice not configured' }).disabled).toBe(true)
+    expect(within(region).getByText(/Configure a private Anvil Voice Realtime endpoint/)).toBeTruthy()
   })
 
   it('shows a truthful empty state instead of a seeded delivery when the hub has no projects', async () => {
@@ -1224,6 +1229,128 @@ describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () =>
     expect(retryTurn).not.toHaveBeenCalled()
     expect(branchTurn).not.toHaveBeenCalled()
     expect(getConversation).toHaveBeenCalledTimes(1) // only the initial open
+  })
+
+  // Placement (live-qualification): the DICTATION control renders INLINE in the
+  // composer action row, immediately to the left of Send — not a detached banner
+  // row above the composer. It is dictation only (transcribe → editable draft →
+  // explicit Send), never the realtime speech-to-speech relay.
+  it('renders the dictation control inline in the composer action row, next to Send', async () => {
+    const user = await renderChat()
+    await openConversation(user, [])
+    const ptt = screen.getByRole('button', { name: 'Hold to talk' })
+    const send = screen.getByRole('button', { name: 'Send message' })
+    // Both share the SAME composer action row (not a separate banner above it).
+    const actions = send.closest('.composer-actions')
+    expect(actions).toBeTruthy()
+    expect(actions.contains(ptt)).toBe(true)
+    // The whole control is inside the chat composer form — inline, not detached.
+    expect(ptt.closest('.chat-composer')).toBeTruthy()
+    // Order in that row: the voice control precedes Send (voice, then Send).
+    const voice = actions.querySelector('.voice-ptt')
+    const kids = Array.from(actions.children)
+    expect(kids.indexOf(voice)).toBeLessThan(kids.indexOf(send))
+    // It is dictation, NOT the realtime relay: no Connect/Disconnect in the row.
+    expect(within(actions).queryByRole('button', { name: 'Connect voice' })).toBeNull()
+    expect(within(actions).queryByRole('button', { name: 'Disconnect' })).toBeNull()
+    // Read-aloud (per-message TTS) remains a distinct use, not part of the row.
+    expect(within(actions).queryByRole('button', { name: 'Read this response aloud' })).toBeNull()
+  })
+})
+
+// --- Realtime voice (speech-to-speech): its own dedicated interface -----------
+//
+// The realtime relay is the ONE session-bound speech-to-speech surface, moved out
+// of a cramped inline dock into its own labeled region (heading + connection
+// state + session binding). These tests pin two live-qualification invariants:
+// (1) BOTH the playback and capture AudioContexts construct at the 16 kHz relay
+// contract rate (a 24k mismatch garbled the live test), and (2) the S2S interface
+// is a distinct labeled region, separate from the chat composer.
+
+class _FakeAudioContext {
+  constructor(options) { _FakeAudioContext.calls.push(options); this.sampleRate = options?.sampleRate; this.destination = {} }
+  createBuffer(channels, length, rate) { _FakeAudioContext.bufferCalls.push({ channels, length, rate }); return { getChannelData: () => new Float32Array(Math.max(0, length)) } }
+  createBufferSource() { return { buffer: null, connect() {}, start() {}, onended: null } }
+  createMediaStreamSource() { return { connect() {} } }
+  createScriptProcessor() { return { connect() {}, disconnect() {}, onaudioprocess: null } }
+  close() { return Promise.resolve() }
+}
+
+class _FakeRealtimeSocket {
+  constructor(url) { this.url = url; this.readyState = _FakeRealtimeSocket.OPEN; this.sent = []; this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null; _FakeRealtimeSocket.last = this }
+  send(data) { this.sent.push(data) }
+  close() { this.readyState = 3; this.onclose?.() }
+}
+_FakeRealtimeSocket.OPEN = 1
+
+describe('Realtime voice (speech-to-speech) dedicated interface (live-qualification)', () => {
+  const voiceFixture = { ...fixture, voice: { available: true, transport: 'realtime', retains_transcripts: false } }
+  let originalAudioContext, originalWebSocket, originalMediaDevices
+
+  beforeEach(() => {
+    bootstrap.mockResolvedValue(voiceFixture)
+    _FakeAudioContext.calls = []
+    _FakeAudioContext.bufferCalls = []
+    _FakeRealtimeSocket.last = null
+    originalAudioContext = window.AudioContext
+    originalWebSocket = window.WebSocket
+    originalMediaDevices = navigator.mediaDevices
+    window.AudioContext = _FakeAudioContext
+    global.AudioContext = _FakeAudioContext
+    window.WebSocket = _FakeRealtimeSocket
+    global.WebSocket = _FakeRealtimeSocket
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] }) },
+    })
+  })
+
+  afterEach(() => {
+    window.AudioContext = originalAudioContext
+    global.AudioContext = originalAudioContext
+    window.WebSocket = originalWebSocket
+    global.WebSocket = originalWebSocket
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: originalMediaDevices })
+  })
+
+  async function renderRealtime() {
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Delivery' }))
+    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    return user
+  }
+
+  it('is a distinct labeled region, separate from the chat composer', async () => {
+    await renderRealtime()
+    const region = screen.getByRole('region', { name: /realtime voice/i })
+    expect(within(region).getByRole('heading', { name: /realtime voice/i })).toBeTruthy()
+    // It is NOT the composer: no message composer / Send live inside it.
+    expect(within(region).queryByRole('textbox', { name: 'Message composer' })).toBeNull()
+    expect(region.querySelector('.chat-composer')).toBeNull()
+    // It is session-bound (relay-only), the security semantic that must survive.
+    expect(within(region).getByText(/session_1/)).toBeTruthy()
+  })
+
+  it('constructs BOTH the playback and capture AudioContexts at the 16 kHz relay rate', async () => {
+    const user = await renderRealtime()
+    const region = screen.getByRole('region', { name: /realtime voice/i })
+    await user.click(within(region).getByRole('button', { name: 'Connect voice' }))
+    const socket = _FakeRealtimeSocket.last
+    expect(socket).toBeTruthy()
+    await act(async () => { socket.onopen?.() })
+    // Playback direction: an output-audio delta decodes + plays PCM16 back.
+    const pcm = btoa('\x01\x02\x03\x04') // 4 bytes -> 2 PCM16 samples
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: pcm }) }) })
+    // Capture direction: hold-to-talk opens the mic AudioContext.
+    const hold = await within(region).findByRole('button', { name: 'Hold to talk' })
+    await act(async () => { fireEvent.pointerDown(hold) })
+    await waitFor(() => expect(_FakeAudioContext.calls.length).toBe(2))
+    // BOTH constructions pin the 16 kHz relay contract (24000 -> garbled audio).
+    expect(_FakeAudioContext.calls.every((opts) => opts && opts.sampleRate === 16000)).toBe(true)
+    // The playback buffer is allocated at the SAME rate — no drift between sites.
+    expect(_FakeAudioContext.bufferCalls.length).toBeGreaterThan(0)
+    expect(_FakeAudioContext.bufferCalls.every((call) => call.rate === 16000)).toBe(true)
   })
 })
 

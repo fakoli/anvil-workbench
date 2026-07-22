@@ -66,6 +66,17 @@ function Rail({ active, setActive, onNewDelivery, onProfile }) {
   </aside>
 }
 
+// The Anvil Voice Realtime relay contract is 16 kHz PCM16 mono in BOTH
+// directions. Upstream `voice/messages.py` pins the input `sample_rate: int =
+// 16000`, and the operator manifest resamples the TTS output to
+// `target_sample_rate = 16000`. The playback AudioContext AND the capture
+// AudioContext MUST both construct at this exact rate: a mismatch is what
+// garbled the live test — STT interpreted 24k audio as 16k (0.67x, slurred
+// transcripts) and TTS 16k audio played at 24k (1.5x chipmunk). One named
+// constant is used at every rate-coupled site (both AudioContexts and the
+// playback createBuffer) so the two directions can never silently drift apart.
+const VOICE_RELAY_SAMPLE_RATE = 16000
+
 function encodePcm16(samples) {
   const bytes = new Uint8Array(samples.length * 2)
   const view = new DataView(bytes.buffer)
@@ -75,7 +86,17 @@ function encodePcm16(samples) {
   return window.btoa(binary)
 }
 
-function VoiceDock({ data, append }) {
+// --- Realtime voice (speech-to-speech) — its OWN dedicated interface ----------
+//
+// This is the ONE realtime relay surface: a session-bound `voice/realtime`
+// websocket that streams mic audio up and plays synthesized audio back. It is
+// deliberately SEPARATE from the two request/response voice uses (chat dictation
+// STT via PushToTalk, per-message read-aloud TTS via ReadAloud) — the operator
+// asked for realtime speech-to-speech to have its own clearly-labeled area, not
+// a cramped inline dock. Rendered as a labeled region with its own heading,
+// connection state, and session binding. Security semantics are unchanged: it is
+// session-bound and relay-only, and NO delivery action can be started from voice.
+function RealtimeVoice({ data, append }) {
   const session = data.sessions?.[0]
   const configured = Boolean(data.voice?.available && session)
   const [state, setState] = useState('disconnected')
@@ -90,8 +111,10 @@ function VoiceDock({ data, append }) {
   const playAudio = (encoded) => {
     if (typeof encoded !== 'string' || !encoded || !window.AudioContext) return
     try {
-      const binary = window.atob(encoded); const context = new window.AudioContext({ sampleRate: 24000 })
-      const buffer = context.createBuffer(1, binary.length / 2, 24000); const channel = buffer.getChannelData(0)
+      // Playback direction of the 16 kHz relay contract: decode the relay's
+      // PCM16 at VOICE_RELAY_SAMPLE_RATE and play it back at the SAME rate.
+      const binary = window.atob(encoded); const context = new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE })
+      const buffer = context.createBuffer(1, binary.length / 2, VOICE_RELAY_SAMPLE_RATE); const channel = buffer.getChannelData(0)
       const bytes = new Uint8Array(binary.length); for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
       const view = new DataView(bytes.buffer); for (let index = 0; index < channel.length; index += 1) channel[index] = view.getInt16(index * 2, true) / 0x8000
       const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination); source.start(); source.onended = () => context.close().catch(() => undefined)
@@ -110,7 +133,11 @@ function VoiceDock({ data, append }) {
     if (state !== 'ready' || socketRef.current?.readyState !== WebSocket.OPEN) return
     if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) { append('This browser cannot capture microphone audio for the Workbench voice relay.'); return }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const context = new window.AudioContext({ sampleRate: 24000 })
+      // Capture direction of the SAME 16 kHz relay contract: the mic AudioContext
+      // MUST match VOICE_RELAY_SAMPLE_RATE so the relay's STT reads real-time,
+      // not slowed, audio. The 4096-frame ScriptProcessor and encodePcm16 are
+      // rate-agnostic (frames/samples, not Hz), so only this rate is coupled.
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const context = new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE })
       const source = context.createMediaStreamSource(stream); const processor = context.createScriptProcessor(4096, 1, 1)
       processor.onaudioprocess = (event) => { if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: encodePcm16(event.inputBuffer.getChannelData(0)) })) }
       source.connect(processor); processor.connect(context.destination); captureRef.current = { stream, context, source, processor }; setState('listening')
@@ -118,7 +145,31 @@ function VoiceDock({ data, append }) {
   }
   const finishCapture = () => { if (state !== 'listening') return; releaseCapture(); if (socketRef.current?.readyState === WebSocket.OPEN) { socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); socketRef.current.send(JSON.stringify({ type: 'response.create' })) }; setState('ready') }
   const disconnect = () => { releaseCapture(); socketRef.current?.close(); socketRef.current = null; setState('disconnected') }
-  return <section className="voice-dock" aria-label="Voice controls"><div><b>Voice, session-bound</b><small>{configured ? 'Push to talk through the private relay; delivery actions still require the bridge.' : 'Configure a private Anvil Voice Realtime endpoint to enable push to talk.'}</small></div>{!configured ? <button disabled aria-label="Voice not configured">Voice unavailable</button> : state === 'disconnected' || state === 'connecting' ? <button onClick={connect} disabled={state === 'connecting'}>{state === 'connecting' ? 'Connecting…' : 'Connect voice'}</button> : <><button className={state === 'listening' ? 'speaking' : ''} onPointerDown={startCapture} onPointerUp={finishCapture} onPointerCancel={finishCapture} aria-label="Hold to talk">{state === 'listening' ? 'Listening… release to send' : 'Hold to talk'}</button><button className="voice-close" onClick={disconnect}>Disconnect</button></>}</section>
+  const connectionLabel = { disconnected: 'Disconnected', connecting: 'Connecting…', ready: 'Connected · ready', listening: 'Listening…' }[state] || state
+  return <section className="realtime-voice" aria-labelledby="realtime-voice-heading">
+    <header className="realtime-voice-head">
+      <div>
+        <h2 id="realtime-voice-heading">Realtime voice</h2>
+        <small>Session-bound speech-to-speech through the private Anvil Voice Realtime relay. This is separate from chat dictation and read-aloud; a delivery action still requires the bridge and an approval — voice cannot start one.</small>
+      </div>
+      <Status tone={state === 'ready' || state === 'listening' ? 'green' : 'amber'}>{connectionLabel}</Status>
+    </header>
+    <p className="realtime-voice-binding">{configured ? <>Bound to session <b>{session.title}</b> <code>{session.id}</code></> : 'Configure a private Anvil Voice Realtime endpoint to enable session-bound speech-to-speech.'}</p>
+    <div className="realtime-voice-controls">
+      {!configured
+        ? <button disabled aria-label="Voice not configured">Voice unavailable</button>
+        : state === 'disconnected' || state === 'connecting'
+        ? <button onClick={connect} disabled={state === 'connecting'}>{state === 'connecting' ? 'Connecting…' : 'Connect voice'}</button>
+        : <>
+            <button className={state === 'listening' ? 'speaking' : ''} onPointerDown={startCapture} onPointerUp={finishCapture} onPointerCancel={finishCapture} aria-label="Hold to talk">{state === 'listening' ? 'Listening… release to send' : 'Hold to talk'}</button>
+            <button className="voice-close" onClick={disconnect}>Disconnect</button>
+          </>}
+    </div>
+    {/* A visually-collapsed live region mirrors the connection state to a screen
+        reader on every transition. It uses aria-live WITHOUT the ARIA status role
+        so it does not collide with the app's role="status" toast/notification. */}
+    <span className="realtime-voice-status" aria-live="polite">Realtime voice {connectionLabel}</span>
+  </section>
 }
 
 function Delivery({ data, append, onDirective, onGuide, onDeliverNext }) {
@@ -132,7 +183,7 @@ function Delivery({ data, append, onDirective, onGuide, onDeliverNext }) {
   return <main className="delivery"><header className="project-header"><div><span className="crumb">Delivery / {project.name}</span><h1>{run?.task_id ? `Task ${run.task_id}` : 'No active task'}</h1><p>PRD → State plan → local Codex run → evidence → approved PR</p></div><div className="project-header-actions"><button className="session-action" onClick={onDeliverNext}>Deliver next task</button><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'ready for session'}</Status></div></header>
     <section className="flow-card"><div className="flow-top"><span className="thread-avatar">A</span><div><strong>Delivery operator</strong><small>{run ? `${run.model} through Anvil Serving` : 'Waiting for a bridge-supervised run'}</small></div><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'idle'}</Status></div><ol className="steps"><li className={run ? 'complete' : 'current'}><span>{run ? '✓' : '1'}</span><div><b>{run ? 'State work packet requested' : 'Create a session'}</b><small>{run ? `${run.id} is bound to the bridge and its configured worktree.` : 'A session creates a durable workflow and lease boundary.'}</small></div></li><li className={run?.status === 'evidenced' ? 'complete' : run ? 'current' : ''}><span>{run?.status === 'evidenced' ? '✓' : '2'}</span><div><b>Bridge edits and verifies locally</b><small>Redacted transcripts and State evidence return through the bridge.</small></div></li><li className={run?.status === 'evidenced' ? 'current' : ''}><span>3</span><div><b>Review evidence and authorize a hash-bound action</b><small>GitHub remains local to the bridge and requires approval.</small></div></li></ol></section>
     <section className="conversation" aria-label="Delivery directions">{messages.length ? messages.map((message) => <article className="message human" key={message.id}><div className="message-head"><span>OP</span><b>Recorded direction</b><small>event {message.sequence}</small></div><p>{message.data?.content}</p></article>) : <p className="evidence-empty">No recorded delivery directions for this session yet.</p>}</section>
-    <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!session} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={session ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!session || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form><VoiceDock data={data} append={append} />
+    <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!session} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={session ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!session || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form><RealtimeVoice data={data} append={append} />
   </main>
 }
 
@@ -579,7 +630,7 @@ function Transcript({ selected, turns, streamingTurn, onRetry, onBranch, convers
   return <ol className="transcript" aria-label="Transcript">{rendered.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={onRetry} onBranch={onBranch} streamActive={streamActive} conversationId={conversationId} autoplayPreference={autoplayPreference} />)}</ol>
 }
 
-function Composer({ draft, setDraft, onSend, onCancel, streaming, disabled, canSend }) {
+function Composer({ draft, setDraft, onSend, onCancel, streaming, disabled, canSend, voiceControl }) {
   const textareaRef = useRef(null)
   const cancelRef = useRef(null)
   const wasStreamingRef = useRef(false)
@@ -604,9 +655,17 @@ function Composer({ draft, setDraft, onSend, onCancel, streaming, disabled, canS
       placeholder={disabled ? 'Select or start a conversation to send a message…' : 'Message…  (Enter to send, Shift+Enter for a new line)'} />
     <div className="composer-bar">
       <small id="composer-hint">Enter sends. Shift+Enter inserts a new line.</small>
-      {streaming
-        ? <button ref={cancelRef} type="button" className="composer-cancel" aria-label="Cancel streaming response" onClick={onCancel}>Cancel</button>
-        : <button type="submit" aria-label="Send message" disabled={!canSend}>Send <span aria-hidden="true">↵</span></button>}
+      {/* The voice affordance sits in the SAME action row as Send, immediately to
+          its left. It is dictation only (record → editable transcript → explicit
+          Send), never the realtime speech-to-speech loop — that lives in its own
+          Realtime voice panel. Placing it here keeps the dictation control next to
+          the primary Send action instead of a detached banner row above. */}
+      <div className="composer-actions">
+        {voiceControl}
+        {streaming
+          ? <button ref={cancelRef} type="button" className="composer-cancel" aria-label="Cancel streaming response" onClick={onCancel}>Cancel</button>
+          : <button type="submit" aria-label="Send message" disabled={!canSend}>Send <span aria-hidden="true">↵</span></button>}
+      </div>
     </div>
   </form>
 }
@@ -1271,10 +1330,13 @@ function ChatView({ append }) {
         <button type="button" aria-label="Dismiss route divergence notice" onClick={() => setDivergence(null)}>×</button>
       </div>}
       <div className="chat-live" role="status" aria-live="polite">{lifecycle}</div>
-      {/* Push-to-talk drops an EDITABLE transcript into the composer; a turn is
-          sent only when the actor explicitly submits it below. */}
-      <PushToTalk conversationId={selectedId} onDraft={setDraft} disabled={!selectedId || streaming} />
-      <Composer draft={draft} setDraft={setDraft} onSend={send} onCancel={cancel} streaming={streaming} disabled={!selectedId} canSend={canSend} />
+      {/* Push-to-talk (DICTATION) drops an EDITABLE transcript into the composer;
+          a turn is sent only when the actor explicitly submits it. It renders
+          INLINE in the composer action row, next to Send — not a detached banner
+          row above — and is scoped to dictation, distinct from the realtime
+          speech-to-speech panel and from per-message read-aloud. */}
+      <Composer draft={draft} setDraft={setDraft} onSend={send} onCancel={cancel} streaming={streaming} disabled={!selectedId} canSend={canSend}
+        voiceControl={<PushToTalk conversationId={selectedId} onDraft={setDraft} disabled={!selectedId || streaming} />} />
     </section>
   </main>
 }
