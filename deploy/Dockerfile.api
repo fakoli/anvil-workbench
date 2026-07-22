@@ -2,6 +2,10 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY workbench ./workbench
+# The runtime loads the reviewed contract schemas (workbench/contracts.py,
+# workbench/plugin_host.py) from docs/contracts and fails closed when they are
+# absent, so the image must ship them alongside the package.
+COPY docs/contracts ./docs/contracts
 RUN pip install --no-cache-dir .
 EXPOSE 8090
 CMD ["uvicorn", "workbench.main:app", "--host", "0.0.0.0", "--port", "8090", "--proxy-headers"]
