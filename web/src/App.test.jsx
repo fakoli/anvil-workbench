@@ -214,6 +214,24 @@ describe('Workbench delivery cockpit', () => {
     for (const [button, heading] of views) { await user.click(screen.getByRole('button', { name: button })); expect(screen.getByRole('heading', { name: heading })).toBeTruthy() }
   })
 
+  it('leads each run row with the human title and demotes the machine ids to secondary text', async () => {
+    // Operator hierarchy rule: names are for humans, ids are for machines. The
+    // run row must lead with the human title (its session title, prefixed by the
+    // requested route as work-class) and never with a bare State task id or the
+    // raw run id. The title is server-derived: it is the session.title the
+    // bootstrap payload already serves, joined by run.session_id.
+    const user = userEvent.setup(); await renderLive()
+    await user.click(screen.getByRole('button', { name: 'Runs' }))
+    const title = await screen.findByText('Heavy-local · Router qualification')
+    // The human title is the PRIMARY line: a <b>, not the id-styled secondary.
+    expect(title.tagName).toBe('B')
+    expect(title.textContent).not.toContain('run_1')
+    const row = title.closest('article')
+    // The machine ids (run id + task id) appear ONLY in the secondary <small>.
+    const ids = within(row).getByText(/run run_1 · task TASK-1/)
+    expect(ids.tagName).toBe('SMALL')
+  })
+
   it('persists a delivery direction for the next local bridge work packet', async () => {
     // The reload after submit reflects the recorded directive (the real API
     // returns {outcome, recorded, event}; the app must read result.event, not
