@@ -33,6 +33,10 @@ from .configuration_transfer import (
     ConfigurationTransferError,
     ConfigurationTransferService,
 )
+from .conversation_transfer import (
+    ConversationTransferError,
+    ConversationTransferService,
+)
 from .contracts import settings_actor_view
 from .conversation_api import (
     build_conversation_router,
@@ -67,8 +71,8 @@ from .models import (
     reviewed_catalog_valid_refs,
 )
 from .retrieval import AnvilPurposeRetrieval
-from .router import RouterError, route_decisions, sandbox_response
-from .redaction import scrub_config_payload
+from .router import RouterError, route_decisions, route_resolution, sandbox_response
+from .redaction import scrub_config_payload, scrub_conversation_payload
 from .store import (
     MemoryPluginPreferenceService, MemoryPreferenceStore, MemorySkillAdoptionStore, PluginPreferenceStoreError,
     PostgresStore, PreferenceStoreError, StalePreferenceWriteError, StoreError,
@@ -1432,6 +1436,107 @@ class ConfigurationResetBody(BaseModel):
     base_versions: dict[str, int] | None = None
 
 
+#: The conversation-id path/body grammar, mirrored from the conversation model so
+#: a malformed id is rejected at the edge before it reaches the store.
+_CONVERSATION_ID_PATTERN = r"^conv_[a-zA-Z0-9_-]{8,128}$"
+
+
+class ConversationImportBody(BaseModel):
+    # Closed body: an import names ONLY the export envelope. It can never name a
+    # target actor or a target conversation -- the apply always creates a fresh
+    # conversation owned by the requesting (authenticated) actor.
+    model_config = ConfigDict(extra="forbid")
+
+    envelope: dict[str, Any]
+
+
+def build_conversation_transfer_router(
+    actor_dependency: Callable[..., str],
+    conversation_transfer_service: ConversationTransferService | None,
+) -> APIRouter:
+    """Build the redacted conversation export / same-actor import surface (T012).
+
+    Every endpoint is authenticated by the trusted ``actor`` dependency and is
+    scope-bound to that actor BY CONSTRUCTION: the export reads only a
+    conversation the requesting actor OWNS (a foreign/missing id renders the same
+    fixed 404 the chat surface uses, so it is never a cross-actor existence
+    oracle), and the import ALWAYS applies into a brand-new conversation owned by
+    the requesting actor -- never another actor or an existing conversation.  The
+    export is a CLOSED, redacted, opaque-referenced serialization where a
+    metadata-only / purged / deleted turn carries no content; an import validates
+    the whole artifact (an invalid one applies nothing) and replays it atomically
+    through the append gate so append-only lineage is preserved and deleted/purged
+    content can never re-enter.  Every response is scrubbed on the last hop with
+    :func:`~workbench.redaction.scrub_conversation_payload`.  When the service is
+    ``None`` the surface fails closed with 503, mirroring the other injectable
+    supervision models.
+    """
+    router = APIRouter(prefix="/api/conversation-transfer")
+
+    def service() -> ConversationTransferService:
+        if conversation_transfer_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="conversation transfer is not configured",
+            )
+        return conversation_transfer_service
+
+    @router.get("/export/{conversation_id}")
+    def export_conversation(
+        conversation_id: str = Path(pattern=_CONVERSATION_ID_PATTERN),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """The requesting actor's CLOSED, redacted export of one owned conversation.
+
+        A conversation owned by another actor (or a missing id) raises the store's
+        ``UnknownConversationError`` -> the fixed 404 body, so this is never a
+        cross-actor existence oracle.
+        """
+        export = service().export(
+            actor=conversation_actor(actor), conversation_id=conversation_id,
+        )
+        return scrub_conversation_payload(export)
+
+    @router.post("/import/preview")
+    def preview_import(
+        body: ConversationImportBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """A content-free SAMPLE of what an import would create; mutate nothing."""
+        try:
+            result = service().import_preview(
+                actor=conversation_actor(actor), envelope=body.envelope,
+            )
+        except ConversationTransferError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        return scrub_conversation_payload(result)
+
+    @router.post("/import/apply", status_code=status.HTTP_201_CREATED)
+    def apply_import(
+        body: ConversationImportBody,
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        """Replay a valid artifact into a NEW conversation owned by the requester.
+
+        An invalid artifact applies NOTHING (422); a valid one is replayed
+        atomically into the requesting actor's scope only.
+        """
+        try:
+            result = service().import_apply(
+                actor=conversation_actor(actor), envelope=body.envelope,
+            )
+        except ConversationTransferError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        return scrub_conversation_payload(result)
+
+    @router.get("/audit")
+    def list_audit(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """The non-identifying audit trail of applied conversation imports."""
+        return scrub_conversation_payload({"audit": service().audit_records()})
+
+    return router
+
+
 def build_configuration_transfer_router(
     actor_dependency: Callable[..., str],
     configuration_transfer_service: ConfigurationTransferService | None,
@@ -1862,6 +1967,7 @@ def create_app(
     policy_gate_service: PolicyGateService | None = None,
     voice_relay_service: VoiceRelayService | None = None,
     configuration_transfer_service: ConfigurationTransferService | None = None,
+    conversation_transfer_service: ConversationTransferService | None = None,
     advanced_preset_store: "AdvancedPresetStore | None" = None,
     advanced_template_store: "AdvancedTemplateStore | None" = None,
     advanced_rating_store: "AdvancedRatingStore | None" = None,
@@ -1942,6 +2048,12 @@ def create_app(
     # bridge poll loop; it stays ``None`` unless injected, so the browser surface
     # fails closed (503).
     app.state.configuration_transfer_service = configuration_transfer_service
+    # The redacted conversation export/import service is a hub-side supervision
+    # read/write model over the reviewed conversation spine (chat-first-voice
+    # T012). Like the configuration transfer service it is deliberately NOT wired
+    # into the live bridge poll loop; it stays ``None`` unless injected, so the
+    # browser surface fails closed (503).
+    app.state.conversation_transfer_service = conversation_transfer_service
     # The advanced-model-playground preset/template/rating stores are hub-side
     # actor-private supervision read/write models. Like the other injectable
     # surfaces they are deliberately NOT wired into the live bridge poll loop; they
@@ -2128,6 +2240,14 @@ def create_app(
     # validate/preview/apply, and a scoped reset preview/apply over the reviewed
     # preference spine. Fails closed (503) until a service is injected.
     app.include_router(build_configuration_transfer_router(actor, configuration_transfer_service))
+    # Redacted conversation export / same-actor import surface (chat-first-voice
+    # T012): authenticated by the same trusted ``actor`` dependency, scoped to the
+    # requesting actor by construction (export reads only an owned conversation;
+    # import always creates a fresh conversation owned by the requester), and
+    # fail-closed (503) until a service is injected. A metadata-only / purged /
+    # deleted turn carries no content, an invalid import applies nothing, and the
+    # append gate preserves append-only lineage so deleted content never re-enters.
+    app.include_router(build_conversation_transfer_router(actor, conversation_transfer_service))
     # Advanced model playground surfaces: presets + comparison (T006), instruction
     # templates (T009), and declared-criterion route ratings (T010). Each is
     # actor-private and fails closed (503) until its store is injected.
@@ -2427,6 +2547,26 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         known_runs = {run.id for run in store.list_runs()}
         return {"routes": [row for row in rows if row.get("workbench_run_id") in known_runs]}
+
+    @app.get("/api/chat/route-resolutions")
+    def chat_route_resolutions(limit: int = 50, _: str = Depends(actor)) -> dict[str, Any]:
+        """Truthful route-resolution marks for chat turns (chat-first-voice:T010).
+
+        SURFACE-ONLY: each mark is derived from Serving's OWN reported
+        requested-vs-served route and selection provenance via
+        :func:`~workbench.router.route_resolution`; Workbench performs no failover
+        or retry-to-alternate-route, so a served route is only ever the one Serving
+        resolved.  The browser correlates a mark to its turn by ``request_id`` and
+        shows the divergence notice exactly once per ``episode_id``, non-blocking.
+        Behind the same trusted ``actor`` dependency as ``/api/routes``; an
+        unconfigured Serving route settles as the same 409 (never a raw-provider
+        fallback), and every string is credential-scrubbed at the Serving read.
+        """
+        try:
+            rows = route_decisions(settings.anvil_router_base_url, settings.anvil_router_token, limit)
+        except RouterError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return {"resolutions": [route_resolution(row) for row in rows]}
 
     @app.post("/api/sandbox")
     def sandbox(payload: SandboxInput, current_actor: str = Depends(actor)) -> dict[str, Any]:

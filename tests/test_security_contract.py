@@ -2785,3 +2785,142 @@ def test_configuration_projection_never_leaks_a_secret_url_or_path_from_rogue_se
     assert by_id["approvals.approver_count"].value == 2
     assert by_id["sandbox.model_count"].value == 1
     assert by_id["plugins.catalog_configured"].value is True
+
+
+# ---------------------------------------------------------------------------
+# chat-first-voice:T012 — a redacted conversation export must NEVER carry a
+# secret, path, dotless host:port, AWS key, JWT, PEM, DB URL, or RAW/SYNTH AUDIO
+# blob, and must reference the actor only by a SAFE OPAQUE token. A metadata_only
+# or purged/deleted turn must export as METADATA ONLY, and a round-trip import
+# must never resurrect deleted/purged content. This exercises the REAL export
+# serializer + the real value-scan (incl. the no-audio media scrub) over a store
+# seeded with the full dangerous corpus. Appended at EOF (keep-both merges).
+# ---------------------------------------------------------------------------
+
+import json as _ctv_json
+
+from workbench.conversation_models import (
+    ConversationActor as _CtvActor,
+    ContentBlock as _CtvBlock,
+    RetentionPolicy as _CtvRetention,
+    TurnLineage as _CtvLineage,
+    TurnRedaction as _CtvRedaction,
+)
+from workbench.conversation_store import MemoryConversationStore as _CtvStore
+from workbench.conversation_transfer import (
+    ConversationTransferError as _CtvError,
+    ConversationTransferService as _CtvService,
+    validate_conversation_envelope as _ctv_validate,
+)
+from workbench.redaction import redact_conversation_text as _ctv_redact
+
+_CTV_BS = chr(92)
+_CTV_DANGEROUS = (
+    "leak sk_live_ABCDEFGH12345678 "
+    "C:" + _CTV_BS + "deploy" + _CTV_BS + "secrets" + _CTV_BS + "prod.pem "
+    "serving:8443 AKIAIOSFODNN7EXAMPLE "
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.DEADBEEFsig "
+    "-----BEGIN RSA PRIVATE KEY-----MIIEpQ-----END RSA PRIVATE KEY----- "
+    "postgresql://user:passw0rd@db.internal.example/app "
+    "data:audio/webm;base64,QUJDQUJDQUJDQUJDQUJD"
+)
+
+
+def test_conversation_export_never_carries_a_secret_path_url_audio_or_raw_actor():
+    store = _CtvStore(content_hash_key=b"conversation-export-hash-key-000")
+    actor = _CtvActor("alice.operator")
+    conv = store.create_conversation(
+        actor,
+        _CtvRetention("workbench.default", "retained_redacted", "retained_redacted"),
+        title="Release sk_live_ABCDEFGH12345678 serving:8443",
+    )
+    root = store.append_turn(
+        actor, conv.id, role="user", status="complete",
+        lineage=_CtvLineage(None, 0, "initial"),
+        redaction=_CtvRedaction("redacted", "workbench.default"),
+        content=(_CtvBlock("text", _CTV_DANGEROUS),),
+    )
+    # A metadata_only turn must export as metadata only (no content string).
+    store.append_turn(
+        actor, conv.id, role="assistant", status="complete",
+        lineage=_CtvLineage(root.id, 0, "branch"),
+        redaction=_CtvRedaction("metadata_only", "workbench.default"),
+        content=(),
+    )
+
+    service = _CtvService(store, audit_key=b"conversation-export-audit-key-0")
+    export = service.export(actor=actor, conversation_id=conv.id)
+    blob = _ctv_json.dumps(export)
+
+    for marker in (
+        "sk_live", "prod.pem", "deploy", "secrets", ":8443", "AKIA",
+        "AKIAIOSFODNN7EXAMPLE", "eyJhbGci", "MIIEpQ", "BEGIN RSA",
+        "postgresql://", "passw0rd", "data:audio", "QUJDQUJD",
+        "alice.operator",  # the raw actor identity never appears
+    ):
+        assert marker not in blob, marker
+
+    # The source references the actor/conversation ONLY by safe opaque tokens.
+    assert export["source"]["actor_ref"].startswith("actorref:")
+    assert "alice" not in export["source"]["actor_ref"]
+    assert export["source"]["conversation_ref"].startswith("conversationref:")
+    # The metadata_only turn carried no content.
+    meta = [t for t in export["turns"] if t["redaction"]["status"] == "metadata_only"][0]
+    assert meta["content"] == [] and meta["content_omitted"] is True
+    assert export["schema_version"] == "workbench-conversation-export/v1"
+
+
+def test_conversation_value_scan_strips_audio_but_keeps_safe_tokens():
+    # SHOULD: the scan runs per STRING value (never over a JSON blob), so a
+    # numeric-adjacent safe token (sha256 digest, .../v1 version) survives while a
+    # base64 audio data URI is stripped.
+    assert _ctv_redact("data:audio/webm;base64,QUJDQUJD") == "[REDACTED-AUDIO]"
+    assert "serving:8443" not in _ctv_redact("host serving:8443 here")
+    safe = "workbench-conversation-export/v1 sha256:" + ("a" * 64)
+    assert _ctv_redact(safe) == safe
+
+
+def test_conversation_import_round_trip_never_resurrects_deleted_or_purged_content():
+    # T012 #3: an artifact that pairs a purged / metadata-only turn WITH content is
+    # refused BEFORE any effect, so a round trip can never reintroduce removed
+    # content. Proven at the service layer (not only the HTTP edge).
+    store = _CtvStore(content_hash_key=b"conversation-export-hash-key-000")
+    actor = _CtvActor("alice.operator")
+    conv = store.create_conversation(
+        actor, _CtvRetention("workbench.default", "retained_redacted", "retained_redacted"),
+        title="plan",
+    )
+    root = store.append_turn(
+        actor, conv.id, role="user", status="complete",
+        lineage=_CtvLineage(None, 0, "initial"),
+        redaction=_CtvRedaction("redacted", "workbench.default"),
+        content=(_CtvBlock("text", "kept"),),
+    )
+    store.append_turn(
+        actor, conv.id, role="assistant", status="complete",
+        lineage=_CtvLineage(root.id, 0, "branch"),
+        redaction=_CtvRedaction("metadata_only", "workbench.default"), content=(),
+    )
+    service = _CtvService(store, audit_key=b"conversation-export-audit-key-0")
+    export = service.export(actor=actor, conversation_id=conv.id)
+
+    # Force content onto the metadata_only turn -> the import refuses it.
+    poisoned = _ctv_json.loads(_ctv_json.dumps(export))
+    meta = [t for t in poisoned["turns"] if t["redaction"]["status"] == "metadata_only"][0]
+    meta["content"] = [{"kind": "text", "text": "resurrected"}]
+    try:
+        service.import_apply(actor=actor, envelope=poisoned)
+        raise AssertionError("a metadata_only turn carrying content must be refused")
+    except _CtvError:
+        pass
+
+    # Force content onto a purged tombstone turn -> refused the same way.
+    poisoned2 = _ctv_json.loads(_ctv_json.dumps(export))
+    poisoned2["turns"][0]["content_purged"] = True
+    poisoned2["turns"][0]["content"] = [{"kind": "text", "text": "resurrected"}]
+    try:
+        _ctv_validate(poisoned2)
+        service.import_apply(actor=actor, envelope=poisoned2)
+        raise AssertionError("a purged tombstone turn carrying content must be refused")
+    except _CtvError:
+        pass

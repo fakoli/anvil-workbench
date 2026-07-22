@@ -10,7 +10,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .redaction import redact_value
+from .redaction import redact_config_text, redact_value
 
 
 class RouterError(RuntimeError):
@@ -50,8 +50,93 @@ def route_decisions(base_url: str, token: str, limit: int = 50) -> list[dict[str
         "request_id", "workbench_run_id", "task_id", "model", "served_model", "route",
         "tier", "profile", "reason", "created_at", "timestamp", "status", "fallback",
         "intent", "work_class", "served_tier", "fell_back",
+        # Serving-supplied SAFE route-resolution metadata (chat-first-voice:T010):
+        # what the request asked for, what Serving actually resolved to, how the
+        # route was chosen, and a stable per-episode grouping id.  These are
+        # REPORTED by Serving; Workbench never sets them.
+        "requested_route", "served_route", "requested_model",
+        "route_selection", "route_source", "divergence_reason", "episode_id",
+        "correlation_id",
     }
     return [{key: redact_value(row[key]) for key in allowed if key in row} for row in rows if isinstance(row, dict)]
+
+
+#: The two provenance values a route-resolution mark distinguishes: a route the
+#: caller EXPLICITLY selected, versus one DEFAULTED from a stored preference.  A
+#: decision that reports neither is surfaced with ``provenance = None`` — a mark
+#: is never invented.
+_ROUTE_SELECTION_VALUES = frozenset({"explicit", "preference_default"})
+
+
+def _first_str(decision: Any, *keys: str) -> str | None:
+    """The first present, non-empty STRING among ``keys`` (Serving-supplied only)."""
+    if not isinstance(decision, dict):
+        return None
+    for key in keys:
+        value = decision.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def route_resolution(decision: Any) -> dict[str, Any]:
+    """Derive a truthful route-resolution mark from Serving-supplied safe metadata.
+
+    SURFACE-ONLY, and deliberately so (chat-first-voice:T010 / AGENTS.md: Anvil
+    Serving owns model policy — Workbench adds NO provider fallback).  This
+    function READS the requested-vs-served route and the selection provenance that
+    Serving reported and reports them back; it performs NO failover and NO
+    retry-to-alternate-route — it never picks a substitute route, so ``served_route``
+    is exactly the route Serving resolved, never a Workbench-chosen alternate.
+
+    * ``requested_route`` / ``served_route`` come only from the decision's own
+      fields; a mark is never fabricated from a route Workbench selected.
+    * ``diverged`` is true when Serving reported a fallback (``fell_back``) or when
+      the served route differs from the requested route it reported.
+    * ``provenance`` distinguishes an EXPLICIT selection from a PREFERENCE-DEFAULTED
+      one, taken from Serving's reported ``route_selection`` / ``route_source``;
+      an unreported provenance stays ``None`` rather than being guessed.
+    * ``episode_id`` groups one divergence episode so the browser can show the
+      notice exactly once.  It is Serving's OWN episode/correlation id when
+      reported; otherwise a stable key derived from the STABLE, non-free-text
+      ``(requested_route, served_route, fell_back)`` shape — NEVER the free-text
+      reason.  Keying off stable fields (not the reason) does two things: it keeps
+      an unscrubbed reason (a credential a future direct caller passed in raw)
+      from ever riding out through ``episode_id`` while ``divergence_reason`` is
+      the visibly-scrubbed field, AND it makes the key identical whether or not
+      Serving reported a reason on a given turn, so a re-announcement of the same
+      episode can never slip through with a different key.  It is never a re-route.
+    """
+    requested = _first_str(decision, "requested_route", "route", "requested_model", "model")
+    served = _first_str(decision, "served_route", "served_model", "model")
+    provenance = _first_str(decision, "route_selection", "route_source")
+    if provenance not in _ROUTE_SELECTION_VALUES:
+        provenance = None
+    fell_back = bool(decision.get("fell_back")) if isinstance(decision, dict) else False
+    diverged = fell_back or (requested is not None and served is not None and requested != served)
+    reason = _first_str(decision, "divergence_reason", "reason") if diverged else None
+    # Serving's own episode/correlation id wins; both are stable, non-free-text ids.
+    episode = _first_str(decision, "episode_id", "correlation_id")
+    if diverged and episode is None:
+        # A STABLE grouping key derived ONLY from stable, non-free-text fields —
+        # NOT a route choice and NEVER the free-text reason.  Two turns of the same
+        # episode share it even when Serving reports the reason on one turn and not
+        # the other, so the browser shows the divergence notice exactly once; and a
+        # credential smuggled into a raw reason can never leak through this key.
+        episode = "ep:" + "|".join(str(part) for part in (requested, served, fell_back))
+    return {
+        "request_id": _first_str(decision, "request_id"),
+        "requested_route": requested,
+        "served_route": served,
+        "provenance": provenance,
+        "diverged": diverged,
+        # Endpoint/path/host-scrub the reason at the SAME last-hop strength as the
+        # rest of the config corpus (covers a dotless ``serving:8443`` host:port, a
+        # provider URL, and a local path) — not just the credential scrub — so a
+        # reason naming a provider host can never reach the browser.
+        "divergence_reason": redact_config_text(reason) if isinstance(reason, str) else None,
+        "episode_id": episode,
+    }
 
 
 #: Anvil Serving's declared audio surface.  Serving is the ONLY managed model

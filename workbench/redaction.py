@@ -177,3 +177,51 @@ def scrub_config_payload(value):
         return [scrub_config_payload(item) for item in value]
     return value
 
+
+#: A base64 media/audio payload the conversation transfer must never carry
+#: (chat-first-voice:T012).  The chat contracts already make audio structurally
+#: unrepresentable in a turn (a ``ContentBlock`` is text, a ``VoiceEvent`` is
+#: metadata), so raw/synth audio can only appear if a caller smuggled it into a
+#: content-text string.  This closes that free-text edge: a ``data:audio/…``
+#: (or any ``data:…;base64,…``) media URI is stripped, mirroring the voice
+#: relay's no-raw-audio / no-transcript-draft discipline.  Anchored on the
+#: ``data:<type>/<subtype>;base64,`` shape so a bare ``sha256:``/version token
+#: or an ordinary colon in prose is never over-matched.
+_MEDIA_DATA_URI_PATTERN = re.compile(
+    r"(?i)\bdata:[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*(?:;[a-z0-9.+=-]+)*;base64,[A-Za-z0-9+/=]+"
+)
+_REDACTED_AUDIO = "[REDACTED-AUDIO]"
+
+
+def redact_conversation_text(value: str) -> str:
+    """Scrub a conversation content string for redacted export (T012).
+
+    The strongest single value-scan: the full configuration scrub
+    (:func:`redact_config_text` — every credential/secret shape, sensitive raw
+    URL/endpoint including a dotless ``serving:8443``, and local path) PLUS the
+    structural no-audio discipline (a ``data:…;base64,…`` media/audio blob is
+    stripped).  Applied per STRING value (never over a JSON blob), so a numeric
+    field can never be mistaken for a secret and a safe ``sha256:``/``…/v1``
+    token survives intact.
+    """
+    return _MEDIA_DATA_URI_PATTERN.sub(_REDACTED_AUDIO, redact_config_text(value))
+
+
+def scrub_conversation_payload(value):
+    """Recursively apply :func:`redact_conversation_text` to every string value.
+
+    The API last-hop guarantee for the redacted conversation export/import
+    surface (T012), exactly mirroring :func:`scrub_config_payload` but with the
+    added no-audio media scrub, so even a rogue or duck-typed projection that
+    bypassed construction-time scrubbing cannot emit a secret, endpoint, path,
+    or raw audio blob through the router.  Non-string scalars pass through
+    unchanged.
+    """
+    if isinstance(value, str):
+        return redact_conversation_text(value)
+    if isinstance(value, dict):
+        return {key: scrub_conversation_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_conversation_payload(item) for item in value]
+    return value
+

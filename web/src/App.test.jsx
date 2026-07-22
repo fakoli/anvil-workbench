@@ -426,6 +426,79 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     expect(getConversation).toHaveBeenCalledTimes(2) // once on open, once on reconnect refresh
   })
 
+  // Route-resolution divergence (chat-first-voice T010): the marks come ONLY from
+  // the Serving-supplied resolution carried on the settled turn (via the real
+  // reduceStreamState reducer + the real send()/TurnView), with the network
+  // boundary mocked. Workbench never picks a route — it surfaces what Serving did.
+  it('distinguishes an explicitly-selected route from a preference-defaulted one on the turn', async () => {
+    const user = await renderChat()
+    await openConversation(user, [])
+    // The default route is preference-derived; the settled turn shows it.
+    sendMessage.mockResolvedValueOnce({ text: 'defaulted answer', terminal: 'completed', needsRefresh: false,
+      routeResolution: { requested_route: 'route.fast', served_route: 'route.fast', provenance: 'preference_default', diverged: false, episode_id: null } })
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'one')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Defaulted from preference')).toBeTruthy()
+    // The actor now EXPLICITLY picks a route: the provenance is sent (a real
+    // served field, not a reducer-only guess) and the next turn shows it.
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Chat route' }), 'route.deep')
+    sendMessage.mockResolvedValueOnce({ text: 'explicit answer', terminal: 'completed', needsRefresh: false,
+      routeResolution: { requested_route: 'route.deep', served_route: 'route.deep', provenance: 'explicit', diverged: false, episode_id: null } })
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'two')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Explicitly selected route')).toBeTruthy()
+    const lastCall = sendMessage.mock.calls[sendMessage.mock.calls.length - 1][0]
+    expect(lastCall.routeProvenance).toBe('explicit')
+  })
+
+  it('shows the divergence notice exactly once per episode and never blocks sending', async () => {
+    const user = await renderChat()
+    await openConversation(user, [])
+    // Two turns of ONE divergence episode (shared episode id).
+    sendMessage.mockResolvedValue({ text: 'answer', terminal: 'completed', needsRefresh: false,
+      routeResolution: { requested_route: 'route.fast', served_route: 'route.heavy', provenance: 'explicit', diverged: true, episode_id: 'ep_1', divergence_reason: 'route.fast at capacity' } })
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'one')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText(/served a different route than requested/)).toBeTruthy()
+    // DISMISS the notice, then send a second turn of the SAME episode. This is
+    // what distinguishes "re-announced" from "shown once": if the announcement
+    // re-fired per turn it would re-set `divergence` and the (now-dismissed)
+    // notice would REAPPEAR. Because it is once-per-episode (the episode id is
+    // already recorded), turn 2 announces nothing and the notice stays gone.
+    await user.click(screen.getByRole('button', { name: 'Dismiss route divergence notice' }))
+    expect(screen.queryByText(/served a different route than requested/)).toBeNull()
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'two')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findAllByText('answer')
+    // The dismissed notice does NOT come back for the same episode's second turn.
+    expect(screen.queryByText(/served a different route than requested/)).toBeNull()
+    // A NEW episode (different episode id) still announces once — proving the
+    // dismissal above was episode-scoped suppression, not a permanent mute.
+    sendMessage.mockResolvedValue({ text: 'answer', terminal: 'completed', needsRefresh: false,
+      routeResolution: { requested_route: 'route.fast', served_route: 'route.deep', provenance: 'explicit', diverged: true, episode_id: 'ep_2', divergence_reason: 'route.fast at capacity' } })
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'four')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText(/served a different route than requested/)).toBeTruthy()
+    // NON-BLOCKING: the composer stays usable and a further message can be typed.
+    const composer = screen.getByRole('textbox', { name: 'Message composer' })
+    expect(composer.disabled).toBe(false)
+    await user.type(composer, 'three')
+    expect(composer.value).toContain('three')
+  })
+
+  it('surfaces the served route Serving reported on a diverged turn, never a substitute', async () => {
+    const user = await renderChat()
+    await openConversation(user, [])
+    sendMessage.mockResolvedValueOnce({ text: 'rerouted answer', terminal: 'completed', needsRefresh: false,
+      routeResolution: { requested_route: 'route.fast', served_route: 'route.heavy', provenance: 'preference_default', diverged: true, episode_id: 'ep_2' } })
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'go')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    // The turn carries the rerouted marker, and the notice names EXACTLY the
+    // requested→served pair Serving reported (no Workbench-chosen alternate).
+    expect(await screen.findByText('rerouted')).toBeTruthy()
+    expect(screen.getByText(/route\.fast → route\.heavy/)).toBeTruthy()
+  })
+
   it('records a retry as a visible successor instead of rewriting the prior turn', async () => {
     const user = await renderChat()
     await openConversation(user, [assistantTurn('turn_1', 'first answer')])
