@@ -6,7 +6,7 @@ only to an operator-configured Anvil Serving URL; it has no provider fallback.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -261,3 +261,109 @@ def sandbox_response(base_url: str, token: str, model: str, text: str) -> dict[s
         "status": str(response.get("status", "completed"))[:80],
         "output_text": redact_value(output_text[:12_000]),
     }
+
+
+#: Anvil Serving's declared Responses stream path.  Serving is the ONLY managed
+#: model path and owns model policy (AGENTS.md); the chat send/stream join relays
+#: exactly this endpoint with ``stream: True``.  There is no provider fallback and
+#: no raw-provider path -- a failure settles as a terminal Serving outcome.
+_SERVING_RESPONSES_PATH = "/responses"
+
+#: Hard ceilings on the relayed Serving Responses SSE stream, mirroring the
+#: in-relay bounds in :mod:`workbench.chat_stream` and the byte ceilings the voice
+#: functions enforce: a misbehaving upstream cannot stream unboundedly or smuggle
+#: an over-long single event through the relay.
+_MAX_RESPONSES_STREAM_EVENTS = 10_000
+_MAX_SSE_EVENT_BYTES = 1_000_000
+#: A bound, not a policy: the whole stream must make progress within it.
+_RESPONSES_STREAM_TIMEOUT = 300
+
+
+def stream_responses(
+    base_url: str, token: str, request: Mapping[str, Any], cancel: Any,
+) -> Iterator[dict[str, Any]]:
+    """Relay Anvil Serving's streaming Responses SSE events (chat-first-voice live join).
+
+    A generator implementing the ``ServingStreamTransport.open`` contract the chat
+    relay (:class:`workbench.chat_stream.ChatStreamRelay`) expects: it yields each
+    parsed SSE event mapping (a dict with a ``type`` key) from Serving's declared
+    ``/responses`` endpoint with ``stream: True``.  ``request`` is the already-bounded
+    Responses request assembled by ``workbench.chat_stream.build_bounded_request``
+    (validated route/controls only -- never an endpoint, URL, or credential).
+
+    Talks ONLY to the operator-configured Anvil Serving URL over the tailnet; there
+    is no provider fallback and no raw-provider path.  Bounded like the voice relay
+    (a cap on event count and per-event bytes).  The caller's ``CancellationToken``
+    is honored before each read and the connection is torn down on every exit
+    (``close()`` on the ``finally``), so a browser cancel terminates the upstream
+    request.  A connection/HTTP failure raises :class:`RouterError` (the relay
+    settles it as ``serving_unavailable``); a read deadline raises ``TimeoutError``
+    (the relay settles it as ``timed_out``) -- neither leaks the router URL or token.
+    """
+    if not base_url or not token:
+        raise RouterError("Anvil Serving route access is not configured")
+    body = json.dumps(dict(request), separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    http_request = Request(
+        base_url.rstrip("/") + _SERVING_RESPONSES_PATH, data=body, headers=headers, method="POST",
+    )
+    try:
+        response = urlopen(http_request, timeout=_RESPONSES_STREAM_TIMEOUT)  # nosec B310: operator-configured tailnet router
+    except HTTPError as exc:
+        raise RouterError(f"Anvil Serving rejected the stream ({exc.code})") from exc
+    except URLError as exc:
+        raise RouterError(f"Anvil Serving is unreachable: {exc.reason}") from exc
+    events = 0
+    try:
+        for raw_line in response:
+            if cancel.cancelled:
+                return
+            if len(raw_line) > _MAX_SSE_EVENT_BYTES:
+                raise RouterError("Anvil Serving stream line exceeds the byte ceiling")
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                return
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            events += 1
+            if events > _MAX_RESPONSES_STREAM_EVENTS:
+                raise RouterError("Anvil Serving stream exceeded the event ceiling")
+            yield event
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - best-effort teardown of the upstream request
+                pass
+
+
+class ServingResponsesTransport:
+    """Production ``ServingStreamTransport`` backed by Anvil Serving's Responses stream.
+
+    Implements the structural ``open(request, cancel)`` contract the chat relay
+    (:class:`workbench.chat_stream.ChatStreamRelay`) expects, returning the bounded
+    :func:`stream_responses` generator.  It holds the operator-configured Serving
+    base URL and token on the instance only (never handed to the browser), and
+    reaches ONLY that URL -- there is no provider fallback and no raw-provider path.
+    """
+
+    def __init__(self, base_url: str, token: str) -> None:
+        self._base_url = base_url
+        self._token = token
+
+    def open(self, request: Mapping[str, Any], cancel: Any) -> Iterator[dict[str, Any]]:
+        return stream_responses(self._base_url, self._token, request, cancel)

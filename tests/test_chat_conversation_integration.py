@@ -304,6 +304,9 @@ _PROBE_BODY_BY_SUFFIX: dict[str, dict | None] = {
     "/folder": {"folder": "hijackfolder"},
     "/folder/clear": None,
     "/delete": {"mode": "purge_all_records"},
+    # The live send/stream join: ownership is checked before route/serving, so a
+    # foreign or missing id is the fixed 404 identically -- no existence oracle.
+    "/send": {"route_id": "chat.heavy", "prompt": "hi", "controls": {}},
     "/turns": {"role": "assistant", "status": "complete"},
     "/turns/{turn_id}/retry": {"role": "assistant", "status": "complete"},
     "/turns/{turn_id}/branch": {"role": "assistant", "status": "complete"},

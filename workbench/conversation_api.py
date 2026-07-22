@@ -27,11 +27,12 @@ values, maps errors, and serializes responses:
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .conversation_models import (
@@ -54,7 +55,29 @@ from .conversation_models import (
     is_metadata_only,
 )
 from .conversation_store import ConversationStore, UnknownConversationError
+from .chat_routes import (
+    ChatRouteError,
+    ChatRouteSelection,
+    DiscoveredChatRoutes,
+    validate_chat_route_selection,
+)
+from .chat_stream import (
+    CancellationToken,
+    ChatStreamError,
+    ChatStreamRelay,
+    ServingStreamTransport,
+    StreamOutcome,
+)
 from .idempotency_store import IdempotencyStore, MemoryIdempotencyStore, request_hash_for
+from .models import new_id
+from .redaction import redact_text
+from .response_lifecycle_store import (
+    IN_PROGRESS_STATE,
+    LIFECYCLE_STATE_FOR_OUTCOME,
+    ResponseLifecycleError,
+    ResponseLifecycleStore,
+)
+from .stream_sequence import sequence_events
 
 #: The one non-leaking body every unknown-or-foreign conversation lookup gets.
 _UNKNOWN_DETAIL = "unknown conversation"
@@ -166,6 +189,24 @@ class TurnAppendInput(TurnBodyInput):
 
 class TurnStatusInput(_ChatInput):
     status: str = Field(pattern=r"^(complete|interrupted|cancelled|failed)$")
+
+
+class SendMessageInput(_ChatInput):
+    """The browser's live send/stream body (``web/src/api.js`` ``sendMessage``).
+
+    A closed field set matching exactly what the client posts:
+    ``{route_id, route_selection, prompt, controls}``.  ``route_selection`` is the
+    provenance the client records (``explicit`` / ``preference_default``) so Serving
+    can echo it on a future resolution mark; it selects no route and is bounded but
+    otherwise advisory here.  ``controls`` is validated fail-closed against the
+    selected route's declared controls by ``validate_chat_route_selection`` before
+    any Serving call, so an undeclared or out-of-range control is refused typed.
+    """
+
+    route_id: str = Field(min_length=1, max_length=128)
+    prompt: str = Field(min_length=1, max_length=MAX_CONTENT_TEXT_CHARS)
+    controls: dict[str, Any] = Field(default_factory=dict)
+    route_selection: str | None = Field(default=None, max_length=64)
 
 
 # --- typed-value conversion (validation errors fail closed as 409) ----------
@@ -698,3 +739,195 @@ def build_hub_retention_router(
         return {"enforced": [deletion_json(item) for item in enforced]}
 
     return router
+
+
+#: The redaction posture every send-persisted turn carries.  ``redacted`` matches
+#: the credential scrub applied to the durable content on the way in.
+_SEND_REDACTION = TurnRedaction("redacted", "workbench.default")
+
+
+def _send_lineage(turns: tuple[Turn, ...] | list[Turn], parent_id: str | None) -> TurnLineage:
+    """Build a valid append lineage under ``parent_id`` (``None`` for the root).
+
+    The first turn is the single null-parent root (``initial``); every later turn
+    is a ``branch`` child of the current tip, with the next free sibling index
+    under that parent -- so ``validate_turn_append``'s single-root and
+    ``(parent, sibling_index)`` uniqueness invariants always hold.
+    """
+    taken = [t.lineage.sibling_index for t in turns if t.lineage.parent_turn_id == parent_id]
+    sibling_index = (max(taken) + 1) if taken else 0
+    kind = "initial" if parent_id is None else "branch"
+    return TurnLineage(parent_id, sibling_index, kind)
+
+
+def _relayed_turn_status(relay: ChatStreamRelay) -> str:
+    """The chat-turn.v1 status for a settled relay, defaulting to ``cancelled``.
+
+    A settled relay maps its outcome truthfully (a non-completed stream is never
+    ``complete``).  An unsettled relay -- the client disconnected before any
+    terminal -- is persisted ``cancelled``: the upstream was torn down, so the
+    partial turn is a cancelled turn, never fabricated as complete.
+    """
+    try:
+        return relay.terminal_turn_status()
+    except ChatStreamError:
+        return "cancelled"
+
+
+def build_chat_send_router(
+    actor_dependency: Callable[..., str],
+    conversation_store: ConversationStore | None,
+    lifecycle_store: ResponseLifecycleStore | None,
+    routes_provider: Callable[[], DiscoveredChatRoutes],
+    transport_factory: Callable[[ChatRouteSelection], ServingStreamTransport],
+) -> APIRouter:
+    """Mount ``POST /api/conversations/{id}/send`` -- the live send/stream join.
+
+    This is the production endpoint the browser client already targets
+    (``web/src/api.js`` ``sendMessage``): it POSTs
+    ``{route_id, route_selection, prompt, controls}`` and reads a newline-delimited
+    stream of ``chat_stream.RelayEvent`` frames (``delta`` / ``terminal`` only), each
+    stamped with a strictly-monotonic ``seq`` from the response-lifecycle machinery.
+
+    The discipline, in order and fail-closed:
+
+    * The conversation must belong to the acting actor.  A missing or foreign id
+      raises the store's ``UnknownConversationError``, rendered as the same fixed
+      404 as a truly missing id (no cross-actor existence oracle) -- BEFORE any
+      Serving call or durable write.
+    * The ``{route_id, controls}`` selection is validated against the operator-
+      discovered routes; an unknown route or undeclared/out-of-range control is a
+      typed 422 refusal, strictly BEFORE any Serving call or durable write, and
+      there is no provider fallback.
+    * The user turn is persisted durably (credential-scrubbed content).
+    * The assistant response is streamed as NDJSON ``RelayEvent`` frames from the
+      bounded relay over the injected Serving transport; each committed frame
+      advances the reconnect-safe lifecycle so a dropped-frame client can refresh
+      from the ``GET`` snapshot.
+    * On the terminal frame the assistant turn is persisted durably with the
+      streamed content and the truthful terminal status.  On a client
+      disconnect/abort the relay's cancel is tripped (tearing down the upstream
+      Serving request) and a consistent ``cancelled`` record is left.  A Serving
+      failure settles a ``serving_unavailable`` terminal (persisted ``failed``),
+      never a provider fallback and never leaking the router URL or token.
+
+    When ``conversation_store`` or ``lifecycle_store`` is ``None`` the hub has no
+    chat persistence and the endpoint refuses with 503, matching the sibling
+    conversation surface.
+    """
+    router = APIRouter(prefix="/api/conversations")
+
+    def stores() -> tuple[ConversationStore, ResponseLifecycleStore]:
+        if conversation_store is None or lifecycle_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="chat persistence is not configured; set WORKBENCH_CHAT_HASH_KEY",
+            )
+        return conversation_store, lifecycle_store
+
+    def chat_actor(current_actor: str = Depends(actor_dependency)) -> ConversationActor:
+        return conversation_actor(current_actor)
+
+    @router.post("/{conversation_id}/send")
+    def send_message(
+        conversation_id: str,
+        payload: SendMessageInput,
+        actor: ConversationActor = Depends(chat_actor),
+    ) -> StreamingResponse:
+        store, lifecycle = stores()
+        # (1) Ownership: a missing OR foreign id raises UnknownConversationError,
+        # rendered as the fixed 404 -- strictly before any write or Serving call.
+        _conversation, turns = store.get_conversation_with_turns(actor, conversation_id)
+
+        # (2) Fail-closed route/control validation, strictly before any Serving
+        # request or durable write.  A malformed operator config is a 503; an
+        # unknown route or undeclared/out-of-range control is a typed 422.
+        try:
+            discovered = routes_provider()
+        except ChatRouteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="chat routes are not configured",
+            ) from exc
+        try:
+            selection = validate_chat_route_selection(payload.route_id, payload.controls, discovered)
+        except ChatRouteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="chat route selection is not allowed",
+            ) from exc
+
+        # (3) Persist the user turn durably (credential-scrubbed content) before
+        # the stream opens, so the send is recorded even if the client drops.
+        user_turn = store.append_turn(
+            actor, conversation_id, role="user", status="complete",
+            lineage=_send_lineage(turns, turns[-1].id if turns else None),
+            redaction=_SEND_REDACTION,
+            content=(ContentBlock("text", redact_text(payload.prompt)),),
+        )
+
+        # (4) Drive the bounded relay over the injected Serving transport, stamping
+        # and committing each frame's seq from the durable per-conversation allocator.
+        cancel = CancellationToken()
+        transport = transport_factory(selection)
+        relay = ChatStreamRelay(selection, payload.prompt, transport, cancel)
+        request_id = new_id("resp")
+        lifecycle.begin(actor, conversation_id, request_id)
+        stream_gen = relay.stream()
+        seq_gen = sequence_events(stream_gen, lambda: lifecycle.next_seq(actor, request_id))
+
+        def _persist_assistant(text: str, turn_status: str) -> None:
+            content = (ContentBlock("text", redact_text(text)),) if text else ()
+            store.append_turn(
+                actor, conversation_id, role="assistant", status=turn_status,
+                lineage=TurnLineage(user_turn.id, 0, "branch"),
+                redaction=_SEND_REDACTION, content=content,
+            )
+
+        def _frames() -> Iterator[bytes]:
+            parts: list[str] = []
+            settled = False
+            try:
+                for frame in seq_gen:
+                    if frame.kind == "delta":
+                        lifecycle.advance(actor, request_id, IN_PROGRESS_STATE, seq=frame.seq)
+                        parts.append(frame.text)
+                        yield _ndjson({"seq": frame.seq, "kind": "delta", "text": redact_text(frame.text)})
+                    else:
+                        outcome = frame.outcome
+                        lifecycle.advance(
+                            actor, request_id, LIFECYCLE_STATE_FOR_OUTCOME[outcome.value], seq=frame.seq,
+                        )
+                        # Persist the assistant turn durably BEFORE the terminal frame
+                        # leaves, so the settled record survives a disconnect on the
+                        # last write.  A non-completed outcome is never persisted complete.
+                        _persist_assistant("".join(parts), relay.terminal_turn_status())
+                        settled = True
+                        yield _ndjson({"seq": frame.seq, "kind": "terminal", "outcome": outcome.value})
+            finally:
+                if not settled:
+                    # The client disconnected (or the stream was torn down) before a
+                    # terminal.  Cancel the upstream Serving request and leave a
+                    # consistent cancelled record -- never a fabricated completion.
+                    cancel.cancel()
+                    try:
+                        seq_gen.close()
+                    except Exception:  # noqa: BLE001 - best-effort upstream teardown
+                        pass
+                    out = relay.outcome if relay.outcome is not None else StreamOutcome.cancelled
+                    try:
+                        lifecycle.advance(
+                            actor, request_id, LIFECYCLE_STATE_FOR_OUTCOME[out.value],
+                            seq=lifecycle.next_seq(actor, request_id),
+                        )
+                    except ResponseLifecycleError:
+                        pass  # already terminal (a race settled it); leave it stable
+                    _persist_assistant("".join(parts), _relayed_turn_status(relay))
+
+        return StreamingResponse(_frames(), media_type="application/x-ndjson")
+
+    return router
+
+
+def _ndjson(frame: dict[str, Any]) -> bytes:
+    """Serialize one relay frame as a newline-delimited JSON line (the FE transport)."""
+    return (json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")

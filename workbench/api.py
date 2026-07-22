@@ -28,7 +28,12 @@ from .advanced_playground import (
     UNKNOWN_ITEM_DETAIL,
     build_comparison,
 )
-from .chat_routes import ChatRouteError, discover_chat_routes, parse_chat_routes_config
+from .chat_routes import (
+    ChatRouteError,
+    ChatRouteSelection,
+    discover_chat_routes,
+    parse_chat_routes_config,
+)
 from .config import Settings
 from .configuration_transfer import (
     ConfigurationTransferError,
@@ -40,6 +45,7 @@ from .conversation_transfer import (
 )
 from .contracts import settings_actor_view
 from .conversation_api import (
+    build_chat_send_router,
     build_conversation_router,
     build_hub_retention_router,
     conversation_actor,
@@ -72,7 +78,15 @@ from .models import (
     reviewed_catalog_valid_refs,
 )
 from .retrieval import AnvilPurposeRetrieval
-from .router import RouterError, route_decisions, route_resolution, sandbox_response
+from .router import (
+    RouterError,
+    ServingResponsesTransport,
+    route_decisions,
+    route_resolution,
+    sandbox_response,
+)
+from .chat_stream import ServingStreamTransport
+from .response_lifecycle_store import MemoryResponseLifecycleStore, ResponseLifecycleStore
 from .redaction import scrub_config_payload, scrub_conversation_payload
 from .store import (
     MemoryPluginPreferenceService, MemoryPreferenceStore, MemorySkillAdoptionStore, PluginPreferenceStoreError,
@@ -1954,6 +1968,8 @@ def create_app(
     graph: EvidenceGraph | None = None,
     conversation_store: ConversationStore | None = None,
     idempotency_store: IdempotencyStore | None = None,
+    response_lifecycle_store: ResponseLifecycleStore | None = None,
+    chat_stream_transport_factory: Callable[[ChatRouteSelection], ServingStreamTransport] | None = None,
     project_context_store: ProjectContextStore | None = None,
     run_context_store: RunContextStore | None = None,
     delivery_projection_store: DeliveryProjectionStore | None = None,
@@ -1978,6 +1994,18 @@ def create_app(
     graph = graph or _graph(settings)
     conversation_store = conversation_store or _conversation_store(settings)
     idempotency_store = idempotency_store or MemoryIdempotencyStore()
+    # The reconnect-safe response-lifecycle store backs the live send/stream join
+    # (seq allocation, per-frame commit, snapshot reconnect). It holds no content
+    # and no key, so it defaults to an in-memory instance; a Postgres projection
+    # lands with the durable chat backend. The default chat transport reaches ONLY
+    # the operator-configured Anvil Serving Responses stream (no provider fallback);
+    # tests inject a scripted transport factory over the same relay contract.
+    response_lifecycle_store = response_lifecycle_store or MemoryResponseLifecycleStore()
+    chat_stream_transport_factory = chat_stream_transport_factory or (
+        lambda _selection: ServingResponsesTransport(
+            settings.anvil_router_base_url, settings.anvil_router_token,
+        )
+    )
     # System health is always available: it is a read-only projection of the
     # already-parsed settings, so it defaults to a live service rather than
     # failing closed. An injected service lets tests exercise mock bridge health
@@ -1995,6 +2023,7 @@ def create_app(
     app.state.graph = graph
     app.state.conversation_store = conversation_store
     app.state.idempotency_store = idempotency_store
+    app.state.response_lifecycle_store = response_lifecycle_store
     # The derived project-context projection is a display read-model that is
     # deliberately NOT wired into the live bridge poll loop; it stays ``None``
     # unless an instance is injected, so the browser surface fails closed (503).
@@ -2162,6 +2191,20 @@ def create_app(
     # the same trusted ``actor`` dependency; the store enforces ownership.
     register_conversation_handlers(app)
     app.include_router(build_conversation_router(actor, conversation_store, idempotency_store))
+    # Live send/stream join (chat-first-voice T010 live join): the production
+    # POST /api/conversations/{id}/send the browser client targets. Actor-gated by
+    # the same trusted identity dependency; validates the route/control selection
+    # against the operator-discovered chat routes fail-closed BEFORE any Serving
+    # call or durable write; persists the user turn; streams the assistant response
+    # as NDJSON RelayEvent frames over the response-lifecycle machinery; and settles
+    # a truthful terminal (cancelled on disconnect, serving_unavailable on a Serving
+    # failure) durably. Model traffic flows ONLY through the Serving Responses stream
+    # transport -- there is no provider fallback and the router URL/token never leak.
+    app.include_router(build_chat_send_router(
+        actor, conversation_store, response_lifecycle_store,
+        lambda: discover_chat_routes(parse_chat_routes_config(settings.chat_routes)),
+        chat_stream_transport_factory,
+    ))
     # Off-read-path retention (chat-first-voice T009): the preview + explicit
     # batched enforce pass are operator-only and mounted OFF the actor surface;
     # a single actor can neither preview across nor delete another actor's records.
