@@ -967,19 +967,6 @@ describe('Chat routing, navigation, and accessibility (T004.4)', () => {
 // submission; read-aloud playback NEVER mutates message state; both degrade
 // truthfully (a 503 becomes textual error state) and never block textual chat.
 
-class _FakeMediaRecorder {
-  constructor(stream) { this.stream = stream; this.ondataavailable = null; this.onstop = null; _FakeMediaRecorder.last = this }
-  // Accepts an optional timeslice arg (as the real API does when emitting periodic
-  // chunks); the fake ignores it and lets a test drive interim chunks manually.
-  start() {}
-  // Simulate one interim chunk delivered DURING the hold (before release).
-  emitInterimChunk() { this.ondataavailable?.({ data: new Blob([new Uint8Array([9, 9])]) }) }
-  stop() {
-    this.ondataavailable?.({ data: new Blob([new Uint8Array([1, 2, 3, 4])]) })
-    this.onstop?.()
-  }
-}
-
 class _FakeAudio {
   constructor(src) { this.src = src; this.currentTime = 0; this.onended = null; this.onerror = null; this.paused = false; this.playCount = 0; _FakeAudio.last = this; (_FakeAudio.instances ||= []).push(this) }
   play() { this.paused = false; this.playCount += 1; return Promise.resolve() }
@@ -988,32 +975,36 @@ class _FakeAudio {
 
 describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () => {
   let originalMediaDevices
-  let originalMediaRecorder
+  let originalAudioContext
   let originalAudio
 
   beforeEach(() => {
     transcribeVoice.mockResolvedValue({ draft: { text: 'dictated draft words', is_final: true, duration_ms: 900 } })
     speakMessage.mockResolvedValue({ audio_base64: 'QUJDRA==', audio_format: 'mp3', sample_rate: 24000 })
     originalMediaDevices = navigator.mediaDevices
-    originalMediaRecorder = window.MediaRecorder
+    originalAudioContext = window.AudioContext
     originalAudio = window.Audio
     Object.defineProperty(navigator, 'mediaDevices', {
       configurable: true,
       value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] }) },
     })
-    window.MediaRecorder = _FakeMediaRecorder
-    global.MediaRecorder = _FakeMediaRecorder
+    // Dictation now captures PCM16 via AudioContext/ScriptProcessor (WAV on the
+    // wire), so the capture API under test is AudioContext, not MediaRecorder.
+    _FakeAudioContext.calls = []
+    _FakeAudioContext.bufferCalls = []
+    _FakeAudioContext.lastProcessor = null
+    window.AudioContext = _FakeAudioContext
+    global.AudioContext = _FakeAudioContext
     window.Audio = _FakeAudio
     global.Audio = _FakeAudio
     _FakeAudio.instances = []
     _FakeAudio.last = null
-    _FakeMediaRecorder.last = null
   })
 
   afterEach(() => {
     Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: originalMediaDevices })
-    window.MediaRecorder = originalMediaRecorder
-    global.MediaRecorder = originalMediaRecorder
+    window.AudioContext = originalAudioContext
+    global.AudioContext = originalAudioContext
     window.Audio = originalAudio
     global.Audio = originalAudio
   })
@@ -1185,8 +1176,8 @@ describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () =>
     const ptt = screen.getByRole('button', { name: 'Hold to talk' })
     fireEvent.pointerDown(ptt)
     await waitFor(() => expect(ptt.getAttribute('aria-pressed')).toBe('true'))
-    // A chunk delivered DURING the hold drives a live interim caption.
-    await act(async () => { _FakeMediaRecorder.last.emitInterimChunk() })
+    // An audio block captured DURING the hold drives a live interim caption.
+    await act(async () => { _fireAudioBlock() })
     const caption = await screen.findByLabelText('Interim transcript')
     expect(caption.textContent).toBe('interim partial words')
     expect(caption.getAttribute('aria-live')).toBe('polite') // live-region caption
@@ -1201,6 +1192,91 @@ describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () =>
     expect(sendMessage).not.toHaveBeenCalled()
     await user.type(composer, ' edited')
     expect(composer.value).toBe('final dictated sentence edited')
+  })
+
+  // live-qualification: dictation captures 16 kHz PCM16 and relays a WAV, NOT
+  // webm/opus — the Dark STT serve accepts a real WAV and has no transcoder.
+  it('captures 16 kHz PCM16 and relays a WAV to the transcribe endpoint', async () => {
+    const user = await renderChat()
+    await openConversation(user, [])
+    const ptt = screen.getByRole('button', { name: 'Hold to talk' })
+    fireEvent.pointerDown(ptt)
+    await waitFor(() => expect(ptt.getAttribute('aria-pressed')).toBe('true'))
+    // The capture AudioContext is constructed at the 16 kHz relay rate.
+    expect(_FakeAudioContext.calls.at(-1)).toEqual({ sampleRate: 16000 })
+    await act(async () => { _fireAudioBlock() })
+    fireEvent.pointerUp(ptt)
+    await waitFor(() => expect(transcribeVoice).toHaveBeenCalledTimes(2)) // interim + final
+    for (const [args] of transcribeVoice.mock.calls) {
+      expect(args.audioFormat).toBe('wav') // never webm_opus
+      // The relayed payload is a base64 WAV: it decodes to bytes beginning "RIFF".
+      const wav = window.atob(args.audioBase64)
+      expect(wav.slice(0, 4)).toBe('RIFF')
+      // CRUCIAL: the WAV header's sample-rate field (bytes 24..27, LE u32) MUST be
+      // 16000. If capture mislabeled it (e.g. 24000), parakeet would decode 16k
+      // audio as 24k -> 1.5x garbled transcripts. Asserting the "RIFF" magic alone
+      // let that mutation survive; this byte check kills it.
+      const rate = wav.charCodeAt(24) | (wav.charCodeAt(25) << 8) | (wav.charCodeAt(26) << 16) | (wav.charCodeAt(27) << 24)
+      expect(rate).toBe(16000)
+    }
+  })
+
+  // product defect regression: the mic must be released even when capture setup
+  // fails AFTER getUserMedia resolves (e.g. a fixed-rate AudioContext throwing
+  // NotSupportedError on Firefox). Otherwise the mic indicator stays hot.
+  it('stops the mic track when AudioContext construction fails after acquiring the stream', async () => {
+    const stop = vi.fn()
+    navigator.mediaDevices.getUserMedia.mockResolvedValueOnce({ getTracks: () => [{ stop }] })
+    // The mic resolves, then AudioContext construction throws.
+    window.AudioContext = class { constructor() { throw new Error('NotSupportedError') } }
+    global.AudioContext = window.AudioContext
+    const user = await renderChat()
+    await openConversation(user, [])
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Hold to talk' }))
+    await screen.findByText(/Microphone access was not granted/)
+    // The acquired mic stream was stopped directly — not left hot.
+    await waitFor(() => expect(stop).toHaveBeenCalled())
+    // Textual chat stays fully usable.
+    const composer = screen.getByRole('textbox', { name: 'Message composer' })
+    await user.type(composer, 'typed instead')
+    expect(composer.value).toBe('typed instead')
+  })
+
+  // live-qualification: read-aloud plays raw PCM16 at the serve-REPORTED sample
+  // rate (kokoro's 24 kHz), wrapped as WAV — never a hardcoded/assumed rate.
+  it('plays raw PCM16 read-aloud audio at the serve-reported sample rate', async () => {
+    // 8 bytes of raw PCM16 at 24 kHz; the client must wrap it as a 24 kHz WAV.
+    speakMessage.mockResolvedValueOnce({ audio_base64: window.btoa('\x01\x02\x03\x04\x05\x06\x07\x08'), audio_format: 'pcm16', sample_rate: 24000 })
+    const user = await renderChat()
+    await openConversation(user, [assistantTurn('t1', 'answer to voice')])
+    await user.click(screen.getByRole('button', { name: 'Read this response aloud' }))
+    await waitFor(() => expect(speakMessage).toHaveBeenCalledTimes(1))
+    // The client requested pcm16 (the serve's native format).
+    expect(speakMessage.mock.calls[0][0].outputFormat).toBe('pcm16')
+    // The played source is a WAV data URI honoring the serve-reported rate.
+    const src = _FakeAudio.last.src
+    expect(src.startsWith('data:audio/wav;base64,')).toBe(true)
+    const wav = window.atob(src.split(',')[1])
+    // FULL 44-byte header parse. `_wrapPcm16Wav` is shared by capture AND playback,
+    // so pinning every field here (not just the rate) kills mutations such as
+    // bits-per-sample 16->8 or blockAlign 2->1 that byte-partial checks miss.
+    const u16 = (o) => wav.charCodeAt(o) | (wav.charCodeAt(o + 1) << 8)
+    const u32 = (o) => wav.charCodeAt(o) | (wav.charCodeAt(o + 1) << 8) | (wav.charCodeAt(o + 2) << 16) | (wav.charCodeAt(o + 3) << 24)
+    const dataLen = 8 // 8 raw PCM16 bytes in this fixture
+    expect(wav.slice(0, 4)).toBe('RIFF')
+    expect(u32(4)).toBe(36 + dataLen)     // RIFF chunk size
+    expect(wav.slice(8, 12)).toBe('WAVE')
+    expect(wav.slice(12, 16)).toBe('fmt ')
+    expect(u32(16)).toBe(16)              // PCM fmt chunk size
+    expect(u16(20)).toBe(1)               // audioFormat = PCM
+    expect(u16(22)).toBe(1)               // channels = mono
+    expect(u32(24)).toBe(24000)           // sampleRate = serve-reported rate
+    expect(u32(28)).toBe(24000 * 2)       // byteRate = rate * blockAlign
+    expect(u16(32)).toBe(2)               // blockAlign = channels * bytesPerSample
+    expect(u16(34)).toBe(16)              // bitsPerSample = 16
+    expect(wav.slice(36, 40)).toBe('data')
+    expect(u32(40)).toBe(dataLen)         // data chunk size
+    expect(wav.length).toBe(44 + dataLen) // no trailing/short bytes
   })
 
   // SHOULD (playback is singleton: starting message B interrupts message A so the
@@ -1268,12 +1344,17 @@ describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () =>
 // is a distinct labeled region, separate from the chat composer.
 
 class _FakeAudioContext {
-  constructor(options) { _FakeAudioContext.calls.push(options); this.sampleRate = options?.sampleRate; this.destination = {} }
+  constructor(options) { _FakeAudioContext.calls.push(options); this.sampleRate = options?.sampleRate; this.destination = {}; _FakeAudioContext.lastContext = this }
   createBuffer(channels, length, rate) { _FakeAudioContext.bufferCalls.push({ channels, length, rate }); return { getChannelData: () => new Float32Array(Math.max(0, length)) } }
   createBufferSource() { return { buffer: null, connect() {}, start() {}, onended: null } }
-  createMediaStreamSource() { return { connect() {} } }
-  createScriptProcessor() { return { connect() {}, disconnect() {}, onaudioprocess: null } }
+  createMediaStreamSource() { return { connect() {}, disconnect() {} } }
+  createScriptProcessor() { const processor = { connect() {}, disconnect() {}, onaudioprocess: null }; _FakeAudioContext.lastProcessor = processor; return processor }
   close() { return Promise.resolve() }
+}
+// Drive one captured audio block through the last ScriptProcessor, simulating a
+// mic buffer of `length` mono samples (the values are irrelevant to the WAV path).
+function _fireAudioBlock(length = 4096) {
+  _FakeAudioContext.lastProcessor?.onaudioprocess?.({ inputBuffer: { getChannelData: () => new Float32Array(length) } })
 }
 
 class _FakeRealtimeSocket {

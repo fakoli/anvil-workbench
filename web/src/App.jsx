@@ -86,6 +86,50 @@ function encodePcm16(samples) {
   return window.btoa(binary)
 }
 
+// The chat DICTATION (STT) and READ-ALOUD (TTS) request/response lanes speak a
+// WAV/PCM16 contract, distinct from the realtime relay above. Dictation captures
+// 16 kHz mono PCM16 and wraps it in a minimal WAV header (the Dark STT serve
+// accepts a real WAV and there is no server-side transcoder). Read-aloud receives
+// raw PCM16 at the serve's OWN sample rate (kokoro's 24 kHz, reported per response)
+// and must play it back at THAT rate — a hardcoded rate is the same class of
+// garble the realtime fix addressed. These helpers are the single rate-honest
+// bridge between raw PCM16 and a browser-decodable WAV.
+function _bytesToBase64(bytes) {
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
+  return window.btoa(binary)
+}
+function _base64ToBytes(base64) {
+  const binary = window.atob(base64 || '')
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
+// Wrap raw little-endian PCM16 mono bytes in a 44-byte WAV header for `sampleRate`.
+function _wrapPcm16Wav(pcmBytes, sampleRate) {
+  const buffer = new Uint8Array(44 + pcmBytes.length)
+  const view = new DataView(buffer.buffer)
+  const ascii = (offset, text) => { for (let index = 0; index < text.length; index += 1) view.setUint8(offset + index, text.charCodeAt(index)) }
+  ascii(0, 'RIFF'); view.setUint32(4, 36 + pcmBytes.length, true); ascii(8, 'WAVE')
+  ascii(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true)
+  ascii(36, 'data'); view.setUint32(40, pcmBytes.length, true)
+  buffer.set(pcmBytes, 44)
+  return buffer
+}
+// Capture direction: Float32 samples -> base64 WAV (PCM16 at `sampleRate`).
+function float32ToWavBase64(samples, sampleRate) {
+  const pcm = new Uint8Array(samples.length * 2)
+  const view = new DataView(pcm.buffer)
+  for (let index = 0; index < samples.length; index += 1) view.setInt16(index * 2, Math.max(-1, Math.min(1, samples[index])) * 0x7fff, true)
+  return _bytesToBase64(_wrapPcm16Wav(pcm, sampleRate))
+}
+// Playback direction: base64 raw PCM16 -> a `data:audio/wav` URI honoring the
+// serve-reported `sampleRate`, so the existing HTMLAudioElement controls play it.
+function pcm16Base64ToWavDataUri(pcmBase64, sampleRate) {
+  return `data:audio/wav;base64,${_bytesToBase64(_wrapPcm16Wav(_base64ToBytes(pcmBase64), sampleRate))}`
+}
+
 // --- Realtime voice (speech-to-speech) — its OWN dedicated interface ----------
 //
 // This is the ONE realtime relay surface: a session-bound `voice/realtime`
@@ -687,34 +731,49 @@ function RouteSelect({ routes, routeId, onChange }) {
 // degrade truthfully when the relay is unconfigured (a 503 becomes textual error
 // state) and NEVER block the textual chat.
 
-async function blobToBase64(blob) {
-  const buffer = await blob.arrayBuffer()
-  const bytes = new Uint8Array(buffer)
-  let binary = ''
-  for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
-  return window.btoa(binary)
-}
-
 // Push-to-talk: hold to record, release to transcribe into an EDITABLE draft
 // dropped into the composer. It NEVER sends a turn — the actor reviews, edits,
 // and submits through the ordinary composer. Permission denial or an STT failure
 // is a non-blocking textual error; the composer stays usable throughout.
 function PushToTalk({ conversationId, onDraft, disabled }) {
   const [state, dispatch] = useReducer(voiceInputReducer, undefined, initialVoiceInputState)
-  const recorderRef = useRef(null)
-  const chunksRef = useRef([])
-  const streamRef = useRef(null)
+  // Captured Float32 sample chunks (copies) for the whole hold. Wrapped in a WAV
+  // header on interim/final so the Dark STT serve — which accepts a real WAV and
+  // has no server-side transcoder — reads honest 16 kHz mono PCM16.
+  const samplesRef = useRef([])
+  const captureRef = useRef(null)
   const mountedRef = useRef(true)
   // True only during the hold (press→release). An interim transcription is
   // emitted ONLY while this is set, so a chunk delivered on stop cannot fire a
   // stray interim after release, and the reducer's own `listening`-guard is a
   // second backstop against an out-of-order interim landing on a settled draft.
   const recordingRef = useRef(false)
-  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; recordingRef.current = false; stopTracks() } }, [])
+  // Throttle interim captions: an onaudioprocess block fires ~4x/second, but the
+  // relay is request/response, so we transcribe accumulated audio at most this
+  // often. Starts at 0 so the first captured block emits an interim promptly.
+  const lastInterimRef = useRef(0)
+  const interimInFlightRef = useRef(false)
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; recordingRef.current = false; releaseCapture() } }, [])
 
-  const stopTracks = () => {
-    streamRef.current?.getTracks?.().forEach((track) => { try { track.stop() } catch { /* already stopped */ } })
-    streamRef.current = null
+  const releaseCapture = () => {
+    const capture = captureRef.current
+    if (!capture) return
+    try { capture.processor.disconnect() } catch { /* already gone */ }
+    try { capture.source.disconnect() } catch { /* already gone */ }
+    capture.stream?.getTracks?.().forEach((track) => { try { track.stop() } catch { /* already stopped */ } })
+    try { capture.context.close?.() } catch { /* already closing */ }
+    captureRef.current = null
+  }
+
+  // Concatenate accumulated Float32 chunks and wrap them as a base64 WAV. NEVER a
+  // turn — the bytes are relayed to STT and dropped; no audio is stored anywhere.
+  const accumulatedWavBase64 = () => {
+    const chunks = samplesRef.current
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+    const merged = new Float32Array(total)
+    let offset = 0
+    for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.length }
+    return float32ToWavBase64(merged, VOICE_RELAY_SAMPLE_RATE)
   }
 
   // Provisional caption: transcribe the audio captured SO FAR as a non-final
@@ -723,23 +782,25 @@ function PushToTalk({ conversationId, onDraft, disabled }) {
   // `listening`, and the release-time final pass supersedes it. A failed interim
   // is silent — the final pass still runs and textual chat is never blocked.
   const emitInterim = async () => {
-    if (!recordingRef.current || !chunksRef.current.length) return
+    if (!recordingRef.current || interimInFlightRef.current || !samplesRef.current.length) return
+    interimInFlightRef.current = true
+    lastInterimRef.current = Date.now()
     try {
-      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-      const audioBase64 = await blobToBase64(blob)
-      const value = await transcribeVoice({ conversationId, audioBase64, audioFormat: 'webm_opus', isFinal: false })
+      const audioBase64 = accumulatedWavBase64()
+      const value = await transcribeVoice({ conversationId, audioBase64, audioFormat: 'wav', isFinal: false })
       if (!mountedRef.current || !recordingRef.current) return
       dispatch({ type: 'interim', text: value?.draft?.text || '' })
     } catch {
       /* a provisional caption failure is non-blocking; the final pass still runs */
+    } finally {
+      interimInFlightRef.current = false
     }
   }
 
   const finish = async () => {
     try {
-      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-      const audioBase64 = await blobToBase64(blob)
-      const value = await transcribeVoice({ conversationId, audioBase64, audioFormat: 'webm_opus', isFinal: true })
+      const audioBase64 = accumulatedWavBase64()
+      const value = await transcribeVoice({ conversationId, audioBase64, audioFormat: 'wav', isFinal: true })
       if (!mountedRef.current) return
       const text = value?.draft?.text || ''
       // The interim caption settles into the EDITABLE final draft in the composer.
@@ -748,51 +809,61 @@ function PushToTalk({ conversationId, onDraft, disabled }) {
     } catch (error) {
       if (mountedRef.current) dispatch({ type: 'error', message: error?.message || 'Your recording could not be transcribed.' })
     } finally {
-      chunksRef.current = []
-      stopTracks()
+      samplesRef.current = []
     }
   }
 
   const start = async () => {
     if (disabled || !conversationId || state.status === 'listening') return
-    if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === 'undefined') {
+    if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) {
       dispatch({ type: 'error', message: 'This browser cannot capture audio. You can still type your message.' })
       return
     }
+    // Held across the try/catch so a throw AFTER the mic is acquired (e.g. a
+    // fixed-rate AudioContext NotSupportedError on Firefox) can still stop the
+    // stream's tracks directly — releaseCapture() alone would early-return while
+    // captureRef is still null and leave the mic indicator hot.
+    let stream = null
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      streamRef.current = stream
-      const recorder = new window.MediaRecorder(stream)
-      chunksRef.current = []
+      // Capture 16 kHz mono PCM16 through the SAME rate-honest AudioContext path
+      // the realtime relay uses; the accumulated samples are wrapped in a WAV
+      // header on release (dictation is request/response, not a socket).
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const context = new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE })
+      const source = context.createMediaStreamSource(stream)
+      const processor = context.createScriptProcessor(4096, 1, 1)
+      samplesRef.current = []
+      lastInterimRef.current = 0
+      interimInFlightRef.current = false
       recordingRef.current = true
-      // A chunk delivered DURING the hold drives a live interim caption; a chunk
-      // delivered on stop (recordingRef already false) only accumulates for final.
-      recorder.ondataavailable = (event) => {
-        if (event?.data && event.data.size) chunksRef.current.push(event.data)
-        if (recordingRef.current) emitInterim()
+      processor.onaudioprocess = (event) => {
+        if (!recordingRef.current) return
+        // Copy the reused input buffer — the underlying Float32Array is recycled.
+        samplesRef.current.push(Float32Array.from(event.inputBuffer.getChannelData(0)))
+        // A throttled interim caption while holding; superseded by the final draft.
+        if (Date.now() - lastInterimRef.current >= 900) emitInterim()
       }
-      recorder.onstop = () => { finish() }
-      recorderRef.current = recorder
-      // A timeslice makes the recorder emit periodic chunks while held, so an
-      // interim caption can render before release (the relay is request/response,
-      // not a socket — each chunk is a bounded non-final transcription).
-      recorder.start(1200)
+      source.connect(processor); processor.connect(context.destination)
+      captureRef.current = { stream, context, source, processor }
       dispatch({ type: 'press' })
     } catch {
-      // Permission denial is non-blocking: no audio left this browser.
+      // Non-blocking: no audio left this browser. Stop any acquired mic tracks
+      // directly so the mic never stays hot when capture setup failed mid-way.
       recordingRef.current = false
+      stream?.getTracks?.().forEach((track) => { try { track.stop() } catch { /* already stopped */ } })
       dispatch({ type: 'error', message: 'Microphone access was not granted. You can still type your message.' })
-      stopTracks()
+      releaseCapture()
     }
   }
 
   const stop = () => {
     if (state.status !== 'listening') return
-    // Clear the hold flag BEFORE stopping so the final chunk delivered by stop()
-    // does not fire a stray interim after release.
+    // Clear the hold flag BEFORE tearing down so a late audio block cannot fire a
+    // stray interim after release.
     recordingRef.current = false
     dispatch({ type: 'release' })
-    try { recorderRef.current?.stop() } catch { finish() }
+    releaseCapture()
+    finish()
   }
 
   const listening = state.status === 'listening'
@@ -826,6 +897,21 @@ function releasePlayback(entry) {
   if (_activePlayback === entry) _activePlayback = null
 }
 
+// Build the <audio> source URI from a read-aloud response. Raw PCM16 (the Dark
+// TTS serve's native output) carries no container, so it is wrapped in a WAV
+// header at the serve-REPORTED sample rate (kokoro's 24 kHz, not the 16 kHz
+// capture rate) — playing it at a wrong rate is the same garble the realtime fix
+// addressed. Any already-containered format (mp3/wav/opus) passes straight through.
+function audioSourceFor(value) {
+  const format = value?.audio_format || 'mp3'
+  const base64 = value?.audio_base64 || ''
+  if (format === 'pcm16' || format === 'pcm') {
+    const rate = Number.isFinite(value?.sample_rate) && value.sample_rate > 0 ? value.sample_rate : 24000
+    return pcm16Base64ToWavDataUri(base64, rate)
+  }
+  return `data:audio/${format};base64,${base64}`
+}
+
 // Read-aloud: transient TTS playback for one assistant response. Playback moves
 // only local audio status — it NEVER changes the message or conversation. The
 // text stays available before/during/after audio. Autoplay is OPTIONAL and only
@@ -857,10 +943,10 @@ function ReadAloud({ conversationId, turn, autoplayPreference }) {
     if (!text.trim() || !conversationId) return
     dispatch({ type: 'load', messageRef: turn.id })
     try {
-      const value = await speakMessage({ conversationId, messageRef: turn.id, text })
+      const value = await speakMessage({ conversationId, messageRef: turn.id, text, outputFormat: 'pcm16' })
       if (!mountedRef.current) return
       teardown()
-      const audio = new window.Audio(`data:audio/${value?.audio_format || 'mp3'};base64,${value?.audio_base64 || ''}`)
+      const audio = new window.Audio(audioSourceFor(value))
       audioRef.current = audio
       audio.onended = () => { if (mountedRef.current) dispatch({ type: 'ended' }); releasePlayback(entryRef.current) }
       audio.onerror = () => { if (mountedRef.current) dispatch({ type: 'error', message: 'Audio playback failed.' }); releasePlayback(entryRef.current) }

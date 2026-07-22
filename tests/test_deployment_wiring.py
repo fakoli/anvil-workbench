@@ -486,3 +486,157 @@ def test_delivery_projection_surface_requires_a_seed_directory():
             "WORKBENCH_LIVE_SURFACES": "delivery_projection_store",
             "WORKBENCH_DELIVERY_PROJECTION_SEED": "Z:/nope/definitely-missing-seed",
         })
+
+
+# ---------------------------------------------------------------------------
+# (e) voice_relay_service wires the Dark Serving audio adapter, gated + closed
+# ---------------------------------------------------------------------------
+
+import base64 as _b64
+import json as _json
+
+_VOICE_STT_URL = "http://serving-stt.internal:30010/v1/audio/transcriptions"
+_VOICE_TTS_URL = "http://serving-tts.internal:30011/v1/audio/speech"
+
+
+class _FakeAudioServeResponse:
+    """One canned serve answer for the monkeypatched ``urlopen`` context manager."""
+
+    def __init__(self, body: bytes) -> None:
+        self.status = 200
+        self._body = body
+
+    def __enter__(self) -> "_FakeAudioServeResponse":
+        return self
+
+    def __exit__(self, *_a: object) -> bool:
+        return False
+
+    def read(self, n: int = -1) -> bytes:
+        return self._body if (n is None or n < 0) else self._body[:n]
+
+
+def _stub_audio_serves(monkeypatch) -> None:
+    """Route the adapter's STT/TTS hop to canned answers -- no real serve is hit.
+
+    The STT URL answers the parakeet ``{"text"}`` shape; the TTS URL answers raw
+    PCM16 bytes (the kokoro shape). This exercises the WIRED deployment transport
+    end to end without a network.
+    """
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001
+        if request.full_url == _VOICE_TTS_URL:
+            return _FakeAudioServeResponse(b"\x07\x08" * 64)  # raw PCM16
+        return _FakeAudioServeResponse(_json.dumps({"text": "wired draft words"}).encode())
+
+    monkeypatch.setattr("workbench.serving_audio._urlopen", fake_urlopen)
+
+
+def _voice_env(**extra: str) -> dict[str, str]:
+    return _base_env(
+        WORKBENCH_LIVE_SURFACES="voice_relay_service",
+        WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY,
+        ANVIL_VOICE_STT_URL=_VOICE_STT_URL,
+        ANVIL_VOICE_TTS_URL=_VOICE_TTS_URL,
+        **extra,
+    )
+
+
+def test_voice_relay_defaults_to_503_when_not_wired():
+    # The voice lane fails closed by default (no WORKBENCH_LIVE_SURFACES entry).
+    client = _wired_client(_base_env(WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY))
+    r = client.post("/api/chat/voice/transcribe", headers=_ACTOR, json={
+        "conversation_id": "c", "audio_base64": _b64.b64encode(b"x").decode(),
+        "audio_format": "wav", "is_final": True,
+    })
+    assert r.status_code == 503
+
+
+def test_voice_relay_wired_serves_stt_and_tts_over_the_dark_serves(monkeypatch):
+    # The wired relay goes 503 -> 200 through the REAL deployment composition and
+    # the REAL DarkServingAudioTransport (only the network hop is stubbed).
+    _stub_audio_serves(monkeypatch)
+    client = _wired_client(_voice_env())
+
+    # Scope is authoritative: relay only for a conversation the actor OWNS. Create
+    # one through the real chat surface (the SAME shared store the relay checks).
+    created = client.post("/api/conversations", headers=_ACTOR, json={"title": "voice conv"})
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["id"]
+
+    # STT: multipart upload -> editable draft (no turn created).
+    stt = client.post("/api/chat/voice/transcribe", headers=_ACTOR, json={
+        "conversation_id": conversation_id,
+        "audio_base64": _b64.b64encode(b"RIFF____WAVE" + b"\x00" * 48).decode(),
+        "audio_format": "wav", "is_final": True,
+    })
+    assert stt.status_code == 200, stt.text
+    # The 60-byte WAV body estimates to 0 ms (8 samples at 16 kHz): a concrete
+    # value, never self-referential.
+    assert stt.json() == {"draft": {"text": "wired draft words", "is_final": True, "duration_ms": 0}}
+
+    # TTS: raw PCM16 -> transient playback audio, reporting the serve sample rate.
+    tts = client.post("/api/chat/voice/speak", headers=_ACTOR, json={
+        "conversation_id": conversation_id, "message_ref": "m1",
+        "text": "please read this back", "output_format": "pcm16",
+    })
+    assert tts.status_code == 200, tts.text
+    payload = tts.json()
+    assert _b64.b64decode(payload["audio_base64"]) == b"\x07\x08" * 64
+    assert payload["audio_format"] == "pcm16"
+    assert payload["sample_rate"] == 24000  # the default kokoro serve rate, honored
+
+
+def test_voice_relay_sample_rate_env_is_honored(monkeypatch):
+    _stub_audio_serves(monkeypatch)
+    client = _wired_client(_voice_env(ANVIL_VOICE_TTS_SAMPLE_RATE="22050"))
+    created = client.post("/api/conversations", headers=_ACTOR, json={"title": "c"})
+    conversation_id = created.json()["id"]
+    tts = client.post("/api/chat/voice/speak", headers=_ACTOR, json={
+        "conversation_id": conversation_id, "message_ref": "m", "text": "hi", "output_format": "pcm16",
+    })
+    assert tts.status_code == 200
+    assert tts.json()["sample_rate"] == 22050
+
+
+def test_voice_relay_scope_refuses_a_conversation_the_actor_does_not_own(monkeypatch):
+    # A second allowlisted actor may reach the endpoint, but the ownership scope
+    # check (through the shared store) fails closed with 403 for someone else's id.
+    _stub_audio_serves(monkeypatch)
+    client = _wired_client(_voice_env(WORKBENCH_APPROVERS="operator,intruder"))
+    owned = client.post("/api/conversations", headers=_ACTOR, json={"title": "owners only"})
+    conversation_id = owned.json()["id"]
+    # ``intruder`` is allowlisted (passes the actor gate) but owns nothing here.
+    r = client.post("/api/chat/voice/transcribe", headers={"X-Workbench-Actor": "intruder"}, json={
+        "conversation_id": conversation_id,
+        "audio_base64": _b64.b64encode(b"wavbytes____").decode(), "audio_format": "wav", "is_final": True,
+    })
+    assert r.status_code == 403
+
+
+def test_voice_relay_without_serve_urls_fails_closed_at_startup():
+    # Naming voice_relay_service but leaving the serve URLs unset fails the hub
+    # closed at startup, not a per-request 503 an operator cannot diagnose.
+    with pytest.raises(DeploymentConfigError, match="ANVIL_VOICE_STT_URL"):
+        build_live_overrides(_base_env(
+            WORKBENCH_LIVE_SURFACES="voice_relay_service",
+            WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY,
+        ))
+    # A non-http URL is also refused.
+    with pytest.raises(DeploymentConfigError):
+        build_live_overrides(_base_env(
+            WORKBENCH_LIVE_SURFACES="voice_relay_service",
+            WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY,
+            ANVIL_VOICE_STT_URL="ftp://nope",
+            ANVIL_VOICE_TTS_URL=_VOICE_TTS_URL,
+        ))
+
+
+def test_voice_relay_without_chat_persistence_fails_closed_at_startup():
+    # The scope check needs the shared conversation store; without the chat hash
+    # key there is no store, so the build fails closed with a precise message.
+    with pytest.raises(DeploymentConfigError):
+        build_live_overrides(_base_env(
+            WORKBENCH_LIVE_SURFACES="voice_relay_service",
+            ANVIL_VOICE_STT_URL=_VOICE_STT_URL,
+            ANVIL_VOICE_TTS_URL=_VOICE_TTS_URL,
+        ))
