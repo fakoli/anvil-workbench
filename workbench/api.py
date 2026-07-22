@@ -2000,7 +2000,11 @@ def create_app(
     # lands with the durable chat backend. The default chat transport reaches ONLY
     # the operator-configured Anvil Serving Responses stream (no provider fallback);
     # tests inject a scripted transport factory over the same relay contract.
-    response_lifecycle_store = response_lifecycle_store or MemoryResponseLifecycleStore()
+    # Recover on open like the conversation store (G4): a response found
+    # ``in_progress`` after a restart was streaming when the hub stopped; recovery
+    # surfaces it as ``interrupted`` (never a fabricated completion) before serving
+    # reconnects. Harmless for a fresh in-memory store; correct once durably backed.
+    response_lifecycle_store = response_lifecycle_store or MemoryResponseLifecycleStore(recover_on_open=True)
     chat_stream_transport_factory = chat_stream_transport_factory or (
         lambda _selection: ServingResponsesTransport(
             settings.anvil_router_base_url, settings.anvil_router_token,
