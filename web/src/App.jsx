@@ -943,7 +943,7 @@ function ChatView({ append }) {
   }, [])
   // Load the reviewed advanced-route allowlist. NOTE (S6): the advanced HTTP
   // surface — GET /api/chat/advanced/routes and POST
-  // /api/conversations/{id}/advanced/run, served by `build_advanced_router` — is
+  // /api/conversations/{id}/advanced/run — is
   // NOT yet wired server-side. T005 is proven at the COMPONENT level over the
   // merged serializer shapes (route/control/branch/advanced-trace.v1), and the
   // live path degrades to `advUnavailable` (503 → the shared not-configured

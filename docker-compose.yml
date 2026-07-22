@@ -23,6 +23,10 @@ services:
       WORKBENCH_OWNER: ${WORKBENCH_OWNER:?set in .env}
       WORKBENCH_APPROVERS: ${WORKBENCH_APPROVERS:-}
       WORKBENCH_IDENTITY_HEADER: ${WORKBENCH_IDENTITY_HEADER:-Tailscale-User-Login}
+      # Hub-held content-fingerprint key for durable chat persistence. Left unset
+      # the hub builds no conversation store and every chat endpoint returns 503;
+      # set it (host env or .env) to enable chat. Never returned to the browser.
+      WORKBENCH_CHAT_HASH_KEY: ${WORKBENCH_CHAT_HASH_KEY:-}
       # Loopback-only development escape hatch. Production must remain false and
       # receive identity exclusively from the tailnet proxy.
       WORKBENCH_ALLOW_INSECURE_DEV_ACTOR: ${WORKBENCH_ALLOW_INSECURE_DEV_ACTOR:-false}

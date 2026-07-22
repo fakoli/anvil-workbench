@@ -14,6 +14,97 @@ Use this file to resume work in a new Anvil Workbench coding session.
 - Immediate roadmap: [ROADMAP.md](ROADMAP.md)
 - Agent rules: [../AGENTS.md](../AGENTS.md)
 
+## 2026-07-21 FINAL RUN STATE — qualification finale (state-context-operations:T007)
+
+This is the authoritative closing state of the multi-PRD delivery run. The
+qualification matrix is [QUALIFICATION.md](QUALIFICATION.md); the per-surface UI
+record is [UI-ACCEPTANCE-AUDIT.md](UI-ACCEPTANCE-AUDIT.md).
+
+### What is implemented + merged
+
+- **PRs #9–#35** on `fakoli/anvil-workbench` (27 contiguous gate-reviewed merges,
+  verified on `origin/main`, HEAD `11f787f`) delivered every
+  hermetically-completable task across all six approved PRDs
+  (chat-first-voice, state-context-operations, preferences-configuration,
+  advanced-model-playground, plan-task-delivery, reviewed-tools-plugins).
+- Per the control plane, **101 of 108 tasks are `done`**. (State was not
+  queryable from this worktree — `anvil` is not initialized here — so the count
+  and the blocked-task IDs are recorded as provided and corroborated
+  structurally; see QUALIFICATION.md.)
+- Everything merged is hermetic: contract, persistence, runtime, and browser
+  **component** slices. Each is deliberately **not wired into `create_app`'s live
+  loop / the bridge poll loop** — the injected stores/services stay `None`→503
+  until a real backend is provided.
+
+### Implemented vs proposed (do not overstate)
+
+- **Implemented (hermetic):** the typed-operation spine (T006.1/.2/.3) with the
+  full fail-closed matrix and stable `OPERATION_REFUSAL_CODES`; run-context
+  capture + read API; project-context projection + store; State read-adapters;
+  provider catalogs; capability profiles; workflow snapshots; the whole chat
+  foundation; advanced-mode runtime/dispatch modules; preferences/config/policy
+  gates; delivery projection + Deliver + directives; plugin host + skill-adoption
+  gate; every browser surface at the component level.
+- **Proposed (not an implemented endpoint):** the workflow operation-layer
+  wiring into the live bridge (`dispatch_with_run_context` has no production
+  caller); the advanced run/dispatch HTTP execution path; the
+  `/api/conversations/{id}/send` + `RelayEvent` `resolution` join; production
+  Postgres backends for the in-memory hub stores.
+
+### T007 changes in this task
+
+- `tests/test_adversarial_qualification.py` (**new**, +7 cases) — the
+  consolidating adversarial-qualification index: every operation-spine refusal is
+  a declared member of the closed `OPERATION_REFUSAL_CODES` set **and** attempts
+  no external effect (reuses the proven `test_typed_operation_integration`
+  harness; asserts the cross-surface invariant, not each gate in isolation).
+- `.env.example` + `docker-compose.yml` — added `WORKBENCH_CHAT_HASH_KEY`
+  (the documented var was absent from both, so Compose chat would 503 even when
+  configured). Optional `${…:-}` form, so `docker compose config -q` still
+  validates and chat stays 503-until-set. `docker compose --env-file .env.example
+  config -q` exits 0 with `ANVIL_ROUTER_TOKEN` set in the host env.
+- Rewrote `docs/QUALIFICATION.md` (final local-vs-live matrix) and
+  `docs/UI-ACCEPTANCE-AUDIT.md` (per-surface component-proven vs
+  rendered-browser-deferred).
+
+### Corrections to the provided final-state summary (verified against the repo)
+
+- There is **no `build_advanced_router` symbol**. The advanced
+  preset/template/rating persistence routers **are mounted** (`create_app`); what
+  is unwired is the advanced **run/dispatch execution path**
+  (`advanced_routes`/`advanced_runtime`/`advanced_dispatch`), which no HTTP
+  endpoint invokes. The client still degrades to 503 for a run with no route.
+- `RelayEvent` currently emits only `delta`/`terminal`; the `resolution` kind is
+  described in the docstring as future work and is **not yet added** (consistent
+  with "not mounted").
+
+### Follow-up hardening backlog (non-blocking — flagged by the adversarial gates, NOT fixed here)
+
+1. **Shared redaction dotless `host:port` is lowercase-anchored** — the pattern
+   `\b[a-z][a-z0-9-]*:\d{2,5}\b` misses a capitalized single-label host
+   (`Serving:8443`), a case-smuggle. Anchor case-insensitively (and re-verify no
+   over-redaction of `sha256:`/timestamps).
+2. **`Cookie` / `Set-Cookie` are not in the export/redaction corpus** — add them
+   to the proven-leak corpus and the scrubber.
+3. **Project-scope preference writes have no membership check** — a project-scoped
+   write on the shared spine is not gated by project membership; add the check
+   before a live multi-tenant deployment.
+4. **Inline `-c` / `-e` verification commands are outside the script-drift gate** —
+   the T008 gate drift-checks a resolvable *script file* operand only; inline code
+   (`python -c "…"`, `node -e "…"`) has no file to check. Document this as an
+   operator note (declare inline verification code in the packet) and consider a
+   gate extension.
+
+### The exact remaining gate
+
+The **7 blocked-live tasks**, each needing the full live stack (tailnet identity
++ real project bridge/Codex/GitHub + real Anvil Serving route + real PR/merge +
+State-apply), upstream-blocked by
+[fakoli/anvil#178](https://github.com/fakoli/anvil/issues/178):
+`chat-first-voice:T004`, `chat-first-voice:T005`, `chat-first-voice:T006`,
+`preferences-configuration:T007`, `advanced-model-playground:T007`,
+`plan-task-delivery:T007`, `reviewed-tools-plugins:T007`.
+
 ## 2026-07-21 delivery display projection + Deliver + typed directives (plan-task-delivery T002/T004/T005/T008)
 
 - **New browser-facing delivery API boundary (read-only, project-scoped, GET):**
