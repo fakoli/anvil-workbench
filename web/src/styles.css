@@ -107,18 +107,19 @@
 .chat-composer{border:1px solid #294047;background:#0d191d;border-radius:9px;overflow:hidden}.chat-composer textarea{display:block;width:100%;resize:vertical;min-height:52px;outline:0;border:0;padding:12px 14px 4px;background:transparent;color:#dce9e6;font-size:12px;line-height:1.55}.chat-composer textarea::placeholder{color:#62767a}.chat-composer textarea:disabled{color:#607276}
 .composer-bar{display:flex;justify-content:space-between;align-items:center;padding:4px 9px 8px 14px}.composer-bar small{font-size:8px;color:#64777b}.chat-composer button{border:0;border-radius:6px;background:var(--teal);color:#09211d;font-size:10px;font-weight:800;padding:8px 13px}.chat-composer button:disabled{background:#264944;color:#8da9a3;cursor:default}.composer-cancel{background:#bd6a48!important;color:#fff!important}
 @media(max-width:900px){.chat{grid-template-columns:1fr}.conv-rail{max-height:none;border-right:0;border-bottom:1px solid var(--line-soft)}.chat-main{padding:18px 18px 16px}
+.voice-console{grid-template-columns:1fr}.voice-conv-rail{max-height:none;border-right:0;box-shadow:none;border-bottom:1px solid var(--line-soft)}
 /* Chat narrow layout (a11y #4): the app nav rail is position:fixed at full
    width and would otherwise overlay the composer once the page can shrink below
    980px. On the chat route only, drop it out of the fixed layer into normal flow
    as a stacked top bar so it pushes chat content down instead of occluding it,
    and let the workspace use the full width. The Delivery route keeps its fixed
    rail + 980px assumption (scoped by .chat-active). */
-.app-shell.chat-active{flex-direction:column}
-.app-shell.chat-active .rail{position:static;inset:auto;width:100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:12px 16px}
-.app-shell.chat-active .rail nav{grid-auto-flow:column;grid-template-columns:none;display:flex;flex-wrap:wrap;gap:4px}
-.app-shell.chat-active .rail .brand{padding:0 12px 0 0}
-.app-shell.chat-active .rail-footer{margin:0 0 0 auto}
-.app-shell.chat-active .workspace{margin-left:0;width:100%}}
+.app-shell.chat-active,.app-shell.voice-active{flex-direction:column}
+.app-shell.chat-active .rail,.app-shell.voice-active .rail{position:static;inset:auto;width:100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:12px 16px}
+.app-shell.chat-active .rail nav,.app-shell.voice-active .rail nav{grid-auto-flow:column;grid-template-columns:none;display:flex;flex-wrap:wrap;gap:4px}
+.app-shell.chat-active .rail .brand,.app-shell.voice-active .rail .brand{padding:0 12px 0 0}
+.app-shell.chat-active .rail-footer,.app-shell.voice-active .rail-footer{margin:0 0 0 auto}
+.app-shell.chat-active .workspace,.app-shell.voice-active .workspace{margin-left:0;width:100%}}
 
 /* Delivery explorer (plan-task-delivery T003). Project → PRD → plan → task
    master/detail over the redacted delivery projection. Titles + lineage lead;
@@ -350,7 +351,16 @@
    sitting above the focal LIVE TRANSCRIPT. Everything else stays quiet.
    ==========================================================================*/
 .voice-grid{min-height:calc(100vh - 64px)}
-.voice-page{display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:0;min-height:calc(100vh - 64px);max-width:1100px;margin:0 auto;width:100%;padding:0 40px}
+/* Two columns: the unified conversation rail + the voice-first console. The rail
+   is the SAME component as Chat, voice-tinted; it defers to the orb signature. */
+.voice-console{display:grid;grid-template-columns:288px minmax(0,1fr);min-height:calc(100vh - 64px)}
+.voice-console.no-rail{grid-template-columns:1fr}
+.voice-page{display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:0;min-height:calc(100vh - 64px);max-width:1000px;margin:0 auto;width:100%;padding:0 40px;min-width:0}
+/* Voice-tinted rail: a teal left edge signals the voice modality without forking
+   the Chat rail component. */
+.voice-conv-rail{background:linear-gradient(180deg,#0a1618,#081415);box-shadow:inset 3px 0 0 rgba(79,214,192,.28)}
+.conv-rail-caption{margin:-4px 0 2px;font-size:9px;line-height:1.5;color:#6f8884}
+.voice-conv-rail .conv-open[aria-current='true']{box-shadow:inset 2px 0 0 var(--teal)}
 .voice-head{display:flex;justify-content:space-between;align-items:flex-start;gap:26px;padding:34px 4px 22px;border-bottom:1px solid var(--line-soft)}
 .voice-head-titles{max-width:560px}
 .voice-head h1{margin:9px 0 10px;font-size:30px;letter-spacing:-.055em;font-weight:800}
@@ -364,7 +374,11 @@
 .voice-ro{font-family:'DM Mono',monospace;font-size:7px;text-transform:uppercase;letter-spacing:.08em;color:#5e7b76;border:1px solid #234540;border-radius:3px;padding:1px 4px}
 
 /* The stage: presence orb + the scrolling live transcript (the focal element). */
-.voice-stage{display:grid;grid-template-rows:auto minmax(0,1fr);gap:18px;padding:26px 0 18px;min-height:0}
+.voice-stage{display:grid;grid-template-rows:auto auto minmax(0,1fr);gap:14px;padding:22px 0 18px;min-height:0}
+/* The active-conversation bar: names which thread new turns record into. */
+.voice-thread-bar{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}
+.voice-thread-label{font-size:12px;font-weight:700;letter-spacing:-.02em;color:#cfe4df;max-width:60ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.voice-thread-badge{font-family:'DM Mono',monospace;font-size:7px;text-transform:uppercase;letter-spacing:.09em;color:#7fd6c4;border:1px solid #2a4f49;border-radius:999px;padding:2px 8px}
 .voice-unconfigured{display:grid;place-content:center;justify-items:center;gap:12px;text-align:center;padding:60px 20px}
 .voice-unconfigured h2{margin:6px 0 0;font-size:19px;letter-spacing:-.03em}
 .voice-unconfigured p{margin:0;max-width:430px;color:#7f9a95;font-size:12px;line-height:1.6}
@@ -435,11 +449,7 @@
 .voice-stop:disabled{border-color:#2c3a3b;background:#182226;color:#5c7377;cursor:default}
 .voice-disconnect{border:1px solid #344749;background:transparent;color:#92aaa7;border-radius:8px;padding:11px 16px;font-size:11px;font-weight:800}
 .voice-connect:disabled{border-color:#2a3c3e;background:#182226;color:#637a7b;cursor:default}
-.voice-save{margin-left:auto;display:grid;gap:5px;justify-items:end;text-align:right;max-width:300px}
-.voice-save-btn{border:1px solid #32665e;background:#13342f;color:#b9f4e5;border-radius:7px;padding:9px 14px;font-size:10px;font-weight:800;white-space:nowrap}
-.voice-save-btn:disabled{border-color:#273a3d;background:#172226;color:#60777a;cursor:default}
-.voice-save-note{font-size:8px;color:#6f8884;line-height:1.5}
-.voice-connect:focus-visible,.vp-ptt:focus-visible,.voice-handsfree:focus-visible,.voice-stop:focus-visible,.voice-disconnect:focus-visible,.voice-mode-btn:focus-visible,.voice-replay:focus-visible,.voice-save-btn:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
+.voice-connect:focus-visible,.vp-ptt:focus-visible,.voice-handsfree:focus-visible,.voice-stop:focus-visible,.voice-disconnect:focus-visible,.voice-mode-btn:focus-visible,.voice-replay:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
 .voice-live{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 
 /* Voice route reflow: stack the rail into a top bar like the other full-width
@@ -634,13 +644,13 @@
   .deliver-start,.deliver-actions .secondary-button,
   .query-form button,.query-form input,.sandbox-form button,
   .setting-save-btn,.setting-preview-btn,.setting-reset-btn,
-  .voice-ptt .ptt-button,.vp-ptt,.voice-handsfree,.voice-connect,.voice-stop,.voice-disconnect,.voice-mode-btn,.voice-save-btn,
+  .voice-ptt .ptt-button,.vp-ptt,.voice-handsfree,.voice-connect,.voice-stop,.voice-disconnect,.voice-mode-btn,
   .chat-route select{min-height:44px}
   .composer button,.chat-composer button,.session-action,.ghost-button,
   .inline-action,.explorer-open-prd,.conv-new,.advanced-toggle,
   .deliver-start,.query-form button,.sandbox-form button,
   .setting-save-btn,.setting-preview-btn,.setting-reset-btn,
-  .voice-ptt .ptt-button,.vp-ptt,.voice-handsfree,.voice-connect,.voice-stop,.voice-disconnect,.voice-save-btn{display:inline-flex;align-items:center;justify-content:center}
+  .voice-ptt .ptt-button,.vp-ptt,.voice-handsfree,.voice-connect,.voice-stop,.voice-disconnect{display:inline-flex;align-items:center;justify-content:center}
   /* Tappable list/nav rows: give the whole row a comfortable minimum. */
   .data-list article,.session-list article,.run-row,
   .explorer-project,.explorer-task button,.conv-open,.pc-tool-select{min-height:44px}
@@ -671,7 +681,7 @@
   .chat-controls,.composer>div,.composer-bar,.query-form,
   .voice-head,.voice-controls,.voice-actions,.explorer-prd-head,.explorer-detail-topbar,
   .pc-plugin-head{flex-wrap:wrap}
-  .voice-page{padding:0 16px}.voice-save{margin-left:0}
+  .voice-page{padding:0 16px}
   .composer>div,.composer-bar{gap:8px}
   .query-form input{min-width:0}
 

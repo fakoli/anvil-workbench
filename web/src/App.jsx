@@ -187,16 +187,169 @@ function pcm16Base64ToWavDataUri(pcmBase64, sampleRate) {
   return `data:audio/wav;base64,${_bytesToBase64(_wrapPcm16Wav(_base64ToBytes(pcmBase64), sampleRate))}`
 }
 
+// The text stored for an assistant turn whose reply was audio-only. Raw audio is
+// NEVER persisted — only this honest text placeholder marks that a spoken reply
+// happened, so a saved (or cross-modality) conversation reads truthfully.
+const VOICE_SPOKEN_PLACEHOLDER = '[Spoken reply — the assistant replied by voice; audio was not recorded.]'
+
+// Adapt stored conversation turns (content blocks) into the flat voice-transcript
+// shape. Loaded turns are historical: they carry no live audio buffer, so they
+// render without a Replay control (`live` is absent).
+function voiceTurnsFromStored(turns) {
+  return (Array.isArray(turns) ? turns : []).map((turn, index) => ({
+    id: turn.id || `stored-${index}`,
+    role: turn.role === 'assistant' ? 'assistant' : 'user',
+    text: (turn.content || []).map((block) => block.text || '').join(''),
+    status: 'complete',
+  }))
+}
+
+// --- Shared conversation rail (unified store) --------------------------------
+//
+// Voice conversations ARE Chat conversations. This hook owns the conversation
+// list/search/select/create/manage cycle over the SAME `/api/conversations`
+// store the Chat surface uses (api.js create/list/search/get/append/rename/
+// archive/delete) — never a parallel store — so a conversation spoken in Voice
+// loads through the exact API Chat reads, and vice versa. It degrades honestly:
+// a 503/unconfigured store sets `unavailable` (the caller then runs ephemeral)
+// rather than throwing. `onOpen(id, turns)` fires ONLY on an explicit
+// select/new/delete so the caller can load/clear its transcript; an
+// auto-created conversation (mid-utterance) never fires it, so live turns
+// already on screen are preserved and simply re-scoped to the new conversation.
+function useConversationRail({ append, enabled = true, onOpen }) {
+  const [conversations, setConversations] = useState([])
+  const [includeArchived, setIncludeArchived] = useState(false)
+  const [query, setQuery] = useState('')
+  const [selectedId, setSelectedId] = useState(null)
+  const [renamingId, setRenamingId] = useState(null)
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null)
+  const [unavailable, setUnavailable] = useState(false)
+  const listSeqRef = useRef(0)
+  const listAbortRef = useRef(null)
+  const railRef = useRef(null)
+  // The active-target id readable from an async settle without a stale closure:
+  // a voice turn persisting after a switch reads THIS to record into the current
+  // conversation, and a select/delete updates it synchronously.
+  const selectedIdRef = useRef(null)
+  // One in-flight auto-create is shared so two quick turns cannot create two
+  // conversations (the first utterance's user + assistant turns race otherwise).
+  const creatingRef = useRef(null)
+
+  const refreshList = async (nextQuery, nextArchived, signal) => {
+    const seq = (listSeqRef.current += 1)
+    try {
+      const value = nextQuery && nextQuery.trim()
+        ? await searchConversations(nextQuery.trim(), { includeArchived: nextArchived, signal })
+        : await listConversations({ includeArchived: nextArchived, signal })
+      if (seq !== listSeqRef.current) return // a newer list/search superseded this one
+      setConversations(value.conversations || [])
+      setUnavailable(false)
+    } catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError') return // superseded fetch aborted
+      // Degrade honestly: mark the rail unavailable (the caller runs ephemeral).
+      // No toast — an unconfigured store is an expected, non-error mode here.
+      if (seq === listSeqRef.current) setUnavailable(true)
+    }
+  }
+  // Latest-wins list/search with debounce + abort, mirroring the Chat rail.
+  useEffect(() => {
+    if (!enabled) return undefined
+    const controller = new AbortController()
+    listAbortRef.current?.abort()
+    listAbortRef.current = controller
+    if (!query.trim()) { refreshList(query, includeArchived, controller.signal); return () => controller.abort() }
+    const handle = setTimeout(() => { refreshList(query, includeArchived, controller.signal) }, 150)
+    return () => { clearTimeout(handle); controller.abort() }
+  }, [query, includeArchived, enabled])
+
+  const focusRail = () => {
+    const rail = railRef.current
+    if (!rail) return
+    const target = rail.querySelector('.conv-open') || rail.querySelector('.conv-new')
+    target?.focus()
+  }
+
+  const select = async (id) => {
+    selectedIdRef.current = id
+    setSelectedId(id); setRenamingId(null); setConfirmingDeleteId(null)
+    if (!id) { onOpen?.(null, []); return }
+    try { const value = await getConversation(id); if (selectedIdRef.current === id) onOpen?.(id, value.turns || []) }
+    catch { if (selectedIdRef.current === id) { onOpen?.(id, []); append('That conversation could not be opened.') } }
+  }
+  const newConversation = async () => {
+    try {
+      const record = await createConversation({})
+      setConversations((current) => [record, ...current])
+      await select(record.id)
+      return record.id
+    } catch { append('A new conversation could not be created.'); return null }
+  }
+  // Ensure a durable target for a turn about to persist. If one is already
+  // selected, reuse it; otherwise auto-create ONE (shared across a racing pair)
+  // and select it WITHOUT clearing the live transcript (no onOpen).
+  const ensureConversation = (title) => {
+    if (selectedIdRef.current) return Promise.resolve(selectedIdRef.current)
+    if (creatingRef.current) return creatingRef.current
+    creatingRef.current = (async () => {
+      try {
+        const record = await createConversation(title ? { title } : {})
+        setConversations((current) => [record, ...current])
+        selectedIdRef.current = record.id; setSelectedId(record.id)
+        return record.id
+      } catch { return null }
+      finally { creatingRef.current = null }
+    })()
+    return creatingRef.current
+  }
+  const rename = async (id, title) => {
+    setRenamingId(null)
+    try { const record = await renameConversation(id, title); setConversations((current) => current.map((item) => (item.id === id ? record : item))) }
+    catch { append('The conversation could not be renamed.') }
+  }
+  const archive = async (id) => { try { await archiveConversation(id); await refreshList(query, includeArchived); focusRail() } catch { append('The conversation could not be archived.') } }
+  const unarchive = async (id) => { try { await unarchiveConversation(id); await refreshList(query, includeArchived); focusRail() } catch { append('The conversation could not be unarchived.') } }
+  const remove = async (id) => {
+    setConfirmingDeleteId(null)
+    try {
+      await deleteConversation(id)
+      if (selectedIdRef.current === id) { selectedIdRef.current = null; setSelectedId(null); onOpen?.(null, []) }
+      await refreshList(query, includeArchived); focusRail()
+    } catch { append('The conversation could not be deleted.') }
+  }
+
+  return {
+    conversations, selectedId, selectedIdRef, includeArchived, query, renamingId, confirmingDeleteId, railRef, unavailable,
+    select, newConversation, ensureConversation,
+    setQuery, toggleArchived: () => setIncludeArchived((value) => !value),
+    rename, archive, unarchive, remove,
+    startRename: (id) => { setConfirmingDeleteId(null); setRenamingId(id) },
+    cancelRename: () => setRenamingId(null),
+    requestDelete: (id) => { setRenamingId(null); setConfirmingDeleteId(id) },
+    cancelDelete: () => setConfirmingDeleteId(null),
+  }
+}
+
 // --- Voice: a dedicated speech-to-speech page (its OWN top-level tab) ----------
 //
 // The ONE realtime relay surface, promoted from a panel bolted onto Delivery into
 // its own voice-first page: a session-bound `voice/realtime` websocket that
 // streams mic audio up and plays synthesized audio back. It is a conversational
 // modality, not a delivery action — session-bound and relay-only, and NO delivery
-// action can be started from voice. It is content-free by default: no raw audio
-// and no durable transcript are persisted; the live transcript is ephemeral and
-// clears on disconnect. Save to Chat is the ONE explicit, opt-in exit from that
-// no-recording default, and it persists TEXT only (never audio).
+// action can be started from voice.
+//
+// A voice conversation IS a conversation: the page carries the SAME rail as Chat
+// (create/select/switch/rename/archive/delete over `/api/conversations`), and as
+// each turn COMPLETES it is appended to the selected conversation AS TEXT — a
+// completed user turn as its transcribed text, a completed assistant turn as an
+// audio-only spoken-reply placeholder. RAW AUDIO IS NEVER PERSISTED. So a Voice
+// conversation reopens through the exact API Chat reads, and is continuable
+// across modalities (spoken here, typed in Chat). If no conversation is selected
+// when speaking begins, one is auto-created so nothing is lost. Switching
+// conversations re-scopes which conversation new turns persist to and loads that
+// conversation's prior turns into the transcript view; the realtime socket is
+// session-bound and stays open across the switch. When the conversation store is
+// unavailable (503/unconfigured) the rail degrades honestly and voice runs
+// ephemeral (live transcript only, cleared on disconnect) rather than erroring.
 //
 // Two capture modes, both operator-switchable:
 //   * Hold to talk — press-hold streams `input_audio_buffer.append`; on release
@@ -225,9 +378,8 @@ function VoicePage({ data, append }) {
   const [captureMode, setCaptureMode] = useState('hold') // hold | handsfree
   const [capturing, setCapturing] = useState(false) // mic hot (either mode)
   const [speaking, setSpeaking] = useState(false) // assistant audio playing
-  const [transcript, setTranscript] = useState([]) // ephemeral {id, role, text, kind}
+  const [transcript, setTranscript] = useState([]) // {id, role, text, status, live}
   const [announce, setAnnounce] = useState('')
-  const [saveState, setSaveState] = useState({ status: 'idle', message: '' }) // idle|saving|saved|unavailable
   // Session tuning: the live system prompt (draft + last-applied) and the chosen
   // TTS voice, both persisted and re-sent on (re)connect. `preset` names the
   // curated personality that seeded the draft, or 'custom' once the operator
@@ -257,7 +409,7 @@ function VoicePage({ data, append }) {
   const pendingSourcesRef = useRef(0)
   // Buffered assistant audio, keyed by assistant turn id, so each "spoken reply"
   // bubble can Replay its own turn's audio. This is transient in-memory only —
-  // never persisted, never sent to Save to Chat.
+  // never persisted anywhere.
   const chunkBufRef = useRef(new Map())
   const currentAssistantRef = useRef(null)
   const currentUserRef = useRef(null)
@@ -268,6 +420,36 @@ function VoicePage({ data, append }) {
   const heardSpeechRef = useRef(false)
   const silenceStartRef = useRef(0)
   const utterancePendingRef = useRef(false)
+  // Serializes turn persistence so appended turns keep transcript order even when
+  // a user turn and the assistant's reply settle back-to-back on one utterance.
+  const persistQueueRef = useRef(Promise.resolve())
+
+  // The unified conversation rail — the SAME `/api/conversations` store as Chat.
+  // `enabled` gates loading on a configured relay; `onOpen` loads a selected
+  // conversation's turns into (or clears) the transcript. `loadConversationInto
+  // Transcript` is a hoisted declaration below, so it is available here.
+  const rail = useConversationRail({ append, enabled: configured, onOpen: loadConversationIntoTranscript })
+  // Mirror availability into a ref so the socket.onclose closure (captured at
+  // connect) reports the CURRENT persistence mode, not a stale one.
+  const railUnavailableRef = useRef(false)
+  railUnavailableRef.current = rail.unavailable
+  const disconnectMessage = () => (railUnavailableRef.current
+    ? 'Disconnected. Nothing was recorded — chat storage is unavailable, so this session was ephemeral.'
+    : 'Disconnected. The live view cleared; saved conversations remain in your list.')
+
+  // Append ONE completed turn to the selected conversation AS TEXT (never audio).
+  // Auto-creates a conversation when none is selected so a first utterance is not
+  // lost, and is a no-op when the store is unavailable (voice runs ephemeral).
+  // Best-effort: a failed append is swallowed so the live session is never blocked.
+  const persistVoiceTurn = (role, text) => {
+    if (rail.unavailable) return
+    persistQueueRef.current = persistQueueRef.current.then(async () => {
+      const id = await rail.ensureConversation(`Voice · ${new Date().toLocaleString()}`)
+      if (!id) return
+      try { await appendTurn(id, { role, status: 'complete', content: [{ kind: 'text', text }] }) }
+      catch { /* best-effort; a persistence failure never blocks speaking */ }
+    })
+  }
 
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; teardownAll(); socketRef.current?.close?.(); socketRef.current = null } }, [])
 
@@ -367,13 +549,40 @@ function VoicePage({ data, append }) {
       setTranscript((current) => [...current, { id, role: 'user', text, status: final ? 'complete' : 'partial' }])
     }
     setAnnounce(`You said: ${text}`)
+    // Persist the settled user turn as TEXT (only a non-empty final transcript).
+    if (final && text.trim()) persistVoiceTurn('user', text.trim())
   }
   const beginAssistantTurn = () => {
     const id = `voice-assistant-${(turnSeqRef.current += 1)}`
     currentAssistantRef.current = id
     chunkBufRef.current.set(id, [])
-    setTranscript((current) => [...current, { id, role: 'assistant', text: 'Spoken reply', status: 'streaming' }])
+    // `live` marks a turn whose audio is buffered this session — only those offer
+    // Replay. Text stays empty so the render falls back to the spoken-reply note;
+    // a loaded/historical assistant turn instead shows its stored placeholder text.
+    setTranscript((current) => [...current, { id, role: 'assistant', text: '', status: 'streaming', live: true }])
     setAnnounce('Assistant is replying by voice.')
+  }
+  // A spoken reply has settled: mark its bubble complete and persist an audio-only
+  // TEXT placeholder (never the audio) to the selected conversation.
+  const completeAssistantTurn = () => {
+    const id = currentAssistantRef.current
+    if (!id) return
+    setTranscript((current) => current.map((turn) => (turn.id === id ? { ...turn, status: 'complete' } : turn)))
+    currentAssistantRef.current = null
+    persistVoiceTurn('assistant', VOICE_SPOKEN_PLACEHOLDER)
+  }
+  // Load a selected conversation's stored turns into the transcript (or clear it
+  // for a fresh/removed one). Settle any in-flight playback from the PREVIOUS
+  // conversation and drop its live per-turn refs so a straggling event cannot
+  // attach to the newly selected conversation; the realtime socket stays open.
+  function loadConversationIntoTranscript(id, turns) {
+    if (playbackRef.current || pendingSourcesRef.current > 0) {
+      closePlayback(); if (mountedRef.current) setSpeaking(false)
+      if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+    }
+    currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map()
+    setTranscript(voiceTurnsFromStored(turns))
+    setAnnounce(id ? 'Switched conversation. New turns save here.' : 'Started a new conversation.')
   }
 
   const handleMessage = (event) => {
@@ -388,7 +597,7 @@ function VoicePage({ data, append }) {
       return
     }
     if (type === 'response.created') { beginAssistantTurn(); return }
-    if (type === 'response.done' || type === 'response.completed') { currentAssistantRef.current = null; return }
+    if (type === 'response.done' || type === 'response.completed') { completeAssistantTurn(); return }
     if (type === 'conversation.item.input_audio_transcription.delta') { upsertUserTurn(message.delta || message.transcript || '', false); return }
     if (type === 'conversation.item.input_audio_transcription.completed') { upsertUserTurn(message.transcript || message.text || '', true); return }
     // The server emits speech_stopped only as a byproduct of a commit, but honor
@@ -400,7 +609,7 @@ function VoicePage({ data, append }) {
 
   const connect = () => {
     if (!configured) return
-    setConnection('connecting'); setSaveState({ status: 'idle', message: '' }); setAnnounce('Connecting to the voice relay.')
+    setConnection('connecting'); setAnnounce('Connecting to the voice relay.')
     const socket = new WebSocket(voiceSocketUrl(session.id)); socketRef.current = socket
     socket.onopen = () => {
       // Apply the operator's session tuning on connect (and again on every
@@ -414,13 +623,13 @@ function VoicePage({ data, append }) {
       if (captureMode === 'handsfree') openMic('handsfree')
     }
     socket.onmessage = handleMessage
-    socket.onclose = () => { teardownAll(); currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map(); setTranscript([]); setConnection('disconnected'); setAnnounce('Disconnected. The live transcript was cleared; nothing was recorded.') }
+    socket.onclose = () => { teardownAll(); currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map(); setTranscript([]); setConnection('disconnected'); setAnnounce(disconnectMessage()) }
     socket.onerror = () => setAnnounce('Voice relay is unavailable. The session and workflow remain unchanged.')
   }
   const disconnect = () => {
     teardownAll(); socketRef.current?.close(); socketRef.current = null
     currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map()
-    setTranscript([]); setConnection('disconnected'); setAnnounce('Disconnected. The live transcript was cleared; nothing was recorded.')
+    setTranscript([]); setConnection('disconnected'); setAnnounce(disconnectMessage())
   }
 
   // Capture direction of the SAME 16 kHz relay contract: the mic AudioContext MUST
@@ -532,32 +741,15 @@ function VoicePage({ data, append }) {
     setAnnounce(id ? `Voice set to ${prettifyVoice({ id })}.` : 'Using the default voice.')
   }
 
-  // Save to Chat: the ONE explicit, opt-in move from an ephemeral voice session
-  // into durable Chat storage. It persists TEXT only — user turns as their
-  // transcribed text; assistant turns (audio-only) as a placeholder noting the
-  // reply was spoken (no assistant text exists yet, and raw audio is NEVER
-  // persisted). A 503/unconfigured conversations API degrades honestly: Save
-  // disables with a truthful note.
-  const saveToChat = async () => {
-    if (!transcript.length || saveState.status === 'saving' || saveState.status === 'unavailable') return
-    setSaveState({ status: 'saving', message: 'Saving this transcript to Chat…' }); setAnnounce('Saving this transcript to Chat.')
-    try {
-      const conversation = await createConversation({ title: `Voice session · ${new Date().toLocaleString()}` })
-      for (const turn of transcript) {
-        const text = turn.role === 'assistant'
-          ? '[Spoken reply — the assistant replied by voice; audio was not recorded.]'
-          : (turn.text || '')
-        await appendTurn(conversation.id, { role: turn.role, status: 'complete', content: [{ kind: 'text', text }] })
-      }
-      setSaveState({ status: 'saved', message: 'Saved to Chat as a durable conversation. This ephemeral session was moved into storage as text.' })
-      setAnnounce('Saved to Chat as a durable conversation.')
-    } catch {
-      setSaveState({ status: 'unavailable', message: 'Saving to Chat is unavailable on this hub. Nothing was recorded; the transcript stays ephemeral.' })
-      setAnnounce('Saving to Chat is unavailable.')
-    }
-  }
-
   const connected = connection === 'ready'
+  const activeConv = rail.conversations.find((record) => record.id === rail.selectedId) || null
+  const activeTitle = activeConv ? describeConversation(activeConv).title : null
+  // Context-aware empty state: honest about whether turns are being saved.
+  const emptyState = rail.unavailable
+    ? { head: 'Live, not saved', body: 'Chat storage is unavailable, so this session is ephemeral and clears on disconnect. Raw audio is never recorded.' }
+    : rail.selectedId
+      ? { head: 'Saved as text', body: 'Speak — your words and each spoken reply are added to this conversation as text you can reopen. Raw audio is never recorded.' }
+      : { head: 'Speak to begin', body: 'A conversation is created and saved automatically the moment you talk. Text only — raw audio is never recorded.' }
   const statusLabel = connection === 'disconnected' ? 'Disconnected'
     : connection === 'connecting' ? 'Connecting'
     : speaking ? 'Assistant speaking'
@@ -565,12 +757,26 @@ function VoicePage({ data, append }) {
     : 'Connected · ready'
   const orbState = connection === 'disconnected' || connection === 'connecting' ? 'idle' : speaking ? 'speaking' : capturing ? 'listening' : 'ready'
 
-  return <main className="voice-page" aria-labelledby="voice-heading">
+  return <div className={`voice-console ${configured ? '' : 'no-rail'}`}>
+    {configured && (rail.unavailable
+      ? <nav className="conv-rail voice-conv-rail" aria-label="Conversations">
+          <div className="conv-rail-head"><p className="conv-rail-title">Conversations</p></div>
+          <p className="conv-empty">Chat storage is unavailable, so voice runs without saving. This session is ephemeral and clears on disconnect.</p>
+        </nav>
+      : <ConversationRail
+          railClassName="conv-rail voice-conv-rail"
+          caption="Spoken here, saved as text — the same conversations as Chat."
+          conversations={rail.conversations} selectedId={rail.selectedId} includeArchived={rail.includeArchived} query={rail.query}
+          renamingId={rail.renamingId} confirmingDeleteId={rail.confirmingDeleteId} railRef={rail.railRef}
+          onSelect={rail.select} onNew={rail.newConversation} onQueryChange={rail.setQuery} onToggleArchived={rail.toggleArchived}
+          onRename={rail.rename} onArchive={rail.archive} onUnarchive={rail.unarchive} onDelete={rail.remove}
+          onStartRename={rail.startRename} onCancelRename={rail.cancelRename} onRequestDelete={rail.requestDelete} onCancelDelete={rail.cancelDelete} />)}
+    <main className="voice-page" aria-labelledby="voice-heading">
     <header className="voice-head">
       <div className="voice-head-titles">
         <span className="crumb">Voice / speech-to-speech</span>
         <h1 id="voice-heading">Voice</h1>
-        <p className="voice-privacy">Session-bound and relay-only. Audio stays on the tailnet and nothing is recorded — the live transcript is ephemeral and clears on disconnect. Voice cannot start a delivery action.</p>
+        <p className="voice-privacy">Session-bound and relay-only. The text transcript is saved as a conversation — the same conversations as Chat, switchable in the list. Raw audio stays on the tailnet and is never recorded or persisted. Voice cannot start a delivery action.</p>
       </div>
       <div className="voice-head-meta">
         <Status tone={connected ? 'green' : 'amber'}>{statusLabel}</Status>
@@ -591,16 +797,20 @@ function VoicePage({ data, append }) {
       : <>
           <section className="voice-stage" aria-label="Live voice transcript">
             <div className={`voice-orb orb-${orbState}`} aria-hidden="true"><i /><i /><i /></div>
+            <div className="voice-thread-bar">
+              <span className="voice-thread-label">{activeTitle || 'New conversation'}</span>
+              {!rail.unavailable && <span className="voice-thread-badge">{rail.selectedId ? 'saved · text only' : 'auto-saves as text'}</span>}
+            </div>
             <ol className="voice-transcript" role="log" aria-live="polite" aria-label="Live transcript">
               {transcript.length === 0
                 ? <li className="voice-transcript-empty">
-                    <b>Live, not saved.</b>
-                    <span>Connect and speak. Your words and the assistant’s spoken replies appear here as they happen, and clear when you disconnect.</span>
+                    <b>{emptyState.head}</b>
+                    <span>{emptyState.body}</span>
                   </li>
                 : transcript.map((turn) => <li key={turn.id} className={`voice-turn voice-turn-${turn.role} ${turn.status === 'partial' ? 'is-partial' : ''}`}>
                     <span className="voice-turn-role">{turn.role === 'user' ? 'You' : 'Assistant · spoken reply'}</span>
-                    <p className="voice-turn-text">{turn.role === 'assistant' ? 'The assistant replied by voice.' : (turn.text || (turn.status === 'partial' ? '…' : ''))}</p>
-                    {turn.role === 'assistant' && <button className="voice-replay" aria-label="Replay this spoken reply" onClick={() => replayTurn(turn.id)}>Replay</button>}
+                    <p className="voice-turn-text">{turn.role === 'assistant' ? (turn.text?.trim() ? turn.text : 'The assistant replied by voice.') : (turn.text || (turn.status === 'partial' ? '…' : ''))}</p>
+                    {turn.role === 'assistant' && turn.live && <button className="voice-replay" aria-label="Replay this spoken reply" onClick={() => replayTurn(turn.id)}>Replay</button>}
                   </li>)}
             </ol>
           </section>
@@ -668,13 +878,6 @@ function VoicePage({ data, append }) {
                     <button type="button" className="voice-disconnect" aria-label="Disconnect voice" onClick={disconnect}>Disconnect</button>
                   </>}
             </div>
-
-            <div className="voice-save">
-              <button type="button" className="voice-save-btn" aria-label="Save this transcript to Chat" onClick={saveToChat} disabled={!transcript.length || saveState.status === 'saving' || saveState.status === 'unavailable'}>
-                {saveState.status === 'saving' ? 'Saving…' : 'Save to Chat'}
-              </button>
-              <small className="voice-save-note">{saveState.message || 'Optional. Moves this ephemeral session into durable Chat storage as text — never audio.'}</small>
-            </div>
           </div>
         </>}
 
@@ -682,7 +885,8 @@ function VoicePage({ data, append }) {
         reader. role="status" keeps it off the region tree so it never collides
         with the page region's name. */}
     <div className="voice-live" role="status" aria-live="polite">{announce}</div>
-  </main>
+    </main>
+  </div>
 }
 
 function Delivery({ data, append, onDirective, onGuide, onDeliverNext }) {
@@ -1056,7 +1260,7 @@ function ConversationRow({ record, selected, onSelect, onRename, onArchive, onUn
   </li>
 }
 
-function ConversationRail({ conversations, selectedId, includeArchived, query, renamingId, confirmingDeleteId, railRef, onSelect, onNew, onQueryChange, onToggleArchived, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename, onRequestDelete, onCancelDelete }) {
+function ConversationRail({ conversations, selectedId, includeArchived, query, renamingId, confirmingDeleteId, railRef, onSelect, onNew, onQueryChange, onToggleArchived, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename, onRequestDelete, onCancelDelete, railClassName = 'conv-rail', caption }) {
   const active = conversations.filter((record) => record.status !== 'archived')
   const archived = conversations.filter((record) => record.status === 'archived')
   const rowProps = { selected: false, onSelect, onRename, onArchive, onUnarchive, onDelete, onStartRename, onCancelRename, onRequestDelete, onCancelDelete }
@@ -1064,8 +1268,9 @@ function ConversationRail({ conversations, selectedId, includeArchived, query, r
   // Heading order (a11y #11): the rail is first in document order, so its label
   // is a non-heading element. The page <h1> in chat-main is the document's first
   // heading, keeping the rank sequence h1 → … without a rail <h2> preceding it.
-  return <nav className="conv-rail" aria-label="Conversations" ref={railRef}>
+  return <nav className={railClassName} aria-label="Conversations" ref={railRef}>
     <div className="conv-rail-head"><p className="conv-rail-title">Conversations</p><button className="conv-new" aria-label="Start a new conversation" onClick={onNew}>+ New</button></div>
+    {caption && <p className="conv-rail-caption">{caption}</p>}
     <form className="conv-search" role="search" onSubmit={(event) => event.preventDefault()}>
       <input type="search" aria-label="Search conversations" placeholder="Search titles and messages" value={query} onChange={(event) => onQueryChange(event.target.value)} />
     </form>
