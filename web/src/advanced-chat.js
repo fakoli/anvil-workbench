@@ -192,6 +192,20 @@ export function isBranchSettled(branch) {
   return SETTLED_STATUSES.includes(branch?.status)
 }
 
+// The FACTUAL attempt-status enum the advanced-comparison.v1 schema admits. A
+// branch's real settled status (chat-api.terminalToStatus → complete / cancelled
+// / interrupted / failed, plus the in-flight `streaming`) already lands in this
+// set, so a comparison attempt carries the branch's TRUE status. Any unexpected
+// value maps to the safe factual `interrupted` — NEVER a blanket `complete` that
+// would misreport a cancelled/failed attempt as a completed one.
+export const COMPARISON_ATTEMPT_STATUSES = Object.freeze([
+  'complete', 'cancelled', 'timed_out', 'failed', 'interrupted', 'streaming',
+])
+
+export function comparisonAttemptStatus(status) {
+  return COMPARISON_ATTEMPT_STATUSES.includes(status) ? status : 'interrupted'
+}
+
 // Which operations are available for `branch`, given the surrounding context
 // (`settledCount` — how many settled branches exist for compare; `streaming` —
 // whether any stream is in flight). Every panel button keys its `disabled` off

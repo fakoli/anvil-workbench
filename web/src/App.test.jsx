@@ -13,6 +13,9 @@ import {
   fetchConfigurationExport, previewConfigurationImport, applyConfigurationImport,
   previewConfigurationReset, applyConfigurationReset,
   fetchAdvancedRoutes, runAdvancedBranch,
+  fetchAdvancedPresets, resolveAdvancedPreset, buildAdvancedComparison,
+  fetchAdvancedTemplates, resolveAdvancedTemplate, renderAdvancedDeclaredInstructions,
+  fetchRatingCriteria, recordAdvancedRating, fetchRatingAggregates,
 } from './api'
 
 vi.mock('./api', () => ({
@@ -27,9 +30,13 @@ vi.mock('./api', () => ({
   fetchConfigurationExport: vi.fn(), previewConfigurationImport: vi.fn(), applyConfigurationImport: vi.fn(),
   previewConfigurationReset: vi.fn(), applyConfigurationReset: vi.fn(),
   fetchAdvancedRoutes: vi.fn(), runAdvancedBranch: vi.fn(),
+  fetchAdvancedPresets: vi.fn(), resolveAdvancedPreset: vi.fn(), buildAdvancedComparison: vi.fn(),
+  fetchAdvancedTemplates: vi.fn(), resolveAdvancedTemplate: vi.fn(), renderAdvancedDeclaredInstructions: vi.fn(),
+  fetchRatingCriteria: vi.fn(), recordAdvancedRating: vi.fn(), fetchRatingAggregates: vi.fn(),
   // The panel keys its unconfigured-degrade branch off this SHARED sentinel by
   // value equality; the mock must export the exact string api.js throws on 503.
   ADVANCED_NOT_CONFIGURED: 'The advanced playground is not configured for this hub',
+  ADVANCED_PLAYGROUND_NOT_CONFIGURED: 'The advanced playground surfaces are not configured for this hub',
 }))
 
 // The served advanced-route allowlist shape, traceable to
@@ -144,6 +151,19 @@ function resetChatMocks() {
   // degrades truthfully; the advanced-flow tests opt into a configured runtime.
   fetchAdvancedRoutes.mockRejectedValue(new Error('The advanced playground is not configured for this hub'))
   runAdvancedBranch.mockResolvedValue({ text: 'tuned answer', terminal: 'completed', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv', branchId: 'advbranch_srv' })
+  // The playground extension surfaces are unconfigured BY DEFAULT (503 sentinel)
+  // so the panel degrades truthfully; the playground-flow tests opt into a
+  // configured runtime with mockResolvedValue.
+  const playgroundReject = () => Promise.reject(new Error('The advanced playground surfaces are not configured for this hub'))
+  fetchAdvancedPresets.mockImplementation(playgroundReject)
+  fetchAdvancedTemplates.mockImplementation(playgroundReject)
+  fetchRatingCriteria.mockImplementation(playgroundReject)
+  fetchRatingAggregates.mockImplementation(playgroundReject)
+  resolveAdvancedPreset.mockImplementation(playgroundReject)
+  buildAdvancedComparison.mockImplementation(playgroundReject)
+  resolveAdvancedTemplate.mockImplementation(playgroundReject)
+  renderAdvancedDeclaredInstructions.mockImplementation(playgroundReject)
+  recordAdvancedRating.mockImplementation(playgroundReject)
 }
 
 beforeEach(() => {
@@ -1813,5 +1833,224 @@ describe('Configuration backup & transfer workflows', () => {
     // The result reports the scope and next remediation.
     expect(await within(resetPanel).findByText(/personal preferences were reset/i)).toBeTruthy()
     expect(applyConfigurationReset).toHaveBeenCalledWith(expect.objectContaining({ scope: 'personal', baseVersions: { 'personal.landing_surface': 1 } }))
+  })
+})
+
+// --- Advanced playground extensions, wired over the REAL served preset/comparison
+// /template/rating shapes (advanced-model-playground T006 / T009 / T010). --------
+describe('Advanced playground extensions (presets, comparison, templates, ratings)', () => {
+  const presetFixture = { presets: [{ preset_id: 'advpreset_fast_0001', name: { text: 'Fast strict JSON' } }] }
+  const templateFixture = {
+    templates: [{
+      template_id: 'strict_reviewer',
+      name: { text: 'Strict reviewer' },
+      body: { content_trust: 'untrusted_task_data', text: 'Review the {{target}} carefully and report only high-confidence issues.' },
+      substitutions: [{ name: 'target' }],
+      template_digest: 'sha256:' + 'e'.repeat(64),
+    }],
+  }
+  const criteriaFixture = {
+    non_qualification: true,
+    criteria: [
+      { criterion_id: 'instruction_following', label: { text: 'Instruction following' } },
+      { criterion_id: 'latency', label: { text: 'Latency' } },
+    ],
+  }
+  const aggregatesFixture = {
+    non_qualification: true,
+    disclaimer: { content_trust: 'untrusted_task_data', text: 'Informal preference evidence only — never model qualification or delivery evidence.' },
+    aggregates: [{
+      route_id: 'route.chat-fast', criterion_id: 'latency', criterion_label: { text: 'Latency' },
+      count: 2, score_total: 9, average_score_milli: 4500, score_min: 4, score_max: 5, non_qualification: true,
+    }],
+  }
+
+  async function openPlayground(overrides = {}) {
+    fetchAdvancedRoutes.mockResolvedValue({ routes: advancedRoutes })
+    fetchAdvancedPresets.mockResolvedValue(overrides.presets || presetFixture)
+    fetchAdvancedTemplates.mockResolvedValue(overrides.templates || templateFixture)
+    fetchRatingCriteria.mockResolvedValue(overrides.criteria || criteriaFixture)
+    fetchRatingAggregates.mockResolvedValue(overrides.aggregates || aggregatesFixture)
+    const user = await renderChat()
+    await openConversation(user, [assistantTurn('turn_1', 'base answer')])
+    await user.click(screen.getByRole('button', { name: 'Toggle Advanced mode' }))
+    await screen.findByRole('region', { name: 'Advanced playground' })
+    return user
+  }
+
+  it('opens REPAIR MODE on a drifted preset and never shows a substituted ready preset (T006)', async () => {
+    resolveAdvancedPreset.mockResolvedValue({
+      status: 'repair_required', preset_id: 'advpreset_fast_0001',
+      drifted_refs: [{ ref_kind: 'tool', id: 'echo_fixture', pinned_digest: 'sha256:' + 'c'.repeat(64) }],
+    })
+    const user = await openPlayground()
+    await user.click(screen.getByRole('button', { name: 'Select Fast strict JSON' }))
+    const repair = await screen.findByRole('alert', { name: 'Preset repair required' })
+    expect(within(repair).getByText(/Repair required/)).toBeTruthy()
+    expect(within(repair).getByText('echo_fixture')).toBeTruthy()
+    // No substitute: the ready/apply affordance is never rendered on drift.
+    expect(screen.queryByText(/is ready to apply/)).toBeNull()
+  })
+
+  it('shows a ready preset when its pins still match (T006)', async () => {
+    resolveAdvancedPreset.mockResolvedValue({ status: 'ready', preset: { preset_id: 'advpreset_fast_0001', name: { text: 'Fast strict JSON' } } })
+    const user = await openPlayground()
+    await user.click(screen.getByRole('button', { name: 'Select Fast strict JSON' }))
+    expect(await screen.findByText(/is ready to apply/)).toBeTruthy()
+    expect(screen.queryByRole('alert', { name: 'Preset repair required' })).toBeNull()
+  })
+
+  it('announces a distinct UNVERIFIABLE note and applies nothing — never "ready" — when the hub cannot verify pins (T006)', async () => {
+    // Revert-detection: the server now returns status:'unverifiable' (the DEFAULT
+    // for a preset store injected without a live_digests_provider). Without an
+    // explicit unverifiable branch this state collapses into the ready/else tail
+    // and the live region falsely announces "Preset … is ready." — a false factual
+    // label. With the fix it announces the distinct unverifiable message and the
+    // body renders a factual note that nothing was applied (no substitute).
+    resolveAdvancedPreset.mockResolvedValue({
+      status: 'unverifiable', preset_id: 'advpreset_fast_0001', reason: 'no_live_digests_provider',
+      unverifiable_refs: [{ ref_kind: 'tool', id: 'echo_fixture', pinned_digest: 'sha256:' + 'c'.repeat(64) }],
+    })
+    const user = await openPlayground()
+    await user.click(screen.getByRole('button', { name: 'Select Fast strict JSON' }))
+    // The distinct unverifiable note renders — not a repair banner, not a ready line.
+    const note = await screen.findByRole('status', { name: 'Preset could not be verified' })
+    expect(within(note).getByText(/Could not be verified/)).toBeTruthy()
+    expect(within(note).getByText('echo_fixture')).toBeTruthy()
+    expect(screen.queryByRole('alert', { name: 'Preset repair required' })).toBeNull()
+    expect(screen.queryByText(/is ready to apply/)).toBeNull()
+    // The playground live region announces the unverifiable message — NOT "ready".
+    const playground = screen.getByRole('region', { name: 'Advanced playground' })
+    const live = playground.querySelector('.adv-live')
+    expect(live.textContent).toMatch(/could not be verified right now — not applied/)
+    expect(live.textContent).not.toMatch(/ready/i)
+  })
+
+  it('renders a comparison with NO winner when no criterion is declared (T006)', async () => {
+    buildAdvancedComparison.mockResolvedValue({
+      schema_version: 'workbench-advanced-comparison/v1', comparison_id: 'advcompare_x_0001',
+      conversation_id: 'conv_' + 'a'.repeat(10), fork_point: { parent_turn_id: 'turn_' + 'b'.repeat(10) },
+      attempts: [
+        { turn_id: 'turn_' + 'a'.repeat(10), route: { route_id: 'route.chat-fast' }, status: 'complete', metrics: { output_tokens: 200, latency_ms: 850 } },
+        { turn_id: 'turn_' + 'b'.repeat(10), route: { route_id: 'route.chat-heavy' }, status: 'complete', metrics: { output_tokens: 512, latency_ms: 2600 } },
+      ],
+      created_at: '2026-07-21T10:02:00Z',
+    })
+    const user = await openPlayground()
+    await user.click(screen.getByRole('button', { name: 'Build comparison' }))
+    const region = await screen.findByRole('region', { name: 'Comparison' })
+    expect(await within(region).findByText(/Factual metrics only — no winner/)).toBeTruthy()
+    expect(within(region).queryByText(/Ranked by declared criterion/)).toBeNull()
+  })
+
+  it('renders a labelled ranking ONLY with a declared non-qualification criterion (T006)', async () => {
+    buildAdvancedComparison.mockResolvedValue({
+      schema_version: 'workbench-advanced-comparison/v1', comparison_id: 'advcompare_y_0001',
+      conversation_id: 'conv_' + 'a'.repeat(10), fork_point: { parent_turn_id: 'turn_' + 'b'.repeat(10) },
+      attempts: [
+        { turn_id: 'turn_' + 'a'.repeat(10), route: { route_id: 'route.chat-fast' }, status: 'complete', metrics: { output_tokens: 200, latency_ms: 850 } },
+        { turn_id: 'turn_' + 'b'.repeat(10), route: { route_id: 'route.chat-heavy' }, status: 'complete', metrics: { output_tokens: 512, latency_ms: 2600 } },
+      ],
+      criterion: { criterion_id: 'instruction_following', label: { text: 'Instruction following' }, non_qualification: true },
+      ranking: [{ turn_id: 'turn_' + 'a'.repeat(10), rank: 1 }, { turn_id: 'turn_' + 'b'.repeat(10), rank: 2 }],
+      created_at: '2026-07-21T10:02:00Z',
+    })
+    const user = await openPlayground()
+    await user.click(screen.getByRole('button', { name: 'Build comparison' }))
+    const region = await screen.findByRole('region', { name: 'Comparison' })
+    expect(await within(region).findByText(/Ranked by declared criterion/)).toBeTruthy()
+    expect(within(region).getByText(/Instruction following/)).toBeTruthy()
+    expect(within(region).getByText(/rank 1/)).toBeTruthy()
+  })
+
+  it('assembles the comparison with each branch REAL settled status — never a fabricated complete (T006)', async () => {
+    // This request-side assembly (App.buildPlaygroundComparison → buildAdvancedComparison)
+    // was previously untested, which is how a hardcoded status:'complete' slipped
+    // through. Run two branches — one that settles COMPLETE and one CANCELLED, both
+    // with a trace — then assert the record handed to the client carries the REAL
+    // statuses, not a blanket 'complete', and excludes any unsettled/traceless one.
+    const user = await openPlayground()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'first attempt')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer') // branch 1 settled complete (with trace)
+    // Fork a second branch whose run settles CANCELLED (still producing a trace).
+    runAdvancedBranch.mockResolvedValueOnce({ text: 'stopped attempt', terminal: 'cancelled', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv_c', branchId: 'advbranch_c' })
+    await user.click(screen.getByRole('button', { name: /Fork/ }))
+    await screen.findByText('stopped attempt')
+    // Capture the ASSEMBLED record the request-side assembly hands to the client.
+    buildAdvancedComparison.mockResolvedValue({
+      schema_version: 'workbench-advanced-comparison/v1', comparison_id: 'advcompare_z_0001',
+      conversation_id: 'conv_' + 'a'.repeat(10), fork_point: { parent_turn_id: 'turn_' + 'b'.repeat(10) },
+      attempts: [], created_at: '2026-07-21T10:02:00Z',
+    })
+    await user.click(screen.getByRole('button', { name: 'Build comparison' }))
+    expect(buildAdvancedComparison).toHaveBeenCalled()
+    const record = buildAdvancedComparison.mock.calls.at(-1)[0]
+    const statuses = record.attempts.map((attempt) => attempt.status)
+    // The cancelled attempt is labelled with its REAL status — not fabricated as complete.
+    expect(record.attempts).toHaveLength(2)
+    expect(statuses).toContain('complete')
+    expect(statuses).toContain('cancelled')
+    expect(statuses).not.toEqual(['complete', 'complete'])
+    // Every assembled attempt is a genuinely settled branch that produced a trace.
+    expect(record.attempts.every((attempt) => attempt.route.route_id === 'route.chat-fast')).toBe(true)
+  })
+
+  it('shows a template full body text and a DECLARED instructions preview pre-send (T009)', async () => {
+    resolveAdvancedTemplate.mockResolvedValue({ status: 'ready', template: templateFixture.templates[0] })
+    renderAdvancedDeclaredInstructions.mockResolvedValue({
+      content_trust: 'untrusted_task_data', provenance: 'declared', template_id: 'strict_reviewer',
+      template_digest: 'sha256:' + 'e'.repeat(64),
+      text: 'Review the the PR carefully and report only high-confidence issues.',
+      substitutions: [{ name: 'target', value: 'the PR' }],
+    })
+    const user = await openPlayground()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Instruction template' }), 'strict_reviewer')
+    // The full body text is visible BEFORE any send.
+    expect(await screen.findByText(/Review the \{\{target\}\} carefully/)).toBeTruthy()
+    fireEvent.change(screen.getByRole('textbox', { name: 'substitution target' }), { target: { value: 'the PR' } })
+    await user.click(screen.getByRole('button', { name: 'Preview declared instructions' }))
+    const declared = await screen.findByRole('region', { name: 'Declared instructions' })
+    expect(within(declared).getByText(/Review the the PR carefully/)).toBeTruthy()
+    expect(within(declared).getByText(/recorded as declared, not a hidden prompt/)).toBeTruthy()
+  })
+
+  it('opens REPAIR MODE for a drifted/removed template — no silent substitution (T009)', async () => {
+    resolveAdvancedTemplate.mockResolvedValue({
+      status: 'repair_required', template_id: 'strict_reviewer', reason: 'digest_drift',
+      drifted_refs: [{ ref_kind: 'template', id: 'strict_reviewer', pinned_digest: 'sha256:' + 'e'.repeat(64) }],
+    })
+    const user = await openPlayground()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Instruction template' }), 'strict_reviewer')
+    const repair = await screen.findByRole('alert', { name: 'Template repair required' })
+    expect(within(repair).getByText(/Repair required/)).toBeTruthy()
+    // The full body / declared preview is NOT offered on drift (no substitution).
+    expect(screen.queryByText(/Full template text/)).toBeNull()
+  })
+
+  it('disables the rating submit until a declared criterion is chosen, and shows non-qualification aggregates (T010)', async () => {
+    recordAdvancedRating.mockResolvedValue({ rating_id: 'advrating_1', non_qualification: true })
+    const user = await openPlayground()
+    const submit = screen.getByRole('button', { name: 'Record rating' })
+    expect(submit.disabled).toBe(true) // a rating cannot be recorded without a declared criterion
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Rating route' }), 'route.chat-fast')
+    expect(submit.disabled).toBe(true) // still no criterion
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Rating criterion' }), 'latency')
+    expect(submit.disabled).toBe(false)
+    // Aggregates carry the non-qualification label.
+    const aggregates = screen.getByRole('region', { name: 'Rating aggregates' })
+    expect(within(aggregates).getByText(/Non-qualification/)).toBeTruthy()
+    expect(within(aggregates).getByText(/non-qualification/)).toBeTruthy()
+  })
+
+  it('degrades truthfully when the playground surfaces are unconfigured while the transcript stays usable (503)', async () => {
+    // Default resetChatMocks rejects the playground fetches with the sentinel.
+    fetchAdvancedRoutes.mockResolvedValue({ routes: advancedRoutes })
+    const user = await renderChat()
+    await openConversation(user, [assistantTurn('turn_1', 'kept answer')])
+    await user.click(screen.getByRole('button', { name: 'Toggle Advanced mode' }))
+    const region = await screen.findByRole('region', { name: 'Advanced playground' })
+    expect(within(region).getByText('The advanced playground surfaces are not configured for this hub')).toBeTruthy()
+    expect(screen.getByText('kept answer')).toBeTruthy() // transcript untouched
   })
 })
