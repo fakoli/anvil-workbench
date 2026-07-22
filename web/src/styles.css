@@ -444,3 +444,152 @@
 .app-shell.plugins-active .rail-footer{margin:0 0 0 auto}
 .app-shell.plugins-active .workspace{margin-left:0;width:100%}
 .app-shell.plugins-active .toast{left:16px;right:16px}}
+
+/* ============================================================================
+   MOBILE RESPONSIVE PASS
+   The desktop layout above is dense by design and stays UNCHANGED — every rule
+   below lives inside a mobile media query. Two tiers:
+     • ≤900px (tablet/phone): the structural reflow. The nav rail is
+       position:fixed at ~206px with the workspace offset by that width. Four
+       routes already unfixed it under a scoped *-active class; every OTHER route
+       kept the fixed rail, so on a phone it occupied half the screen and pushed
+       content off-canvas. This tier GENERALIZES that reflow to .app-shell for
+       ALL routes, and stacks the wide Delivery cockpit grid.
+     • ≤640px (phone): the readability tier. Type floor, ~44px touch targets,
+       single-column inner grids, and wrapping control rows.
+   ==========================================================================*/
+
+/* ---- Tier 1: global rail collapse + wide-grid stacking (≤900px) ------------
+   Drop the rail out of the fixed layer into a stacked, wrapping top bar and let
+   the workspace use the full width, for EVERY route — generalizing the existing
+   .chat-active / .explorer-active / .settings-active / .plugins-active pattern.
+   Preserves those routes' a11y intent (no occlusion of content or the fixed
+   *-live regions; the rail stays first in the DOM, so keyboard/focus order is
+   unchanged — it is simply rendered as a visible top bar rather than a fixed
+   side column). The scoped *-active blocks above remain as per-route
+   documentation; they now resolve to the same result. */
+@media(max-width:900px){
+  .app-shell{flex-direction:column}
+  .rail{position:static;inset:auto;width:100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:12px 16px}
+  .rail nav{grid-auto-flow:column;grid-template-columns:none;display:flex;flex-wrap:wrap;gap:4px}
+  .rail .brand{padding:0 12px 0 0}
+  .rail-footer{margin:0 0 0 auto}
+  .workspace{margin-left:0;width:100%}
+  /* Delivery cockpit: the right-hand Live trace / Evidence packet / Approval
+     panel must stack UNDER the conversation, not sit in a 300px column beside
+     it, and the 980px floor must go so nothing scrolls off a phone. */
+  .main-grid{grid-template-columns:1fr;min-width:0}
+  .trace{border-left:0;border-top:1px solid var(--line-soft)}
+  /* Long-token safety: once the grid is a single 1fr track, an unbroken token
+     in a delivery direction (an id, digest, or path — routine here) would push
+     the page wider than the viewport and reintroduce the horizontal overflow
+     the operator hit. `.turn-text` already breaks; `.message p` (delivery) and
+     the user-named `.conv-title` (chat rail) did not — break them here too. */
+  .message p,.conv-title{overflow-wrap:anywhere}
+  /* The global "hub unavailable" toast is fixed with insets sized for the rail +
+     right panel (left:252px;right:351px); on the stacked layout those collapse
+     it to zero/negative width. Span it edge to edge for all routes. */
+  .toast{left:16px;right:16px}
+  /* Fixed bottom-left live regions are keyed to the old 206px rail (left:262px);
+     with the rail now a top bar, pin them to the freed corner so they never
+     paint off-canvas. (explorer/settings/pc are also handled by their scoped
+     blocks; configuration-live was not, so cover it here too.) */
+  .explorer-live,.settings-live,.pc-live,.configuration-live{left:16px;right:16px}
+}
+
+/* ---- Tier 2: phone readability + touch targets (≤640px) --------------------
+   The desktop UI packs id/meta/pill/label text at 8–10px — legible at a desk,
+   not on a phone held at arm's length over Tailscale. Lift a type FLOOR (no
+   uniform scaling: primary reading text → 13px, secondary body → 12px,
+   captions/ids/pills → 11px) and give the primary controls ~44px touch targets.
+   Colours are untouched, so the audited ≥4.5:1 contrast pairings still hold. */
+@media(max-width:640px){
+  /* Primary reading text */
+  .message p,.composer textarea,.turn-text{font-size:13px}
+
+  /* Secondary body copy, list primaries, step/trace labels */
+  .crumb,.explorer-intro,.setting-desc,.setting-effective,
+  .data-list b,.data-list span,.run-row b,.session-list b,.session-list>article>span,
+  .steps b,.steps small,.flow-top strong,.flow-top small,
+  .message-head b,.trace-step b{font-size:12px}
+
+  /* Captions, ids, pills, and mono metadata — the true sub-readable tier */
+  .status,.pc-pill,.composer small,.composer-bar small,.message-head small,.steps time,
+  .trace-step small,.trace-step span,.approval-title span,.approval-card p,
+  .approval-binding dt,.approval-binding dd,
+  .evidence-mini b,.evidence-mini small,.evidence-mini time,
+  .evidence-mini header span,.evidence-mini header button,
+  .run-row small,.session-list small,.session-list button,
+  .explorer-scoped,.explorer-pill,.explorer-project small,
+  .explorer-section-title,.conv-section-title,
+  .conv-id,.conv-state,.conv-badge,.conv-tag,
+  .turn-lineage,.turn-advanced,.turn-status,.turn-route-provenance,.turn-route-diverged,.read-aloud button,
+  .explorer-prd-lineage,.explorer-prd-meta dt,.explorer-prd-meta dd,
+  .setting-owner,.setting-badge,.settings-tier,
+  .pc-plugin-id,.pc-tool-scoped,.pc-digest,.pc-kv dt,
+  .deliver-candidate-eyebrow,.deliver-candidate-scoped,.deliver-candidate-meta{font-size:11px}
+
+  /* Touch targets (~44px) on the primary interactive controls: nav buttons,
+     Send, Deliver, route selector, Advanced, list rows, and the voice controls.
+     Small inline row actions (turn/conv/adv chips) are deliberately left dense —
+     they are secondary and clustered, and 44px each would break their layout. */
+  .nav-item,.new-run,.profile,
+  .composer button,.chat-composer button,.session-action,.ghost-button,
+  .inline-action,.explorer-open-prd,.conv-new,.advanced-toggle,
+  .deliver-start,.deliver-actions .secondary-button,
+  .query-form button,.query-form input,.sandbox-form button,
+  .setting-save-btn,.setting-preview-btn,.setting-reset-btn,
+  .voice-ptt .ptt-button,.realtime-voice-controls button,
+  .chat-route select{min-height:44px}
+  .composer button,.chat-composer button,.session-action,.ghost-button,
+  .inline-action,.explorer-open-prd,.conv-new,.advanced-toggle,
+  .deliver-start,.query-form button,.sandbox-form button,
+  .setting-save-btn,.setting-preview-btn,.setting-reset-btn,
+  .voice-ptt .ptt-button,.realtime-voice-controls button{display:inline-flex;align-items:center;justify-content:center}
+  /* Tappable list/nav rows: give the whole row a comfortable minimum. */
+  .data-list article,.session-list article,.run-row,
+  .explorer-project,.explorer-task button,.conv-open,.pc-tool-select{min-height:44px}
+  /* Second pass of primary/important controls the first pass missed: Authorize
+     (the key Delivery control), the inner Start-delivery button (its row got a
+     target but the button itself was ~28px), Retry, and the Close/× buttons. */
+  .approval-card button,.session-list button,
+  .settings-state button,.pc-state button,
+  .explorer-close,.pc-close,.setting-editor-close{min-height:44px;display:inline-flex;align-items:center;justify-content:center}
+  /* Icon-only controls need width AS WELL as height to be a real 44px target:
+     the topbar help/bell and every modal/sheet close ×. min-width/height win
+     over the base fixed 20px on .help. */
+  .topbar .help,.topbar .bell,.modal header button{min-width:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center}
+  /* Conversation-row actions: the earlier pass kept these dense on purpose, but
+     the destructive Delete sitting flush against Archive/Rename is a mis-tap
+     risk on touch. Rather than a lone oversized Delete (which reads as broken),
+     give the whole small cluster a uniform safe height — better for touch and
+     visually even. */
+  .conv-actions button{min-height:44px}
+
+  /* Wide inner grids collapse to a single column at phone width. */
+  .explorer-prd-meta,.data-list article,.session-list article,
+  .approval-binding div,.explorer-ids div{grid-template-columns:1fr}
+
+  /* Control/heading rows wrap instead of overflowing at ~390px. */
+  .project-header,.view-heading,.chat-header{flex-direction:column;gap:10px}
+  .project-header-actions{align-items:flex-start;flex-direction:row;flex-wrap:wrap}
+  .chat-controls,.composer>div,.composer-bar,.query-form,
+  .realtime-voice-head,.explorer-prd-head,.explorer-detail-topbar,
+  .pc-plugin-head{flex-wrap:wrap}
+  .composer>div,.composer-bar{gap:8px}
+  .query-form input{min-width:0}
+
+  /* Chat message column: reclaim the desktop indent/width caps on a phone. */
+  .message{max-width:100%}.message.agent{margin-left:16px}
+
+  /* Trim the desktop's generous page padding and oversized headings so short
+     titles fit a 390px column without horizontal scroll. */
+  .delivery{padding:22px 16px 26px}
+  .workspace-view,.empty-view{padding:24px 16px}
+  .topbar{padding:0 16px}
+  .trace{padding:0 16px}
+  .conversation{padding:20px 0 12px}
+  .modal-backdrop{padding:12px}
+  .project-header h1,.workspace-view h1,.empty-view h1{font-size:22px}
+  .empty-delivery h1{font-size:24px}
+}
