@@ -74,6 +74,33 @@ def _wired_client(env: dict[str, str]) -> TestClient:
     ))
 
 
+def _wired_overrides_and_client(env: dict[str, str]) -> tuple[dict, TestClient]:
+    """Same as :func:`_wired_client` but also hands back the composed overrides.
+
+    A test can then make an IDENTITY assertion over the shared instances (e.g. the
+    gate's preference store IS the read surface's) and, playing the operator's
+    out-of-band approval role, mint a one-time grant on the gate's OWN approval
+    store -- exactly the seam the deployment composition produced.
+    """
+    settings = Settings.from_env(env)
+    overrides = build_live_overrides(env)
+    client = TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), **overrides,
+    ))
+    return overrides, client
+
+
+def _memory_infra(monkeypatch) -> None:
+    """Substitute the ONLY infra ``create_live_app`` would otherwise build itself
+    (the Postgres store + Neo4j graph) with in-memory equivalents, so the REAL
+    ``create_live_app`` composition runs end-to-end without external infra -- the
+    same substitution the rest of this suite applies, moved to the ``_store`` /
+    ``_graph`` seam so ``create_live_app`` itself is exercised, not bypassed.
+    """
+    monkeypatch.setattr("workbench.api._store", lambda settings: MemoryStore())
+    monkeypatch.setattr("workbench.api._graph", lambda settings: NullGraph())
+
+
 # ---------------------------------------------------------------------------
 # (a) default env keeps every injectable surface 503, exactly as today
 # ---------------------------------------------------------------------------
@@ -146,6 +173,51 @@ def test_policy_gate_serves_a_real_preview_over_the_observational_spine():
     assert payload["preview"]["effect_summary"].endswith("hub-local")
 
 
+def test_policy_gate_applies_over_the_shared_preference_store_and_is_visible_at_the_read_surface():
+    # M1 regression: the gate MUST commit an approved hub-local change into the
+    # SAME preference store the read/export surfaces serve. A private gate store
+    # would receipt the change `succeeded` yet leave /api/preferences stale.
+    env = _base_env(
+        WORKBENCH_LIVE_SURFACES="preference_store,policy_gate_service",
+        WORKBENCH_SETTINGS_CATALOG_FILE=_CATALOG_FILE,
+    )
+    overrides, client = _wired_overrides_and_client(env)
+    gate = overrides["policy_gate_service"]
+    # IDENTITY: the gate's store IS the shared preference store create_app serves.
+    assert gate.preferences is overrides["preference_store"]
+
+    op = {
+        "setting_id": "personal.appearance_density", "scope": "personal",
+        "operation": "preference.set", "op_version": 1, "value": "compact",
+    }
+
+    def _density(payload: dict) -> dict:
+        return next(v for v in payload["effective"] if v["setting_id"] == "personal.appearance_density")
+
+    # BEFORE: the read surface shows the reviewed default, provenance `default`.
+    before = _density(client.get("/api/preferences", headers=_ACTOR).json())
+    assert before["value"] == "comfortable" and before["source"] == "default"
+
+    # The operator's out-of-band approval binds EXACTLY the previewed effect; mint
+    # it on the gate's own approval store, then drive apply through REAL HTTP.
+    binding = client.post("/api/policy-operations/approval-binding", headers=_ACTOR, json=op).json()
+    gate.approvals.grant(
+        "grant_density_compact", binding["action"], binding["payload_hash"],
+        binding["actor"], binding["scope_key"],
+    )
+    applied = client.post(
+        "/api/policy-operations/apply", headers=_ACTOR,
+        json={**op, "grant_id": "grant_density_compact"},
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["receipt"]["status"] == "succeeded"
+
+    # VISIBLE: the gate-applied change now shows at /api/preferences, provenance
+    # flipped from the reviewed default to a stored value.
+    after = _density(client.get("/api/preferences", headers=_ACTOR).json())
+    assert after["value"] == "compact" and after["source"] == "stored"
+
+
 def test_configuration_transfer_export_shares_the_preference_store():
     env = _base_env(
         WORKBENCH_LIVE_SURFACES="preference_store,configuration_transfer_service",
@@ -166,19 +238,49 @@ def test_configuration_transfer_export_shares_the_preference_store():
 
 
 def test_conversation_search_and_transfer_serve_over_shared_conversation_store():
+    # MUST-4 regression: the search/transfer surfaces must wrap the SAME
+    # conversation store the chat write path uses. A conversation CREATED through
+    # the real chat HTTP surface must therefore be findable by the injectable
+    # search surface AND exportable by the transfer surface. If the deployment
+    # composition dropped the shared-store handoff (create_app builds its OWN
+    # store), the chat write would land in a DIFFERENT instance than the surfaces
+    # wrap, so both value assertions below would fail closed -- which is exactly
+    # the defect an empty-envelope-only assertion let survive.
     env = _base_env(
         WORKBENCH_LIVE_SURFACES="conversation_search_service,conversation_transfer_service",
         WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY,
         WORKBENCH_PREF_AUDIT_KEY=_AUDIT_KEY,
     )
     client = _wired_client(env)
-    search = client.get("/api/conversations/search?query=nothing", headers=_ACTOR)
-    assert search.status_code == 200
-    # A cross-actor / empty probe is the byte-identical empty envelope.
-    assert search.json()["conversations"] == []
+
+    # A cross-actor / empty probe is still the byte-identical empty envelope.
+    search = client.get("/api/conversation-search?query=nothing-here", headers=_ACTOR)
+    assert search.status_code == 200 and search.json()["result_count"] == 0
+
+    # CREATE a conversation through the REAL chat write surface.
+    title = "Router qualification alpha"
+    created = client.post("/api/conversations", headers=_ACTOR, json={"title": title})
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["id"]
+
+    # FINDABLE: the injectable search surface (which wraps the shared store) finds
+    # the just-written conversation by title.
+    found = client.get("/api/conversation-search?query=qualification", headers=_ACTOR)
+    assert found.status_code == 200
+    found_payload = found.json()
+    assert found_payload["result_count"] == 1
+    results = json.loads(found_payload["payload_json"])
+    assert [r["conversation_id"] for r in results] == [conversation_id]
+
+    # EXPORTABLE: the transfer surface (same shared store) exports that exact
+    # conversation, title round-tripping through the redacted export.
+    export = client.get(f"/api/conversation-transfer/export/{conversation_id}", headers=_ACTOR)
+    assert export.status_code == 200, export.text
+    assert export.json()["conversation"]["title"] == title
+
+    # The transfer audit still serves (empty until an export/import is audited).
     audit = client.get("/api/conversation-transfer/audit", headers=_ACTOR)
     assert audit.status_code == 200
-    assert audit.json()["audit"] == []
 
 
 def test_advanced_playground_stores_serve_live_actor_private_surfaces():
@@ -321,3 +423,52 @@ def test_create_live_app_default_produces_no_overrides():
     # switch path is the same all-None default (its infra build is exercised in
     # deployment, not hermetically here).
     assert callable(create_live_app)
+
+
+# ---------------------------------------------------------------------------
+# (f) the REAL create_live_app entrypoint is executed, infra substituted at the
+#     _store/_graph seam so no external Postgres/Neo4j is reached
+# ---------------------------------------------------------------------------
+
+
+def test_create_live_app_empty_env_probes_fail_closed(monkeypatch):
+    # S1: run the REAL create_live_app with an empty switch; a spot-check of
+    # injectable probes still fails closed with 503, exactly the hermetic default.
+    _memory_infra(monkeypatch)
+    client = TestClient(create_live_app(_base_env()))
+    for path, method, body in _INJECTABLE_PROBES[:3]:
+        response = (
+            getattr(client, method)(path, headers=_ACTOR, json=body)
+            if body else getattr(client, method)(path, headers=_ACTOR)
+        )
+        assert response.status_code == 503, f"{path} should fail closed by default"
+
+
+def test_create_live_app_one_surface_env_serves_that_surface_live(monkeypatch):
+    # S1: run the REAL create_live_app with a single surface opted in; that
+    # surface serves its real 200 contract while the rest stay 503.
+    _memory_infra(monkeypatch)
+    client = TestClient(create_live_app(_base_env(
+        WORKBENCH_LIVE_SURFACES="preference_store",
+        WORKBENCH_SETTINGS_CATALOG_FILE=_CATALOG_FILE,
+    )))
+    live = client.get("/api/preferences", headers=_ACTOR)
+    assert live.status_code == 200
+    ids = {setting["id"] for setting in live.json()["catalog"]["settings"]}
+    assert "personal.appearance_density" in ids
+    # A surface NOT opted in remains fail-closed.
+    assert client.get("/api/skill-adoptions", headers=_ACTOR).status_code == 503
+
+
+def test_create_live_app_malformed_chat_routes_fails_closed_at_startup(monkeypatch):
+    # S4: a present-but-malformed WORKBENCH_CHAT_ROUTES raises at STARTUP (not a
+    # per-request 503 indistinguishable from unconfigured). Empty stays valid.
+    _memory_infra(monkeypatch)
+    with pytest.raises(DeploymentConfigError):
+        create_live_app(_base_env(WORKBENCH_CHAT_ROUTES="{ not a json array"))
+    # A malformed non-empty ARRAY (a route missing required keys) also fails closed.
+    with pytest.raises(DeploymentConfigError):
+        create_live_app(_base_env(WORKBENCH_CHAT_ROUTES=json.dumps([{"route_id": "route.x"}])))
+    # Empty is valid: create_live_app boots and serves the honest empty allowlist.
+    client = TestClient(create_live_app(_base_env(WORKBENCH_CHAT_ROUTES="")))
+    assert client.get("/api/chat/routes", headers=_ACTOR).json() == {"routes": []}

@@ -14,25 +14,45 @@ The STT/TTS backend is faked ONLY at the injected transport seam the production
 code already declares; every authorization gate, bound, lifecycle-event write,
 turn-append gate, redaction hop, and error handler under test is the real code.
 
+A NOTE ON WIREDNESS, so no claim here overstates what the product actually wires:
+
+* The STT draft path (``POST /api/chat/voice/transcribe``) and the TTS read-aloud
+  path (``POST /api/chat/voice/speak``) are REAL relay endpoints the browser
+  calls; those legs run through the production ``VoiceRelayService``.
+* Playback CONTROLS — pause and stop — are client-transient BY DESIGN.  The voice
+  API surface exposes ONLY ``transcribe`` and ``speak`` (asserted structurally in
+  ``test_voice_surface_exposes_only_transcribe_and_speak``), so there is no relay
+  endpoint a pause/stop could traverse, and this module claims none.
+* The ONLY DURABLE representation of an interruption is the content-free
+  ``chat.turn.assistant-interrupted.v1`` ``voice_events`` decoration on a
+  committed turn, appended through the real append-only ``POST /turns`` endpoint.
+  It is NOT a relay-emitted event (the relay logs only ``utterance_start`` /
+  ``stt_commit`` / ``tts_start``); it is the shipped turn-contract shape the
+  client commits, which this module exercises through the real turns endpoint and
+  asserts is content-free (no audio, no transcript mutation) and mutates no
+  message content or conversation state.
+
 Each test maps to a T005 acceptance criterion:
 
 1. ``test_full_voice_loop_through_wired_endpoints`` — one integration flow that
-   exercises tap-to-record AND hold-to-record STT, editable transcript review,
-   an EXPLICIT send, TTS start, stop/pause + interruption (as content-free
-   lifecycle markers on the committed turn), and replay — all through the real
-   HTTP relay/conversation endpoints the browser uses.
+   exercises tap-to-record AND hold-to-record STT (real ``/transcribe``),
+   editable transcript review, an EXPLICIT send, TTS start and replay (real
+   ``/speak``), and the committed content-free interruption marker (real
+   ``POST /turns``).  It asserts NO pause/stop relay traffic, because none exists.
 2. It also proves STT creates NO conversation turn until the reviewed transcript
    is explicitly submitted, and that the EDITED text (not the raw STT draft)
    becomes the turn.
 3. ``test_tts_and_replay_never_mutate_conversation_state`` — the conversation
-   record is byte-identical before and after TTS start / replay / the playback
-   lifecycle.
+   record is byte-identical before and after TTS start / replay.
 4. ``test_raw_audio_absent_from_every_durable_surface``,
    ``test_error_payloads_never_reflect_request_audio`` and
    ``test_browser_cache_contract_fixtures_carry_no_audio`` — a distinctive audio
    byte marker appears NOWHERE in durable storage, audit, the graph, the browser
    contract fixtures, or any 4xx/5xx error body (including the path-scoped
    RequestValidationError scrub).
+5. ``test_voice_surface_exposes_only_transcribe_and_speak`` — the structural
+   proof that a playback-control server call is UNREPRESENTABLE: the mounted
+   voice routes are exactly ``/transcribe`` and ``/speak``.
 """
 from __future__ import annotations
 
@@ -228,9 +248,16 @@ def _submit_user_transcript(client: TestClient, conversation_id: str, text: str)
 
 
 def _append_assistant_turn(client: TestClient, conversation_id: str, parent_turn_id: str) -> dict[str, Any]:
-    """The read-aloud target: an assistant turn whose playback lifecycle (start,
-    interruption, stop) is recorded as content-free voice_events — exactly the
-    shipped ``chat.turn.assistant-interrupted.v1`` contract shape.
+    """The read-aloud target: an assistant turn carrying the DURABLE, content-free
+    ``voice_events`` interruption decoration — exactly the shipped
+    ``chat.turn.assistant-interrupted.v1`` contract shape the client commits.
+
+    These markers are NOT relay-emitted (the relay logs only utterance_start /
+    stt_commit / tts_start); they are the append-only turn-contract representation
+    of a playback interruption, committed here through the real ``POST /turns``
+    endpoint.  The append gate is what is under test — that this decoration is
+    accepted content-free (no audio, no transcript mutation), never that a relay
+    produced it.
     """
     response = client.post(f"/api/conversations/{conversation_id}/turns", json={
         "role": "assistant", "status": "interrupted",
@@ -337,13 +364,21 @@ def test_full_voice_loop_through_wired_endpoints():
         assert [event["event"] for event in user_turn["voice_events"]] == ["utterance_start", "stt_commit"]
         assert all("audio" not in event for event in user_turn["voice_events"])
 
-        # -- TTS start + read-aloud playback lifecycle + replay ---------------
+        # -- Durable interruption marker via the REAL append-only POST /turns ---
+        # The interruption/stop are NOT relay events (no server surface exists for
+        # a playback control); their ONLY durable form is this content-free
+        # voice_events decoration on a committed turn, which the append gate here
+        # accepts and returns.  Assert it is content-free: only lifecycle event
+        # names, and NO audio field on any event.
         assistant = _append_assistant_turn(client, conversation_id, user_turn_id)
         assistant_ref = assistant["id"]
-        # The committed assistant turn records start/interruption/stop as
-        # content-free markers (the browser contract shape), never audio.
         assert [event["event"] for event in assistant["voice_events"]] == ["tts_start", "interruption", "tts_stop"]
+        assert all("audio" not in event for event in assistant["voice_events"])
+        # The committed message CONTENT is the assistant text only — the playback
+        # decoration mutated no transcript and carried no audio.
+        assert [block["text"] for block in assistant["content"]] == [_ASSISTANT_TEXT]
 
+        # -- TTS start + read-aloud replay through the REAL relay /speak --------
         start = _speak(client, conversation_id, assistant_ref, _ASSISTANT_TEXT)
         assert start.status_code == 200, start.text
         # TTS start returns transient playback audio the browser plays and drops.
@@ -540,3 +575,36 @@ def test_browser_cache_contract_fixtures_carry_no_audio():
 
     # The scan actually saw voice events (not vacuously passing on empty lists).
     assert seen_voice_events >= 3
+
+
+# --------------------------------------------------------------------------- #
+# Criterion 5 (structural): a playback-control server call is UNREPRESENTABLE.
+# Pause/stop are client-transient by design; the voice surface exposes only STT
+# (transcribe) and TTS (speak). If a pause/stop endpoint were ever added this set
+# would grow and the assertion would fail — the claim is ENFORCED, not narrated.
+# --------------------------------------------------------------------------- #
+
+
+def _all_route_paths(routes: Any) -> list[str]:
+    """Every mounted route path, descending through the hub's ``_IncludedRouter``
+    wrapper (which nests an ``original_router`` rather than flattening its routes
+    onto ``app.routes``)."""
+    paths: list[str] = []
+    for route in routes:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            paths.extend(_all_route_paths(original.routes))
+            continue
+        path = getattr(route, "path", None)
+        if path:
+            paths.append(path)
+    return paths
+
+
+def test_voice_surface_exposes_only_transcribe_and_speak():
+    client, *_rest = _harness()
+    voice_paths = {
+        path for path in _all_route_paths(client.app.routes)
+        if path.startswith("/api/chat/voice")
+    }
+    assert voice_paths == {"/api/chat/voice/transcribe", "/api/chat/voice/speak"}

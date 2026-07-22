@@ -82,13 +82,20 @@ function conv(id, title, overrides = {}) {
   }
 }
 
-// `turn_json` shape (conversation_api.py:234-273).
+// `turn_json` shape (conversation_api.py:234-273). `committed`/`interrupted`/
+// `terminal` are DERIVED booleans the serializer computes from `status`
+// (conversation_models.py:471-480); `TERMINAL_TURN_STATUSES` =
+// {complete, interrupted, cancelled, failed}. `content_trust` is always
+// `untrusted_task_data` — the only value ContentBlock accepts
+// (conversation_models.py:79,294-299); `trusted_actor_input` is un-emittable.
+const _TERMINAL_TURN_STATUSES = ['complete', 'interrupted', 'cancelled', 'failed']
 function turn(id, conversationId, role, text, { status = 'complete', kind = 'initial', mode = 'ordinary' } = {}) {
   return {
     id, conversation_id: conversationId, role, mode, status,
-    committed: status === 'complete', interrupted: false, terminal: null, content_purged: false,
+    committed: status === 'complete', interrupted: status === 'interrupted',
+    terminal: _TERMINAL_TURN_STATUSES.includes(status), content_purged: false,
     lineage: { parent_turn_id: null, sibling_index: 0, kind },
-    content: [{ kind: 'text', text, content_trust: 'trusted_actor_input' }],
+    content: [{ kind: 'text', text, content_trust: 'untrusted_task_data' }],
     voice_events: [], created_at: '2026-07-21T00:00:00Z', completed_at: '2026-07-21T00:00:00Z',
   }
 }
@@ -110,7 +117,22 @@ const BOOTSTRAP = {
   voice: { available: false, transport: 'not_configured', retains_transcripts: false },
 }
 
-const CHAT_ROUTES = { routes: [{ route_id: 'route.fast', display_name: 'Fast local' }, { route_id: 'route.deep', display_name: 'Deep local' }] }
+// `/api/chat/routes` projection shape (chat_routes.py ChatRouteDescriptor.as_dict):
+// exactly the 7 keys the real endpoint on this branch serves — provider const
+// `anvil-serving`, route_id, display_name, serving_contract_version, route_digest
+// (sha256:<64 hex>), model_profile, controls — matching the projection grammar.
+const CHAT_ROUTES = { routes: [
+  {
+    provider: 'anvil-serving', route_id: 'route.fast', display_name: 'Fast local',
+    serving_contract_version: '1.0.0', route_digest: `sha256:${'a'.repeat(64)}`,
+    model_profile: 'chat-fast', controls: ['temperature_milli'],
+  },
+  {
+    provider: 'anvil-serving', route_id: 'route.deep', display_name: 'Deep local',
+    serving_contract_version: '1.0.0', route_digest: `sha256:${'b'.repeat(64)}`,
+    model_profile: 'chat-deep', controls: ['reasoning_effort'],
+  },
+] }
 // Served `/api/preferences` payload (autoplay OFF) — the resolver's effective-row shape.
 const PREFERENCES = { catalog: { settings: [] }, effective: [{ setting_id: 'personal.voice_autoplay', scope: 'personal', value: false, source: 'default' }] }
 
@@ -206,6 +228,17 @@ async function finish(stream) {
   await act(async () => { stream.end(); await tick() })
 }
 
+// Assert a lifecycle announcement lives INSIDE the polite live region — the
+// element carrying BOTH role="status" and aria-live="polite" (App.jsx:1273).
+// Returns the region element (truthy) only when such an element contains the
+// text; stripping either attribute (which silences the announcement for screen
+// readers) makes the selector miss and the assertion fail, so the announcement's
+// accessibility, not merely its presence in the DOM, is what is proven.
+function liveRegionAnnouncing(text) {
+  return [...document.querySelectorAll('[role="status"][aria-live="polite"]')]
+    .find((region) => region.textContent.includes(text))
+}
+
 const activeConv = conv('conv_active', 'Router planning')
 
 // Land a NEW actor (empty rail → create + select) or a RETURNING actor (existing
@@ -229,16 +262,22 @@ async function land(kind) {
   return { server, user, convId: 'conv_active' }
 }
 
+// Captured once so the responsive test's 375px override is always restored,
+// even if that test throws mid-assertion — no later test inherits a narrow width.
+const ORIGINAL_INNER_WIDTH = window.innerWidth
 beforeEach(() => { window.location.hash = '' })
-afterEach(() => { vi.unstubAllGlobals() })
+afterEach(() => {
+  vi.unstubAllGlobals()
+  Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: ORIGINAL_INNER_WIDTH })
+})
 
 // --- Criterion 1: new + returning actors complete the conversation loop -------
 describe('Criterion 1 — a new and a returning actor complete the wired chat loop', () => {
   it.each(['new', 'returning'])('%s actor: streamed deltas render progressively through the real reducer', async (kind) => {
     const { user, server } = await land(kind)
     await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'hello there{Enter}')
-    // The composer is streaming before any frame arrives.
-    expect(screen.getByText('Streaming response…')).toBeTruthy()
+    // The composer is streaming before any frame arrives — announced in the live region.
+    expect(liveRegionAnnouncing('Streaming response…')).toBeTruthy()
     const stream = server.state.latestStream
     expect(stream).toBeTruthy()
 
@@ -253,7 +292,7 @@ describe('Criterion 1 — a new and a returning actor complete the wired chat lo
     // Terminal (seq 3, completed) settles the turn as complete.
     await emit(stream, terminalFrame('completed', 3))
     await finish(stream)
-    expect(await screen.findByText('Response complete')).toBeTruthy()
+    await waitFor(() => expect(liveRegionAnnouncing('Response complete')).toBeTruthy())
     // One transcript, and the streamed text settled into a normal turn.
     expect(screen.getAllByRole('list', { name: 'Transcript' })).toHaveLength(1)
     expect(screen.getByText('AlphaBeta')).toBeTruthy()
@@ -416,7 +455,7 @@ describe('Criterion 5 — keyboard-only operation with predictable focus and liv
     // Keyboard-only: Enter submits (no Send button click); the aria-live region
     // announces the streaming state.
     await user.type(composer, 'keyboard send{Enter}')
-    expect(screen.getByText('Streaming response…')).toBeTruthy()
+    expect(liveRegionAnnouncing('Streaming response…')).toBeTruthy()
     // Focus moves to Cancel when streaming starts, so it is never dropped to <body>.
     const cancel = screen.getByRole('button', { name: 'Cancel streaming response' })
     expect(document.activeElement).toBe(cancel)
@@ -424,8 +463,8 @@ describe('Criterion 5 — keyboard-only operation with predictable focus and liv
     const stream = server.state.latestStream
     await emit(stream, deltaFrame('done', 1), terminalFrame('completed', 2))
     await finish(stream)
-    // The aria-live region announces completion.
-    expect(await screen.findByText('Response complete')).toBeTruthy()
+    // The aria-live region announces completion (asserted inside the live region).
+    await waitFor(() => expect(liveRegionAnnouncing('Response complete')).toBeTruthy())
     // Focus returns to the composer for the next message.
     expect(document.activeElement).toBe(composer)
   })

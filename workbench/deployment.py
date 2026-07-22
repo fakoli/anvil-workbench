@@ -44,6 +44,7 @@ from .advanced_playground import (
     AdvancedTemplateStore,
 )
 from .api import _conversation_store, create_app
+from .chat_routes import ChatRouteError, discover_chat_routes, parse_chat_routes_config
 from .config import Settings
 from .configuration_transfer import ConfigurationTransferService
 from .contracts import ContractValidationError, validate_settings_descriptor
@@ -67,6 +68,11 @@ SETTINGS_CATALOG_FILE_ENV = "WORKBENCH_SETTINGS_CATALOG_FILE"
 PREF_AUDIT_KEY_ENV = "WORKBENCH_PREF_AUDIT_KEY"
 #: The master switch: a comma-separated list of injectable surface names to wire.
 LIVE_SURFACES_ENV = "WORKBENCH_LIVE_SURFACES"
+#: Operator-reviewed JSON array of allowed Anvil Serving chat routes.  Empty is
+#: valid (the honest empty allowlist); a present-but-malformed value fails the hub
+#: closed at startup rather than booting into a per-request 503 that an operator
+#: cannot tell apart from "no routes configured".
+CHAT_ROUTES_ENV = "WORKBENCH_CHAT_ROUTES"
 
 #: The exact injectable-surface names ``WORKBENCH_LIVE_SURFACES`` may name.  A
 #: name outside this set fails closed at startup.
@@ -262,11 +268,18 @@ def build_live_overrides(env: Mapping[str, str] | None = None) -> dict[str, Any]
         overrides["preference_store"] = preference_store()
 
     if "policy_gate_service" in requested:
-        # The gate is constructed over the reviewed settings catalog only: its
-        # operations are the hub-local, observational preference set/reset spine
-        # (no external production declarations), so a browser can never route a
-        # production effect through it.
-        overrides["policy_gate_service"] = PolicyGateService(settings_catalog())
+        # The gate is constructed over the reviewed settings catalog, and it MUST
+        # share the SAME preference store the ``/api/preferences`` surface and the
+        # configuration-transfer service use.  Otherwise the gate commits an
+        # approved hub-local change into a PRIVATE store (the PolicyGateService
+        # default at preference_gates.py:156) and receipts it ``succeeded`` while
+        # ``/api/preferences`` and the export never reflect it.  Its operations are
+        # the hub-local, observational preference set/reset spine (no external
+        # production declarations), so a browser can never route a production
+        # effect through it.
+        overrides["policy_gate_service"] = PolicyGateService(
+            settings_catalog(), preference_store=preference_store(),
+        )
 
     if "configuration_transfer_service" in requested:
         overrides["configuration_transfer_service"] = ConfigurationTransferService(
@@ -306,14 +319,40 @@ def build_live_overrides(env: Mapping[str, str] | None = None) -> dict[str, Any]
     return overrides
 
 
+def _validate_chat_routes_config(env: Mapping[str, str]) -> None:
+    """Fail closed at startup when ``WORKBENCH_CHAT_ROUTES`` is malformed.
+
+    An empty/unset value is valid: it parses to the honest empty allowlist that
+    ``GET /api/chat/routes`` serves as ``{"routes": []}``.  A present-but-malformed
+    value, however, must NOT boot the hub into a per-request 503 that an operator
+    cannot distinguish from "no routes configured" -- the operator declared routes
+    and a typo would silently disable chat.  Run the SAME reviewed grammar the
+    ``/api/chat/routes`` surface enforces (``parse_chat_routes_config`` +
+    ``discover_chat_routes``) once, loudly, before the app serves.
+    """
+    raw = env.get(CHAT_ROUTES_ENV, "")
+    try:
+        discover_chat_routes(parse_chat_routes_config(raw))
+    except ChatRouteError as exc:
+        raise DeploymentConfigError(
+            f"{CHAT_ROUTES_ENV} is malformed; a reviewed chat-route allowlist must "
+            f"parse and validate before the hub serves (empty is valid): {exc}"
+        ) from exc
+
+
 def create_live_app(env: Mapping[str, str] | None = None) -> FastAPI:
     """Build the FastAPI app with the operator-opted-in live surfaces wired.
 
     This is the deployment entrypoint's single composition seam.  With an
     empty/unset ``WORKBENCH_LIVE_SURFACES`` it is byte-for-byte the hermetic
     ``create_app()`` default (every injectable surface ``None`` -> 503).
+
+    A present-but-malformed ``WORKBENCH_CHAT_ROUTES`` fails the hub closed HERE,
+    at startup, rather than serving a per-request 503 indistinguishable from an
+    unconfigured allowlist.
     """
     resolved_env = dict(os.environ if env is None else env)
     settings = Settings.from_env(resolved_env)
+    _validate_chat_routes_config(resolved_env)
     overrides = build_live_overrides(resolved_env)
     return create_app(settings=settings, **overrides)
