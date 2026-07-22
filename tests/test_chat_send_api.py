@@ -375,6 +375,45 @@ def test_followup_send_carries_prior_user_and_assistant_turns_in_order():
     ]
 
 
+def test_history_excludes_failed_turns_from_the_next_request():
+    """A failed assistant turn never re-enters the model's context (D1 exclusion)."""
+
+    class FailSecondFactory:
+        def __init__(self):
+            self.requests: list[dict] = []
+            self.calls = 0
+
+        def __call__(self, _selection):
+            self.calls += 1
+            if self.calls == 2:
+                return ScriptedTransport(
+                    [_delta("bad partial")], raise_at=1,
+                    error=ServingStreamUnavailable("503"), sink=self.requests,
+                )
+            reply = "first answer" if self.calls == 1 else "third answer"
+            return ScriptedTransport([_delta(reply), _COMPLETED], sink=self.requests)
+
+    factory = FailSecondFactory()
+    client, _store, _lifecycle = _build(factory=factory)
+    with client:
+        conversation_id = _create_conversation(client)
+        assert _send(client, conversation_id, "first prompt").status_code == 200
+        assert _send(client, conversation_id, "second prompt").status_code == 200
+        assert _send(client, conversation_id, "third prompt").status_code == 200
+        turns = _turns(client, conversation_id)
+
+    # The second exchange's assistant turn durably failed.
+    assert [t["status"] for t in turns if t["role"] == "assistant"] == [
+        "complete", "failed", "complete",
+    ]
+    third_input = factory.requests[-1]["input"]
+    contents = [message["content"] for message in third_input]
+    # The failed assistant text is excluded; its (complete) user turn and the
+    # first full exchange remain, in order, with the current prompt last.
+    assert "bad partial" not in contents
+    assert contents == ["first prompt", "first answer", "second prompt", "third prompt"]
+
+
 def test_history_is_bounded_and_drops_the_oldest_turns():
     # Six sends -> 5 prior complete pairs (10 turns) before the 6th; the bound keeps
     # only the last HISTORY_MAX_TURNS, dropping the oldest.
@@ -630,6 +669,18 @@ def test_concurrent_stream_ceiling_refuses_beyond_the_per_actor_bound():
                 )
             assert refused.status_code == 429
             assert refused.json()["detail"] == "too many concurrent chat streams are active for this actor"
+            # The ceiling is acquired BEFORE the user-turn write: a refused send
+            # leaves no orphan user turn (kills the acquire-after-write mutation).
+            with httpx.Client(base_url=base) as client:
+                snapshot = client.get(
+                    f"/api/conversations/{conversation_id}", headers=_actor(OWNER),
+                ).json()
+            refused_texts = [
+                block.get("text")
+                for turn in snapshot.get("turns", [])
+                for block in turn.get("content", [])
+            ]
+            assert "one too many" not in refused_texts
         finally:
             release.set()  # let the held streams complete so their slots free
             for sock in held:
