@@ -161,6 +161,15 @@ class RelayEvent:
     A ``delta`` event carries the incremental ``text``; the single ``terminal``
     event carries the settled :class:`StreamOutcome`.  Exactly one terminal
     event is yielded per stream, always last.
+
+    NOTE (chat-first-voice T010 live-integration join, blocked-live T004/T005/T006):
+    this relay currently emits only ``delta`` and ``terminal`` kinds.  When the
+    chat relay is mounted behind an ``/api/conversations/{id}/send`` endpoint,
+    ``RelayEvent`` must grow a ``resolution`` kind so the SURFACE-ONLY
+    route-resolution mark (``workbench.router.route_resolution``) reaches the
+    browser inline with the stream — the FE already consumes a ``resolution``
+    frame (``web/src/chat-api.js`` ``reduceStreamState``).  Until then the wired
+    mark surface is the polled ``GET /api/chat/route-resolutions`` endpoint.
     """
 
     kind: str  # "delta" | "terminal"

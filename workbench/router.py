@@ -10,7 +10,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .redaction import redact_value
+from .redaction import redact_config_text, redact_value
 
 
 class RouterError(RuntimeError):
@@ -56,6 +56,7 @@ def route_decisions(base_url: str, token: str, limit: int = 50) -> list[dict[str
         # REPORTED by Serving; Workbench never sets them.
         "requested_route", "served_route", "requested_model",
         "route_selection", "route_source", "divergence_reason", "episode_id",
+        "correlation_id",
     }
     return [{key: redact_value(row[key]) for key in allowed if key in row} for row in rows if isinstance(row, dict)]
 
@@ -96,8 +97,15 @@ def route_resolution(decision: Any) -> dict[str, Any]:
       one, taken from Serving's reported ``route_selection`` / ``route_source``;
       an unreported provenance stays ``None`` rather than being guessed.
     * ``episode_id`` groups one divergence episode so the browser can show the
-      notice exactly once; it is Serving's own id when reported, else a stable
-      derivation of the (requested, served, reason) tuple — never a re-route.
+      notice exactly once.  It is Serving's OWN episode/correlation id when
+      reported; otherwise a stable key derived from the STABLE, non-free-text
+      ``(requested_route, served_route, fell_back)`` shape — NEVER the free-text
+      reason.  Keying off stable fields (not the reason) does two things: it keeps
+      an unscrubbed reason (a credential a future direct caller passed in raw)
+      from ever riding out through ``episode_id`` while ``divergence_reason`` is
+      the visibly-scrubbed field, AND it makes the key identical whether or not
+      Serving reported a reason on a given turn, so a re-announcement of the same
+      episode can never slip through with a different key.  It is never a re-route.
     """
     requested = _first_str(decision, "requested_route", "route", "requested_model", "model")
     served = _first_str(decision, "served_route", "served_model", "model")
@@ -107,19 +115,26 @@ def route_resolution(decision: Any) -> dict[str, Any]:
     fell_back = bool(decision.get("fell_back")) if isinstance(decision, dict) else False
     diverged = fell_back or (requested is not None and served is not None and requested != served)
     reason = _first_str(decision, "divergence_reason", "reason") if diverged else None
-    episode = _first_str(decision, "episode_id")
+    # Serving's own episode/correlation id wins; both are stable, non-free-text ids.
+    episode = _first_str(decision, "episode_id", "correlation_id")
     if diverged and episode is None:
-        # A STABLE grouping key derived from what Serving reported — NOT a route
-        # choice.  Two turns of the same episode (same requested→served/reason)
-        # share it, so the browser shows the divergence notice exactly once.
-        episode = "ep:" + "|".join(str(part) for part in (requested, served, reason))
+        # A STABLE grouping key derived ONLY from stable, non-free-text fields —
+        # NOT a route choice and NEVER the free-text reason.  Two turns of the same
+        # episode share it even when Serving reports the reason on one turn and not
+        # the other, so the browser shows the divergence notice exactly once; and a
+        # credential smuggled into a raw reason can never leak through this key.
+        episode = "ep:" + "|".join(str(part) for part in (requested, served, fell_back))
     return {
         "request_id": _first_str(decision, "request_id"),
         "requested_route": requested,
         "served_route": served,
         "provenance": provenance,
         "diverged": diverged,
-        "divergence_reason": redact_value(reason) if isinstance(reason, str) else None,
+        # Endpoint/path/host-scrub the reason at the SAME last-hop strength as the
+        # rest of the config corpus (covers a dotless ``serving:8443`` host:port, a
+        # provider URL, and a local path) — not just the credential scrub — so a
+        # reason naming a provider host can never reach the browser.
+        "divergence_reason": redact_config_text(reason) if isinstance(reason, str) else None,
         "episode_id": episode,
     }
 

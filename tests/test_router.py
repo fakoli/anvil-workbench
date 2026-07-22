@@ -52,6 +52,24 @@ def test_route_resolution_is_surface_only_and_never_substitutes_a_route():
     assert resolution["episode_id"]  # a stable per-episode grouping id
 
 
+def test_route_resolution_under_fell_back_never_substitutes_a_route():
+    # T010 criterion 1, the fell_back branch (S5): when Serving REPORTS a fallback,
+    # the served route must STILL be exactly the route Serving resolved — Workbench
+    # inserts no substitute under the fell_back branch either.  The prior surface-
+    # only fixture carried no `fell_back` key, so a re-route inserted under this
+    # branch went unseen at the unit level; this fixture drives it directly.
+    decision = {
+        "request_id": "req_fb", "requested_route": "route.fast", "served_route": "route.heavy",
+        "route_selection": "explicit", "fell_back": True, "divergence_reason": "route.fast at capacity",
+    }
+    resolution = router.route_resolution(decision)
+    assert resolution["diverged"] is True
+    # Byte-for-byte pass-through in the fell_back case: a Workbench-chosen alternate
+    # inserted under the fell_back branch would fail this equality (revert-detection).
+    assert resolution["served_route"] == decision["served_route"]
+    assert resolution["requested_route"] == decision["requested_route"]
+
+
 def test_route_resolution_distinguishes_explicit_from_preference_default():
     # T010 criterion 2: explicit vs preference-derived is a real served field, not
     # a guess — an unreported provenance stays None rather than being invented.
@@ -82,6 +100,69 @@ def test_route_resolution_credential_scrubs_a_divergence_reason():
     })
     assert "sk-ABCDEFGH12345678" not in resolution["divergence_reason"]
     assert "[REDACTED]" in resolution["divergence_reason"]
+
+
+def test_route_resolution_endpoint_scrubs_a_divergence_reason():
+    # S2: the reason is scrubbed at config strength, not merely credential-scrubbed,
+    # so a provider host:port (incl. a DOTLESS `serving:8443`), a provider URL, or a
+    # local path in Serving's reason can never reach the browser.
+    resolution = router.route_resolution({
+        "requested_route": "route.a", "served_route": "route.b",
+        "divergence_reason": "serving:8443 at capacity; see https://api.example.com/v1 and /etc/serving/route.conf",
+    })
+    reason = resolution["divergence_reason"]
+    assert "serving:8443" not in reason
+    assert "api.example.com" not in reason
+    assert "/etc/serving/route.conf" not in reason
+
+
+def test_route_resolution_episode_id_never_leaks_a_raw_reason_credential():
+    # S1(a): a FUTURE direct caller could pass a raw (unscrubbed) Serving reason
+    # carrying a credential. The episode id is derived from STABLE, non-free-text
+    # fields — never the reason — so the credential can never ride out through the
+    # (unscrubbed-by-nature) grouping key, even when route_resolution is called
+    # directly. Revert-detection: the old reason-embedded key would EMBED the secret.
+    resolution = router.route_resolution({
+        "requested_route": "route.a", "served_route": "route.b",
+        "divergence_reason": "token=sk-LEAK9999ABCDEFGH and Bearer sk-BEARER0000TOKEN exhausted",
+    })
+    episode = resolution["episode_id"]
+    assert episode  # a diverged turn always carries a grouping key
+    assert "sk-LEAK9999ABCDEFGH" not in episode
+    assert "sk-BEARER0000TOKEN" not in episode
+    assert "Bearer" not in episode
+    assert "token=" not in episode
+
+
+def test_route_resolution_episode_id_is_stable_whether_or_not_reason_is_present():
+    # S1(b): two turns of the SAME fell_back episode — one WITH a divergence_reason,
+    # one WITHOUT — must derive the SAME episode id, so the once-per-episode notice
+    # can never re-announce just because Serving reported the reason on one turn and
+    # not the other. Revert-detection: the old reason-embedded key differs across the
+    # pair (one embeds the reason, one embeds `None`).
+    with_reason = router.route_resolution({
+        "requested_route": "route.fast", "served_route": "route.heavy",
+        "fell_back": True, "divergence_reason": "capacity",
+    })
+    without_reason = router.route_resolution({
+        "requested_route": "route.fast", "served_route": "route.heavy",
+        "fell_back": True,
+    })
+    assert with_reason["episode_id"] == without_reason["episode_id"]
+
+
+def test_route_resolution_prefers_servings_own_episode_id():
+    # S1: Serving's OWN episode/correlation id wins over a derived key when reported.
+    by_episode = router.route_resolution({
+        "requested_route": "route.fast", "served_route": "route.heavy",
+        "fell_back": True, "episode_id": "srv-ep-42",
+    })
+    by_correlation = router.route_resolution({
+        "requested_route": "route.fast", "served_route": "route.heavy",
+        "fell_back": True, "correlation_id": "corr-7",
+    })
+    assert by_episode["episode_id"] == "srv-ep-42"
+    assert by_correlation["episode_id"] == "corr-7"
 
 
 def test_sandbox_response_extracts_standard_responses_output_text(monkeypatch):

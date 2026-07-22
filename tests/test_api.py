@@ -2921,6 +2921,39 @@ def test_conversation_import_never_resurrects_deleted_or_purged_content():
         assert rejected2.status_code == 422
 
 
+def test_conversation_import_rolls_back_fully_when_the_append_gate_refuses_mid_apply():
+    # S3 (atomic rollback): an envelope that is schema-valid and PASSES `_plan`
+    # but fails the append gate MID-APPLY (a well-formed but DANGLING
+    # parent_turn_id on the second turn) must roll the just-created conversation
+    # back entirely -- 422, and NO new conversation left behind. Revert-detection:
+    # remove the except/delete_conversation rollback and the partial (1-turn)
+    # conversation survives, so the count assertion below fails.
+    store, conv_id = _ctv_seeded_store()
+    with _ctv_client(store) as client_:
+        export = client_.get(
+            f"/api/conversation-transfer/export/{conv_id}", headers=_CTV_ACTOR,
+        ).json()
+        before = client_.get("/api/conversations", headers=_CTV_ACTOR).json()["conversations"]
+
+        # The root turn (turns[0]) applies cleanly; the branch turn (turns[1]) names
+        # a well-formed but non-existent parent, so its append is refused only after
+        # the conversation + root already exist -- exercising the rollback branch,
+        # not the pre-apply `_plan` validation (which accepts the well-formed id).
+        poisoned = _copy.deepcopy(export)
+        poisoned["turns"][1]["lineage"]["parent_turn_id"] = "turn_dangling99999999"
+        rejected = client_.post(
+            "/api/conversation-transfer/import/apply", headers=_CTV_ACTOR,
+            json={"envelope": poisoned},
+        )
+        assert rejected.status_code == 422
+
+        after = client_.get("/api/conversations", headers=_CTV_ACTOR).json()["conversations"]
+        # Full rollback: the partial conversation is gone, count is unchanged, and
+        # no new conversation id appeared.
+        assert len(after) == len(before)
+        assert {c["id"] for c in after} == {c["id"] for c in before}
+
+
 def test_conversation_transfer_requires_a_trusted_allowlisted_actor():
     store, conv_id = _ctv_seeded_store()
     settings = _pref_settings()

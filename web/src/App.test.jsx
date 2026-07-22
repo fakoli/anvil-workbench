@@ -460,11 +460,25 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'one')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     expect(await screen.findByText(/served a different route than requested/)).toBeTruthy()
-    // A second turn in the SAME episode must NOT re-show the notice.
+    // DISMISS the notice, then send a second turn of the SAME episode. This is
+    // what distinguishes "re-announced" from "shown once": if the announcement
+    // re-fired per turn it would re-set `divergence` and the (now-dismissed)
+    // notice would REAPPEAR. Because it is once-per-episode (the episode id is
+    // already recorded), turn 2 announces nothing and the notice stays gone.
+    await user.click(screen.getByRole('button', { name: 'Dismiss route divergence notice' }))
+    expect(screen.queryByText(/served a different route than requested/)).toBeNull()
     await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'two')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     await screen.findAllByText('answer')
-    expect(screen.getAllByText(/served a different route than requested/)).toHaveLength(1)
+    // The dismissed notice does NOT come back for the same episode's second turn.
+    expect(screen.queryByText(/served a different route than requested/)).toBeNull()
+    // A NEW episode (different episode id) still announces once — proving the
+    // dismissal above was episode-scoped suppression, not a permanent mute.
+    sendMessage.mockResolvedValue({ text: 'answer', terminal: 'completed', needsRefresh: false,
+      routeResolution: { requested_route: 'route.fast', served_route: 'route.deep', provenance: 'explicit', diverged: true, episode_id: 'ep_2', divergence_reason: 'route.fast at capacity' } })
+    await user.type(screen.getByRole('textbox', { name: 'Message composer' }), 'four')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText(/served a different route than requested/)).toBeTruthy()
     // NON-BLOCKING: the composer stays usable and a further message can be typed.
     const composer = screen.getByRole('textbox', { name: 'Message composer' })
     expect(composer.disabled).toBe(false)
