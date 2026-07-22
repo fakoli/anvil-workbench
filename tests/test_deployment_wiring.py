@@ -472,3 +472,17 @@ def test_create_live_app_malformed_chat_routes_fails_closed_at_startup(monkeypat
     # Empty is valid: create_live_app boots and serves the honest empty allowlist.
     client = TestClient(create_live_app(_base_env(WORKBENCH_CHAT_ROUTES="")))
     assert client.get("/api/chat/routes", headers=_ACTOR).json() == {"routes": []}
+
+
+def test_delivery_projection_surface_requires_a_seed_directory():
+    """Naming delivery_projection_store without a seed env fails closed at startup."""
+    from workbench.deployment import DeploymentConfigError, build_live_overrides
+
+    with pytest.raises(DeploymentConfigError, match="validated projection seed"):
+        build_live_overrides({"WORKBENCH_LIVE_SURFACES": "delivery_projection_store"})
+
+    with pytest.raises(DeploymentConfigError, match="missing seed directory"):
+        build_live_overrides({
+            "WORKBENCH_LIVE_SURFACES": "delivery_projection_store",
+            "WORKBENCH_DELIVERY_PROJECTION_SEED": "Z:/nope/definitely-missing-seed",
+        })

@@ -26,9 +26,11 @@ Fail-closed discipline (an adversarial reviewer will check each):
 
 Surfaces this module deliberately does NOT wire (they have separate live gates,
 left unchanged): ``project_context_store``, ``run_context_store``,
-``delivery_projection_store``, ``voice_relay_service``,
-``chat_tool_dispatch_service``, and ``plugin_host_service`` beyond its existing
-settings-driven path in ``create_app``.
+``voice_relay_service``, ``chat_tool_dispatch_service``, and
+``plugin_host_service`` beyond its existing settings-driven path in
+``create_app``.  ``delivery_projection_store`` IS wireable here, but only from a
+validated projection seed produced through the supported State CLI read
+adapters (``workbench.projection_seed``) -- never from hub-fabricated payloads.
 """
 from __future__ import annotations
 
@@ -49,9 +51,11 @@ from .config import Settings
 from .configuration_transfer import ConfigurationTransferService
 from .contracts import ContractValidationError, validate_settings_descriptor
 from .conversation_store import ConversationSearchService, ConversationStore
+from .delivery_projection import MemoryDeliveryProjectionStore
 from .conversation_transfer import ConversationTransferService
 from .models import MIN_PREF_AUDIT_KEY_BYTES
 from .preference_gates import PolicyGateService
+from .projection_seed import ProjectionSeedError, load_seed_dir
 from .store import (
     MemoryPluginPreferenceService,
     MemoryPreferenceStore,
@@ -73,6 +77,11 @@ LIVE_SURFACES_ENV = "WORKBENCH_LIVE_SURFACES"
 #: closed at startup rather than booting into a per-request 503 that an operator
 #: cannot tell apart from "no routes configured".
 CHAT_ROUTES_ENV = "WORKBENCH_CHAT_ROUTES"
+#: Operator-declared path to a validated projection seed directory (produced by
+#: ``python -m workbench.projection_seed generate`` against the supported State
+#: CLI read adapters).  Required when ``delivery_projection_store`` is named in
+#: ``WORKBENCH_LIVE_SURFACES``.
+DELIVERY_PROJECTION_SEED_ENV = "WORKBENCH_DELIVERY_PROJECTION_SEED"
 
 #: The exact injectable-surface names ``WORKBENCH_LIVE_SURFACES`` may name.  A
 #: name outside this set fails closed at startup.
@@ -87,6 +96,7 @@ LIVE_SURFACE_NAMES: frozenset[str] = frozenset({
     "plugin_preference_service",
     "conversation_search_service",
     "skill_adoption_store",
+    "delivery_projection_store",
 })
 
 
@@ -152,6 +162,28 @@ def _load_settings_catalog(env: Mapping[str, str]) -> Mapping[str, Any]:
             f"the reviewed settings catalog fails contract validation: {exc}"
         ) from exc
     return document
+
+
+def _load_delivery_projection_store(env: Mapping[str, str]) -> MemoryDeliveryProjectionStore:
+    """Build the projection store from a reviewed seed dir; fail closed."""
+    path = env.get(DELIVERY_PROJECTION_SEED_ENV, "").strip()
+    if not path:
+        raise DeploymentConfigError(
+            "delivery_projection_store requires a validated projection seed; set "
+            f"{DELIVERY_PROJECTION_SEED_ENV} to the seed directory path"
+        )
+    if not os.path.isdir(path):
+        raise DeploymentConfigError(
+            f"{DELIVERY_PROJECTION_SEED_ENV} points at a missing seed directory: {path}"
+        )
+    store = MemoryDeliveryProjectionStore()
+    try:
+        load_seed_dir(store, path)
+    except ProjectionSeedError as exc:
+        raise DeploymentConfigError(
+            f"the projection seed at {path} is invalid; refusing to serve a partial projection: {exc}"
+        ) from exc
+    return store
 
 
 def _load_plugin_catalog(env: Mapping[str, str]) -> Mapping[str, Any]:
@@ -310,6 +342,9 @@ def build_live_overrides(env: Mapping[str, str] | None = None) -> dict[str, Any]
 
     if "skill_adoption_store" in requested:
         overrides["skill_adoption_store"] = MemorySkillAdoptionStore()
+
+    if "delivery_projection_store" in requested:
+        overrides["delivery_projection_store"] = _load_delivery_projection_store(resolved_env)
 
     # When a shared conversation store was built, hand the SAME instance to
     # create_app so the chat endpoints and the wrapping surfaces agree.
