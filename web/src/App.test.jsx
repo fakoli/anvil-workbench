@@ -1555,45 +1555,171 @@ describe('Voice page (speech-to-speech) dedicated tab (live-qualification)', () 
     expect(within(log).getByRole('button', { name: 'Replay this spoken reply' })).toBeTruthy()
   })
 
-  it('clears the ephemeral transcript on disconnect', async () => {
+  it('clears the LIVE view on disconnect (the saved conversation remains in the list)', async () => {
     const user = await renderVoice()
     const socket = await connectVoice(user)
     await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'a passing thought' }) }) })
     expect(await screen.findByText('a passing thought')).toBeTruthy()
     await user.click(screen.getByRole('button', { name: 'Disconnect voice' }))
-    expect(screen.queryByText('a passing thought')).toBeNull() // ephemeral: gone on disconnect
+    // The live transcript view clears; the durable conversation stays reopenable.
+    expect(screen.queryByText('a passing thought')).toBeNull()
   })
 
-  it('Save to Chat persists the transcript as TEXT turns via the conversations API — never audio', async () => {
+  // --- Unified conversation rail (voice conversations ARE conversations) ------
+
+  const transcription = (transcript) => ({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript }) })
+
+  it('lists conversations from the SAME store as Chat and loads a selected transcript', async () => {
     const user = await renderVoice()
+    // The rail lists conversations from the shared /api/conversations store.
+    expect(listConversations).toHaveBeenCalled()
+    const open = await screen.findByRole('button', { name: 'Open Router planning' })
+    // Selecting loads THAT conversation's stored turns into the voice transcript —
+    // including an assistant turn whose stored text (e.g. typed in Chat) is shown,
+    // proving the conversation is continuable across modalities.
+    getConversation.mockResolvedValueOnce({ conversation: activeConversation, turns: [
+      { id: 't1', role: 'user', content: [{ kind: 'text', text: 'earlier spoken question' }] },
+      { id: 't2', role: 'assistant', content: [{ kind: 'text', text: 'a typed reply from chat' }] },
+    ] })
+    await user.click(open)
+    const log = screen.getByRole('log', { name: 'Live transcript' })
+    expect(await within(log).findByText('earlier spoken question')).toBeTruthy()
+    expect(within(log).getByText('a typed reply from chat')).toBeTruthy()
+  })
+
+  it('persists each completed turn as TEXT to the selected conversation via appendTurn — never audio', async () => {
+    const user = await renderVoice()
+    await user.click(await screen.findByRole('button', { name: 'Open Router planning' }))
     const socket = await connectVoice(user)
-    // One user turn (text) and one assistant turn (audio-only spoken reply).
-    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'what is pending' }) }) })
+    // A user turn (transcribed text) and an assistant turn (audio-only reply).
+    await act(async () => { socket.onmessage?.(transcription('what is pending')) })
     await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
     await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
-    await user.click(screen.getByRole('button', { name: 'Save this transcript to Chat' }))
-    await waitFor(() => expect(createConversation).toHaveBeenCalled())
-    // A durable conversation is created, then each turn is appended as TEXT.
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.done' }) }) })
     await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(2))
+    // A conversation was already selected, so nothing new was created.
+    expect(createConversation).not.toHaveBeenCalled()
     const userCall = appendTurn.mock.calls.find((call) => call[1].role === 'user')
     const asstCall = appendTurn.mock.calls.find((call) => call[1].role === 'assistant')
+    // Scoped to the SELECTED conversation, appended AS TEXT as each turn completes.
+    expect(userCall[0]).toBe('conv_active')
     expect(userCall[1].content).toEqual([{ kind: 'text', text: 'what is pending' }])
-    // Assistant is a TEXT placeholder (audio-only reply) — never raw audio.
+    // Assistant is an audio-only spoken-reply TEXT placeholder — never raw audio.
+    expect(asstCall[0]).toBe('conv_active')
     expect(asstCall[1].content[0].kind).toBe('text')
     expect(asstCall[1].content[0].text).toMatch(/spoken reply/i)
     const serialized = JSON.stringify(appendTurn.mock.calls)
     expect(serialized).not.toMatch(/audio_base64|audio_format|"audio"/)
-    expect(await screen.findByText(/moved into storage as text/)).toBeTruthy()
   })
 
-  it('degrades honestly when Save to Chat is unavailable (503) — disables with a note', async () => {
-    createConversation.mockRejectedValueOnce(new Error('Conversation could not be created'))
+  it('auto-creates a conversation on the first utterance when none is selected', async () => {
+    const user = await renderVoice()
+    await screen.findByRole('button', { name: 'Open Router planning' }) // rail loaded; nothing selected
+    const socket = await connectVoice(user)
+    await act(async () => { socket.onmessage?.(transcription('first thing said')) })
+    // One conversation is created (like Chat on first send) and the turn persists to it.
+    await waitFor(() => expect(createConversation).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledWith('conv_new', expect.objectContaining({ role: 'user' })))
+  })
+
+  it('switching conversations re-scopes persistence and loads the other transcript', async () => {
+    const user = await renderVoice()
+    await screen.findByRole('button', { name: 'Open Router planning' })
+    const socket = await connectVoice(user)
+    // Speaking with none selected auto-creates conv_new and records there.
+    await act(async () => { socket.onmessage?.(transcription('goes to the new one')) })
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledWith('conv_new', expect.objectContaining({ role: 'user' })))
+    // Jump to another conversation: its stored turns load into the view.
+    getConversation.mockResolvedValueOnce({ conversation: activeConversation, turns: [
+      { id: 'x1', role: 'user', content: [{ kind: 'text', text: 'older thread text' }] },
+    ] })
+    await user.click(screen.getByRole('button', { name: 'Open Router planning' }))
+    const log = screen.getByRole('log', { name: 'Live transcript' })
+    expect(await within(log).findByText('older thread text')).toBeTruthy()
+    // New turns now record into the switched-to conversation, not the old one.
+    appendTurn.mockClear()
+    await act(async () => { socket.onmessage?.(transcription('goes to the older one')) })
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledWith('conv_active', expect.objectContaining({ role: 'user' })))
+  })
+
+  it('does not split an exchange when a switch lands mid-append (race #1: settle-time destination)', async () => {
+    // Two conversations in the rail; the exchange happens entirely in A (conv_active).
+    listConversations.mockResolvedValue({ conversations: [activeConversation, secondConversation] })
+    const user = await renderVoice()
+    await user.click(await screen.findByRole('button', { name: 'Open Router planning' }))
+    const socket = await connectVoice(user)
+    // Park the FIRST append (the user turn) in-flight so the persist queue is still
+    // draining when the operator switches away — the exact window that split turns.
+    let releaseUserAppend
+    appendTurn.mockImplementationOnce(() => new Promise((resolve) => { releaseUserAppend = () => resolve({ id: 'turn_user' }) }))
+    // A full exchange settles while A is selected (user transcription + spoken reply).
+    await act(async () => { socket.onmessage?.(transcription('what is pending')) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.done' }) }) })
+    // The user append is parked; the assistant append is queued behind it.
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(1))
+    // Switch to a DIFFERENT conversation while the queue is mid-drain.
+    getConversation.mockResolvedValueOnce({ conversation: secondConversation, turns: [] })
+    await user.click(screen.getByRole('button', { name: 'Open Second thread' }))
+    // Release the parked append; the queued assistant append drains AFTER the switch.
+    await act(async () => { releaseUserAppend() })
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(2))
+    // BOTH turns landed in the ORIGIN conversation — not split, not in the new one.
+    expect(appendTurn.mock.calls.every((call) => call[0] === 'conv_active')).toBe(true)
+    const roles = appendTurn.mock.calls.map((call) => call[1].role)
+    expect(roles).toContain('user'); expect(roles).toContain('assistant')
+  })
+
+  it('routes a post-switch transcription straggler to its ORIGIN, not the live selection (race #2: user-path guard)', async () => {
+    listConversations.mockResolvedValue({ conversations: [activeConversation, secondConversation] })
+    const user = await renderVoice()
+    await user.click(await screen.findByRole('button', { name: 'Open Router planning' })) // origin A = conv_active
+    const socket = await connectVoice(user)
+    // The utterance STARTS in A: a partial transcription arrives while A is viewed.
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.delta', delta: 'spoken in A' }) }) })
+    const log = screen.getByRole('log', { name: 'Live transcript' })
+    expect(await within(log).findByText('spoken in A')).toBeTruthy()
+    // Switch to B BEFORE the transcription completes.
+    getConversation.mockResolvedValueOnce({ conversation: secondConversation, turns: [] })
+    await user.click(screen.getByRole('button', { name: 'Open Second thread' }))
+    // The straggler `completed` for A's audio now arrives while B is selected.
+    await act(async () => { socket.onmessage?.(transcription('spoken in A, finished later')) })
+    // It persists to the ORIGIN (A) — never the live selection (B).
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledWith('conv_active', expect.objectContaining({ role: 'user' })))
+    expect(appendTurn.mock.calls.every((call) => call[0] === 'conv_active')).toBe(true)
+    // ...and it does NOT render into B's view (neither the partial nor the final).
+    expect(within(log).queryByText(/finished later/)).toBeNull()
+    expect(within(log).queryByText('spoken in A')).toBeNull()
+  })
+
+  it('degrades to ephemeral when the conversation store is unavailable (503)', async () => {
+    listConversations.mockRejectedValue(new Error('Conversations are unavailable'))
+    const user = await renderVoice()
+    // The rail shows an honest unavailable note instead of erroring.
+    expect(await screen.findByText(/voice runs without saving/i)).toBeTruthy()
+    const socket = await connectVoice(user)
+    await act(async () => { socket.onmessage?.(transcription('ephemeral words')) })
+    // Voice still works: the live transcript renders the turn...
+    expect(await screen.findByText('ephemeral words')).toBeTruthy()
+    // ...but nothing is persisted (no store to write to).
+    expect(createConversation).not.toHaveBeenCalled()
+    expect(appendTurn).not.toHaveBeenCalled()
+  })
+
+  it('no longer offers a manual Save to Chat control (persistence is automatic)', async () => {
     const user = await renderVoice()
     const socket = await connectVoice(user)
-    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'save me' }) }) })
-    await user.click(screen.getByRole('button', { name: 'Save this transcript to Chat' }))
-    expect(await screen.findByText(/Saving to Chat is unavailable on this hub/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Save this transcript to Chat' }).disabled).toBe(true)
+    await act(async () => { socket.onmessage?.(transcription('anything at all')) })
+    expect(screen.queryByRole('button', { name: 'Save this transcript to Chat' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Save to Chat/i })).toBeNull()
+  })
+
+  it('states honestly that text is saved as a conversation while raw audio is never recorded', async () => {
+    await renderVoice()
+    const privacy = screen.getByText(/text transcript is saved as a conversation/i)
+    expect(privacy).toBeTruthy()
+    expect(privacy.textContent).toMatch(/audio.*never recorded/i)
   })
 
   // --- Automatic barge-in (openclaw-style interruption) ----------------------
