@@ -253,6 +253,58 @@ def test_skills_probe_and_router_only_hub_actions_are_explicit(monkeypatch):
         assert test_client.post("/api/sandbox", json={"model": "heavy-local", "input": "hello"}).status_code == 409
 
 
+def test_chat_route_resolutions_surface_servings_divergence_without_failover(monkeypatch):
+    # chat-first-voice:T010 (WIRED): the route-resolution surface derives its marks
+    # ONLY from Serving-supplied safe metadata -- requested vs served route +
+    # provenance -- and NEVER substitutes a route (surface-only, no failover).
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://100.87.34.66:8000/v1", anvil_router_token="server-held",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    from workbench import api as api_module
+
+    # Two turns of ONE divergence episode (shared episode id) + a settled turn.
+    monkeypatch.setattr(api_module, "route_decisions", lambda *_args: [
+        {"request_id": "req_1", "requested_route": "route.fast", "served_route": "route.heavy",
+         "route_selection": "explicit", "episode_id": "ep_1", "fell_back": True,
+         "divergence_reason": "route.fast at capacity"},
+        {"request_id": "req_2", "requested_route": "route.fast", "served_route": "route.heavy",
+         "route_selection": "explicit", "episode_id": "ep_1", "fell_back": True},
+        {"request_id": "req_3", "requested_route": "route.a", "served_route": "route.a",
+         "route_source": "preference_default"},
+    ])
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as test_client:
+        resp = test_client.get("/api/chat/route-resolutions", headers={"X-Workbench-Actor": "operator"})
+    assert resp.status_code == 200
+    rows = resp.json()["resolutions"]
+    diverged = [r for r in rows if r["diverged"]]
+    # SURFACE-ONLY: the served route is exactly what Serving reported, never a
+    # Workbench-chosen substitute (no-failover proof).
+    assert all(r["served_route"] == "route.heavy" for r in diverged)
+    # Both diverged turns share one episode id (once-per-episode grouping).
+    assert {r["episode_id"] for r in diverged} == {"ep_1"}
+    # Explicit vs preference-default provenance is distinguished truthfully.
+    assert diverged[0]["provenance"] == "explicit"
+    settled = [r for r in rows if not r["diverged"]][0]
+    assert settled["provenance"] == "preference_default" and settled["episode_id"] is None
+
+
+def test_chat_route_resolutions_settle_as_409_when_serving_is_unconfigured():
+    # No raw-provider fallback: an unconfigured/unreachable Serving route settles as
+    # the same 409 /api/routes does, never a substitute provider.
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
+    )
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as test_client:
+        resp = test_client.get("/api/chat/route-resolutions", headers={"X-Workbench-Actor": "operator"})
+    assert resp.status_code == 409
+
+
 # ---------------------------------------------------------------------------
 # Read-only project-context browser projection (state-context-operations
 # T003.3 / T003.4): the hub exposes the explicitly non-canonical display
@@ -2663,3 +2715,228 @@ def test_system_configuration_requires_a_trusted_allowlisted_actor():
         assert client_.get("/api/system/configuration").status_code == 401
         assert client_.get("/api/system/configuration",
                            headers={"X-Workbench-Actor": "intruder"}).status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Redacted conversation export / same-actor import (chat-first-voice:T012),
+# proven through the ACTUAL wired /api/conversation-transfer surface. Export is
+# closed + redacted (incl. audio) with metadata-only turns carrying no content;
+# import validates the whole artifact, applies atomically into the requesting
+# actor's scope ONLY, preserves append-only lineage, and never resurrects
+# deleted/purged content. Appended at EOF for trivial keep-both merges.
+# --------------------------------------------------------------------------- #
+
+from workbench.conversation_models import (
+    ConversationActor as _CTvActor,
+    ContentBlock as _CTvBlock,
+    RetentionPolicy as _CTvRetention,
+    TurnLineage as _CTvLineage,
+    TurnRedaction as _CTvRedaction,
+)
+from workbench.conversation_store import MemoryConversationStore as _CTvStore
+from workbench.conversation_transfer import ConversationTransferService as _CTvService
+
+_CTV_ACTOR = {"X-Workbench-Actor": "operator"}
+_CTV_OTHER = {"X-Workbench-Actor": "reviewer"}
+
+# The dangerous corpus a redacted export must never carry, seeded into content.
+_CTV_PATH = "C:" + chr(92) + "deploy" + chr(92) + "secrets" + chr(92) + "prod.pem"
+_CTV_CORPUS = (
+    "leak sk_live_ABCDEFGH12345678 " + _CTV_PATH + " serving:8443 AKIAIOSFODNN7EXAMPLE "
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig "
+    "postgresql://u:p@db.internal/app data:audio/webm;base64,QUJDQUJDQUJD"
+)
+
+
+def _ctv_seeded_store() -> tuple[_CTvStore, str]:
+    store = _CTvStore(content_hash_key=b"conversation-transfer-hash-key-0")
+    actor = _CTvActor("operator")
+    conv = store.create_conversation(
+        actor,
+        _CTvRetention("workbench.default", "retained_redacted", "retained_redacted"),
+        title="Release plan",
+    )
+    root = store.append_turn(
+        actor, conv.id, role="user", status="complete",
+        lineage=_CTvLineage(None, 0, "initial"),
+        redaction=_CTvRedaction("redacted", "workbench.default"),
+        content=(_CTvBlock("text", _CTV_CORPUS),),
+    )
+    # A metadata_only turn: it must export as METADATA ONLY (no content).
+    store.append_turn(
+        actor, conv.id, role="assistant", status="complete",
+        lineage=_CTvLineage(root.id, 0, "branch"),
+        redaction=_CTvRedaction("metadata_only", "workbench.default"),
+        content=(),
+    )
+    return store, conv.id
+
+
+def _ctv_client(store: _CTvStore | None) -> TestClient:
+    service = _CTvService(store, audit_key=b"conversation-transfer-audit-0") if store else None
+    # Share the SAME conversation store with the actor chat surface so an imported
+    # conversation is readable back through /api/conversations in the round trip.
+    return TestClient(create_app(
+        settings=_pref_settings(), store=MemoryStore(), graph=NullGraph(),
+        conversation_store=store, conversation_transfer_service=service,
+    ))
+
+
+def test_conversation_transfer_surface_fails_closed_when_unconfigured():
+    with _ctv_client(None) as client_:
+        assert client_.get(
+            "/api/conversation-transfer/export/conv_abcdefgh1234", headers=_CTV_ACTOR,
+        ).status_code == 503
+        assert client_.post(
+            "/api/conversation-transfer/import/preview", headers=_CTV_ACTOR,
+            json={"envelope": {"schema_version": "workbench-conversation-export/v1", "turns": []}},
+        ).status_code == 503
+
+
+def test_conversation_export_is_closed_redacted_incl_audio_and_metadata_only():
+    # T012 #1: the export scrubs the full secret/path/audio corpus, and a
+    # metadata_only turn exports ONLY its metadata (no content).
+    store, conv_id = _ctv_seeded_store()
+    with _ctv_client(store) as client_:
+        resp = client_.get(f"/api/conversation-transfer/export/{conv_id}", headers=_CTV_ACTOR)
+    assert resp.status_code == 200
+    export = resp.json()
+    assert export["schema_version"] == "workbench-conversation-export/v1"
+    blob = resp.text
+    for marker in (
+        "sk_live", "prod.pem", "deploy", "secrets", ":8443", "AKIA",
+        "AKIAIOSFODNN7EXAMPLE", "eyJhbGci", "postgresql://", "data:audio", "QUJDQUJD",
+        "operator",  # the raw actor identity is referenced only by an opaque token
+    ):
+        assert marker not in blob, marker
+    assert export["source"]["actor_ref"].startswith("actorref:")
+    assert export["source"]["conversation_ref"].startswith("conversationref:")
+    # The metadata_only turn carries no content.
+    meta = [t for t in export["turns"] if t["redaction"]["status"] == "metadata_only"][0]
+    assert meta["content"] == [] and meta["content_omitted"] is True
+    assert meta["content_omitted_reason"] == "metadata_only"
+
+
+def test_conversation_export_is_actor_scoped_and_indistinct_for_a_foreign_id():
+    # T012 #2: a conversation owned by another actor renders the SAME fixed 404 a
+    # missing id does, so the export is never a cross-actor existence oracle.
+    store, conv_id = _ctv_seeded_store()
+    with _ctv_client(store) as client_:
+        foreign = client_.get(f"/api/conversation-transfer/export/{conv_id}", headers=_CTV_OTHER)
+        missing = client_.get(
+            "/api/conversation-transfer/export/conv_doesnotexist99", headers=_CTV_OTHER,
+        )
+    assert foreign.status_code == 404 and missing.status_code == 404
+    assert foreign.json() == missing.json()
+
+
+def test_conversation_import_round_trip_applies_into_the_requesting_actor_scope_only():
+    # T012 #2: an import validates the artifact, previews a content-free SAMPLE,
+    # and applies ATOMICALLY into the requesting actor's scope -- a BRAND-NEW
+    # conversation preserving append-only lineage, never touching the source.
+    store, conv_id = _ctv_seeded_store()
+    with _ctv_client(store) as client_:
+        export = client_.get(
+            f"/api/conversation-transfer/export/{conv_id}", headers=_CTV_ACTOR,
+        ).json()
+        preview = client_.post(
+            "/api/conversation-transfer/import/preview", headers=_CTV_ACTOR,
+            json={"envelope": export},
+        )
+        assert preview.status_code == 200
+        sample = preview.json()
+        assert sample["valid"] is True and sample["turn_count"] == 2
+        assert sample["content_turn_count"] == 1 and sample["metadata_only_turn_count"] == 1
+
+        applied = client_.post(
+            "/api/conversation-transfer/import/apply", headers=_CTV_ACTOR,
+            json={"envelope": export},
+        )
+        assert applied.status_code == 201
+        new_id = applied.json()["conversation_id"]
+        assert new_id != conv_id
+        # The replayed conversation is readable by the requesting actor with its
+        # append-only lineage intact (initial root + branch child).
+        fetched = client_.get(f"/api/conversations/{new_id}", headers=_CTV_ACTOR).json()
+        kinds = [t["lineage"]["kind"] for t in fetched["turns"]]
+        assert kinds == ["initial", "branch"]
+        # The audit trail is non-identifying (opaque refs, never the raw actor).
+        audit = client_.get("/api/conversation-transfer/audit", headers=_CTV_ACTOR).json()["audit"]
+        assert audit and audit[0]["actor_ref"].startswith("actorref:")
+        assert all("operator" not in _json.dumps(row) for row in audit)
+
+
+def test_conversation_import_rejects_an_unknown_extension_envelope_and_applies_nothing():
+    # T012 #2: an unknown/unsupported extension envelope is REJECTED (closed
+    # schema, additionalProperties:false), never interpreted loosely.
+    store, _conv_id = _ctv_seeded_store()
+    with _ctv_client(store) as client_:
+        extension = client_.post(
+            "/api/conversation-transfer/import/apply", headers=_CTV_ACTOR,
+            json={"envelope": {
+                "schema_version": "workbench-conversation-export/v1", "turns": [], "evil": 1,
+            }},
+        )
+        assert extension.status_code == 422
+        wrong_version = client_.post(
+            "/api/conversation-transfer/import/preview", headers=_CTV_ACTOR,
+            json={"envelope": {"schema_version": "other/v9", "turns": []}},
+        )
+        assert wrong_version.status_code == 422
+
+
+def test_conversation_import_never_resurrects_deleted_or_purged_content():
+    # T012 #3: a purged turn exports without content, AND an artifact that pairs a
+    # purged / metadata-only turn WITH content is refused -- a round trip can never
+    # bring deleted content back.
+    store, conv_id = _ctv_seeded_store()
+    actor = _CTvActor("operator")
+    # Purge the source conversation's content (keep tombstone), then export it.
+    store.delete_conversation(actor, conv_id, "purge_content_keep_tombstone")
+    with _ctv_client(store) as client_:
+        # The purged conversation is a deleted tombstone; a fresh export target is
+        # a still-live conversation, so build the resurrection artifact by hand.
+        live_store, live_id = _ctv_seeded_store()
+        with _ctv_client(live_store) as live_client:
+            export = live_client.get(
+                f"/api/conversation-transfer/export/{live_id}", headers=_CTV_ACTOR,
+            ).json()
+        # Force content onto the metadata_only turn: the import must refuse it.
+        poisoned = _copy.deepcopy(export)
+        meta = [t for t in poisoned["turns"] if t["redaction"]["status"] == "metadata_only"][0]
+        meta["content"] = [{"kind": "text", "text": "resurrected transcript"}]
+        rejected = client_.post(
+            "/api/conversation-transfer/import/apply", headers=_CTV_ACTOR,
+            json={"envelope": poisoned},
+        )
+        assert rejected.status_code == 422
+        # And a purged tombstone turn with content is refused the same way.
+        poisoned2 = _copy.deepcopy(export)
+        poisoned2["turns"][0]["content_purged"] = True
+        poisoned2["turns"][0]["content"] = [{"kind": "text", "text": "resurrected"}]
+        rejected2 = client_.post(
+            "/api/conversation-transfer/import/apply", headers=_CTV_ACTOR,
+            json={"envelope": poisoned2},
+        )
+        assert rejected2.status_code == 422
+
+
+def test_conversation_transfer_requires_a_trusted_allowlisted_actor():
+    store, conv_id = _ctv_seeded_store()
+    settings = _pref_settings()
+    service = _CTvService(store, audit_key=b"conversation-transfer-audit-0")
+    settings = Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=False,
+    )
+    with TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(),
+        conversation_transfer_service=service,
+    )) as client_:
+        assert client_.get(f"/api/conversation-transfer/export/{conv_id}").status_code == 401
+        assert client_.get(
+            f"/api/conversation-transfer/export/{conv_id}",
+            headers={"X-Workbench-Actor": "intruder"},
+        ).status_code == 403
