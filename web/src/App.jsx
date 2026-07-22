@@ -232,8 +232,11 @@ function VoicePage({ data, append }) {
   // TTS voice, both persisted and re-sent on (re)connect. `preset` names the
   // curated personality that seeded the draft, or 'custom' once the operator
   // edits it. `voices` is the picker's options, fetched from the hub.
-  const [instructionsDraft, setInstructionsDraft] = useState(() => loadVoicePref(VOICE_INSTRUCTIONS_KEY))
-  const [instructionsApplied, setInstructionsApplied] = useState(() => loadVoicePref(VOICE_INSTRUCTIONS_KEY))
+  // Clamp on LOAD, not only on Apply: a corrupted/oversize stored value must
+  // degrade to the bound rather than be sent verbatim on connect and trip the
+  // relay's fail-closed bound (which would drop the whole session).
+  const [instructionsDraft, setInstructionsDraft] = useState(() => loadVoicePref(VOICE_INSTRUCTIONS_KEY).slice(0, VOICE_MAX_INSTRUCTIONS))
+  const [instructionsApplied, setInstructionsApplied] = useState(() => loadVoicePref(VOICE_INSTRUCTIONS_KEY).slice(0, VOICE_MAX_INSTRUCTIONS))
   const [preset, setPreset] = useState(() => loadVoicePref(VOICE_PRESET_KEY, 'custom') || 'custom')
   const [voice, setVoice] = useState(() => loadVoicePref(VOICE_VOICE_KEY))
   const [voices, setVoices] = useState([])

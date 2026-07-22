@@ -56,9 +56,12 @@ def _sanitize_instructions(value: Any) -> str:
 
     ``instructions`` is the actor's own communication-style control, but the relay
     still refuses a non-string or an oversize value (a pasted document or a
-    smuggled blob) and scrubs recognizable secrets/paths with the SAME redaction
-    every retained transcript passes through -- so a credential pasted into the
-    prompt can never ride upstream in the session config.
+    smuggled blob) and scrubs recognizable CREDENTIALS with :func:`redact_text` --
+    so an API key/token pasted into the prompt can never ride upstream in the
+    session config. It deliberately does NOT path/host-scrub (that would mangle a
+    legitimate prompt that names a path or host); the value goes only to the same
+    trusted Anvil Serving upstream the audio channel already reaches, and is never
+    logged or persisted.
     """
     if not isinstance(value, str):
         raise VoiceRelayError("voice instructions must be a string")
