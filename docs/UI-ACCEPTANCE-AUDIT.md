@@ -1,96 +1,68 @@
 # Workbench UI acceptance audit
 
-Date: 2026-07-21  
-Scope: `codex/workbench-release-readiness` candidate + chat-first-voice T004 chat surface
+Date: 2026-07-21 (final state of the multi-PRD delivery run)
+Scope: every browser surface delivered across PRs #9–#35.
 
-This audit distinguishes a functional hub-backed control from a configuration boundary. Nothing in this UI is a synthetic delivery, a raw-provider escape hatch, or a browser-side GitHub action.
+This audit draws one line per surface: **component-proven** (jsdom/vitest, HTTP
+boundary mocked) versus **rendered-browser-deferred** (a real render against a
+live hub + browser with console/network capture). Every browser surface in this
+run is proven at the component level with the network mocked; the
+rendered-browser interaction + console-health check is deferred to each PRD's
+live-qualification task. Nothing here is a synthetic delivery, a raw-provider
+escape hatch, or a browser-side GitHub action.
 
 ## Result
 
 | Measure | Result |
 | --- | --- |
-| Main navigation surfaces covered | 9 / 9 |
-| Hub-backed interactive workflows covered | 7 / 7 |
-| Utility and onboarding controls covered | 5 / 5 |
-| Web component scenarios | **50 / 50 passed** |
-| Backend and bridge contract tests | **661 / 661 passed** |
-| Production web build | passed |
+| Web component test files | 12 |
+| Web component scenarios | **290 / 290 passed** |
+| Production web build (`vite build`) | passed, no console errors |
+| Backend + bridge contract tests | **1135 / 1135 passed** |
 
-The component suites are [`web/src/App.test.jsx`](../web/src/App.test.jsx), [`web/src/api.test.js`](../web/src/api.test.js), and [`web/src/chat-api.test.js`](../web/src/chat-api.test.js). They mock only the HTTP boundary, then assert the request a real control makes; they do not rely on a delivery seed. Backend tests assert the corresponding durable commands and security checks, including exact verification-command allowlisting without a shell, typed operation inputs, atomic approval consumption plus lease renewal, session-lease-bound GitHub worktrees, PR-to-merge lease retention, and action-failure reconciliation.
+Component suites live under `web/src/*.test.js[x]`. They mock only the HTTP
+boundary, then assert the exact request a real control makes; none relies on a
+delivery seed.
 
-## Control matrix
+## Per-surface acceptance
 
-| Surface | Control | Backed operation or boundary | Test status |
+| Surface | Component-proven (vitest files — count) | What the component tests prove | Rendered-browser deferred to |
 | --- | --- | --- | --- |
-| Chat | Rail management, transcript, composer, route select, retry/branch, live region | The default surface. Actor-scoped `/api/conversations` list/search/create/rename/archive/unarchive/delete, streamed send with cancel, and retry/branch successors — each mocked at the HTTP boundary and asserted against the request a real control makes. | Component-passed; live render deferred to T006 (below) |
-| Delivery | Send delivery direction | Persists an `operator.directive` event. It is copied into the next bridge work packet for that session. | Passed |
-| Sessions | New concurrent session; Start delivery | Creates a version-pinned session workflow, then queues a leased bridge run for a State task. | Passed |
-| Runs | Refresh runs | Reloads durable hub run state. | Passed |
-| Routes | Refresh decisions | Reads server-side Serving decision metadata filtered to known Workbench run IDs. | Passed |
-| Approvals | Review action; Authorize action | Brings the hash-bound action into view; calls the approval endpoint only for a pending grant. | Passed |
-| Evidence | Search evidence; Show lineage | Calls narrow cited evidence and lineage APIs. Graph output cannot approve actions. | Passed |
-| Skills | Select skills; Verify bridge skills | Sends selected bridge-published ids when creating a session, then queues a non-mutating local digest probe. Names/descriptions/digests only reach the hub. | Passed |
-| Sandbox | Run through Anvil Serving | Makes a bounded, audited Responses call through the server-held Serving token and allowlisted model. | Passed |
-| Voice | Connect / hold to talk | Available only when the private same-origin realtime relay is configured; otherwise microphone capture is disabled. | Guard passed; live Dark endpoint remains unqualified |
-| Project | New delivery | Creates only a hub project record. It never retrieves a bridge secret into the web UI after registration. | Passed |
-| Setup | Help / setup guide | Walks the operator to the next incomplete *live* setup gate; it cannot manufacture completion. | Passed |
-| Utilities | Operator menu; activity; mark viewed | Shows server-returned actor/audit metadata; “mark viewed” is browser-local read state only. | Passed |
+| **Chat** (default view) | `App.test.jsx` (98, shared with nav), `chat-api.test.js` (9), `api.test.js` (59, shared) | Nav 9/9 with Chat default (`aria-current="page"`); rail list/search/create/rename/archive/two-step delete; transcript states (empty/streaming/interrupted/failed/cancelled); composer Enter/Shift+Enter + IME guard + disabled-while-streaming; route allowlist with undeclared-route refusal before send; `role="status"` live region; retry/branch post the exact `TurnBodyInput` body (revert-detecting) and never rewrite the prior turn; a stream settling after a conversation switch is dropped, not mislanded. | **chat-first-voice:T004 / T006** |
+| **Settings** | `settings-view.test.jsx` (18), `settings.test.js` (13) | Scope-precedence rendering (policy>deployment>project>personal); a policy-ceiling value cannot be exceeded from a personal write; secret/path descriptors are not rendered/editable; optimistic-version conflict surfaces without a fabricated success. | **preferences-configuration:T007** |
+| **Configuration** (export / import / reset) | `configuration-view.test.jsx` (8), `configuration.test.js` (10) | Export renders a redacted, scrubbed payload; import validates a closed schema and refuses unknown fields; reset is explicit and scoped. | **preferences-configuration:T007** |
+| **Plugins catalog** | `plugin-catalog-view.test.jsx` (12), `plugin-catalog.test.js` (15) | Approved-catalog discovery renders reviewed plugins only; permission UI shows declared read-only/mock tool kinds; no browser path can grant a new privilege by name. | **reviewed-tools-plugins:T007** |
+| **Advanced Chat / playground** | `advanced-chat.test.js` (14), `advanced-playground.test.js` (11) | Advanced controls are the declared, in-bounds route capabilities only; a vanished/drifted route surfaces `repair_required`, never a silent substitution; parallel-dispatch preflight refuses undeclared/over-budget/over-concurrency before any transport; an advanced record is refused as authoritative evidence. Client degrades to 503 when the run/dispatch path is unrouted. | **advanced-model-playground:T007** |
+| **Deliver** (delivery explorer + controls) | `delivery-explorer.test.js` (23), `App.test.jsx` (shared) | PRD/plan/task/eligibility browse over the read-only, project-scoped, re-scrubbed projection; Deliver control persists a typed accepted/denied receipt; a denied `safe_summary` is scrubbed; setup sheet walks to the next incomplete live gate and cannot manufacture completion. | **plan-task-delivery:T007** |
+| **Voice** | `App.test.jsx` (guard, shared) | Push-to-talk is available only when the private same-origin realtime relay is configured; otherwise microphone capture is disabled and the control is truthfully off. No model/tool control on the relay; no raw-audio persistence. | **chat-first-voice:T005 / T006** |
 
-## Chat surface (chat-first-voice T004)
+## Why rendered-browser is deferred (not-wired-live boundaries)
 
-The chat surface is the default view. Its acceptance criterion is "component AND
-rendered-browser checks." This entry records the hermetic (jsdom/component) half
-honestly and states plainly what is NOT yet done.
+- The chat send/route-resolution join (`/api/conversations/{id}/send`, a
+  `RelayEvent` `resolution` kind) is **not mounted** — `RelayEvent` emits only
+  `delta`/`terminal`. The mark surface `GET /api/chat/route-resolutions` **is**
+  wired and tested.
+- The advanced **run/dispatch execution path** (`advanced_routes`/
+  `advanced_runtime`/`advanced_dispatch`) is **not wired into any HTTP
+  endpoint**; advanced preset/template/rating persistence routers are mounted but
+  back injected stores that stay `None`→503 by default.
+- The delivery projection, run-context, project-context, and voice-relay routers
+  are **inject-or-503**: they receive a store/service that is `None` in
+  `create_app`'s live loop, so each returns 503 until a real backend is injected.
+- The skill-adoption gate is **operator-enablable** (`--skill-adoption-ledger`)
+  but **ungated by default**.
+- No local Compose deployment has a live tailnet identity, a real project bridge
+  with worktrees, a non-production GitHub PR/merge fixture, a live Dark voice
+  endpoint, or a live Neo4j — all four remain live-qualification work behind
+  [fakoli/anvil#178](https://github.com/fakoli/anvil/issues/178).
 
-What the jsdom/component tests prove (in `web/src/App.test.jsx`,
-`web/src/api.test.js`, `web/src/chat-api.test.js`):
+## Prior live render observation (2026-07-19)
 
-- **Navigation 9/9, Chat default.** Chat is first in the nav and selected on
-  load (`aria-current="page"`); Delivery and the other seven surfaces stay
-  reachable and each render their heading.
-- **Rail.** List (active/archived sections kept visibly distinct), debounced
-  latest-wins search, create, rename (rendered row title updates), archive
-  (row moves to Archived), and a two-step-confirm delete (row disappears).
-- **Transcript.** Distinct no-conversation / empty / streaming / interrupted /
-  failed / cancelled states; retry and branch render as visible successors and
-  never rewrite the prior turn.
-- **Composer.** Multiline with Enter-to-send / Shift+Enter newline, an IME
-  composition guard, and disabled send while streaming.
-- **Route.** Only the reviewed allowlist appears; an undeclared route is refused
-  before any send; changing the route preserves the transcript.
-- **Live region.** `role="status" aria-live="polite"` announces each lifecycle
-  transition (streaming / complete / cancelled / interrupted / failed).
-- **Correctness invariants.** Retry/branch post the exact `{kind:'text', text}`
-  body the server's `TurnBodyInput`/`ContentBlockInput` accept (retry → sibling
-  assistant, branch → follow-up user), with a revert-detecting body-equality
-  assertion; and a stream that settles after the operator switches conversations
-  is dropped rather than landing in — or cancelling — the wrong conversation.
-- **Console health.** The Vite production build and the vitest run complete with
-  no errors or unhandled rejections.
-
-**Deferred — live rendered-browser qualification.** A rendered interaction
-against a live hub + browser (real `/api/conversations` persistence, a real
-streamed relay frame, real console/network capture) is NOT performed here. That
-live qualification is **chat-first-voice:T006's** scope, consistent with the
-not-wired-live constraint on the rest of this run. This entry does not claim a
-browser render that was not done.
-
-## Workflow coverage
-
-1. Empty hub → no seeded delivery is rendered; setup guide opens a real project-creation flow.
-2. Project with published skill metadata → session selects a skill → queued `run_codex` command contains matching digest and recorded directions.
-3. Router decision refresh → only correlated Workbench IDs appear.
-4. Evidence search/lineage → cited results render without a graph write or approval path.
-5. Skills probe → bridge resolves local content/digest without running Codex.
-6. Sandbox → explicit allowlisted Serving request returns redacted output; disallowed models are rejected server-side.
-7. Pending hash-bound approval → a browser request records approval only; the local bridge still owns the GitHub action.
-
-## Remaining live qualifications
-
-- The local Compose hub has no configured `ANVIL_VOICE_REALTIME_URL`, so a real microphone/STT/TTS turn through Dark is not yet evidence. The relay protocol and its guard are covered by unit tests.
-- The current pinned Heavy route reaches Anvil Serving and preserves correlation, but its full Codex tool loop still emits unsupported `shell_command<|channel|>commentary`; the bridge moves that attempt to reconciliation. Do not claim a successful PRD → edit → test → evidence run until a local model/template completes it.
-- The rebuilt loopback stack served the current bundle and all eight navigation views rendered in the in-app browser. The live Routes refresh reads Serving's safe `records` summary and correctly shows that there is not yet a Workbench-correlated decision. A bounded `chat-fast` sandbox request completed through Anvil Serving and rendered its exact response in the browser. A correlated Routes row still requires a bridge delivery after the router's current start.
-- A tailnet identity proxy, a real bridge with two worktrees, a non-production GitHub PR/merge fixture, and Neo4j retrieval still require separate live qualification.
+The rebuilt loopback stack served the bundle and all navigation views rendered in
+the in-app browser; a bounded `chat-fast` sandbox request completed through Anvil
+Serving and rendered its response; Voice correctly showed disabled without a
+relay. This is a **render/transport observation, not a rendered-browser
+qualification** of any surface — the per-surface deferrals above still stand.
 
 ## Re-run recipe
 
@@ -98,10 +70,15 @@ browser render that was not done.
 Set-Location C:\Users\sdoum\ai-code\anvil-workbench
 python -m pytest -q
 Set-Location web
+npm ci
 npm test -- --run
 npm run build
 Set-Location ..
-docker compose up -d --build
+$env:ANVIL_ROUTER_TOKEN = "placeholder-host-token"
+docker compose --env-file .env.example config -q
 ```
 
-Then use the browser to inspect the guide, all eight navigation views, a persisted delivery direction, the deliberate voice/sandbox availability states, and console output. Do not consume a real approval or create an external PR for a UI smoke check.
+Then, for a live qualification, start the stack with real secrets and use the
+browser to inspect the guide, every navigation view, a persisted delivery
+direction, the voice/sandbox availability states, and console output. Do not
+consume a real approval or create an external PR for a UI smoke check.
