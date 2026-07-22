@@ -26,6 +26,7 @@ services:
       # Hub-held content-fingerprint key for durable chat persistence. Left unset
       # the hub builds no conversation store and every chat endpoint returns 503;
       # set it (host env or .env) to enable chat. Never returned to the browser.
+      WORKBENCH_PLUGIN_CAPABILITY_FILE: ${WORKBENCH_PLUGIN_CAPABILITY_FILE:-}
       WORKBENCH_CHAT_HASH_KEY: ${WORKBENCH_CHAT_HASH_KEY:-}
       # Loopback-only development escape hatch. Production must remain false and
       # receive identity exclusively from the tailnet proxy.
@@ -40,6 +41,19 @@ services:
       WORKBENCH_VOICE_RETAIN_TRANSCRIPTS: ${WORKBENCH_VOICE_RETAIN_TRANSCRIPTS:-false}
       WORKBENCH_EMBEDDING_MODEL: ${WORKBENCH_EMBEDDING_MODEL:-}
       WORKBENCH_RERANK_MODEL: ${WORKBENCH_RERANK_MODEL:-}
+      # Operator-reviewed chat-route allowlist (closed chat-turn.v1 shape; no
+      # endpoint/URL/token/policy field). Empty serves the honest empty allowlist;
+      # a malformed value fails GET /api/chat/routes closed (503).
+      WORKBENCH_CHAT_ROUTES: ${WORKBENCH_CHAT_ROUTES:-}
+      # Explicit live-surface opt-in. Empty keeps every injectable supervision
+      # surface None -> 503 (the hermetic default). An unknown name fails the hub
+      # closed at startup. Each named surface needs its reviewed dependency below.
+      WORKBENCH_LIVE_SURFACES: ${WORKBENCH_LIVE_SURFACES:-}
+      # Reviewed dependencies for the live surfaces (each empty = that surface
+      # stays unconfigured / 503). Set the audit key in the host environment.
+      WORKBENCH_SETTINGS_CATALOG_FILE: ${WORKBENCH_SETTINGS_CATALOG_FILE:-}
+      WORKBENCH_PREF_AUDIT_KEY: ${WORKBENCH_PREF_AUDIT_KEY:-}
+      WORKBENCH_PLUGIN_CATALOG_FILE: ${WORKBENCH_PLUGIN_CATALOG_FILE:-}
     depends_on:
       db:
         condition: service_healthy

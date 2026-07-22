@@ -6,7 +6,7 @@ only to an operator-configured Anvil Serving URL; it has no provider fallback.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -261,3 +261,164 @@ def sandbox_response(base_url: str, token: str, model: str, text: str) -> dict[s
         "status": str(response.get("status", "completed"))[:80],
         "output_text": redact_value(output_text[:12_000]),
     }
+
+
+#: Anvil Serving's declared Responses stream path.  Serving is the ONLY managed
+#: model path and owns model policy (AGENTS.md); the chat send/stream join relays
+#: exactly this endpoint with ``stream: True``.  There is no provider fallback and
+#: no raw-provider path -- a failure settles as a terminal Serving outcome.
+_SERVING_RESPONSES_PATH = "/responses"
+
+#: Hard ceilings on the relayed Serving Responses SSE stream, mirroring the
+#: in-relay bounds in :mod:`workbench.chat_stream` and the byte ceilings the voice
+#: functions enforce: a misbehaving upstream cannot stream unboundedly or smuggle
+#: an over-long single event through the relay.
+_MAX_RESPONSES_STREAM_EVENTS = 10_000
+_MAX_SSE_EVENT_BYTES = 1_000_000
+#: Per-READ (per-socket-op) deadline handed to ``urlopen``; the stdlib applies it
+#: to each blocking read, NOT to the whole stream.  A slow-but-steady upstream is
+#: additionally bounded by the event-count and per-event byte ceilings above.
+_RESPONSES_READ_TIMEOUT = 300
+
+#: Sentinel returned by :func:`_dispatch_sse_event` for the ``data: [DONE]`` marker.
+_SSE_DONE = object()
+
+
+def _dispatch_sse_event(payload: str) -> Any:
+    """Parse one dispatched SSE ``data`` payload into an event mapping.
+
+    ``payload`` is the FULL accumulated data of one SSE event (every consecutive
+    ``data:`` line joined with ``\\n`` per the SSE spec), so a JSON value split
+    across continuation lines parses correctly instead of being silently dropped.
+    ``[DONE]`` returns the :data:`_SSE_DONE` sentinel; an empty, non-JSON, or
+    non-object payload returns ``None`` (ignored, never failing the stream).
+    """
+    stripped = payload.strip()
+    if not stripped:
+        return None
+    if stripped == "[DONE]":
+        return _SSE_DONE
+    try:
+        event = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def stream_responses(
+    base_url: str, token: str, request: Mapping[str, Any], cancel: Any,
+) -> Iterator[dict[str, Any]]:
+    """Relay Anvil Serving's streaming Responses SSE events (chat-first-voice live join).
+
+    A generator implementing the ``ServingStreamTransport.open`` contract the chat
+    relay (:class:`workbench.chat_stream.ChatStreamRelay`) expects: it yields each
+    parsed SSE event mapping (a dict with a ``type`` key) from Serving's declared
+    ``/responses`` endpoint with ``stream: True``.  ``request`` is the already-bounded
+    Responses request assembled by ``workbench.chat_stream.build_bounded_request``
+    (validated route/controls only -- never an endpoint, URL, or credential).
+
+    SSE parsing follows the spec: consecutive ``data:`` lines accumulate and are
+    dispatched (parsed once) on the blank separator line, so a JSON payload split
+    across continuation lines is relayed intact; ``event:``/``id:``/``retry:`` field
+    lines and ``:`` comment/keepalive lines are ignored; CRLF and LF both terminate
+    a line; and a trailing event a server left without a final blank line is flushed.
+
+    Talks ONLY to the operator-configured Anvil Serving URL over the tailnet; there
+    is no provider fallback and no raw-provider path.  Bounded like the voice relay:
+    each line is read with an explicit byte limit (so a newline-free stream cannot
+    buffer unbounded memory), the accumulated event data is capped, and the event
+    count is capped.  The caller's ``CancellationToken`` is honored before each read
+    and the connection is torn down on every exit (``close()`` on the ``finally``),
+    so a browser cancel terminates the upstream request.  A connection/HTTP failure
+    raises :class:`RouterError` (the relay settles it ``serving_unavailable``); a
+    read deadline raises ``TimeoutError`` (the relay settles it ``timed_out``) --
+    neither leaks the router URL or token.
+    """
+    if not base_url or not token:
+        raise RouterError("Anvil Serving route access is not configured")
+    body = json.dumps(dict(request), separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    http_request = Request(
+        base_url.rstrip("/") + _SERVING_RESPONSES_PATH, data=body, headers=headers, method="POST",
+    )
+    try:
+        response = urlopen(http_request, timeout=_RESPONSES_READ_TIMEOUT)  # nosec B310: operator-configured tailnet router
+    except HTTPError as exc:
+        raise RouterError(f"Anvil Serving rejected the stream ({exc.code})") from exc
+    except URLError as exc:
+        raise RouterError(f"Anvil Serving is unreachable: {exc.reason}") from exc
+    events = 0
+    data_parts: list[str] = []
+    data_len = 0
+    try:
+        while True:
+            if cancel.cancelled:
+                return
+            # Bounded read: at most the byte ceiling + 1, so a newline-free stream
+            # cannot buffer unbounded memory.  A returned chunk at the limit that is
+            # NOT newline-terminated is an over-long line -> fail closed.
+            raw = response.readline(_MAX_SSE_EVENT_BYTES + 1)
+            if not raw:
+                break  # upstream closed
+            if len(raw) > _MAX_SSE_EVENT_BYTES and not raw.endswith((b"\n", b"\r")):
+                raise RouterError("Anvil Serving stream line exceeds the byte ceiling")
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line == "":
+                # A blank line dispatches the buffered event (SSE spec).
+                if data_parts:
+                    event = _dispatch_sse_event("\n".join(data_parts))
+                    data_parts = []
+                    data_len = 0
+                    if event is _SSE_DONE:
+                        return
+                    if event is not None:
+                        events += 1
+                        if events > _MAX_RESPONSES_STREAM_EVENTS:
+                            raise RouterError("Anvil Serving stream exceeded the event ceiling")
+                        yield event
+                continue
+            if line.startswith(":"):
+                continue  # SSE comment / keepalive
+            if line.startswith("data:"):
+                fragment = line[len("data:"):]
+                if fragment.startswith(" "):
+                    fragment = fragment[1:]
+                data_len += len(fragment) + 1
+                if data_len > _MAX_SSE_EVENT_BYTES:
+                    raise RouterError("Anvil Serving stream event exceeds the byte ceiling")
+                data_parts.append(fragment)
+            # Non-data field lines (event:/id:/retry:) carry no payload we relay.
+        # Flush a trailing event a server left without a final blank separator line.
+        if data_parts:
+            event = _dispatch_sse_event("\n".join(data_parts))
+            if event is not None and event is not _SSE_DONE:
+                yield event
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - best-effort teardown of the upstream request
+                pass
+
+
+class ServingResponsesTransport:
+    """Production ``ServingStreamTransport`` backed by Anvil Serving's Responses stream.
+
+    Implements the structural ``open(request, cancel)`` contract the chat relay
+    (:class:`workbench.chat_stream.ChatStreamRelay`) expects, returning the bounded
+    :func:`stream_responses` generator.  It holds the operator-configured Serving
+    base URL and token on the instance only (never handed to the browser), and
+    reaches ONLY that URL -- there is no provider fallback and no raw-provider path.
+    """
+
+    def __init__(self, base_url: str, token: str) -> None:
+        self._base_url = base_url
+        self._token = token
+
+    def open(self, request: Mapping[str, Any], cancel: Any) -> Iterator[dict[str, Any]]:
+        return stream_responses(self._base_url, self._token, request, cancel)
