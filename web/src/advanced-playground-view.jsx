@@ -67,9 +67,15 @@ export default function AdvancedPlaygroundPanel({
       const result = await onResolvePreset?.(presetId)
       const view = resolvePresetView(result)
       setPresetResolution(view)
-      setAnnounce(view.repairRequired
-        ? `Preset ${presetId} needs repair: ${view.drifted.length} reference${view.drifted.length === 1 ? '' : 's'} drifted.`
-        : `Preset ${presetId} is ready.`)
+      if (view.repairRequired) {
+        setAnnounce(`Preset ${presetId} needs repair: ${view.drifted.length} reference${view.drifted.length === 1 ? '' : 's'} drifted.`)
+      } else if (view.unverifiable) {
+        setAnnounce(`Preset ${presetId} could not be verified right now — not applied. The hub cannot verify its pinned references.`)
+      } else if (view.preset) {
+        setAnnounce(`Preset ${presetId} is ready.`)
+      } else {
+        setAnnounce(`Preset ${presetId} could not be resolved.`)
+      }
     } catch {
       setAnnounce('The preset could not be resolved.')
     }
@@ -150,7 +156,21 @@ export default function AdvancedPlaygroundPanel({
           <button type="button" onClick={() => resolvePreset(presetResolution.presetId)}>Re-check preset</button>
         </div>
       )}
-      {presetResolution && !presetResolution.repairRequired && presetResolution.preset && (
+      {presetResolution && presetResolution.unverifiable && (
+        <div role="status" className="adv-unverifiable" aria-label="Preset could not be verified">
+          <p><b>Could not be verified.</b> The hub cannot verify this preset&apos;s pinned references right now, so nothing was applied — no route, tool, or profile was selected or substituted. Try again once digest verification is available.</p>
+          {presetResolution.unverifiableRefs && presetResolution.unverifiableRefs.length > 0 && (
+            <ul className="adv-unverifiable-list">
+              {presetResolution.unverifiableRefs.map((ref) => (
+                <li key={`${ref.refKind}:${ref.id}`}>
+                  <b>{ref.refKind}</b> <code>{ref.id}</code> could not be verified
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {presetResolution && !presetResolution.repairRequired && !presetResolution.unverifiable && presetResolution.preset && (
         <p className="adv-preset-ready">Preset <b>{presetResolution.preset.name?.text || presetResolution.presetId}</b> is ready to apply.</p>
       )}
     </section>

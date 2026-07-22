@@ -1900,6 +1900,32 @@ describe('Advanced playground extensions (presets, comparison, templates, rating
     expect(screen.queryByRole('alert', { name: 'Preset repair required' })).toBeNull()
   })
 
+  it('announces a distinct UNVERIFIABLE note and applies nothing — never "ready" — when the hub cannot verify pins (T006)', async () => {
+    // Revert-detection: the server now returns status:'unverifiable' (the DEFAULT
+    // for a preset store injected without a live_digests_provider). Without an
+    // explicit unverifiable branch this state collapses into the ready/else tail
+    // and the live region falsely announces "Preset … is ready." — a false factual
+    // label. With the fix it announces the distinct unverifiable message and the
+    // body renders a factual note that nothing was applied (no substitute).
+    resolveAdvancedPreset.mockResolvedValue({
+      status: 'unverifiable', preset_id: 'advpreset_fast_0001', reason: 'no_live_digests_provider',
+      unverifiable_refs: [{ ref_kind: 'tool', id: 'echo_fixture', pinned_digest: 'sha256:' + 'c'.repeat(64) }],
+    })
+    const user = await openPlayground()
+    await user.click(screen.getByRole('button', { name: 'Select Fast strict JSON' }))
+    // The distinct unverifiable note renders — not a repair banner, not a ready line.
+    const note = await screen.findByRole('status', { name: 'Preset could not be verified' })
+    expect(within(note).getByText(/Could not be verified/)).toBeTruthy()
+    expect(within(note).getByText('echo_fixture')).toBeTruthy()
+    expect(screen.queryByRole('alert', { name: 'Preset repair required' })).toBeNull()
+    expect(screen.queryByText(/is ready to apply/)).toBeNull()
+    // The playground live region announces the unverifiable message — NOT "ready".
+    const playground = screen.getByRole('region', { name: 'Advanced playground' })
+    const live = playground.querySelector('.adv-live')
+    expect(live.textContent).toMatch(/could not be verified right now — not applied/)
+    expect(live.textContent).not.toMatch(/ready/i)
+  })
+
   it('renders a comparison with NO winner when no criterion is declared (T006)', async () => {
     buildAdvancedComparison.mockResolvedValue({
       schema_version: 'workbench-advanced-comparison/v1', comparison_id: 'advcompare_x_0001',

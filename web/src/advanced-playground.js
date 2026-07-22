@@ -23,6 +23,13 @@
 // Project a preset resolution into a view model. `repairRequired` is TRUE on any
 // drift; `preset` is null unless the resolution is ready — the UI must never show
 // a selectable/substituted preset while a pinned digest has drifted.
+//
+// A THIRD status, `unverifiable`, is distinct from both: the server could not
+// verify the pinned references at all (e.g. a preset store injected without a
+// `live_digests_provider`). This is NOT ready — it MUST NOT collapse into the
+// ready/else tail, or the panel would falsely announce a ready preset. It carries
+// no selectable preset and opens no repair banner; it is a truthful "cannot
+// verify right now" note.
 export function resolvePresetView(result) {
   const status = result?.status
   if (status === 'repair_required') {
@@ -30,15 +37,29 @@ export function resolvePresetView(result) {
     return {
       status,
       repairRequired: true,
+      unverifiable: false,
       presetId: result?.preset_id || '',
       drifted: drifted.map((ref) => ({ refKind: ref.ref_kind, id: ref.id, pinnedDigest: ref.pinned_digest })),
       preset: null,
     }
   }
-  if (status === 'ready' && result?.preset) {
-    return { status, repairRequired: false, presetId: result.preset.preset_id, drifted: [], preset: result.preset }
+  if (status === 'unverifiable') {
+    const refs = Array.isArray(result?.unverifiable_refs) ? result.unverifiable_refs : []
+    return {
+      status,
+      repairRequired: false,
+      unverifiable: true,
+      presetId: result?.preset_id || '',
+      reason: result?.reason || 'cannot_verify',
+      unverifiableRefs: refs.map((ref) => ({ refKind: ref.ref_kind, id: ref.id, pinnedDigest: ref.pinned_digest })),
+      drifted: [],
+      preset: null,
+    }
   }
-  return { status: status || 'unknown', repairRequired: false, presetId: '', drifted: [], preset: null }
+  if (status === 'ready' && result?.preset) {
+    return { status, repairRequired: false, unverifiable: false, presetId: result.preset.preset_id, drifted: [], preset: result.preset }
+  }
+  return { status: status || 'unknown', repairRequired: false, unverifiable: false, presetId: '', drifted: [], preset: null }
 }
 
 // Project a template resolution into a view model, mirroring the preset shape.
