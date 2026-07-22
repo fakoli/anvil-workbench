@@ -54,6 +54,16 @@ SYSTEM_HEALTH_DESCRIPTOR_FIELDS = frozenset({
     "version", "detail", "last_checked_at",
 })
 
+#: The exact closed field set a system-configuration observation may serialize
+#: (preferences-configuration T003/T003.3). A field added outside this set (a
+#: leak-by-addition) must fail the response/descriptor tests, so the assertion is
+#: not a tautology. Kept here, imported by the API-surface and security-contract
+#: tests, so the two can never drift apart.
+SYSTEM_CONFIGURATION_DESCRIPTOR_FIELDS = frozenset({
+    "setting_id", "title", "kind", "value", "non_canonical", "schema_version",
+    "detail",
+})
+
 
 def load_example(name: str) -> dict:
     return json.loads((_EXAMPLES / name).read_text(encoding="utf-8"))

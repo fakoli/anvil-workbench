@@ -14,6 +14,7 @@ from typing import Callable
 import pytest
 
 from _support import (  # noqa: F401  (re-exported for `from conftest import ...`)
+    SYSTEM_CONFIGURATION_DESCRIPTOR_FIELDS,
     SYSTEM_HEALTH_DESCRIPTOR_FIELDS,
     build_run_context,
     compile_delivery_snapshot,
