@@ -146,6 +146,18 @@ function RealtimeVoice({ data, append }) {
   const [state, setState] = useState('disconnected')
   const socketRef = useRef(null)
   const captureRef = useRef(null)
+  // A SINGLE persistent playback context with a running playhead. A streamed
+  // response arrives as many `response.output_audio.delta` chunks; a fresh
+  // AudioContext per chunk (a) starts every chunk at t=0 so they overlap and
+  // (b) exhausts the browser's ~6-context cap mid-response, which threw and cut
+  // playback off. Instead decode each chunk into the one context and schedule it
+  // at `nextStart` so the chunks play back gaplessly in order.
+  const playbackRef = useRef(null)
+  const closePlayback = () => {
+    const pb = playbackRef.current
+    if (!pb) return
+    pb.context.close().catch(() => undefined); playbackRef.current = null
+  }
   const releaseCapture = () => {
     const capture = captureRef.current
     if (!capture) return
@@ -156,12 +168,19 @@ function RealtimeVoice({ data, append }) {
     if (typeof encoded !== 'string' || !encoded || !window.AudioContext) return
     try {
       // Playback direction of the 16 kHz relay contract: decode the relay's
-      // PCM16 at VOICE_RELAY_SAMPLE_RATE and play it back at the SAME rate.
-      const binary = window.atob(encoded); const context = new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE })
+      // PCM16 at VOICE_RELAY_SAMPLE_RATE and play it back at the SAME rate,
+      // through the ONE shared context created on connect.
+      if (!playbackRef.current) playbackRef.current = { context: new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE }), nextStart: 0 }
+      const pb = playbackRef.current; const context = pb.context
+      const binary = window.atob(encoded)
       const buffer = context.createBuffer(1, binary.length / 2, VOICE_RELAY_SAMPLE_RATE); const channel = buffer.getChannelData(0)
       const bytes = new Uint8Array(binary.length); for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
       const view = new DataView(bytes.buffer); for (let index = 0; index < channel.length; index += 1) channel[index] = view.getInt16(index * 2, true) / 0x8000
-      const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination); source.start(); source.onended = () => context.close().catch(() => undefined)
+      const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination)
+      // Schedule contiguously: never before the context's own clock, never
+      // before the previously-queued chunk ends. Gapless, in-order playback.
+      const startAt = Math.max(context.currentTime, pb.nextStart)
+      source.start(startAt); pb.nextStart = startAt + buffer.duration
     } catch { append('Voice output could not be played in this browser.') }
   }
   const connect = () => {
@@ -170,7 +189,7 @@ function RealtimeVoice({ data, append }) {
     const socket = new WebSocket(voiceSocketUrl(session.id)); socketRef.current = socket
     socket.onopen = () => { socket.send(JSON.stringify({ type: 'session.update', session: { modalities: ['audio', 'text'] } })); setState('ready') }
     socket.onmessage = (event) => { try { const message = JSON.parse(event.data); if (message.type === 'response.output_audio.delta') playAudio(message.delta); if (message.type === 'error') append('Voice relay rejected an event; no delivery action was started.') } catch { append('Voice relay returned an unreadable event; no delivery action was started.') } }
-    socket.onclose = () => { releaseCapture(); setState('disconnected') }
+    socket.onclose = () => { releaseCapture(); closePlayback(); setState('disconnected') }
     socket.onerror = () => append('Voice relay is unavailable. The session and workflow remain unchanged.')
   }
   const startCapture = async () => {
@@ -187,8 +206,15 @@ function RealtimeVoice({ data, append }) {
       source.connect(processor); processor.connect(context.destination); captureRef.current = { stream, context, source, processor }; setState('listening')
     } catch { append('Microphone access was not granted. No audio left this browser.') }
   }
-  const finishCapture = () => { if (state !== 'listening') return; releaseCapture(); if (socketRef.current?.readyState === WebSocket.OPEN) { socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); socketRef.current.send(JSON.stringify({ type: 'response.create' })) }; setState('ready') }
-  const disconnect = () => { releaseCapture(); socketRef.current?.close(); socketRef.current = null; setState('disconnected') }
+  // On release, COMMIT the captured audio and stop. The relay's realtime server
+  // is voice-activity-driven: committing the buffer is what makes it transcribe
+  // and respond. Do NOT also send `response.create` — the server has already
+  // consumed the buffer by the time it would arrive, so it errors with "no
+  // pending input to respond to" (surfaced to the user as a spurious relay
+  // rejection on every turn) while the real response streams anyway. Verified
+  // against the live server: commit-only yields exactly one clean response.
+  const finishCapture = () => { if (state !== 'listening') return; releaseCapture(); if (socketRef.current?.readyState === WebSocket.OPEN) { socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' })) }; setState('ready') }
+  const disconnect = () => { releaseCapture(); closePlayback(); socketRef.current?.close(); socketRef.current = null; setState('disconnected') }
   const connectionLabel = { disconnected: 'Disconnected', connecting: 'Connecting…', ready: 'Connected · ready', listening: 'Listening…' }[state] || state
   return <section className="realtime-voice" aria-labelledby="realtime-voice-heading">
     <header className="realtime-voice-head">
