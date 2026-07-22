@@ -992,6 +992,7 @@ describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () =>
     // wire), so the capture API under test is AudioContext, not MediaRecorder.
     _FakeAudioContext.calls = []
     _FakeAudioContext.bufferCalls = []
+    _FakeAudioContext.startTimes = []
     _FakeAudioContext.lastProcessor = null
     window.AudioContext = _FakeAudioContext
     global.AudioContext = _FakeAudioContext
@@ -1344,9 +1345,9 @@ describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () =>
 // is a distinct labeled region, separate from the chat composer.
 
 class _FakeAudioContext {
-  constructor(options) { _FakeAudioContext.calls.push(options); this.sampleRate = options?.sampleRate; this.destination = {}; _FakeAudioContext.lastContext = this }
-  createBuffer(channels, length, rate) { _FakeAudioContext.bufferCalls.push({ channels, length, rate }); return { getChannelData: () => new Float32Array(Math.max(0, length)) } }
-  createBufferSource() { return { buffer: null, connect() {}, start() {}, onended: null } }
+  constructor(options) { _FakeAudioContext.calls.push(options); this.sampleRate = options?.sampleRate; this.destination = {}; this.currentTime = 0; _FakeAudioContext.lastContext = this }
+  createBuffer(channels, length, rate) { _FakeAudioContext.bufferCalls.push({ channels, length, rate }); return { duration: length / rate, getChannelData: () => new Float32Array(Math.max(0, length)) } }
+  createBufferSource() { const s = { buffer: null, connect() {}, start(when) { _FakeAudioContext.startTimes.push(when) }, onended: null }; return s }
   createMediaStreamSource() { return { connect() {}, disconnect() {} } }
   createScriptProcessor() { const processor = { connect() {}, disconnect() {}, onaudioprocess: null }; _FakeAudioContext.lastProcessor = processor; return processor }
   close() { return Promise.resolve() }
@@ -1372,6 +1373,7 @@ describe('Realtime voice (speech-to-speech) dedicated interface (live-qualificat
     bootstrap.mockResolvedValue(voiceFixture)
     _FakeAudioContext.calls = []
     _FakeAudioContext.bufferCalls = []
+    _FakeAudioContext.startTimes = []
     _FakeRealtimeSocket.last = null
     originalAudioContext = window.AudioContext
     originalWebSocket = window.WebSocket
@@ -1432,6 +1434,43 @@ describe('Realtime voice (speech-to-speech) dedicated interface (live-qualificat
     // The playback buffer is allocated at the SAME rate — no drift between sites.
     expect(_FakeAudioContext.bufferCalls.length).toBeGreaterThan(0)
     expect(_FakeAudioContext.bufferCalls.every((call) => call.rate === 16000)).toBe(true)
+  })
+
+  it('releases with input_audio_buffer.commit and NEVER response.create (VAD server auto-responds)', async () => {
+    const user = await renderRealtime()
+    const region = screen.getByRole('region', { name: /realtime voice/i })
+    await user.click(within(region).getByRole('button', { name: 'Connect voice' }))
+    const socket = _FakeRealtimeSocket.last
+    await act(async () => { socket.onopen?.() })
+    const hold = await within(region).findByRole('button', { name: 'Hold to talk' })
+    await act(async () => { fireEvent.pointerDown(hold) })
+    await act(async () => { fireEvent.pointerUp(hold) })
+    const types = socket.sent.map((raw) => JSON.parse(raw).type)
+    // Commit is what makes the VAD server transcribe+respond; response.create
+    // races ahead of the already-consumed buffer and errors ("no pending input"),
+    // which the UI shows as a spurious relay rejection on every turn.
+    expect(types).toContain('input_audio_buffer.commit')
+    expect(types).not.toContain('response.create')
+  })
+
+  it('plays a multi-chunk response through ONE AudioContext, scheduled gaplessly', async () => {
+    const user = await renderRealtime()
+    const region = screen.getByRole('region', { name: /realtime voice/i })
+    await user.click(within(region).getByRole('button', { name: 'Connect voice' }))
+    const socket = _FakeRealtimeSocket.last
+    await act(async () => { socket.onopen?.() })
+    const chunk = btoa('\x01\x02\x03\x04\x05\x06\x07\x08') // 8 bytes -> 4 PCM16 samples
+    for (let i = 0; i < 5; i += 1) {
+      await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: chunk }) }) })
+    }
+    // A fresh context per chunk (the bug) would be 5 playback contexts and would
+    // exhaust the browser's context cap; ONE reused context is the fix.
+    expect(_FakeAudioContext.calls.length).toBe(1)
+    // Five chunks scheduled; each starts at or after the previous — never all at 0.
+    expect(_FakeAudioContext.startTimes.length).toBe(5)
+    const monotonic = _FakeAudioContext.startTimes.every((t, i, a) => i === 0 || t >= a[i - 1])
+    expect(monotonic).toBe(true)
+    expect(_FakeAudioContext.startTimes.at(-1)).toBeGreaterThan(0)
   })
 })
 
