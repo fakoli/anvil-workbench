@@ -6,7 +6,41 @@ import {
   isStaleFrame,
   needsSnapshotRefresh,
   reduceStreamState,
+  routeProvenanceLabel,
+  isRouteDiverged,
+  divergenceAnnouncement,
 } from './chat-api'
+
+describe('route-resolution divergence surface (T010)', () => {
+  it('folds a Serving-reported resolution frame onto the stream state', () => {
+    let state = initialStreamState()
+    expect(state.routeResolution).toBe(null)
+    const resolution = { requested_route: 'route.fast', served_route: 'route.heavy', provenance: 'explicit', diverged: true, episode_id: 'ep_1' }
+    state = reduceStreamState(state, { seq: 1, kind: 'resolution', resolution })
+    // Surface-only: the reducer records EXACTLY what Serving reported.
+    expect(state.routeResolution).toEqual(resolution)
+    expect(state.routeResolution.served_route).toBe('route.heavy')
+  })
+
+  it('labels explicit vs preference-defaulted provenance and nothing when unreported', () => {
+    expect(routeProvenanceLabel({ provenance: 'explicit' })).toBe('Explicitly selected route')
+    expect(routeProvenanceLabel({ provenance: 'preference_default' })).toBe('Defaulted from preference')
+    expect(routeProvenanceLabel({ provenance: null })).toBe(null)
+    expect(routeProvenanceLabel(null)).toBe(null)
+  })
+
+  it('announces a divergence episode exactly once (idempotent per episode)', () => {
+    const diverged = { requested_route: 'route.fast', served_route: 'route.heavy', diverged: true, episode_id: 'ep_1' }
+    expect(isRouteDiverged(diverged)).toBe(true)
+    const first = divergenceAnnouncement([], diverged)
+    expect(first.episodeId).toBe('ep_1')
+    expect(first.message).toContain('route.fast → route.heavy')
+    // The SAME episode is not announced again.
+    expect(divergenceAnnouncement(['ep_1'], diverged)).toBe(null)
+    // A non-diverged turn never announces.
+    expect(divergenceAnnouncement([], { diverged: false })).toBe(null)
+  })
+})
 
 describe('sequenced stream gap detection (T008)', () => {
   it('detects a skipped frame but not a contiguous or stale one', () => {

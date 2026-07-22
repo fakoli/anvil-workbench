@@ -17,6 +17,73 @@ def test_route_decisions_accepts_the_serving_safe_records_summary(monkeypatch):
     }]
 
 
+def test_route_decisions_surfaces_servings_resolution_metadata(monkeypatch):
+    # T010: the SAFE route-resolution fields Serving reports (requested vs served
+    # route, selection provenance, episode id) are admitted; a prompt is not.
+    monkeypatch.setattr(router, "_request", lambda *_args: {"records": [{
+        "request_id": "req_1", "requested_route": "route.fast", "served_route": "route.heavy",
+        "route_selection": "explicit", "episode_id": "ep_9", "fell_back": True,
+        "divergence_reason": "capacity", "prompt": "must not leave Serving",
+    }]})
+
+    rows = router.route_decisions("http://127.0.0.1:8000/v1", "server-held")
+
+    assert "prompt" not in rows[0]
+    assert rows[0]["requested_route"] == "route.fast"
+    assert rows[0]["served_route"] == "route.heavy"
+
+
+def test_route_resolution_is_surface_only_and_never_substitutes_a_route():
+    # T010 criterion 1 (NO FAILOVER / SURFACE-ONLY): the served route is EXACTLY
+    # the one Serving reported. Workbench performs no retry-to-alternate — a
+    # divergence surfaces Serving's own served route, never a Workbench-chosen one.
+    decision = {
+        "request_id": "req_7", "requested_route": "route.fast", "served_route": "route.heavy",
+        "route_selection": "explicit", "divergence_reason": "route.fast at capacity",
+    }
+    resolution = router.route_resolution(decision)
+    assert resolution["diverged"] is True
+    # Pass-through: the served route is Serving's reported value, byte-for-byte.
+    # (A regression that substituted a Workbench-chosen alternate route here would
+    #  make this assertion fail — the no-failover revert-detection.)
+    assert resolution["served_route"] == decision["served_route"]
+    assert resolution["requested_route"] == decision["requested_route"]
+    assert resolution["provenance"] == "explicit"
+    assert resolution["episode_id"]  # a stable per-episode grouping id
+
+
+def test_route_resolution_distinguishes_explicit_from_preference_default():
+    # T010 criterion 2: explicit vs preference-derived is a real served field, not
+    # a guess — an unreported provenance stays None rather than being invented.
+    explicit = router.route_resolution({"route": "route.a", "served_route": "route.a", "route_selection": "explicit"})
+    defaulted = router.route_resolution({"route": "route.a", "served_route": "route.a", "route_source": "preference_default"})
+    unknown = router.route_resolution({"route": "route.a", "served_route": "route.a"})
+    assert explicit["provenance"] == "explicit" and explicit["diverged"] is False
+    assert defaulted["provenance"] == "preference_default"
+    assert unknown["provenance"] is None
+
+
+def test_route_resolution_shares_one_episode_id_across_a_divergence_episode():
+    # T010 criterion 3 (once-per-episode): two turns of the SAME divergence episode
+    # (same requested→served/reason) share an episode id, so the browser can show
+    # the notice exactly once; a non-diverged turn carries no episode id.
+    a = router.route_resolution({"requested_route": "route.fast", "served_route": "route.heavy", "divergence_reason": "capacity"})
+    b = router.route_resolution({"requested_route": "route.fast", "served_route": "route.heavy", "divergence_reason": "capacity"})
+    settled = router.route_resolution({"requested_route": "route.fast", "served_route": "route.fast"})
+    assert a["episode_id"] == b["episode_id"]
+    assert settled["diverged"] is False and settled["episode_id"] is None
+
+
+def test_route_resolution_credential_scrubs_a_divergence_reason():
+    # The surfaced reason is credential-scrubbed like every other Serving string.
+    resolution = router.route_resolution({
+        "requested_route": "route.a", "served_route": "route.b",
+        "divergence_reason": "token=sk-ABCDEFGH12345678 exhausted",
+    })
+    assert "sk-ABCDEFGH12345678" not in resolution["divergence_reason"]
+    assert "[REDACTED]" in resolution["divergence_reason"]
+
+
 def test_sandbox_response_extracts_standard_responses_output_text(monkeypatch):
     monkeypatch.setattr(router, "_request", lambda *_args: {
         "id": "resp_1", "model": "chat-fast", "status": "completed",

@@ -35,13 +35,13 @@ export function needsSnapshotRefresh(lastSeq, frameSeq) {
 
 // The client's initial stream-consumption state.
 export function initialStreamState() {
-  return { lastSeq: 0, text: '', terminal: null, needsRefresh: false }
+  return { lastSeq: 0, text: '', terminal: null, needsRefresh: false, routeResolution: null }
 }
 
 // Pure reducer for one arriving sequenced frame. A stale frame is ignored (no
 // duplication); a gap flags `needsRefresh` without applying the frame; a
 // contiguous frame advances `lastSeq` and appends delta text / records the
-// terminal.
+// terminal / records the SURFACE-ONLY route-resolution mark Serving reported.
 export function reduceStreamState(state, frame) {
   if (isStaleFrame(state.lastSeq, frame.seq)) {
     return state // ignore a stale/duplicate frame -> no duplicated response
@@ -52,6 +52,10 @@ export function reduceStreamState(state, frame) {
   const next = { ...state, lastSeq: frame.seq, needsRefresh: false }
   if (frame.kind === 'delta') next.text = state.text + (frame.text || '')
   if (frame.kind === 'terminal') next.terminal = frame.outcome ?? null
+  // A `resolution` frame carries the route-resolution mark Serving REPORTED
+  // (requested vs served route + provenance). The client only records it; it
+  // never picks a route (chat-first-voice T010 / no failover in Workbench).
+  if (frame.kind === 'resolution') next.routeResolution = frame.resolution ?? null
   return next
 }
 
@@ -130,6 +134,50 @@ export function selectChatRoute(routes, routeId) {
   const match = (Array.isArray(routes) ? routes : []).find((route) => route.route_id === routeId)
   if (!match) throw new Error(`chat route is not in the reviewed allowlist: ${routeId}`)
   return match
+}
+
+// --- Route-resolution divergence (chat-first-voice T010) ---------------------
+//
+// SURFACE-ONLY display projections over the route-resolution mark Serving reports
+// (workbench/router.py `route_resolution`): whether a turn's route was EXPLICITLY
+// selected or DEFAULTED from a preference, and whether Serving served a DIFFERENT
+// route than requested. These NEVER pick a route — Workbench performs no failover
+// and no retry-to-alternate — they only project what Serving actually resolved.
+
+// The human-facing chip distinguishing an explicitly-selected route from a
+// preference-defaulted one, read from Serving's reported provenance. An
+// unreported provenance shows nothing rather than guessing.
+export function routeProvenanceLabel(resolution) {
+  switch (resolution?.provenance) {
+    case 'explicit': return 'Explicitly selected route'
+    case 'preference_default': return 'Defaulted from preference'
+    default: return null
+  }
+}
+
+// True when Serving reported it served a different route than requested. Read
+// straight off the served mark; the client never computes a substitute route.
+export function isRouteDiverged(resolution) {
+  return Boolean(resolution?.diverged)
+}
+
+// The ONCE-PER-EPISODE announcement decision. Given the list of already-announced
+// divergence episode ids and an arriving resolution, returns the notice to show
+// or `null` when the turn did NOT diverge OR its episode was already announced —
+// so the divergence notice is idempotent per episode and never re-shown each turn.
+export function divergenceAnnouncement(announcedEpisodeIds, resolution) {
+  if (!isRouteDiverged(resolution)) return null
+  const episodeId = resolution?.episode_id ?? null
+  const seen = Array.isArray(announcedEpisodeIds) ? announcedEpisodeIds : []
+  if (episodeId && seen.includes(episodeId)) return null
+  const requested = resolution?.requested_route || 'the requested route'
+  const served = resolution?.served_route || 'another route'
+  const reason = typeof resolution?.divergence_reason === 'string' && resolution.divergence_reason
+    ? ` ${resolution.divergence_reason}` : ''
+  return {
+    episodeId,
+    message: `Serving served a different route than requested (${requested} → ${served}).${reason}`,
+  }
 }
 
 // Normalize the text of a rendered turn into the EXACT content-block shape the

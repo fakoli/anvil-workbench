@@ -224,7 +224,7 @@ export async function fetchChatRoutes() {
 // `cancelled` upstream — and settles the local state `cancelled` here without
 // ever emitting a later completion. A genuine transport failure throws so the
 // caller renders a failed (not merely interrupted) state.
-export async function sendMessage({ conversationId, routeId, prompt, controls, signal, onFrame, onState } = {}) {
+export async function sendMessage({ conversationId, routeId, routeProvenance, prompt, controls, signal, onFrame, onState } = {}) {
   const settleCancelled = (state) => {
     const cancelled = { ...state, terminal: 'cancelled' }
     onState?.(cancelled)
@@ -235,7 +235,10 @@ export async function sendMessage({ conversationId, routeId, prompt, controls, s
   try {
     response = await jsonPostWithSignal(
       `${CONVERSATIONS}/${encodeURIComponent(conversationId)}/send`,
-      { route_id: routeId, prompt, controls },
+      // `route_selection` records whether the route was EXPLICITLY chosen or
+      // DEFAULTED from preference, so Serving can echo the provenance back on the
+      // turn's resolution mark (chat-first-voice T010). It never selects a route.
+      { route_id: routeId, route_selection: routeProvenance, prompt, controls },
       signal,
     )
   } catch (error) {

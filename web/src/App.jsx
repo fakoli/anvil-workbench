@@ -18,6 +18,7 @@ import {
   initialVoiceInputState, voiceInputReducer, voiceInputLabel, voiceDraftReady,
   initialPlaybackState, playbackReducer, playbackLabel, isPlaybackActiveFor, shouldAutoplay,
   voiceAutoplayFromPreferences,
+  routeProvenanceLabel, isRouteDiverged, divergenceAnnouncement,
 } from './chat-api'
 import { submittedControls, isBranchSettled, comparisonAttemptStatus } from './advanced-chat'
 import SettingsView from './settings-view'
@@ -531,11 +532,20 @@ function TurnView({ turn, onRetry, onBranch, streamActive, conversationId, autop
   // as a distinct badge alongside the lineage chip so it is distinguishable from
   // an ordinary branch turn (S4).
   const advancedMode = turn.mode === 'advanced'
+  // Route-resolution marks (chat-first-voice T010), derived ONLY from the
+  // Serving-supplied mark carried on the settled turn: a provenance chip that
+  // distinguishes an explicitly-selected route from a preference-defaulted one,
+  // and a rerouted marker when Serving served a different route than requested.
+  // These SURFACE what Serving reported — the client never picks a route.
+  const provenance = routeProvenanceLabel(turn.routeResolution)
+  const diverged = isRouteDiverged(turn.routeResolution)
   return <li className={`turn turn-${turn.role} turn-${turn.status}`}>
     <div className="turn-head">
       <span className="turn-role">{turn.role === 'user' ? 'You' : 'Assistant'}</span>
       {lineage && <span className="turn-lineage">{lineage}</span>}
       {advancedMode && <span className="turn-advanced" aria-label="Advanced tuned run">advanced</span>}
+      {provenance && <span className={`turn-route-provenance provenance-${turn.routeResolution.provenance}`} title={provenance}>{provenance}</span>}
+      {diverged && <span className="turn-route-diverged" title="Serving served a different route than requested">rerouted</span>}
       {streaming && <span className="turn-status streaming">streaming…</span>}
       {distinct && <span className={`turn-status turn-status-${turn.status}`}>{turn.status}</span>}
     </div>
@@ -842,6 +852,16 @@ function ChatView({ append }) {
   const [turns, setTurns] = useState([])
   const [routes, setRoutes] = useState([])
   const [routeId, setRouteId] = useState('')
+  // Route-resolution provenance (chat-first-voice T010): a route the actor
+  // EXPLICITLY picks vs one DEFAULTED from preference. It is sent so Serving can
+  // echo it back on the turn's resolution mark; the displayed provenance always
+  // comes from that served mark, never this local hint alone.
+  const [routeProvenance, setRouteProvenance] = useState('preference_default')
+  // The current divergence notice (one per episode) + the episode ids already
+  // announced, so the notice appears EXACTLY ONCE per divergence episode and is
+  // non-blocking (a dismissible status line; the composer stays usable).
+  const [divergence, setDivergence] = useState(null)
+  const announcedEpisodesRef = useRef([])
   const [advanced, setAdvanced] = useState(false)
   // Advanced playground state (advanced-model-playground T005). Routes are the
   // reviewed advanced-route allowlist; a 503/unconfigured surface degrades
@@ -1072,7 +1092,7 @@ function ChatView({ append }) {
     const controller = new AbortController(); abortRef.current = controller
     try {
       const state = await sendMessage({
-        conversationId, routeId, prompt, signal: controller.signal,
+        conversationId, routeId, routeProvenance, prompt, signal: controller.signal,
         onState: (streamState) => { if (!isCurrent()) return; setStreamingTurn((current) => (current ? {
           ...current, content: [{ text: streamState.text }],
           status: streamState.terminal ? terminalToStatus(streamState.terminal) : 'streaming',
@@ -1080,11 +1100,22 @@ function ChatView({ append }) {
       })
       if (!isCurrent()) return // switched away mid-stream: drop this settle entirely
       const status = terminalToStatus(state.terminal)
+      // The SURFACE-ONLY route-resolution mark Serving reported for this turn
+      // (requested vs served route + provenance); the client never picked a route.
+      const resolution = state.routeResolution ?? null
       // `fresh` marks this as a newly-arrived response so ReadAloud may autoplay
       // it (when the saved preference opts in); historical turns never carry it.
-      setTurns((current) => [...current, { ...assistant, content: [{ text: state.text }], status, fresh: true }])
+      setTurns((current) => [...current, { ...assistant, content: [{ text: state.text }], status, fresh: true, routeResolution: resolution }])
       setStreamingTurn(null)
       setLifecycle(LIFECYCLE[status] || LIFECYCLE.complete)
+      // Show the divergence notice EXACTLY ONCE per episode: the pure decision
+      // returns null when the turn did not diverge or its episode was already
+      // announced. Non-blocking — it only sets a dismissible status line.
+      const announcement = divergenceAnnouncement(announcedEpisodesRef.current, resolution)
+      if (announcement) {
+        if (announcement.episodeId) announcedEpisodesRef.current = [...announcedEpisodesRef.current, announcement.episodeId]
+        setDivergence(announcement)
+      }
       if (state.needsRefresh) {
         try { const value = await getConversation(conversationId); if (isCurrent()) setTurns(value.turns || []) }
         catch { if (isCurrent()) append('The reconnected transcript could not be refreshed.') }
@@ -1205,7 +1236,7 @@ function ChatView({ append }) {
       <header className="chat-header">
         <div><span className="crumb">Chat / private</span><h1>{selected ? describeConversation(selected).title : 'Chat'}</h1></div>
         <div className="chat-controls">
-          <RouteSelect routes={routes} routeId={routeId} onChange={setRouteId} />
+          <RouteSelect routes={routes} routeId={routeId} onChange={(value) => { setRouteId(value); setRouteProvenance('explicit') }} />
           <button className={`advanced-toggle ${advanced ? 'on' : ''}`} aria-pressed={advanced} aria-label="Toggle Advanced mode" onClick={() => setAdvanced((value) => !value)}>Advanced</button>
         </div>
       </header>
@@ -1223,6 +1254,13 @@ function ChatView({ append }) {
         onResolveTemplate={resolvePlaygroundTemplate} onDeclaredInstructions={previewPlaygroundDeclared}
         onRecordRating={recordPlaygroundRating} />}
       <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} conversationId={selectedId} autoplayPreference={voicePreferences} /></div>
+      {/* Route-resolution divergence notice (chat-first-voice T010): shown once
+          per episode, NON-BLOCKING (a dismissible status line; the composer and
+          transcript stay fully usable), surfacing only what Serving reported. */}
+      {divergence && <div className="chat-divergence" role="status">
+        <span>{divergence.message}</span>
+        <button type="button" aria-label="Dismiss route divergence notice" onClick={() => setDivergence(null)}>×</button>
+      </div>}
       <div className="chat-live" role="status" aria-live="polite">{lifecycle}</div>
       {/* Push-to-talk drops an EDITABLE transcript into the composer; a turn is
           sent only when the actor explicitly submits it below. */}
