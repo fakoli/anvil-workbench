@@ -63,6 +63,19 @@ export async function fetchRoutes() {
   return response.json()
 }
 
+// Compact backend model-health for the top-right debug indicator (workbench/api.py
+// GET /api/system/model-health). The hub reads ONLY the Anvil Serving router
+// surface, so this client assembles no actor, token, endpoint, or host — only the
+// safe path. Returns `{schema_version, checked_at, source_note, components:[{id,
+// label, status, detail, last_seen?}]}`, already scrubbed server-side. A non-2xx
+// (e.g. a 503 while the surface is unconfigured) throws a non-leaking Error so the
+// indicator degrades quietly rather than blocking the page.
+export async function fetchModelHealth() {
+  const response = await fetch('/api/system/model-health')
+  if (!response.ok) throw new Error('Model health is unavailable')
+  return response.json()
+}
+
 export async function searchEvidence(projectId, query) {
   const response = await fetch(`/api/evidence/search?project_id=${encodeURIComponent(projectId)}&query=${encodeURIComponent(query)}`)
   if (!response.ok) throw new Error('Evidence search is unavailable')

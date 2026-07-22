@@ -802,6 +802,111 @@ def _sys_client(settings: Settings, *, bridge_health=None, service=None) -> Test
     ))
 
 
+# ---------------------------------------------------------------------------
+# Model-health indicator endpoint (GET /api/system/model-health): the compact
+# backend debug projection for the top-right dots. It reads ONLY the router
+# surface, is actor-gated, scrubbed, and fails closed.
+# ---------------------------------------------------------------------------
+
+from workbench.model_health import ModelHealthService as _ModelHealthService
+
+_MH_ROUTER_BASE = "http://100.87.34.66:8000/v1"
+
+
+def _mh_client(settings, *, health_reader=None, signals_reader=None) -> TestClient:
+    kwargs = {"clock": _FIXED_CLOCK}
+    if health_reader is not None:
+        kwargs["health_reader"] = health_reader
+    if signals_reader is not None:
+        kwargs["signals_reader"] = signals_reader
+    service = _ModelHealthService(settings, **kwargs)
+    return TestClient(create_app(
+        settings=settings, store=MemoryStore(), graph=NullGraph(), model_health=service,
+    ))
+
+
+def _mh_health(audio=True):
+    routes = ["/v1/chat/completions", "/v1/decisions"]
+    if audio:
+        routes = ["/v1/audio/speech", "/v1/audio/transcriptions", *routes]
+    return {"status": "ok", "routes": routes}
+
+
+def _mh_signals(records):
+    return {"totals": {"served_tiers": {}, "attempt_outcomes": {}}, "records": records}
+
+
+def test_model_health_maps_router_and_decision_fixtures_to_the_five_statuses():
+    settings = _sys_settings(anvil_router_base_url=_MH_ROUTER_BASE, anvil_router_token="server-held")
+    records = [
+        {"work_class": "chat", "created_at": "2026-07-22T10:00:00Z",
+         "attempts": [{"tier_id": "heavy-local", "outcome": "served", "verifier_passed": True, "reason": None}]},
+        {"work_class": "chat-fast", "created_at": "2026-07-22T10:01:00Z",
+         "attempts": [{"tier_id": "fast-local", "outcome": "skipped-unavailable", "verifier_passed": None, "reason": None}]},
+    ]
+    with _mh_client(
+        settings, health_reader=lambda *a: _mh_health(), signals_reader=lambda *a: _mh_signals(records),
+    ) as client_:
+        body = client_.get("/api/system/model-health", headers=SYS_ACTOR).json()
+        by_id = {component["id"]: component for component in body["components"]}
+        assert [c["id"] for c in body["components"]] == ["router", "heavy", "fast", "voice", "ocr"]
+        assert by_id["router"]["status"] == "ok"
+        assert by_id["heavy"]["status"] == "ok"          # served -> ok
+        assert by_id["fast"]["status"] == "down"          # skipped-unavailable -> down
+        assert by_id["voice"]["status"] == "ok"           # audio routes registered
+        assert by_id["ocr"]["status"] == "idle"           # no ocr routing seen
+        assert body["schema_version"] == "workbench-model-health/v1"
+        assert "not a live per-tier probe" in body["source_note"]
+
+
+def test_model_health_is_actor_gated():
+    # With a trusted-identity requirement (no insecure dev actor), a request that
+    # carries no identity header is refused by the SAME actor dependency.
+    settings = _sys_settings(
+        anvil_router_base_url=_MH_ROUTER_BASE, anvil_router_token="server-held",
+        allow_insecure_dev_actor=False,
+    )
+    with _mh_client(settings, health_reader=lambda *a: _mh_health(), signals_reader=lambda *a: _mh_signals([])) as client_:
+        assert client_.get("/api/system/model-health").status_code == 401
+
+
+def test_model_health_degrades_honestly_when_the_router_is_unreachable():
+    from workbench.router import RouterError
+
+    def boom(*args):
+        raise RouterError("Anvil Serving is unreachable")
+
+    settings = _sys_settings(anvil_router_base_url=_MH_ROUTER_BASE, anvil_router_token="server-held")
+    with _mh_client(settings, health_reader=boom, signals_reader=boom) as client_:
+        response = client_.get("/api/system/model-health", headers=SYS_ACTOR)
+        assert response.status_code == 200  # never crashes the page
+        by_id = {component["id"]: component for component in response.json()["components"]}
+        assert by_id["router"]["status"] == "down"
+        assert by_id["heavy"]["status"] == "unknown"
+
+
+def test_model_health_unconfigured_router_is_all_unknown():
+    with _mh_client(_sys_settings()) as client_:  # no router configured
+        body = client_.get("/api/system/model-health", headers=SYS_ACTOR).json()
+        assert {component["status"] for component in body["components"]} == {"unknown"}
+
+
+def test_model_health_response_leaks_no_credential_url_or_path():
+    # A secret/host-shaped verify_reason from the router is scrubbed at the last hop.
+    records = [
+        {"work_class": "ocr", "created_at": "2026-07-22T10:00:00Z",
+         "attempts": [{"tier_id": "ocr-local", "outcome": "skipped-unavailable", "verifier_passed": None,
+                       "reason": "connect 100.64.0.9:30010 sk-live-DEADBEEF /var/secrets/key"}]},
+    ]
+    settings = _sys_settings(anvil_router_base_url=_MH_ROUTER_BASE, anvil_router_token="sk-live-supersecret")
+    with _mh_client(
+        settings, health_reader=lambda *a: _mh_health(), signals_reader=lambda *a: _mh_signals(records),
+    ) as client_:
+        raw = client_.get("/api/system/model-health", headers=SYS_ACTOR).text.lower()
+        for marker in ("100.64.0.9", "sk-live", "deadbeef", "/var/secrets", "supersecret", "://"):
+            assert marker not in raw, f"model-health response leaked {marker!r}"
+
+
 def test_system_health_returns_a_descriptor_for_every_declared_integration():
     # T003.2 criterion 1: the endpoint returns descriptors for every declared
     # integration, each with a closed field set and an explicit non-canonical mark.
@@ -976,6 +1081,7 @@ def test_system_health_surface_is_get_only_with_no_mutation_execution_or_approva
         assert set(system_paths) == {
             "/api/system/health", "/api/system/health/{integration_id}",
             "/api/system/posture", "/api/system/configuration",
+            "/api/system/model-health",
         }
         for path, operations in system_paths.items():
             assert set(operations) <= {"get"}, f"{path} declares non-GET operations: {sorted(operations)}"
@@ -987,6 +1093,7 @@ def test_system_health_surface_is_get_only_with_no_mutation_execution_or_approva
             assert verb("/api/system/health/anvil_serving", headers=SYS_ACTOR).status_code == 405
             assert verb("/api/system/posture", headers=SYS_ACTOR).status_code == 405
             assert verb("/api/system/configuration", headers=SYS_ACTOR).status_code == 405
+            assert verb("/api/system/model-health", headers=SYS_ACTOR).status_code == 405
 
 
 def test_system_health_one_integration_detail_and_unknown_and_malformed_ids():

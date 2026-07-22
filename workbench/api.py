@@ -94,6 +94,7 @@ from .store import (
     UnknownPreferenceError, WorkbenchStore,
 )
 from .system_health import SystemHealthService, UnknownIntegrationError
+from .model_health import ModelHealthService
 from .serving_audio import fetch_voice_catalog
 from .voice import (
     MAX_STT_INPUT_BYTES,
@@ -1976,6 +1977,7 @@ def create_app(
     run_context_store: RunContextStore | None = None,
     delivery_projection_store: DeliveryProjectionStore | None = None,
     system_health: SystemHealthService | None = None,
+    model_health: ModelHealthService | None = None,
     plugin_host_service: "PluginHostService | None" = None,
     chat_tool_dispatch_service: "ChatToolDispatchService | None" = None,
     skill_adoption_store: MemorySkillAdoptionStore | None = None,
@@ -2017,6 +2019,12 @@ def create_app(
     # failing closed. An injected service lets tests exercise mock bridge health
     # or seeded prose without env plumbing.
     system_health = system_health or SystemHealthService(settings)
+    # The model-health projection behind the top-right debug indicator. It reads
+    # ONLY the router surface (router /health + /decisions), holds a short TTL cache
+    # so a poll never hammers the router, and degrades honestly when the router is
+    # unreachable. Built once here so its cache persists across requests; an
+    # injected instance lets tests script the router reads without env plumbing.
+    model_health = model_health or ModelHealthService(settings)
     # The reviewed-plugin discovery surface derives from operator-declared config
     # (both the reviewed catalog and the capability profile paths), mirroring the
     # provider-catalog / system-health precedent. An injected service overrides for
@@ -2668,6 +2676,23 @@ def create_app(
         except RouterError as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         return {"resolutions": [route_resolution(row) for row in rows]}
+
+    @app.get("/api/system/model-health")
+    def system_model_health(_: str = Depends(actor)) -> dict[str, Any]:
+        """Compact backend model-health for the top-right debug indicator.
+
+        Behind the SAME trusted ``actor`` dependency as the rest of the system
+        surface.  Reads ONLY the operator-configured Anvil Serving router surface
+        (its ``/health`` and ``/decisions`` log) -- never a raw model-serve host --
+        and returns the five-component projection ``{schema_version, checked_at,
+        source_note, components:[{id,label,status,detail,last_seen?}]}``.  Per-tier
+        and OCR status is DERIVED from recent routing (the router exposes no
+        first-class per-tier health endpoint), so the response carries a
+        ``source_note`` saying so.  It degrades honestly (router unreachable ->
+        ``router`` down, tiers ``unknown``) instead of failing, and the whole body
+        is scrubbed at this last hop so no token, endpoint, host, or path leaks.
+        """
+        return scrub_config_payload(model_health.snapshot())
 
     @app.post("/api/sandbox")
     def sandbox(payload: SandboxInput, current_actor: str = Depends(actor)) -> dict[str, Any]:

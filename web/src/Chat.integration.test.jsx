@@ -400,7 +400,7 @@ describe('Criterion 2 — project/PRD/task context and Advanced mode stay second
     // Every network call the chat surface made is chat-scoped: no delivery or
     // bridge effect (no /workflows/start, /sandbox, /approvals, /sessions POST,
     // /tasks, /projects). Inspect the fetch call log by URL.
-    const allowed = ['/api/bootstrap', '/api/conversations', '/api/chat', '/api/preferences']
+    const allowed = ['/api/bootstrap', '/api/conversations', '/api/chat', '/api/preferences', '/api/system']
     const stray = server.state.calls.filter((call) => !allowed.some((prefix) => call.path.startsWith(prefix)))
     expect(stray).toEqual([])
   })

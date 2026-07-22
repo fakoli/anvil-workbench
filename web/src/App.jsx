@@ -23,6 +23,7 @@ import {
 import { submittedControls, isBranchSettled, comparisonAttemptStatus } from './advanced-chat'
 import SettingsView from './settings-view'
 import ConfigurationView from './configuration-view'
+import ModelHealthIndicator from './model-health-indicator'
 import PluginCatalogView from './plugin-catalog-view'
 import AdvancedPanel from './advanced-chat-view'
 import AdvancedPlaygroundPanel from './advanced-playground-view'
@@ -2509,7 +2510,7 @@ function App() {
   return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Voice' ? ' voice-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
     <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
-    <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
+    <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><ModelHealthIndicator /><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
       {notificationsOpen && <Notifications audit={data.audit || []} read={notificationsRead} onRead={() => setNotificationsRead(true)} />}
       {active === 'Chat'
         ? <div className="chat-grid"><ChatView append={setNotice} /></div>
