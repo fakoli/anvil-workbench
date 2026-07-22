@@ -24,11 +24,16 @@ Fail-closed discipline (an adversarial reviewer will check each):
   reviewed dependency, so the wired HTTP path is the real contract -- not a
   hand-built stand-in.
 
+``voice_relay_service`` IS wireable here: when named, it is constructed from a
+:class:`~workbench.serving_audio.DarkServingAudioTransport` over two operator-
+declared Anvil-Serving-managed audio serve URLs, authorized on the approver set
+and on authoritative ownership in the shared conversation store.
+
 Surfaces this module deliberately does NOT wire (they have separate live gates,
 left unchanged): ``project_context_store``, ``run_context_store``,
-``voice_relay_service``, ``chat_tool_dispatch_service``, and
-``plugin_host_service`` beyond its existing settings-driven path in
-``create_app``.  ``delivery_projection_store`` IS wireable here, but only from a
+``chat_tool_dispatch_service``, and ``plugin_host_service`` beyond its existing
+settings-driven path in ``create_app``.  ``delivery_projection_store`` IS
+wireable here, but only from a
 validated projection seed produced through the supported State CLI read
 adapters (``workbench.projection_seed``) -- never from hub-fabricated payloads.
 """
@@ -50,9 +55,16 @@ from .chat_routes import ChatRouteError, discover_chat_routes, parse_chat_routes
 from .config import Settings
 from .configuration_transfer import ConfigurationTransferService
 from .contracts import ContractValidationError, validate_settings_descriptor
-from .conversation_store import ConversationSearchService, ConversationStore
+from .conversation_api import conversation_actor
+from .conversation_store import (
+    ConversationSearchService,
+    ConversationStore,
+    ConversationStoreError,
+)
 from .delivery_projection import MemoryDeliveryProjectionStore
 from .conversation_transfer import ConversationTransferService
+from .serving_audio import DarkServingAudioTransport
+from .voice import MemoryVoiceEventLog, VoiceRelayService
 from .models import MIN_PREF_AUDIT_KEY_BYTES
 from .preference_gates import PolicyGateService
 from .projection_seed import ProjectionSeedError, load_seed_dir
@@ -83,6 +95,27 @@ CHAT_ROUTES_ENV = "WORKBENCH_CHAT_ROUTES"
 #: ``WORKBENCH_LIVE_SURFACES``.
 DELIVERY_PROJECTION_SEED_ENV = "WORKBENCH_DELIVERY_PROJECTION_SEED"
 
+#: Operator-declared URLs for the two Anvil-Serving-managed Dark audio serves the
+#: ``voice_relay_service`` reaches (analogous to ``ANVIL_ROUTER_BASE_URL``): the
+#: STT serve (multipart upload -> ``{"text"}``) and the TTS serve (JSON -> raw
+#: PCM16).  Both are REQUIRED when ``voice_relay_service`` is named; an unset or
+#: non-http value fails the hub closed at startup.
+VOICE_STT_URL_ENV = "ANVIL_VOICE_STT_URL"
+VOICE_TTS_URL_ENV = "ANVIL_VOICE_TTS_URL"
+#: Serving-managed model identifiers passed through to the two serves.  Optional;
+#: they fall back to the reviewed deployment defaults below.
+VOICE_STT_MODEL_ENV = "ANVIL_VOICE_STT_MODEL"
+VOICE_TTS_MODEL_ENV = "ANVIL_VOICE_TTS_MODEL"
+#: The TTS serve's native PCM16 sample rate, reported to the browser so read-aloud
+#: plays back at the correct rate (a wrong rate garbles playback).  Optional.
+VOICE_TTS_SAMPLE_RATE_ENV = "ANVIL_VOICE_TTS_SAMPLE_RATE"
+
+#: Reviewed deployment defaults for the two Serving-managed audio models and the
+#: TTS sample rate.  These are model/rate configuration, not provider hosts.
+_DEFAULT_VOICE_STT_MODEL = "tdt-0.6b-v3"
+_DEFAULT_VOICE_TTS_MODEL = "kokoro"
+_DEFAULT_VOICE_TTS_SAMPLE_RATE = 24000
+
 #: The exact injectable-surface names ``WORKBENCH_LIVE_SURFACES`` may name.  A
 #: name outside this set fails closed at startup.
 LIVE_SURFACE_NAMES: frozenset[str] = frozenset({
@@ -97,6 +130,7 @@ LIVE_SURFACE_NAMES: frozenset[str] = frozenset({
     "conversation_search_service",
     "skill_adoption_store",
     "delivery_projection_store",
+    "voice_relay_service",
 })
 
 
@@ -215,6 +249,76 @@ def _load_plugin_catalog(env: Mapping[str, str]) -> Mapping[str, Any]:
             "WORKBENCH_PLUGIN_CATALOG_FILE must contain a plugin-catalog object"
         )
     return document
+
+
+def _voice_serve_url(env: Mapping[str, str], name: str) -> str:
+    """Resolve a required Anvil-Serving audio serve URL, fail closed if unusable."""
+    url = env.get(name, "").strip()
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        raise DeploymentConfigError(
+            f"voice_relay_service requires a valid {name} (an http(s) URL for an "
+            "Anvil-Serving-managed audio serve); "
+            + ("it is unset" if not url else "its value is not an http(s) URL")
+        )
+    return url
+
+
+def _voice_tts_sample_rate(env: Mapping[str, str]) -> int:
+    """Resolve the TTS serve's PCM16 sample rate; fail closed on a bad value."""
+    raw = env.get(VOICE_TTS_SAMPLE_RATE_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_VOICE_TTS_SAMPLE_RATE
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DeploymentConfigError(
+            f"{VOICE_TTS_SAMPLE_RATE_ENV} must be a positive integer sample rate"
+        ) from exc
+    if value <= 0 or value > 192_000:
+        raise DeploymentConfigError(
+            f"{VOICE_TTS_SAMPLE_RATE_ENV} must be a positive, sane audio sample rate"
+        )
+    return value
+
+
+def _load_voice_relay_service(
+    env: Mapping[str, str],
+    settings: Settings,
+    conversation_store: ConversationStore,
+) -> VoiceRelayService:
+    """Build the STT/TTS relay over the two Dark audio serves; fail closed.
+
+    The relay authorizes on the operator-declared approver set AND on authoritative
+    ownership of the target conversation in the SAME shared conversation store the
+    chat endpoints use, so an actor can only relay voice for a conversation they own.
+    A missing/invalid serve URL fails the hub closed at startup rather than serving
+    a per-request 503 an operator cannot tell apart from "voice not configured".
+    """
+    stt_url = _voice_serve_url(env, VOICE_STT_URL_ENV)
+    tts_url = _voice_serve_url(env, VOICE_TTS_URL_ENV)
+    stt_model = env.get(VOICE_STT_MODEL_ENV, "").strip() or _DEFAULT_VOICE_STT_MODEL
+    tts_model = env.get(VOICE_TTS_MODEL_ENV, "").strip() or _DEFAULT_VOICE_TTS_MODEL
+    transport = DarkServingAudioTransport(
+        stt_url, tts_url, stt_model, tts_model,
+        sample_rate=_voice_tts_sample_rate(env),
+    )
+
+    def scope_authorized(actor: str, conversation_id: str) -> bool:
+        # Authoritative ownership through the shared store: a conversation the
+        # actor does not own is indistinguishable from a missing one (both raise),
+        # and both fail the scope check closed.
+        try:
+            conversation_store.get_conversation(conversation_actor(actor), conversation_id)
+        except ConversationStoreError:
+            return False
+        return True
+
+    return VoiceRelayService(
+        transport,
+        voice_authorized=settings.approvers,
+        scope_authorized=scope_authorized,
+        event_log=MemoryVoiceEventLog(),
+    )
 
 
 def _pref_audit_key(env: Mapping[str, str]) -> bytes:
@@ -345,6 +449,15 @@ def build_live_overrides(env: Mapping[str, str] | None = None) -> dict[str, Any]
 
     if "delivery_projection_store" in requested:
         overrides["delivery_projection_store"] = _load_delivery_projection_store(resolved_env)
+
+    if "voice_relay_service" in requested:
+        # The relay's scope check reuses the SAME shared conversation store the
+        # chat endpoints serve, so ownership is authoritative.  Building it also
+        # requires chat persistence (WORKBENCH_CHAT_HASH_KEY); conversation_store()
+        # fails closed with a precise message when it is unset.
+        overrides["voice_relay_service"] = _load_voice_relay_service(
+            resolved_env, settings, conversation_store(),
+        )
 
     # When a shared conversation store was built, hand the SAME instance to
     # create_app so the chat endpoints and the wrapping surfaces agree.

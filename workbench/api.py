@@ -2096,10 +2096,10 @@ def create_app(
     app.state.advanced_template_store = advanced_template_store
     app.state.advanced_rating_store = advanced_rating_store
     # The chat push-to-talk / read-aloud voice relay is a hub-side supervision
-    # surface that is deliberately NOT wired into the live poll loop; it stays
-    # ``None`` unless a service is injected, so the browser surface fails closed
-    # (503). The live STT/TTS provider path (Anvil Serving audio) is qualified
-    # under chat-first-voice:T005/T004/T006 (BLOCKED-LIVE), out of scope here.
+    # surface that defaults to ``None`` here, so an imported hermetic app fails the
+    # browser surface closed (503). A live deployment opts it in explicitly through
+    # ``workbench.deployment`` (WORKBENCH_LIVE_SURFACES=voice_relay_service), which
+    # constructs it over the operator-declared Anvil-Serving-managed audio serves.
     app.state.voice_relay_service = voice_relay_service
 
     def actor(request: Request) -> str:

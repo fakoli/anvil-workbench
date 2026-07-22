@@ -1765,13 +1765,16 @@ def test_voice_full_cycle_leaves_no_audio_or_draft_marker_in_the_wired_store_or_
 def test_voice_relay_sources_reach_no_raw_provider():
     # AGENTS.md boundary: STT/TTS relay only through Anvil Serving. The voice
     # relay and its Serving audio functions must never name a raw provider host or
-    # a raw-provider API key env var.
+    # a raw-provider API key env var. serving_audio.py is the voice-lane HTTP
+    # module (it speaks the Dark audio serves' real protocols), and deployment.py
+    # is where those serve hosts are wired -- both are exactly what this scan
+    # exists to catch, so both are in the scan set alongside voice.py/router.py.
     forbidden = ("api.anthropic.com", "ANTHROPIC_API_KEY", "openai.com", "OPENAI_API_KEY")
-    voice_src = (_REPO_ROOT / "workbench" / "voice.py").read_text(encoding="utf-8")
-    router_src = (_REPO_ROOT / "workbench" / "router.py").read_text(encoding="utf-8")
-    for token in forbidden:
-        assert token not in voice_src, f"voice.py references a raw provider: {token}"
-        assert token not in router_src, f"router.py references a raw provider: {token}"
+    scanned = ("voice.py", "router.py", "serving_audio.py", "deployment.py")
+    for filename in scanned:
+        source = (_REPO_ROOT / "workbench" / filename).read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in source, f"{filename} references a raw provider: {token}"
 
 
 # --------------------------------------------------------------------------- #

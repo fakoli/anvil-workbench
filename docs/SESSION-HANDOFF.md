@@ -14,6 +14,100 @@ Use this file to resume work in a new Anvil Workbench coding session.
 - Immediate roadmap: [ROADMAP.md](ROADMAP.md)
 - Agent rules: [../AGENTS.md](../AGENTS.md)
 
+## 2026-07-22 LIVE QUALIFICATION RUN — surface legs on a real tailnet stack
+
+The first live run against a **real tailnet stack**. It exercised a bounded set of
+**surface** legs and recorded them honestly. The authoritative evidence is
+[QUALIFICATION.md → live-qualification section](QUALIFICATION.md#live-qualification-observed-2026-07-22-real-tailnet-stack);
+the rendered-browser record is
+[UI-ACCEPTANCE-AUDIT.md → 2026-07-22 live run](UI-ACCEPTANCE-AUDIT.md#2026-07-22-rendered-browser-live-run-real-tailnet-stack).
+This is **not** a delivery-harness, PR-merge, State-apply, or tailnet-identity
+qualification. Suite green at **1216 pytest / 310 web** (after the voice
+request/response wiring landed).
+
+### The live stack
+
+Serving router at `100.87.34.66:8000` (8 routes); Heavy plane `gpt-oss-puzzle`
+served (`planning`→`heavy-local`); Fast plane `gemma` (`chat`→`fast-local`); Dark
+STT `:30010` + TTS `:30011`; realtime voice proxy on `127.0.0.1:8766`;
+Postgres/Neo4j hub at `127.0.0.1:8090` rebuilt from the merged live-qualification
+branch.
+
+### Cross-cutting live-infra facts
+
+- **Hub rebuilt from the merged live-qualification branch.** The
+  `deploy/Dockerfile.api` fix that ships `docs/contracts/` into the image (so the
+  fail-closed schema loads no longer 500 the boot) is what **unblocked booting
+  current `main`** (commit `20a985f`).
+- **`WORKBENCH_LIVE_SURFACES` composition** (`workbench/deployment.py`,
+  `LIVE_SURFACE_NAMES`) is how the injectable surfaces were wired live; an empty/
+  unset value keeps `create_app` byte-for-byte the hermetic app, and an unknown
+  surface name fails closed at startup.
+- **The send/stream join is now a real mounted endpoint** —
+  `POST /api/conversations/{id}/send` (`workbench/conversation_api.py`), emitting
+  `seq`-stamped `delta`/`terminal` frames. `GET /api/chat/routes` is served from
+  the reviewed routes config.
+- **Voice realtime proxy** was brought up via a **session-local topology**; the
+  operator topology was left untouched.
+- **Request/response voice** was wired live: `voice_relay_service` (in
+  `WORKBENCH_LIVE_SURFACES`) plus the gated hub-side adapter
+  `workbench/serving_audio.py` `DarkServingAudioTransport` to the Dark parakeet
+  STT `:30010` and kokoro TTS `:30011` serves — STT transcribe and TTS read-aloud
+  both verified 200 through the hub, no-leak, no-mutation.
+
+### Per-task live/blocked disposition (one line each)
+
+- `chat-first-voice:T006` — **chat LIVE** (multi-turn streamed chat rendered live
+  on Fast and Heavy routes; safe-metadata decisions; memory/cancel/live-region/
+  keyboard proven). **Voice splits:** the **request/response** STT-dictation
+  ("Hold to talk") + read-aloud ("Play audio") surfaces are now **LIVE** —
+  `voice_relay_service` is wired via `WORKBENCH_LIVE_SURFACES` plus a gated
+  hub-side adapter (`workbench/serving_audio.py` `DarkServingAudioTransport`) to
+  the Dark serves (parakeet STT `:30010`, kokoro TTS `:30011`, env-configured
+  `ANVIL_VOICE_STT_URL`/`TTS_URL`/models/`sample_rate`).
+  `POST /api/chat/voice/transcribe` → 200 with a real draft transcript, no
+  conversation turn (`turns=0`); the rendered-browser "Read this response aloud"
+  button fired `POST /api/chat/voice/speak` → 200, kokoro returned ~1.64 s PCM at
+  `sample_rate=24000`, the client honored the server sample-rate (fixes the
+  16 k/24 k garble class), playback clean, no message/conversation mutation;
+  no-leak verified live. The **realtime** speech-to-speech relay stays
+  **LIVE-PARTIAL** — connected end-to-end (transport; `claims_total=1`). The one
+  remaining voice datum for both surfaces is an **operator-confirmed audible
+  spoken round-trip** (browser mic needs a real user gesture). The interim
+  hub-side adapter's clean long-term replacement is a unified Anvil Serving
+  `/v1/audio/*` gateway
+  ([fakoli-serving#280](https://github.com/fakoli/anvil-serving/issues/280)) — an
+  improvement, not a blocker.
+- `preferences-configuration:T007` — **LIVE (personal scope)** — a real
+  `PUT /api/preferences/personal.voice_autoplay` 200 through the rendered UI,
+  zero-leak scans clean. **Blocked:** project-scope + real tailnet identity (dev
+  loopback override in use).
+- `advanced-model-playground:T007` — **LIVE-PARTIAL (mixed)** — persistence
+  surfaces + a live Sandbox `chat-fast` Responses turn. **Blocked:** the advanced
+  run/dispatch execution path stays unwired (503).
+- `plan-task-delivery:T007` — **LIVE-PARTIAL** — Explorer + human-titled Runs
+  rendered live. **Blocked:** a real Deliver (correctly fails closed
+  `deliver_no_session`, no bridge) and live PRD content (fakoli/anvil#178).
+- `reviewed-tools-plugins:T007` — **LIVE-PARTIAL** — digest-pinned reviewed
+  catalog served live. **Blocked:** skill-adoption-gate live-enable on a real
+  bridge.
+
+### Remaining blocked-live legs (precise)
+
+A **real tailnet identity**; a **live project bridge + Codex + GitHub** PR/merge
+and State-apply; the **advanced run/dispatch HTTP wiring**; **Explorer live PRD
+content** (behind [fakoli/anvil#178](https://github.com/fakoli/anvil/issues/178):
+anvil 0.6.0 advertises no operation catalog); an **operator-confirmed clean
+audible voice round-trip** (request/response dictation and realtime — mic needs a
+user gesture); and the **mini-side realtime voice proxy**.
+
+The request/response STT/TTS surfaces are no longer blocked — `voice_relay_service`
+is wired to the Dark serves via the interim `workbench/serving_audio.py` adapter.
+A unified Anvil Serving `/v1/audio/*` gateway
+([fakoli-serving#280](https://github.com/fakoli/anvil-serving/issues/280)) stays
+noted as the clean long-term replacement for that interim adapter (an improvement,
+not a blocker).
+
 ## 2026-07-21 FINAL RUN STATE — qualification finale (state-context-operations:T007)
 
 This is the authoritative closing state of the multi-PRD delivery run. The

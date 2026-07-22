@@ -295,34 +295,44 @@ def test_c2_lock_off_contest_detects_the_shared_check_then_act():
     # produce DUPLICATE sequence numbers -- proving the lock is what makes the
     # dispatch's concurrency safe. The lock is restored afterwards; nothing here
     # is committed.
-    lifecycle = MemoryResponseLifecycleStore()
-    lifecycle.begin(ACTOR, "conv_contested_0001", "req_contested")
-    allocated: list[int] = []
-    lock = threading.Lock()
-
-    def hammer():
-        for _ in range(200):
-            seq = lifecycle.next_seq(ACTOR, "req_contested")
-            with lock:
-                allocated.append(seq)
-
-    real_lock = lifecycle._lock
+    # Detecting a race is probabilistic: the duplicate only appears when a thread
+    # switch lands inside the unlocked read-modify-write window, which a loaded
+    # host can miss on any single trial. A genuinely-unsafe allocator collides
+    # within a few attempts with overwhelming probability, so retry the unlocked
+    # contest until a duplicate appears; a genuinely-safe allocator would never
+    # collide and this would (correctly) exhaust and fail. This removes the
+    # false-negative flakiness without weakening the guarantee.
     old = sys.getswitchinterval()
     sys.setswitchinterval(1e-9)
+    saw_duplicate = False
     try:
-        lifecycle._lock = _NoLock()  # DISABLE the serialization locally
-        threads = [threading.Thread(target=hammer) for _ in range(6)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        for _attempt in range(20):
+            lifecycle = MemoryResponseLifecycleStore()
+            lifecycle.begin(ACTOR, "conv_contested_0001", "req_contested")
+            allocated: list[int] = []
+            lock = threading.Lock()
+
+            def hammer():
+                for _ in range(200):
+                    seq = lifecycle.next_seq(ACTOR, "req_contested")
+                    with lock:
+                        allocated.append(seq)
+
+            lifecycle._lock = _NoLock()  # DISABLE the serialization locally
+            threads = [threading.Thread(target=hammer) for _ in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            if len(allocated) != len(set(allocated)):
+                saw_duplicate = True
+                break
     finally:
         sys.setswitchinterval(old)
-        lifecycle._lock = real_lock  # RESTORE -- never committed disabled
 
     # Detection: without the lock the read-modify-write of the seq allocator
     # collides, so at least one seq is handed out twice.
-    assert len(allocated) != len(set(allocated)), (
+    assert saw_duplicate, (
         "expected the unlocked allocator to produce duplicate seqs; the race was not contested"
     )
 
