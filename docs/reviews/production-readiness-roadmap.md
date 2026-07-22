@@ -435,19 +435,25 @@ backend capability map. All IA items depend on FREEZE-01 not blocking web work
 
 (EXT-178 is in §2 because it gates the loop.)
 
-### EXT-280 — Unified Anvil Serving `/v1/audio/*` gateway (fakoli/anvil-serving#280)
-- `type`: EXTERNAL-DEP · `priority`: P2 · `effort`: M
-- `problem`: Request/response voice is wired live via an interim hub-side adapter
-  (`workbench/serving_audio.py` `DarkServingAudioTransport`) to the Dark STT/TTS serves;
-  the clean long-term path is a unified Serving audio gateway (`SESSION-HANDOFF.md:78,
-  104-109`). Improvement, not a blocker.
-- `recommendation`: When #280 lands, replace the interim adapter with the unified
-  `/v1/audio/*` gateway.
-- `affected`: fakoli/anvil-serving (upstream); `workbench/serving_audio.py`,
-  `workbench/voice.py`.
-- `dependencies`: none (upstream)
+### EXT-280 — Unified Anvil Serving `/v1/audio/*` gateway (fakoli/anvil-serving#280) — DONE
+- `type`: EXTERNAL-DEP · `priority`: P2 · `effort`: M · `status`: RESOLVED
+- `problem`: Request/response voice was wired live via an interim hub-side adapter
+  (`workbench/serving_audio.py` `DarkServingAudioTransport`) to the raw Dark STT/TTS
+  serves; the clean path was a unified Serving audio gateway.
+- `resolution`: #280 is deployed on the router. `voice_relay_service` now uses the
+  stock `workbench/voice.py` `ServingVoiceTransport` over
+  `workbench/router.py` `voice_transcribe`/`voice_synthesize`, reaching ONLY the
+  router base (`ANVIL_ROUTER_BASE_URL` + `ANVIL_ROUTER_TOKEN`) via
+  `POST {base}/audio/transcriptions` (`purpose:"stt"`, `audio_b64`) and
+  `POST {base}/audio/speech` (`purpose:"tts"`, `response_format`). The interim
+  `DarkServingAudioTransport` is removed; the Voice-tab picker still reads
+  `ANVIL_VOICE_VOICES_URL` (#280 exposes no `/audio/voices`).
+- `affected`: `workbench/router.py`, `workbench/voice.py`, `workbench/deployment.py`,
+  `workbench/serving_audio.py` (now catalog-only), `.env.example`, `docker-compose.yml`.
 - `acceptance`: STT/TTS route through the unified `/v1/audio/*` gateway; the interim
   adapter is removed and voice STT/TTS still return 200 no-leak through the hub.
+  Verified: full pytest green, live gateway round-trip through `ServingVoiceTransport`
+  (STT → `{text,is_final,duration_ms}`; TTS → pcm16 @ 24000).
 
 ### EXT-281 — Realtime assistant transcript text (fakoli/anvil-serving#281)
 - `type`: EXTERNAL-DEP · `priority`: P2 · `effort`: M

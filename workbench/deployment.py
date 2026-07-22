@@ -24,10 +24,12 @@ Fail-closed discipline (an adversarial reviewer will check each):
   reviewed dependency, so the wired HTTP path is the real contract -- not a
   hand-built stand-in.
 
-``voice_relay_service`` IS wireable here: when named, it is constructed from a
-:class:`~workbench.serving_audio.DarkServingAudioTransport` over two operator-
-declared Anvil-Serving-managed audio serve URLs, authorized on the approver set
-and on authoritative ownership in the shared conversation store.
+``voice_relay_service`` IS wireable here: when named, it is constructed from the
+stock :class:`~workbench.voice.ServingVoiceTransport` over Anvil Serving's unified
+audio gateway (anvil-serving#280) -- the SAME operator-configured router base URL
+and bearer token the chat plane already uses (``ANVIL_ROUTER_BASE_URL`` /
+``ANVIL_ROUTER_TOKEN``), never a raw STT/TTS serve.  It is authorized on the
+approver set and on authoritative ownership in the shared conversation store.
 
 Surfaces this module deliberately does NOT wire (they have separate live gates,
 left unchanged): ``project_context_store``, ``run_context_store``,
@@ -63,8 +65,7 @@ from .conversation_store import (
 )
 from .delivery_projection import MemoryDeliveryProjectionStore
 from .conversation_transfer import ConversationTransferService
-from .serving_audio import DarkServingAudioTransport
-from .voice import MemoryVoiceEventLog, VoiceRelayService
+from .voice import MemoryVoiceEventLog, ServingVoiceTransport, VoiceRelayService
 from .models import MIN_PREF_AUDIT_KEY_BYTES
 from .preference_gates import PolicyGateService
 from .projection_seed import ProjectionSeedError, load_seed_dir
@@ -95,26 +96,20 @@ CHAT_ROUTES_ENV = "WORKBENCH_CHAT_ROUTES"
 #: ``WORKBENCH_LIVE_SURFACES``.
 DELIVERY_PROJECTION_SEED_ENV = "WORKBENCH_DELIVERY_PROJECTION_SEED"
 
-#: Operator-declared URLs for the two Anvil-Serving-managed Dark audio serves the
-#: ``voice_relay_service`` reaches (analogous to ``ANVIL_ROUTER_BASE_URL``): the
-#: STT serve (multipart upload -> ``{"text"}``) and the TTS serve (JSON -> raw
-#: PCM16).  Both are REQUIRED when ``voice_relay_service`` is named; an unset or
-#: non-http value fails the hub closed at startup.
-VOICE_STT_URL_ENV = "ANVIL_VOICE_STT_URL"
-VOICE_TTS_URL_ENV = "ANVIL_VOICE_TTS_URL"
-#: Serving-managed model identifiers passed through to the two serves.  Optional;
-#: they fall back to the reviewed deployment defaults below.
+#: Serving-managed model identifiers the ``voice_relay_service`` pins for the two
+#: audio purposes on the unified gateway (anvil-serving#280).  Optional; they fall
+#: back to the reviewed deployment defaults below.  There are deliberately NO
+#: raw-serve URL envs any more: the request/response voice path reaches ONLY the
+#: router base (``ANVIL_ROUTER_BASE_URL`` / ``ANVIL_ROUTER_TOKEN``).
 VOICE_STT_MODEL_ENV = "ANVIL_VOICE_STT_MODEL"
 VOICE_TTS_MODEL_ENV = "ANVIL_VOICE_TTS_MODEL"
-#: The TTS serve's native PCM16 sample rate, reported to the browser so read-aloud
-#: plays back at the correct rate (a wrong rate garbles playback).  Optional.
-VOICE_TTS_SAMPLE_RATE_ENV = "ANVIL_VOICE_TTS_SAMPLE_RATE"
 
-#: Reviewed deployment defaults for the two Serving-managed audio models and the
-#: TTS sample rate.  These are model/rate configuration, not provider hosts.
+#: Reviewed deployment defaults for the two Serving-managed audio models.  These
+#: are model configuration, not provider hosts.  (The TTS sample rate is no longer
+#: a hub concern: the #280 gateway REPORTS ``sample_rate`` on each speech response,
+#: which the relay forwards to the browser so read-aloud is not garbled.)
 _DEFAULT_VOICE_STT_MODEL = "tdt-0.6b-v3"
 _DEFAULT_VOICE_TTS_MODEL = "kokoro"
-_DEFAULT_VOICE_TTS_SAMPLE_RATE = 24000
 
 #: The exact injectable-surface names ``WORKBENCH_LIVE_SURFACES`` may name.  A
 #: name outside this set fails closed at startup.
@@ -251,57 +246,34 @@ def _load_plugin_catalog(env: Mapping[str, str]) -> Mapping[str, Any]:
     return document
 
 
-def _voice_serve_url(env: Mapping[str, str], name: str) -> str:
-    """Resolve a required Anvil-Serving audio serve URL, fail closed if unusable."""
-    url = env.get(name, "").strip()
-    if not url or not (url.startswith("http://") or url.startswith("https://")):
-        raise DeploymentConfigError(
-            f"voice_relay_service requires a valid {name} (an http(s) URL for an "
-            "Anvil-Serving-managed audio serve); "
-            + ("it is unset" if not url else "its value is not an http(s) URL")
-        )
-    return url
-
-
-def _voice_tts_sample_rate(env: Mapping[str, str]) -> int:
-    """Resolve the TTS serve's PCM16 sample rate; fail closed on a bad value."""
-    raw = env.get(VOICE_TTS_SAMPLE_RATE_ENV, "").strip()
-    if not raw:
-        return _DEFAULT_VOICE_TTS_SAMPLE_RATE
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise DeploymentConfigError(
-            f"{VOICE_TTS_SAMPLE_RATE_ENV} must be a positive integer sample rate"
-        ) from exc
-    if value <= 0 or value > 192_000:
-        raise DeploymentConfigError(
-            f"{VOICE_TTS_SAMPLE_RATE_ENV} must be a positive, sane audio sample rate"
-        )
-    return value
-
-
 def _load_voice_relay_service(
     env: Mapping[str, str],
     settings: Settings,
     conversation_store: ConversationStore,
 ) -> VoiceRelayService:
-    """Build the STT/TTS relay over the two Dark audio serves; fail closed.
+    """Build the STT/TTS relay over Anvil Serving's unified audio gateway (#280).
 
-    The relay authorizes on the operator-declared approver set AND on authoritative
-    ownership of the target conversation in the SAME shared conversation store the
-    chat endpoints use, so an actor can only relay voice for a conversation they own.
-    A missing/invalid serve URL fails the hub closed at startup rather than serving
-    a per-request 503 an operator cannot tell apart from "voice not configured".
+    The transport reaches ONLY the operator-configured router base URL and bearer
+    token -- the SAME ``ANVIL_ROUTER_BASE_URL`` / ``ANVIL_ROUTER_TOKEN`` the chat
+    plane uses -- never a raw STT/TTS serve.  The relay authorizes on the
+    operator-declared approver set AND on authoritative ownership of the target
+    conversation in the SAME shared conversation store the chat endpoints use, so
+    an actor can only relay voice for a conversation they own.
+
+    A missing router base/token fails the hub closed at startup rather than serving
+    a per-request 502 an operator cannot tell apart from "voice not configured".
     """
-    stt_url = _voice_serve_url(env, VOICE_STT_URL_ENV)
-    tts_url = _voice_serve_url(env, VOICE_TTS_URL_ENV)
+    base_url = (settings.anvil_router_base_url or "").strip()
+    token = (settings.anvil_router_token or "").strip()
+    if not base_url or not token:
+        raise DeploymentConfigError(
+            "voice_relay_service relays through Anvil Serving's unified audio "
+            "gateway (anvil-serving#280); it requires the router base URL and token "
+            "(set ANVIL_ROUTER_BASE_URL and ANVIL_ROUTER_TOKEN)"
+        )
     stt_model = env.get(VOICE_STT_MODEL_ENV, "").strip() or _DEFAULT_VOICE_STT_MODEL
     tts_model = env.get(VOICE_TTS_MODEL_ENV, "").strip() or _DEFAULT_VOICE_TTS_MODEL
-    transport = DarkServingAudioTransport(
-        stt_url, tts_url, stt_model, tts_model,
-        sample_rate=_voice_tts_sample_rate(env),
-    )
+    transport = ServingVoiceTransport(base_url, token, stt_model, tts_model)
 
     def scope_authorized(actor: str, conversation_id: str) -> bool:
         # Authoritative ownership through the shared store: a conversation the

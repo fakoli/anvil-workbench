@@ -235,3 +235,105 @@ def test_t010_wired_conversation_search_fails_closed_without_service():
     with TestClient(_t010r_app(with_service=False)) as client:
         r = client.get("/api/conversation-search?query=x", headers={"X-Workbench-Actor": "operator"})
     assert r.status_code == 503
+
+
+# =========================================================================== #
+# Unified audio gateway (anvil-serving#280): voice_transcribe / voice_synthesize
+# send the EXACT verified wire contract to the router base and parse the gateway
+# response. Stubs ``router.urlopen`` so no network is touched.
+# =========================================================================== #
+
+import base64 as _gw_b64
+import json as _gw_json
+
+
+class _GwResponse:
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def read(self, n: int = -1) -> bytes:
+        return self._body if (n is None or n < 0) else self._body[:n]
+
+
+def _stub_router_urlopen(monkeypatch, *, status=200, body=b"", capture=None):
+    def fake(request, timeout=None):  # noqa: ANN001
+        if capture is not None:
+            capture.append(request)
+        if status != 200:
+            from urllib.error import HTTPError
+            raise HTTPError(request.full_url, status, "boom: LEAK-MARKER", {}, None)
+        return _GwResponse(status, body)
+
+    monkeypatch.setattr(router, "urlopen", fake)
+
+
+def test_voice_transcribe_sends_280_stt_contract_and_parses_response(monkeypatch):
+    captured: list = []
+    _stub_router_urlopen(monkeypatch, body=_gw_json.dumps({
+        "text": "Yeah.", "is_final": True, "duration_ms": 500,
+        "model": "tdt-0.6b-v3", "request_id": "aud_1", "latency_ms": 90,
+    }).encode(), capture=captured)
+
+    audio_b64 = _gw_b64.b64encode(b"RIFF____WAVE" + b"\x00" * 32).decode()
+    result = router.voice_transcribe(
+        "http://serving:8000/v1", "tok", model="tdt-0.6b-v3",
+        audio_b64=audio_b64, audio_format="wav", is_final=True,
+    )
+    # Parsed the gateway response shape.
+    assert result == {"text": "Yeah.", "is_final": True, "duration_ms": 500}
+
+    # Sent the EXACT #280 STT contract: purpose + audio_b64 + format + is_final.
+    request = captured[0]
+    assert request.full_url == "http://serving:8000/v1/audio/transcriptions"
+    body = _gw_json.loads(request.data.decode())
+    assert body == {
+        "purpose": "stt", "model": "tdt-0.6b-v3",
+        "audio_b64": audio_b64, "format": "wav", "is_final": True,
+    }
+    assert "audio" not in body  # not the retired raw-serve field
+    assert dict(request.header_items())["Authorization"] == "Bearer tok"
+
+
+def test_voice_synthesize_sends_280_tts_contract_and_parses_response(monkeypatch):
+    captured: list = []
+    pcm_b64 = _gw_b64.b64encode(b"\x01\x02" * 40).decode()
+    _stub_router_urlopen(monkeypatch, body=_gw_json.dumps({
+        "audio_b64": pcm_b64, "format": "pcm16", "sample_rate": 24000,
+        "model": "kokoro", "request_id": "aud_2", "latency_ms": 68,
+    }).encode(), capture=captured)
+
+    result = router.voice_synthesize(
+        "http://serving:8000/v1", "tok", model="kokoro",
+        text="read this back", output_format="pcm16",
+    )
+    # Parsed audio_b64 (NOT the retired "audio" key) + format + reported sample_rate.
+    assert result == {"audio_b64": pcm_b64, "format": "pcm16", "sample_rate": 24000}
+
+    request = captured[0]
+    assert request.full_url == "http://serving:8000/v1/audio/speech"
+    body = _gw_json.loads(request.data.decode())
+    assert body == {
+        "purpose": "tts", "model": "kokoro",
+        "input": "read this back", "response_format": "pcm16",
+    }
+    assert "format" not in body  # the request field is response_format on the gateway
+
+
+def test_voice_transcribe_fails_closed_on_non_200(monkeypatch):
+    import pytest
+    _stub_router_urlopen(monkeypatch, status=502)
+    with pytest.raises(router.RouterError) as exc:
+        router.voice_transcribe(
+            "http://serving:8000/v1", "tok", model="m",
+            audio_b64="QUJD", audio_format="wav", is_final=True,
+        )
+    # The RouterError names the status; the transport wrapper maps it to a fixed
+    # VoiceServingError upstream (proven in test_harness_kernel).
+    assert "502" in str(exc.value)

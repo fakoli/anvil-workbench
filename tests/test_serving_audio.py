@@ -1,18 +1,20 @@
-"""Hermetic proofs for the Dark Serving audio adapter (workbench.serving_audio).
+"""Hermetic proofs for the Voice-tab voice-catalog reader (workbench.serving_audio).
 
-The adapter is the ONLY place that speaks the two real Dark serve protocols:
-the STT serve's multipart-upload -> ``{"text"}`` contract and the TTS serve's
-JSON -> raw-PCM16 contract. These tests monkeypatch the stdlib ``urlopen`` the
-adapter uses so NOTHING touches a real serve, then assert:
+The request/response STT/TTS RELAY no longer lives in this module: it goes through
+Anvil Serving's unified audio gateway (anvil-serving#280) via
+``workbench.voice.ServingVoiceTransport`` over the router base URL (proven in
+``tests/test_deployment_wiring.py`` and ``tests/test_harness_kernel.py``).  The
+interim ``DarkServingAudioTransport`` that spoke the two raw Dark serves' wire
+protocols has been retired.
 
-* the request/response mapping in BOTH directions matches the real contracts;
-* a non-200 / oversize / unparseable serve answer fails closed as a fixed,
-  non-leaking ``VoiceServingError`` (no audio, text, or upstream body echoed);
-* the returned draft is credential-scrubbed.
+What remains here is the voice PICKER's catalog read (``fetch_voice_catalog``),
+which #280 deliberately does NOT supersede (the gateway exposes no ``/audio/voices``).
+These tests monkeypatch the stdlib ``urlopen`` the reader uses so nothing touches a
+real serve, then assert the happy-path mapping, credential/bound scrubbing, and
+fail-closed + SSRF hardening.
 """
 from __future__ import annotations
 
-import base64
 import json
 
 import pytest
@@ -20,11 +22,10 @@ import pytest
 from urllib.error import HTTPError
 
 import workbench.serving_audio as sa
-from workbench.serving_audio import DarkServingAudioTransport
-from workbench.voice import MAX_SYNTH_AUDIO_BYTES, VoiceServingError
+from workbench.serving_audio import fetch_voice_catalog
+from workbench.voice import VoiceServingError
 
-_STT_URL = "http://serving-stt.internal:30010/v1/audio/transcriptions"
-_TTS_URL = "http://serving-tts.internal:30011/v1/audio/speech"
+_VOICES_URL = "http://serving-tts.internal:30011/v1/audio/voices"
 
 
 class _FakeResponse:
@@ -55,143 +56,70 @@ def _patch_urlopen(monkeypatch, *, status=200, body=b"", raises=None, capture=No
     monkeypatch.setattr(sa, "_urlopen", fake)
 
 
-def _transport() -> DarkServingAudioTransport:
-    return DarkServingAudioTransport(
-        _STT_URL, _TTS_URL, "tdt-model", "kokoro-model", sample_rate=24000,
-    )
+# --- catalog happy path + shaping --------------------------------------------
 
 
-# --- STT (parakeet-shaped multipart -> {"text"}) -----------------------------
-
-
-def test_transcribe_maps_multipart_upload_to_the_serve_text(monkeypatch):
+def test_fetch_voice_catalog_maps_mapping_and_string_entries(monkeypatch):
     captured: list = []
-    _patch_urlopen(monkeypatch, status=200, body=json.dumps({"text": "hello there"}).encode(), capture=captured)
-    audio = b"RIFF____WAVEfmt " + b"\x00" * 64  # a wav-ish bounded blob
-    result = _transport().transcribe({
-        "audio_b64": base64.b64encode(audio).decode(), "audio_format": "wav", "is_final": True,
-    })
-    # The mapping the relay expects.
-    assert result["text"] == "hello there"
-    assert result["is_final"] is True
-    assert isinstance(result["duration_ms"], int) and result["duration_ms"] >= 0
-
-    # The request really was a multipart upload to the STT serve carrying the
-    # model field and a file part (the real parakeet contract).
+    _patch_urlopen(monkeypatch, body=json.dumps(
+        {"voices": [{"id": "af_heart", "name": "Heart"}, "bm_george", {"id": "af_heart"}]}
+    ).encode(), capture=captured)
+    catalog = fetch_voice_catalog(_VOICES_URL)
+    # A mapping entry keeps id + name; a bare string becomes an id; the duplicate is
+    # de-duplicated.
+    assert catalog == [{"id": "af_heart", "name": "Heart"}, {"id": "bm_george"}]
     request = captured[0]
-    assert request.full_url == _STT_URL
-    assert request.get_method() == "POST"
-    ctype = dict(request.header_items())["Content-type"]
-    assert ctype.startswith("multipart/form-data; boundary=")
-    body = request.data
-    assert b'name="model"' in body and b"tdt-model" in body
-    assert b'name="file"; filename="audio.wav"' in body
-    assert audio in body  # the raw audio rode as the file part
+    assert request.full_url == _VOICES_URL
+    assert request.get_method() == "GET"
 
 
-def test_transcribe_passes_through_interim_flag(monkeypatch):
-    _patch_urlopen(monkeypatch, status=200, body=json.dumps({"text": "partial"}).encode())
-    result = _transport().transcribe({
-        "audio_b64": base64.b64encode(b"x" * 40).decode(), "audio_format": "wav", "is_final": False,
-    })
-    assert result["is_final"] is False
-    assert result["text"] == "partial"
+def test_fetch_voice_catalog_accepts_a_bare_list(monkeypatch):
+    _patch_urlopen(monkeypatch, body=json.dumps(["af_heart", "bm_george"]).encode())
+    assert fetch_voice_catalog(_VOICES_URL) == [{"id": "af_heart"}, {"id": "bm_george"}]
 
 
-def test_transcribe_scrubs_a_credential_in_the_returned_draft(monkeypatch):
-    # A speaker who dictated a secret must not have it ride the draft back out.
-    _patch_urlopen(monkeypatch, status=200, body=json.dumps({"text": "the token: supersecretvalue123 ok"}).encode())
-    result = _transport().transcribe({
-        "audio_b64": base64.b64encode(b"y" * 40).decode(), "audio_format": "wav", "is_final": True,
-    })
-    assert "supersecretvalue123" not in result["text"]
-    assert "[REDACTED]" in result["text"]
+def test_fetch_voice_catalog_scrubs_a_credential_in_an_id_or_name(monkeypatch):
+    # A serve must not be able to smuggle a secret out through a voice label.
+    _patch_urlopen(monkeypatch, body=json.dumps(
+        {"voices": [{"id": "ok_voice", "name": "token: supersecretvalue123"}]}
+    ).encode())
+    catalog = fetch_voice_catalog(_VOICES_URL)
+    blob = json.dumps(catalog)
+    assert "supersecretvalue123" not in blob
+    assert "[REDACTED]" in blob
 
 
-def test_transcribe_fails_closed_on_non_200(monkeypatch):
-    marker = "UPSTREAM-STT-LEAK-MARKER-tok_abcdefgh"
-    err = HTTPError(_STT_URL, 500, "install failed: " + marker, {}, None)
+# --- fail-closed + SSRF hardening --------------------------------------------
+
+
+def test_fetch_voice_catalog_rejects_a_non_http_url():
+    with pytest.raises(VoiceServingError):
+        fetch_voice_catalog("ftp://nope")
+
+
+def test_fetch_voice_catalog_fails_closed_on_non_200(monkeypatch):
+    marker = "UPSTREAM-VOICES-LEAK-MARKER"
+    err = HTTPError(_VOICES_URL, 500, "boom: " + marker, {}, None)
     _patch_urlopen(monkeypatch, raises=err)
     with pytest.raises(VoiceServingError) as exc:
-        _transport().transcribe({
-            "audio_b64": base64.b64encode(b"z" * 40).decode(), "audio_format": "wav", "is_final": True,
-        })
-    # The fixed public detail never carries the upstream body.
+        fetch_voice_catalog(_VOICES_URL)
     assert marker not in str(exc.value)
     assert str(exc.value) == "voice relay is unavailable"
 
 
-def test_transcribe_fails_closed_on_unparseable_json(monkeypatch):
-    _patch_urlopen(monkeypatch, status=200, body=b"not json at all")
+def test_fetch_voice_catalog_fails_closed_on_unparseable_json(monkeypatch):
+    _patch_urlopen(monkeypatch, body=b"not json at all")
     with pytest.raises(VoiceServingError):
-        _transport().transcribe({
-            "audio_b64": base64.b64encode(b"z" * 40).decode(), "audio_format": "wav", "is_final": True,
-        })
+        fetch_voice_catalog(_VOICES_URL)
 
 
-def test_transcribe_rejects_empty_or_invalid_audio(monkeypatch):
-    _patch_urlopen(monkeypatch, status=200, body=json.dumps({"text": "x"}).encode())
-    with pytest.raises(VoiceServingError):
-        _transport().transcribe({"audio_b64": "", "audio_format": "wav", "is_final": True})
-    with pytest.raises(VoiceServingError):
-        _transport().transcribe({"audio_b64": "!!not base64!!", "audio_format": "wav", "is_final": True})
-
-
-# --- TTS (kokoro-shaped JSON -> raw PCM16) -----------------------------------
-
-
-def test_synthesize_posts_json_and_maps_raw_pcm_to_b64(monkeypatch):
-    captured: list = []
-    pcm = b"\x01\x02\x03\x04" * 32  # raw PCM16 bytes, NOT json
-    _patch_urlopen(monkeypatch, status=200, body=pcm, capture=captured)
-    result = _transport().synthesize({"text": "read this aloud", "output_format": "pcm16"})
-    # The mapping the relay expects: base64 of the raw PCM, a pcm16 format, and
-    # the configured serve sample rate (24000 for kokoro, NOT the 16k capture rate).
-    assert base64.b64decode(result["audio_b64"]) == pcm
-    assert result["format"] == "pcm16"
-    assert result["sample_rate"] == 24000
-
-    # The request was a JSON POST to the TTS serve asking for raw PCM.
-    request = captured[0]
-    assert request.full_url == _TTS_URL
-    assert dict(request.header_items())["Content-type"] == "application/json"
-    payload = json.loads(request.data.decode())
-    assert payload == {"model": "kokoro-model", "input": "read this aloud", "response_format": "pcm"}
-
-
-def test_synthesize_fails_closed_over_the_audio_ceiling(monkeypatch):
-    _patch_urlopen(monkeypatch, status=200, body=b"\x00" * (MAX_SYNTH_AUDIO_BYTES + 8))
-    with pytest.raises(VoiceServingError):
-        _transport().synthesize({"text": "too much audio", "output_format": "pcm16"})
-
-
-def test_synthesize_fails_closed_on_empty_body(monkeypatch):
-    _patch_urlopen(monkeypatch, status=200, body=b"")
-    with pytest.raises(VoiceServingError):
-        _transport().synthesize({"text": "silence", "output_format": "pcm16"})
-
-
-def test_synthesize_fails_closed_on_non_200(monkeypatch):
-    marker = "UPSTREAM-TTS-LEAK-MARKER"
-    err = HTTPError(_TTS_URL, 503, marker, {}, None)
-    _patch_urlopen(monkeypatch, raises=err)
-    with pytest.raises(VoiceServingError) as exc:
-        _transport().synthesize({"text": "hello", "output_format": "pcm16"})
-    assert marker not in str(exc.value)
-
-
-# --- SSRF hardening: redirects are refused (never followed) -------------------
-
-
-def test_transcribe_refuses_a_redirect_from_the_serve(monkeypatch):
-    # A compromised serve answering 3xx must NOT re-aim the audio POST. The
-    # redirect-free opener turns the 3xx into an HTTPError -> fixed VoiceServingError.
-    err = HTTPError(_STT_URL, 302, "Found", {"Location": "http://attacker.example/steal"}, None)
+def test_fetch_voice_catalog_refuses_a_redirect_from_the_serve(monkeypatch):
+    # A compromised serve answering 3xx must NOT re-aim the GET. The redirect-free
+    # opener turns the 3xx into an HTTPError -> fixed VoiceServingError.
+    err = HTTPError(_VOICES_URL, 302, "Found", {"Location": "http://attacker.example/steal"}, None)
     _patch_urlopen(monkeypatch, raises=err)
     with pytest.raises(VoiceServingError):
-        _transport().transcribe({
-            "audio_b64": base64.b64encode(b"z" * 40).decode(), "audio_format": "wav", "is_final": True,
-        })
+        fetch_voice_catalog(_VOICES_URL)
 
 
 def test_audio_opener_has_no_redirect_following():

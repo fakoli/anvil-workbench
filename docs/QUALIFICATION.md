@@ -110,26 +110,33 @@ current `main`. Injectable surfaces were wired live through the
     yet been operator-confirmed post-fix**. This is the one remaining
     human-in-the-loop datum for the realtime surface.
   - **Request/response STT dictation + read-aloud: LIVE.** `voice_relay_service`
-    is now wired via `WORKBENCH_LIVE_SURFACES` plus a gated hub-side adapter
-    (`workbench/serving_audio.py` `DarkServingAudioTransport`) to the Dark serves
-    (parakeet STT `:30010`, kokoro TTS `:30011`), env-configured
-    (`ANVIL_VOICE_STT_URL`/`TTS_URL`/models/`sample_rate`). Observed live through
-    the hub against real serves:
-    - **STT:** `POST /api/chat/voice/transcribe` → parakeet → **200** with a real
-      draft transcript; STT creates **no** conversation turn (verified `turns=0`).
+    is wired via `WORKBENCH_LIVE_SURFACES` through **Anvil Serving's unified audio
+    gateway** ([anvil-serving#280](https://github.com/fakoli/anvil-serving/issues/280)),
+    using the stock `workbench/voice.py` `ServingVoiceTransport` over
+    `workbench/router.py` `voice_transcribe`/`voice_synthesize`. It reaches ONLY the
+    router base (`ANVIL_ROUTER_BASE_URL` + `ANVIL_ROUTER_TOKEN`; served model ids
+    `ANVIL_VOICE_STT_MODEL`/`ANVIL_VOICE_TTS_MODEL`) — never a raw STT/TTS serve.
+    Observed live through the hub against the running router:
+    - **STT:** `POST /api/chat/voice/transcribe` → `{base}/audio/transcriptions`
+      (`purpose:"stt"`, `audio_b64`, `format`, `is_final`) → **200** with a real
+      draft transcript (`{text,is_final,duration_ms}`); STT creates **no**
+      conversation turn (verified `turns=0`).
     - **TTS read-aloud:** the rendered-browser "Read this response aloud" button on
-      an assistant turn fired `POST /api/chat/voice/speak` → **200**; kokoro
-      returned ~1.64 s PCM at `sample_rate=24000`; the client honors the server
-      `sample_rate` (fixing the 16 k/24 k garble class); playback succeeded with no
-      console errors; TTS mutated **no** message/conversation state (byte-identical).
+      an assistant turn fired `POST /api/chat/voice/speak` → `{base}/audio/speech`
+      (`purpose:"tts"`, `input`, `response_format:"pcm16"`) → **200**; the gateway
+      returned PCM at `sample_rate=24000` (reported on the response); the client
+      honors the server `sample_rate` (fixing the 16 k/24 k garble class); playback
+      succeeded with no console errors; TTS mutated **no** message/conversation
+      state (byte-identical).
     - **No leak, LIVE:** after real transcribe + speak traffic, the conversation
       record contains no raw audio bytes/base64 blob, and the api logs are
       content-free (200s only, no audio).
-    - **Interim adapter note:** the hub-side `DarkServingAudioTransport` bridges the
-      split raw Dark STT/TTS serves (kokoro `:30011` returns raw `audio/pcm`; the
-      hub audio contract is JSON `{audio_b64}`). A unified Anvil Serving
-      `/v1/audio/*` gateway ([fakoli-serving#280](https://github.com/fakoli/anvil-serving/issues/280))
-      is the clean long-term replacement for this interim adapter.
+    - **#280 switch (was interim adapter):** the earlier hub-side
+      `DarkServingAudioTransport` that spoke the split raw Dark serves directly
+      (parakeet `:30010` multipart, kokoro `:30011` raw PCM) has been **retired**
+      now that #280 is deployed on the router; the boundary deviation #280 tracked
+      is closed. The Voice-tab voice **picker** still sources its list from the TTS
+      serve's `/audio/voices` (`ANVIL_VOICE_VOICES_URL`), which #280 does not expose.
   - **The one remaining voice datum (both surfaces):** an **operator-confirmed
     audible spoken round-trip** — for request/response, an audible spoken
     **dictation** turn end-to-end; for realtime, an audible speech-to-speech turn.
