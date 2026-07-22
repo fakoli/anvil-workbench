@@ -6,6 +6,7 @@ only to an operator-configured Anvil Serving URL; it has no provider fallback.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -71,6 +72,151 @@ def route_decisions(base_url: str, token: str, limit: int = 50) -> list[dict[str
         "correlation_id",
     }
     return [{key: redact_value(row[key]) for key in allowed if key in row} for row in rows if isinstance(row, dict)]
+
+
+# ---------------------------------------------------------------------------
+# Backend model-health signals (top-right debug indicator).
+#
+# Both readers below talk ONLY to the operator-configured Anvil Serving ROUTER
+# surface -- the SAME ``ANVIL_ROUTER_BASE_URL`` + ``ANVIL_ROUTER_TOKEN`` every
+# other read here uses -- through the bounded, redirect-free :func:`_request`.
+# Neither embeds a raw model-serve host or port: the router is the only place the
+# hub reaches, so a per-tier status is DERIVED from the router's own decision log,
+# never probed against a serve directly (that boundary deviation was removed in
+# anvil-serving#280 and would be flagged by the no-raw-provider scan).
+# ---------------------------------------------------------------------------
+
+#: The router serves ``/health`` at its ROOT, while the chat/decisions routes live
+#: under ``/v1`` (``ANVIL_ROUTER_BASE_URL`` ends in ``/v1``).  Derive the root by
+#: dropping a trailing ``/v1`` from the OPERATOR-configured base -- a pure string
+#: transform of the configured URL, never a fabricated or embedded host.
+def _router_root(base_url: str) -> str:
+    trimmed = (base_url or "").rstrip("/")
+    if trimmed.endswith("/v1"):
+        trimmed = trimmed[: -len("/v1")]
+    return trimmed
+
+
+_ROUTER_HEALTH_PATH = "/health"
+_MAX_HEALTH_ROUTES = 64
+_MAX_HEALTH_ROUTE_CHARS = 120
+_MAX_SIGNAL_RECORDS = 100
+_MAX_ATTEMPTS_PER_RECORD = 16
+_MAX_SIGNAL_TOKEN_CHARS = 64
+_MAX_SIGNAL_REASON_CHARS = 120
+_MAX_SIGNAL_COUNT = 1_000_000
+#: A safe route/tier/work-class token: the router emits short lowercase-ish path
+#: and id tokens (``/v1/audio/speech``, ``heavy-local``, ``chat-fast``); anything
+#: longer or shaped like a URL/secret is length-clamped, and the endpoint scrubs
+#: the whole payload again at the last hop.
+_SIGNAL_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,63}$")
+
+
+def _safe_token(value: Any) -> str | None:
+    """A bounded, safe short token, or ``None`` when the value is not one."""
+    if isinstance(value, str) and _SIGNAL_TOKEN.match(value):
+        return value[:_MAX_SIGNAL_TOKEN_CHARS]
+    return None
+
+
+def _safe_count_map(value: Any) -> dict[str, int]:
+    """A bounded ``{safe_token: non-negative int}`` projection of a totals map."""
+    out: dict[str, int] = {}
+    if isinstance(value, dict):
+        for key, count in value.items():
+            token = _safe_token(key)
+            if token is not None and isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= _MAX_SIGNAL_COUNT:
+                out[token] = count
+    return out
+
+
+def router_health(base_url: str, token: str) -> dict[str, Any]:
+    """Read the router's own ``/health`` (liveness + registered route families).
+
+    Talks only to the operator-configured router root (``base`` minus ``/v1``) via
+    the bounded :func:`_request`.  Returns a small, safe projection --
+    ``{"status", "routes": [...]}`` -- keeping only the router's up/down status and
+    which route families are registered (the ``/v1/audio/*`` presence is the voice
+    gateway liveness signal).  A malformed body raises :class:`RouterError` so the
+    caller can degrade the router dot to ``down`` honestly.
+    """
+    value = _request(_router_root(base_url), token, "GET", _ROUTER_HEALTH_PATH)
+    if not isinstance(value, dict):
+        raise RouterError("Anvil Serving health response has an unexpected shape")
+    status = value.get("status")
+    routes = value.get("routes")
+    safe_routes: list[str] = []
+    if isinstance(routes, list):
+        for route in routes[:_MAX_HEALTH_ROUTES]:
+            if isinstance(route, str) and route:
+                safe_routes.append(route[:_MAX_HEALTH_ROUTE_CHARS])
+    return {
+        "status": status[:_MAX_SIGNAL_TOKEN_CHARS] if isinstance(status, str) else None,
+        "routes": safe_routes,
+    }
+
+
+def route_tier_signals(base_url: str, token: str, limit: int = 50) -> dict[str, Any]:
+    """Read the router decision log as bounded, safe per-tier/work-class signals.
+
+    Talks only to the operator-configured router base (``{base}/decisions``, i.e.
+    ``{router}/v1/decisions``) via :func:`_request`.  Unlike :func:`route_decisions`
+    (which projects run-correlation fields) this keeps exactly the fields a tier/
+    work-class health derivation needs: each record's ``work_class`` and
+    ``created_at`` plus its ``attempts: [{tier_id, outcome, verifier_passed,
+    reason}]`` (the router's own ``verify_reason`` is credential/endpoint-scrubbed
+    and bounded), plus the aggregate ``totals``.  Everything is length-bounded and
+    the endpoint scrubs the whole payload again at the last hop, so no token, URL,
+    host, or path can ride out.  This is a PASSIVE read of the router's routing
+    history -- never a probe against a model serve.
+    """
+    value = _request(base_url, token, "GET", f"/decisions?limit={max(1, min(limit, 100))}")
+    records_raw: Any = []
+    totals_raw: Any = {}
+    if isinstance(value, dict):
+        records_raw = value.get("records", value.get("decisions", []))
+        totals_raw = value.get("totals", {})
+    elif isinstance(value, list):
+        records_raw = value
+    if not isinstance(records_raw, list):
+        raise RouterError("Anvil Serving decisions response has an unexpected shape")
+
+    records: list[dict[str, Any]] = []
+    for row in records_raw[:_MAX_SIGNAL_RECORDS]:
+        if not isinstance(row, dict):
+            continue
+        attempts: list[dict[str, Any]] = []
+        raw_attempts = row.get("attempts", [])
+        if isinstance(raw_attempts, list):
+            for attempt in raw_attempts[:_MAX_ATTEMPTS_PER_RECORD]:
+                if not isinstance(attempt, dict):
+                    continue
+                tier_id = _safe_token(attempt.get("tier_id"))
+                outcome = _safe_token(attempt.get("outcome"))
+                if tier_id is None and outcome is None:
+                    continue
+                verifier = attempt.get("verifier_passed")
+                reason = attempt.get("verify_reason")
+                attempts.append({
+                    "tier_id": tier_id,
+                    "outcome": outcome,
+                    "verifier_passed": verifier if isinstance(verifier, bool) else None,
+                    "reason": redact_config_text(reason)[:_MAX_SIGNAL_REASON_CHARS]
+                    if isinstance(reason, str) and reason else None,
+                })
+        records.append({
+            "work_class": _safe_token(row.get("work_class")),
+            "created_at": _safe_token(row.get("created_at") or row.get("timestamp")),
+            "attempts": attempts,
+        })
+
+    totals: dict[str, Any] = {}
+    if isinstance(totals_raw, dict):
+        totals = {
+            "served_tiers": _safe_count_map(totals_raw.get("served_tiers")),
+            "attempt_outcomes": _safe_count_map(totals_raw.get("attempt_outcomes")),
+        }
+    return {"totals": totals, "records": records}
 
 
 #: The two provenance values a route-resolution mark distinguishes: a route the

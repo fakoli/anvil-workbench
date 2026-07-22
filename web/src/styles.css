@@ -699,3 +699,39 @@
   .project-header h1,.workspace-view h1,.empty-view h1{font-size:22px}
   .empty-delivery h1{font-size:24px}
 }
+
+/* --- Top-right backend-health indicator (debug dots) ------------------------
+   A small cluster of five status pips in the shared top bar. Status is encoded by
+   BOTH a colorblind-safe glyph and a color tone (ok/warn/down/unknown). It stays
+   genuinely small and quiet; the detail lives in a popover on activation. */
+.mh{position:relative;display:inline-flex}
+.mh-cluster{display:inline-flex;align-items:center;gap:7px;border:1px solid #223339!important;background:#0a1417;border-radius:20px;padding:5px 9px}
+.mh-cluster:hover{border-color:#33565c!important}
+.mh-cluster:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+.mh-pip{display:inline-flex;flex-direction:column;align-items:center;gap:2px;line-height:1}
+.mh-dot{width:13px;height:13px;border-radius:50%;display:grid;place-items:center;font-family:'DM Mono',monospace;font-size:9px;font-weight:800;color:#071013;background:var(--dim)}
+.mh-tag{font-family:'DM Mono',monospace;font-size:7px;letter-spacing:.02em;color:#5f7378}
+.mh-ok .mh-dot,.mh-ok.mh-word{background:var(--green)}
+.mh-warn .mh-dot{background:var(--amber)}
+.mh-down .mh-dot{background:#e88f8f}
+.mh-unknown .mh-dot{background:#63767b;color:#0c181c}
+.mh-live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.mh-popover{position:absolute;right:0;top:34px;width:288px;z-index:7;border:1px solid #32544f;background:#0d1b1e;box-shadow:0 16px 35px #0009;border-radius:9px;padding:13px 14px;text-align:left}
+.mh-popover:focus{outline:none}
+.mh-pop-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.mh-pop-head b{font-size:11px;color:#e4efec;letter-spacing:-.01em}
+.mh-refresh{border:1px solid #32665e!important;background:#13342f;color:#b9f4e5!important;border-radius:5px;padding:5px 9px;font-size:9px;font-weight:700}
+.mh-refresh:disabled{opacity:.6;cursor:default}
+.mh-list{list-style:none;margin:0;padding:0;display:grid;gap:9px}
+.mh-row{display:grid;grid-template-columns:15px 1fr;gap:9px;align-items:start}
+.mh-row .mh-dot{width:15px;height:15px;font-size:10px;margin-top:1px}
+.mh-row-body{min-width:0}
+.mh-row-head{display:flex;align-items:center;gap:8px}
+.mh-row-head b{font-size:11px;color:#dbeae7}
+.mh-word{font-family:'DM Mono',monospace;font-size:8px;text-transform:uppercase;letter-spacing:.05em;color:#8ca49b}
+.mh-word.mh-ok{color:var(--green)}.mh-word.mh-warn{color:var(--amber)}.mh-word.mh-down{color:#e88f8f}.mh-word.mh-unknown{color:#8199a0}
+.mh-detail{margin:3px 0 0;font-size:10px;color:#93a9a6;line-height:1.45;overflow-wrap:anywhere}
+.mh-seen{display:block;margin-top:3px;font-family:'DM Mono',monospace;font-size:8px;color:#5f7378}
+.mh-note{margin:11px 0 0;padding-top:9px;border-top:1px solid #1b2a30;font-size:9px;color:#7f989c;line-height:1.5}
+.mh-checked{display:block;margin-top:6px;font-family:'DM Mono',monospace;font-size:8px;color:#556a6f}
+@media(max-width:720px){.mh-tag{display:none}.mh-cluster{gap:5px;padding:5px 7px}}
