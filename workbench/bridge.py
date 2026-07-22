@@ -614,6 +614,99 @@ def _git_snapshot(worktree_root: Path) -> GitSnapshot:
                 pass
 
 
+#: Interpreters whose first non-flag operand is the SCRIPT FILE they execute.
+#: A command led by one of these runs its operand AS a script, so that operand
+#: is the drift-checkable script file (``bash verify.sh``, ``python scripts/x.py``,
+#: ``pwsh verify.ps1``).  Matched on argv[0]'s basename, lower-cased, ``.exe``
+#: stripped, so a quoted absolute interpreter path resolves the same way.
+_SCRIPT_INTERPRETERS = frozenset({
+    "sh", "bash", "dash", "zsh", "ksh",
+    "python", "python2", "python3", "py",
+    "pwsh", "powershell",
+    "node", "ruby", "perl", "php",
+})
+
+#: Interpreter flags that introduce an INLINE program / MODULE / stdin instead of
+#: a script FILE, so the command has NO resolvable script operand and is never
+#: drift-checked: ``python -m pytest`` (module), ``python -c "..."`` /
+#: ``node -e "..."`` / ``perl -e`` (inline code), and a bare ``-`` (stdin).  A
+#: normal value-less interpreter flag (``python -O``, ``-q``) is merely skipped.
+_INLINE_PROGRAM_FLAGS = frozenset({"-m", "-c", "-e", "-"})
+
+
+def _worktree_relative_script(candidate: str, worktree_root: Path) -> str | None:
+    """Return ``candidate``'s posix path relative to the worktree if it is a file.
+
+    Resolves ``candidate`` (relative or absolute) against ``worktree_root`` and
+    returns its worktree-relative posix path ONLY when it names an existing
+    regular file inside the worktree -- matching the normalization
+    ``_git_snapshot().changed_files`` and the task's declared changed-files use.
+    A token that is not an existing file, or resolves OUTSIDE the worktree,
+    returns ``None`` (nothing local to drift-check).
+    """
+    if not candidate:
+        return None
+    try:
+        base = worktree_root.resolve()
+        target = (worktree_root / candidate).resolve()
+    except OSError:
+        return None
+    try:
+        rel = target.relative_to(base)
+    except ValueError:
+        return None
+    try:
+        if not target.is_file():
+            return None
+    except OSError:
+        return None
+    return rel.as_posix()
+
+
+def _resolve_script_operand(argv: tuple[str, ...], worktree_root: Path) -> str | None:
+    """Resolve the LOCAL script-file operand a verification command would execute.
+
+    Returns the worktree-relative posix path of the script the command runs, or
+    ``None`` when the command executes no local script file -- so a module or
+    inline-program invocation (``python -m pytest``, ``python -c "..."``) and a
+    plain subcommand (``npm test``, ``pytest``) are unaffected by the drift gate.
+
+    Two shapes resolve to a script operand:
+
+    * DIRECT execution -- ``argv[0]`` itself is a path to an existing worktree
+      file (``./run-checks.sh``, ``scripts/build.sh``, an absolute path).  A bare
+      program name with no path separator (``npm``, ``pytest``) is never treated
+      as a script here.
+    * INTERPRETER execution -- ``argv[0]`` is a known script interpreter
+      (:data:`_SCRIPT_INTERPRETERS`) and a later argument resolves to an existing
+      worktree file.  An :data:`_INLINE_PROGRAM_FLAGS` token short-circuits to
+      ``None`` (the interpreter runs a module/inline program/stdin, not a file);
+      other ``-``-prefixed tokens are skipped as interpreter flags.
+    """
+    if not argv:
+        return None
+    lead = argv[0]
+    # DIRECT: a path-like leader that is an existing worktree file is the script.
+    if "/" in lead or "\\" in lead or lead.startswith("."):
+        direct = _worktree_relative_script(lead, worktree_root)
+        if direct is not None:
+            return direct
+    lead_name = Path(lead).name.lower()
+    if lead_name.endswith(".exe"):
+        lead_name = lead_name[:-4]
+    if lead_name in _SCRIPT_INTERPRETERS:
+        for token in argv[1:]:
+            if token in _INLINE_PROGRAM_FLAGS:
+                # Module/inline program/stdin: no script FILE operand at all.
+                return None
+            if token.startswith("-"):
+                continue  # a value-less interpreter flag; keep scanning
+            resolved = _worktree_relative_script(token, worktree_root)
+            if resolved is not None:
+                return resolved
+    return None
+
+
 class VerificationRunner:
     """Run packet-declared checks outside Codex and attest their actual output to State."""
 
@@ -652,9 +745,60 @@ class VerificationRunner:
             selected.append((rendered, argv))
         return tuple(selected)
 
+    def _declared_changed_files(self, work_packet: dict[str, Any]) -> set[str]:
+        """The task's declared changed-files set (normalized worktree-relative posix).
+
+        A verification script whose path is in this set is a file the task
+        legitimately edits (including a test file), so a change to it is DECLARED
+        and never refused -- only an UNDECLARED drift is a smuggle.
+        """
+        task = work_packet.get("task")
+        likely_files = task.get("likely_files") if isinstance(task, dict) else None
+        declared: set[str] = set()
+        if isinstance(likely_files, list):
+            for item in likely_files:
+                if isinstance(item, str) and item.strip():
+                    declared.add(item.replace("\\", "/"))
+        return declared
+
+    def _refuse_undeclared_script_drift(self, work_packet: dict[str, Any]) -> None:
+        """Fail closed BEFORE execution on an undeclared verification-script drift.
+
+        Reuses the digest-drift discipline of the contract spine at the script
+        layer: a script operand's live content is compared to its reviewed
+        baseline (its committed HEAD content, the drift set
+        :func:`_git_snapshot` computes), and an operand that drifted WITHOUT being
+        in the task's declared changed-files raises a stable
+        ``verification.script_drift`` :class:`TypedOperationError` -- so the
+        mutated script never runs.  A command with no resolvable script operand
+        (``python -m pytest``, ``npm test``) contributes nothing, and when NO
+        command resolves a script operand the git snapshot is skipped entirely, so
+        module/inline verification runs are wholly unaffected.
+        """
+        operands: list[str] = []
+        for _command, argv in self._commands(work_packet):
+            operand = _resolve_script_operand(argv, self.worktree_root)
+            if operand is not None:
+                operands.append(operand)
+        if not operands:
+            return
+        declared = self._declared_changed_files(work_packet)
+        drifted = set(_git_snapshot(self.worktree_root).changed_files)
+        for operand in operands:
+            if operand in drifted and operand not in declared:
+                raise _op_refuse(
+                    "verification.script_drift",
+                    "verification script operand drifted from its reviewed "
+                    "baseline and is not a declared changed file; refused before "
+                    "execution",
+                )
+
     def run(
         self, work_packet: dict[str, Any], state: StateReader, actor: str,
     ) -> tuple[VerificationResult, ...]:
+        # Fail closed BEFORE any script executes: an undeclared drift in a
+        # verification script operand refuses here with a stable typed code.
+        self._refuse_undeclared_script_drift(work_packet)
         results: list[VerificationResult] = []
         for command, argv in self._commands(work_packet):
             completed = subprocess.run(
@@ -1228,25 +1372,35 @@ class Bridge:
                 self.hub.finalize_run(run_id, "reconciliation", str(command["id"]))
                 raise
             except TypedOperationError as exc:
-                # T008 skill-adoption gate refusal (skill.unacknowledged /
-                # skill.digest_changed).  The gate is the first statement of
-                # CodexRunner.run, so it fires BEFORE the router/model/prompt --
-                # nothing executed.  TypedOperationError is a ValueError, NOT a
-                # BridgeError, so it is not caught by the clause above NOR by
-                # main()'s poll-loop ``except BridgeError``.  Without this clause
-                # it escapes dispatch and crashes the daemon with no receipt, and
-                # the still-unsettled command redelivers on restart -> a crash
-                # loop until the skill is acknowledged.  A gate refusal is a
-                # DETERMINISTIC, known refusal: the run did not proceed and
-                # produced no evidence.  Finalize it as the settled, non-evidenced
-                # terminal the finalize API actually models -- "reconciliation"
-                # (there is no "failed" status; "evidenced" would be a lie).
-                # finalize_run consumes the command in the store, so it does NOT
-                # redeliver.  We record the stable typed code as evidence and,
-                # unlike the BridgeError path, do NOT re-raise: poll_once returns
-                # normally and the loop advances to the next command.
+                # A deterministic typed gate refusal from the dispatch body. Two
+                # gates raise it, both BEFORE any evidence is produced:
+                #   * the T008 skill-adoption gate (skill.unacknowledged /
+                #     skill.digest_changed), the first statement of
+                #     CodexRunner.run, so it fires BEFORE the router/model/prompt;
+                #   * the verification.script_drift gate (VerificationRunner.run),
+                #     which refuses BEFORE any verification script executes.
+                # TypedOperationError is a ValueError, NOT a BridgeError, so it is
+                # caught by neither the clause above NOR main()'s poll-loop
+                # ``except BridgeError``.  Without this clause it escapes dispatch
+                # and crashes the daemon with no receipt, and the still-unsettled
+                # command redelivers on restart -> a crash loop until the gate is
+                # cleared.  A gate refusal is a DETERMINISTIC, known refusal: the
+                # run did not proceed to evidence.  Finalize it as the settled,
+                # non-evidenced terminal the finalize API actually models --
+                # "reconciliation" (there is no "failed" status; "evidenced" would
+                # be a lie).  finalize_run consumes the command in the store, so it
+                # does NOT redeliver.  We record the stable typed code as evidence
+                # and, unlike the BridgeError path, do NOT re-raise: poll_once
+                # returns normally and the loop advances to the next command.  The
+                # fingerprint is derived from the refusal-code family so a
+                # script-drift refusal is not mislabeled as a skill-adoption one.
+                fingerprint = (
+                    "skill-adoption-gate" if exc.code.startswith("skill.")
+                    else "verification-script-drift-gate" if exc.code.startswith("verification.")
+                    else "typed-operation-gate"
+                )
                 self.hub.evidence("failure", f"{run_id}:reconciliation", self.settings.project_id, {
-                    "task_id": task_id, "fingerprint": "skill-adoption-gate",
+                    "task_id": task_id, "fingerprint": fingerprint,
                     "reconciliation_required": True, "refusal_code": exc.code, "error": str(exc),
                 })
                 self.hub.finalize_run(run_id, "reconciliation", str(command["id"]))

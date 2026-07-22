@@ -2924,3 +2924,115 @@ def test_conversation_import_round_trip_never_resurrects_deleted_or_purged_conte
         raise AssertionError("a purged tombstone turn carrying content must be refused")
     except _CtvError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# state-context-operations:T008 -- a mutated verification script cannot be
+# smuggled past the gate (security boundary).
+# ---------------------------------------------------------------------------
+#
+# The threat: a task edits a reviewed verification script (`verify.py`) into a
+# malicious one WITHOUT declaring the edit, then names it as its verification
+# command so the bridge runs the mutated body as an "independent" check.  The
+# drift gate refuses BEFORE execution with the stable ``verification.script_drift``
+# code, so the mutated script never runs; a DECLARED edit and a no-script-operand
+# command are not refused.  Reverting the gate (letting the mutated script run)
+# would make the first assertion fail -- the revert-detection guarantee.
+
+import subprocess as _sco_t008_sp
+import sys as _sco_t008_sys
+
+import pytest as _sco_t008_pytest
+
+from workbench.bridge import BridgeSettings as _ScoT008Settings
+from workbench.bridge import VerificationRunner as _ScoT008Verifier
+from workbench.models import (
+    OPERATION_REFUSAL_CODES as _SCO_T008_CODES,
+    TypedOperationError as _ScoT008TypedError,
+)
+
+
+def test_sco_t008_script_drift_refusal_code_is_registered_and_stable() -> None:
+    # The stable typed code lives in the shared closed set (extend, never rename).
+    assert "verification.script_drift" in _SCO_T008_CODES
+
+
+def _sco_t008_settings(root, command):
+    return _ScoT008Settings(
+        hub="https://workbench.tailnet.example", bridge_id="bridge_1", token="t",
+        project_root=root, project_id="project_1", state_events=None,
+        cursor_file=root / ".workbench" / "cursor",
+        state_status_command="anvil status", state_claim_command="anvil claim",
+        state_work_packet_command="anvil packet", state_hook_command="anvil hook",
+        state_submit_command="anvil submit", state_apply_command="",
+        codex_binary="codex", router_base_url="", router_token_env="ROUTER_TOKEN",
+        codex_config=(), verification_commands=(command,),
+    )
+
+
+def _sco_t008_repo(root, committed):
+    def git(*args):
+        result = _sco_t008_sp.run(("git", *args), cwd=root, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    git("init")
+    git("config", "user.email", "t008@example.test")
+    git("config", "user.name", "T008")
+    git("config", "commit.gpgsign", "false")
+    for rel, content in committed.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-m", "baseline")
+
+
+# A "malicious" mutation leaves a marker file IFF the mutated body executes.
+_SCO_T008_BENIGN = "print('ok')\n"
+_SCO_T008_MUTATED = "import pathlib; pathlib.Path('OWNED.txt').write_text('x', encoding='utf-8')\n"
+
+
+def _sco_t008_packet(command, likely_files=()):
+    return {"task": {"verification": {"commands": [command]}, "likely_files": list(likely_files)}}
+
+
+def test_sco_t008_mutated_undeclared_verification_script_is_refused_before_running(tmp_path):
+    root = tmp_path
+    _sco_t008_repo(root, {"verify.py": _SCO_T008_BENIGN})
+    # The task mutates the reviewed script but does NOT declare the change.
+    (root / "verify.py").write_text(_SCO_T008_MUTATED, encoding="utf-8")
+    command = '"' + _sco_t008_sys.executable + '" verify.py'
+    verifier = _ScoT008Verifier(_sco_t008_settings(root, command), lambda _r, _c: None, root)
+
+    with _sco_t008_pytest.raises(_ScoT008TypedError) as excinfo:
+        verifier.run(_sco_t008_packet(command, likely_files=["README.md"]), None, "actor")
+
+    # Refused with the stable code; the mutated body never executed (no marker).
+    # (If the drift check were reverted, verify.py would run and OWNED.txt would
+    # appear -- so this assertion is the revert detector.)
+    assert excinfo.value.code == "verification.script_drift"
+    assert not (root / "OWNED.txt").exists()
+
+
+def test_sco_t008_declared_script_edit_and_no_operand_command_are_not_refused(tmp_path):
+    # (a) A DECLARED edit to the same script is allowed -- no false refusal.
+    root = tmp_path / "declared"
+    root.mkdir()
+    _sco_t008_repo(root, {"verify.py": _SCO_T008_BENIGN})
+    (root / "verify.py").write_text("print('edited-but-declared')\n", encoding="utf-8")
+    command = '"' + _sco_t008_sys.executable + '" verify.py'
+
+    class _State:
+        def capture_verification(self, *args):
+            pass
+
+    verifier = _ScoT008Verifier(_sco_t008_settings(root, command), lambda _r, _c: None, root)
+    results = verifier.run(_sco_t008_packet(command, likely_files=["verify.py"]), _State(), "a")
+    assert len(results) == 1 and results[0].exit_code == 0
+
+    # (b) A command with no resolvable script operand runs untouched (no git repo).
+    root_b = tmp_path / "module"
+    root_b.mkdir()
+    cmd_b = '"' + _sco_t008_sys.executable + '" -c "print(1)"'
+    verifier_b = _ScoT008Verifier(_sco_t008_settings(root_b, cmd_b), lambda _r, _c: None, root_b)
+    results_b = verifier_b.run(_sco_t008_packet(cmd_b), _State(), "a")
+    assert len(results_b) == 1 and results_b[0].exit_code == 0
