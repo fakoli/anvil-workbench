@@ -541,14 +541,18 @@ def build_system_health_router(
     actor_dependency: Callable[..., str],
     health_service: SystemHealthService,
 ) -> APIRouter:
-    """Build the read-only system-health and observational-posture browser surface.
+    """Build the read-only system-health, posture, and configuration surface.
 
     Every endpoint is authenticated by the hub's trusted ``actor`` dependency
     (tailnet identity + allowlist) and serializes only the closed
-    :class:`~workbench.system_health.IntegrationDescriptor` /
-    :class:`~workbench.system_health.PostureReport` display shapes, whose field
-    sets structurally cannot carry a credential, a raw endpoint URL, a local
-    path, an approval, or an execution surface.
+    :class:`~workbench.system_health.IntegrationDescriptor`,
+    :class:`~workbench.system_health.PostureReport`, and
+    :class:`~workbench.system_health.ConfigurationSetting` display shapes, whose
+    field sets structurally cannot carry a credential, a raw endpoint URL, a
+    local path, an approval, or an execution surface.  The configuration
+    observation is additionally *value-free*: every setting is a boolean, a
+    fixed-vocabulary enum, or a bounded count derived from the deployment
+    settings, never a raw config value.
 
     Redaction guarantee (T003.1 criterion 2, security lens): the browser-facing
     scrub is enforced here, at the serialized API boundary, by
@@ -588,6 +592,19 @@ def build_system_health_router(
     def system_posture(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
         """The deterministic observational posture audit (same runner as the CLI)."""
         return scrub_config_payload(health_service.posture().as_dict())
+
+    @router.get("/configuration")
+    def system_configuration(_actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """The safe deployment-configuration observation.
+
+        Every setting is a boolean/enum/count projection of the already-parsed
+        deployment ``Settings`` -- structurally value-free, so no raw secret,
+        endpoint URL, or local path is representable -- and, like the rest of this
+        router, it is GET-only with no mutation, execution, or approval path.
+        """
+        return scrub_config_payload(
+            {"settings": [setting.as_dict() for setting in health_service.configuration()]}
+        )
 
     return router
 

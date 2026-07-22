@@ -1,10 +1,12 @@
-"""Observational integration descriptors and the posture audit.
+"""Observational integration descriptors, the posture audit, and the safe
+configuration observation.
 
 This module builds the *read-only* system-health view of the hub's declared
 integrations (Anvil Serving, the Neo4j evidence projection, purpose retrieval,
 the voice relay, chat persistence, and the project bridge).  It answers one
 question per integration -- "is this configured, and if not, how do I fix it?"
--- and nothing else.
+-- plus (T003) a value-free projection of the rest of the deployment
+configuration as booleans, fixed-vocabulary enums, and bounded counts.
 
 Authority boundary (AGENTS.md + preferences-configuration T003): every value
 here is *observational*.  A descriptor's frozen field set is a closed record
@@ -521,6 +523,193 @@ def render_posture_rows(report: PostureReport) -> list[str]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Configuration observation (T003): the safe, read-only projection of the
+# deployment ``Settings`` as booleans/enums/counts.  The integration descriptors
+# above observe whether each declared integration is *available*; this projects
+# the rest of the operator-declared deployment configuration (feature flags,
+# retention, identity policy, bounded counts) as an observation an operator can
+# read without any raw secret, endpoint URL, or local path ever being
+# representable.  A setting NEVER carries a raw config *value*: every projection
+# is a boolean, a fixed-vocabulary enum, or a bounded non-negative count derived
+# from settings -- so even a rogue ``Settings`` that stuffed a credential into a
+# string field can only flip a boolean or move an enum to ``custom``.
+# ---------------------------------------------------------------------------
+
+CONFIGURATION_SCHEMA_VERSION = "workbench-system-configuration/v1"
+
+#: The three safe projection kinds a configuration observation may report.  Each
+#: is structurally value-free: a ``boolean`` is a yes/no, an ``enum`` is a token
+#: drawn from a fixed reviewed vocabulary (never the raw config string), and a
+#: ``count`` is a bounded non-negative integer.  No kind can carry a secret, a
+#: raw endpoint URL, or a local filesystem path.
+CONFIG_KINDS = frozenset({"boolean", "enum", "count"})
+
+#: A configuration setting id is a stable, dotted ``area.name`` label -- like a
+#: posture check id it requires at least one dot, so a bare command-shaped token
+#: (``run_codex``) can never pass and an id can never smuggle an executable or
+#: approval name.
+_CONFIG_SETTING_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,31}){1,4}$")
+
+#: A projected enum value: a short lowercase token from the reviewed vocabulary.
+#: Strict-pattern validated (never scrubbed prose) so a raw config value -- which
+#: would carry a ``/``, ``:``, ``.``-host, or uppercase/secret shape -- cannot
+#: masquerade as an enum token.
+_CONFIG_ENUM_VALUE = re.compile(r"^[a-z][a-z0-9_\-]{0,63}$")
+
+#: An upper bound on any projected count, so a count field can never carry an
+#: unbounded integer either.
+MAX_CONFIG_COUNT = 65_535
+
+#: The fixed, public catalog of observed configuration setting ids.  Like the
+#: integration catalog this set is deployment-invariant (not per-tenant secret),
+#: so the projection is the same shape for every deployment.
+CONFIGURATION_SETTING_IDS = (
+    "security.insecure_dev_actor",
+    "security.identity_header",
+    "voice.retain_transcripts",
+    "chat.routes_configured",
+    "retrieval.rerank_configured",
+    "sandbox.model_count",
+    "approvals.approver_count",
+    "plugins.catalog_configured",
+    "plugins.capability_configured",
+)
+
+
+@dataclass(frozen=True)
+class ConfigurationSetting:
+    """One observed deployment-configuration value, projected safely.
+
+    The closed field set carries a stable ``setting_id``, a safe ``title``, the
+    projection ``kind``, and a value that is *structurally* a boolean, a
+    fixed-vocabulary enum token, or a bounded count -- never a raw config string.
+    No field is named for, or shaped to hold, a credential, endpoint, path,
+    approval, or execution surface, and construction reads only already-parsed
+    settings and mutates nothing.
+    """
+
+    setting_id: str
+    title: str
+    kind: str
+    value: bool | int | str
+    detail: str | None = None
+    schema_version: str = CONFIGURATION_SCHEMA_VERSION
+    non_canonical: bool = True
+
+    def __post_init__(self) -> None:
+        _require(bool(_CONFIG_SETTING_ID.match(str(self.setting_id))), "setting_id is invalid")
+        _require(str(self.setting_id) in CONFIGURATION_SETTING_IDS, f"unknown setting_id: {self.setting_id}")
+        object.__setattr__(self, "title", _prose(self.title, MAX_TITLE_CHARS, "title"))
+        _require(self.kind in CONFIG_KINDS, f"kind must be one of {sorted(CONFIG_KINDS)}")
+        if self.kind == "boolean":
+            _require(isinstance(self.value, bool), "a boolean setting value must be a bool")
+        elif self.kind == "count":
+            # bool is a subclass of int; a count must be a real, bounded integer.
+            _require(
+                isinstance(self.value, int) and not isinstance(self.value, bool) and 0 <= self.value <= MAX_CONFIG_COUNT,
+                "a count setting value must be a bounded non-negative integer",
+            )
+        else:  # enum
+            _require(
+                isinstance(self.value, str) and bool(_CONFIG_ENUM_VALUE.match(self.value)),
+                "an enum setting value must be a short reviewed token",
+            )
+        if self.detail is not None:
+            object.__setattr__(self, "detail", _prose(self.detail, MAX_DETAIL_CHARS, "detail"))
+        _require(self.schema_version == CONFIGURATION_SCHEMA_VERSION, "schema_version is unexpected")
+        _require(self.non_canonical is True, "a configuration observation is always non-canonical")
+
+    def as_dict(self) -> dict[str, Any]:
+        """Deterministic display serialization with a closed field set."""
+        data: dict[str, Any] = {
+            "kind": self.kind,
+            "non_canonical": self.non_canonical,
+            "schema_version": self.schema_version,
+            "setting_id": self.setting_id,
+            "title": self.title,
+            "value": self.value,
+        }
+        if self.detail is not None:
+            data["detail"] = self.detail
+        return data
+
+
+_DEFAULT_IDENTITY_HEADER = "Tailscale-User-Login"
+
+
+def build_configuration_settings(settings: Settings) -> tuple[ConfigurationSetting, ...]:
+    """Project the deployment ``Settings`` as safe configuration observations.
+
+    Reads only already-parsed settings.  Each observation is a boolean flag, a
+    fixed-vocabulary enum, or a bounded count -- never a raw config value -- so
+    no secret, endpoint, or path can reach the projection.  The identity-header
+    observation reports only whether the configured header is the default or a
+    ``custom`` one (never the raw header name), and every count is the size of a
+    set, never its members.
+    """
+    settings_list: list[ConfigurationSetting] = [
+        ConfigurationSetting(
+            setting_id="security.insecure_dev_actor",
+            title="Insecure development actor override",
+            kind="boolean",
+            value=bool(settings.allow_insecure_dev_actor),
+            detail="on: an unauthenticated loopback identity is trusted (local dev only)"
+            if settings.allow_insecure_dev_actor
+            else None,
+        ),
+        ConfigurationSetting(
+            setting_id="security.identity_header",
+            title="Trusted identity header source",
+            kind="enum",
+            value="default" if settings.identity_header == _DEFAULT_IDENTITY_HEADER else "custom",
+        ),
+        ConfigurationSetting(
+            setting_id="voice.retain_transcripts",
+            title="Voice transcript retention",
+            kind="boolean",
+            value=bool(settings.voice_retain_transcripts),
+        ),
+        ConfigurationSetting(
+            setting_id="chat.routes_configured",
+            title="Reviewed chat routes configured",
+            kind="boolean",
+            value=bool(settings.chat_routes),
+        ),
+        ConfigurationSetting(
+            setting_id="retrieval.rerank_configured",
+            title="Retrieval reranker configured",
+            kind="boolean",
+            value=bool(settings.rerank_model),
+        ),
+        ConfigurationSetting(
+            setting_id="sandbox.model_count",
+            title="Sandbox model allowlist size",
+            kind="count",
+            value=min(len(settings.sandbox_models), MAX_CONFIG_COUNT),
+        ),
+        ConfigurationSetting(
+            setting_id="approvals.approver_count",
+            title="Configured approver count",
+            kind="count",
+            value=min(len(settings.approvers), MAX_CONFIG_COUNT),
+        ),
+        ConfigurationSetting(
+            setting_id="plugins.catalog_configured",
+            title="Reviewed plugin catalog configured",
+            kind="boolean",
+            value=bool(settings.plugin_catalog_file),
+        ),
+        ConfigurationSetting(
+            setting_id="plugins.capability_configured",
+            title="Plugin capability profile configured",
+            kind="boolean",
+            value=bool(settings.plugin_capability_file),
+        ),
+    ]
+    return tuple(settings_list)
+
+
 class UnknownIntegrationError(LookupError):
     """No declared integration has the requested id."""
 
@@ -566,3 +755,7 @@ class SystemHealthService:
         return run_posture_audit(
             self._settings, checked_at=self._now(), bridge_health=self._bridge_health
         )
+
+    def configuration(self) -> tuple[ConfigurationSetting, ...]:
+        """The safe, read-only projection of deployment configuration."""
+        return build_configuration_settings(self._settings)
