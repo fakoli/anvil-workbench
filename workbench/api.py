@@ -28,6 +28,7 @@ from .advanced_playground import (
     UNKNOWN_ITEM_DETAIL,
     build_comparison,
 )
+from .chat_routes import ChatRouteError, discover_chat_routes, parse_chat_routes_config
 from .config import Settings
 from .configuration_transfer import (
     ConfigurationTransferError,
@@ -2260,6 +2261,33 @@ def create_app(
     # service is injected. Raw input and synthesized audio are transient; the only
     # durable trace is a content-free lifecycle event.
     app.include_router(build_voice_relay_router(actor, voice_relay_service))
+
+    # Reviewed chat-route allowlist projection (chat-first-voice T003.1 / T004).
+    # Actor-gated by the same trusted identity dependency and driven ONLY by the
+    # operator-reviewed ``WORKBENCH_CHAT_ROUTES`` config -- not an injectable
+    # service, so it needs no live-surface opt-in. It serves exactly the
+    # browser-safe ``chat-turn.v1`` route-reference shape (identifiers, digests,
+    # declared control names only); the closed config schema makes an endpoint,
+    # URL, token, credential, or policy field unrepresentable, so there is nothing
+    # secret to redact. The last-hop ``scrub_config_payload`` is kept as the same
+    # belt-and-suspenders guarantee every sibling read surface applies.
+    @app.get("/api/chat/routes")
+    def chat_routes(_actor: str = Depends(actor)) -> dict[str, Any]:
+        """The operator-configured chat routes the browser may select.
+
+        An UNSET/empty ``WORKBENCH_CHAT_ROUTES`` is the honest empty allowlist
+        (``{"routes": []}``, 200) -- the web client renders it as "No routes
+        configured". A MALFORMED config fails closed (503, fixed detail); a
+        partial or unreviewed catalog is never served.
+        """
+        try:
+            discovered = discover_chat_routes(parse_chat_routes_config(settings.chat_routes))
+        except ChatRouteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="chat routes are not configured",
+            ) from exc
+        return scrub_config_payload(discovered.as_dict())
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:
