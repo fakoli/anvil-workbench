@@ -2973,3 +2973,118 @@ def test_conversation_transfer_requires_a_trusted_allowlisted_actor():
             f"/api/conversation-transfer/export/{conv_id}",
             headers={"X-Workbench-Actor": "intruder"},
         ).status_code == 403
+
+
+# --- Voice tab: TTS voice catalog endpoint (voice-tab additions) --------------
+#
+# GET /api/chat/voice/voices enumerates the selectable TTS voices for the Voice
+# tab. It is actor-gated, sourced server-side from the operator-declared voices
+# URL (the browser never hits the serve directly), and fails closed with 503 when
+# unconfigured or when the serve is unavailable.
+
+def _voices_settings(voices_url: str, *, insecure: bool = True) -> Settings:
+    return Settings(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="http://serving", anvil_router_token="",
+        anvil_voice_voices_url=voices_url,
+        identity_header="X-Workbench-Actor", allow_insecure_dev_actor=insecure,
+    )
+
+
+def test_voice_voices_endpoint_returns_actor_gated_list(monkeypatch):
+    import workbench.api as api_module
+
+    monkeypatch.setattr(api_module, "fetch_voice_catalog", lambda url: [
+        {"id": "af_bella", "name": "Bella"}, {"id": "am_adam"},
+    ])
+    settings = _voices_settings("http://kokoro/v1/audio/voices")
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as test_client:
+        resp = test_client.get("/api/chat/voice/voices", headers={"X-Workbench-Actor": "operator"})
+        assert resp.status_code == 200
+        assert resp.json() == {"voices": [{"id": "af_bella", "name": "Bella"}, {"id": "am_adam"}]}
+
+
+def test_voice_voices_endpoint_is_actor_gated():
+    settings = _voices_settings("http://kokoro/v1/audio/voices", insecure=False)
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as test_client:
+        assert test_client.get("/api/chat/voice/voices").status_code == 401
+        assert test_client.get(
+            "/api/chat/voice/voices", headers={"X-Workbench-Actor": "intruder"},
+        ).status_code == 403
+
+
+def test_voice_voices_endpoint_fails_closed_when_unconfigured():
+    settings = _voices_settings("")  # no ANVIL_VOICE_VOICES_URL
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as test_client:
+        assert test_client.get(
+            "/api/chat/voice/voices", headers={"X-Workbench-Actor": "operator"},
+        ).status_code == 503
+
+
+def test_voice_voices_endpoint_fails_closed_when_serve_unavailable(monkeypatch):
+    import workbench.api as api_module
+    from workbench.voice import VoiceServingError
+
+    def _boom(url):
+        raise VoiceServingError()
+
+    monkeypatch.setattr(api_module, "fetch_voice_catalog", _boom)
+    settings = _voices_settings("http://kokoro/v1/audio/voices")
+    with TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph())) as test_client:
+        assert test_client.get(
+            "/api/chat/voice/voices", headers={"X-Workbench-Actor": "operator"},
+        ).status_code == 503
+
+
+def test_fetch_voice_catalog_parses_scrubs_and_bounds(monkeypatch):
+    import json
+
+    import pytest
+
+    from workbench import serving_audio
+    from workbench.voice import VoiceServingError
+
+    class _Resp:
+        status = 200
+
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self, size: int = -1) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_open(body: bytes):
+        return lambda request, timeout: _Resp(body)
+
+    # A well-formed catalog: ids extracted, a bare-string entry accepted, a secret
+    # in a label scrubbed, duplicates and id-less entries dropped.
+    payload = json.dumps({"voices": [
+        {"id": "af_bella", "name": "Bella"},
+        "am_adam",
+        {"id": "af_bella"},                 # duplicate -> dropped
+        {"name": "no id here"},             # id-less -> dropped
+        {"id": "bf_emma", "name": "token=sk-supersecretvalue123"},
+    ]}).encode("utf-8")
+    monkeypatch.setattr(serving_audio, "_urlopen", _fake_open(payload))
+    catalog = serving_audio.fetch_voice_catalog("http://kokoro/v1/audio/voices")
+    assert catalog[0] == {"id": "af_bella", "name": "Bella"}
+    assert {"id": "am_adam"} in catalog
+    assert [v["id"] for v in catalog] == ["af_bella", "am_adam", "bf_emma"]
+    emma = next(v for v in catalog if v["id"] == "bf_emma")
+    assert "sk-supersecretvalue123" not in emma["name"]
+
+    # A non-http(s) URL fails closed without any network hop.
+    with pytest.raises(VoiceServingError):
+        serving_audio.fetch_voice_catalog("ftp://nope")
+
+    # A malformed body fails closed.
+    monkeypatch.setattr(serving_audio, "_urlopen", _fake_open(b"not json"))
+    with pytest.raises(VoiceServingError):
+        serving_audio.fetch_voice_catalog("http://kokoro/v1/audio/voices")

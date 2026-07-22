@@ -23,6 +23,12 @@ class Settings:
     sandbox_models: frozenset[str] = frozenset()
     anvil_voice_realtime_url: str = ""
     anvil_voice_realtime_token: str = ""
+    #: Operator-declared http(s) URL of the TTS serve's voice-catalog endpoint
+    #: (e.g. ``http://<kokoro-host>/v1/audio/voices``).  When set, the hub exposes
+    #: an actor-gated ``GET /api/chat/voice/voices`` that enumerates the selectable
+    #: TTS voices for the Voice tab; the browser never hits the serve directly.
+    #: Unset means voice selection is not configured and that endpoint fails closed.
+    anvil_voice_voices_url: str = ""
     voice_retain_transcripts: bool = False
     embedding_model: str = ""
     rerank_model: str = ""
@@ -76,6 +82,7 @@ class Settings:
             sandbox_models=_csv("WORKBENCH_SANDBOX_MODELS", values),
             anvil_voice_realtime_url=values.get("ANVIL_VOICE_REALTIME_URL", "").strip(),
             anvil_voice_realtime_token=values.get("ANVIL_VOICE_REALTIME_TOKEN", ""),
+            anvil_voice_voices_url=values.get("ANVIL_VOICE_VOICES_URL", "").strip(),
             voice_retain_transcripts=values.get("WORKBENCH_VOICE_RETAIN_TRANSCRIPTS", "").lower() in {"1", "true", "yes"},
             embedding_model=values.get("WORKBENCH_EMBEDDING_MODEL", ""),
             rerank_model=values.get("WORKBENCH_RERANK_MODEL", ""),

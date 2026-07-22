@@ -580,8 +580,10 @@ def test_browser_cache_contract_fixtures_carry_no_audio():
 # --------------------------------------------------------------------------- #
 # Criterion 5 (structural): a playback-control server call is UNREPRESENTABLE.
 # Pause/stop are client-transient by design; the voice surface exposes only STT
-# (transcribe) and TTS (speak). If a pause/stop endpoint were ever added this set
-# would grow and the assertion would fail — the claim is ENFORCED, not narrated.
+# (transcribe), TTS (speak), and a READ-ONLY voice catalog (voices — an actor-
+# gated list of selectable TTS voice ids, no audio and no delivery action). If a
+# pause/stop or any other mutating endpoint were ever added this set would grow
+# and the assertion would fail — the claim is ENFORCED, not narrated.
 # --------------------------------------------------------------------------- #
 
 
@@ -607,4 +609,8 @@ def test_voice_surface_exposes_only_transcribe_and_speak():
         path for path in _all_route_paths(client.app.routes)
         if path.startswith("/api/chat/voice")
     }
-    assert voice_paths == {"/api/chat/voice/transcribe", "/api/chat/voice/speak"}
+    assert voice_paths == {
+        "/api/chat/voice/transcribe",
+        "/api/chat/voice/speak",
+        "/api/chat/voice/voices",
+    }

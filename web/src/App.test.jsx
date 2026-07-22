@@ -9,7 +9,7 @@ import {
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
-  transcribeVoice, speakMessage, fetchPreferences,
+  transcribeVoice, speakMessage, fetchPreferences, fetchVoiceCatalog,
   fetchConfigurationExport, previewConfigurationImport, applyConfigurationImport,
   previewConfigurationReset, applyConfigurationReset,
   fetchAdvancedRoutes, runAdvancedBranch,
@@ -26,7 +26,7 @@ vi.mock('./api', () => ({
   fetchChatRoutes: vi.fn(), getConversation: vi.fn(), listConversations: vi.fn(), renameConversation: vi.fn(),
   retryTurn: vi.fn(), searchConversations: vi.fn(), sendMessage: vi.fn(), unarchiveConversation: vi.fn(),
   fetchPrdContent: vi.fn(), fetchPrdTasks: vi.fn(), fetchTaskReference: vi.fn(), fetchTaskEligibility: vi.fn(),
-  transcribeVoice: vi.fn(), speakMessage: vi.fn(), fetchPreferences: vi.fn(),
+  transcribeVoice: vi.fn(), speakMessage: vi.fn(), fetchPreferences: vi.fn(), fetchVoiceCatalog: vi.fn(),
   fetchConfigurationExport: vi.fn(), previewConfigurationImport: vi.fn(), applyConfigurationImport: vi.fn(),
   previewConfigurationReset: vi.fn(), applyConfigurationReset: vi.fn(),
   fetchAdvancedRoutes: vi.fn(), runAdvancedBranch: vi.fn(),
@@ -1363,6 +1363,12 @@ class _FakeAudioContext {
 function _fireAudioBlock(length = 4096) {
   _FakeAudioContext.lastProcessor?.onaudioprocess?.({ inputBuffer: { getChannelData: () => new Float32Array(length) } })
 }
+// A LOUD mic block whose RMS crosses the client VAD speech-onset threshold — used
+// to simulate the operator starting to speak (and, over playback, an auto barge-in).
+function _fireLoudBlock(length = 4096) {
+  const data = new Float32Array(length).fill(0.5)
+  _FakeAudioContext.lastProcessor?.onaudioprocess?.({ inputBuffer: { getChannelData: () => data } })
+}
 
 class _FakeRealtimeSocket {
   constructor(url) { this.url = url; this.readyState = _FakeRealtimeSocket.OPEN; this.sent = []; this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null; _FakeRealtimeSocket.last = this }
@@ -1377,6 +1383,8 @@ describe('Voice page (speech-to-speech) dedicated tab (live-qualification)', () 
 
   beforeEach(() => {
     bootstrap.mockResolvedValue(voiceFixture)
+    fetchVoiceCatalog.mockResolvedValue([{ id: 'af_bella', name: 'Bella' }, { id: 'am_adam' }, { id: 'bf_emma' }])
+    try { window.localStorage?.clear() } catch { /* jsdom always has it */ }
     _FakeAudioContext.calls = []
     _FakeAudioContext.bufferCalls = []
     _FakeAudioContext.startTimes = []
@@ -1586,6 +1594,112 @@ describe('Voice page (speech-to-speech) dedicated tab (live-qualification)', () 
     await user.click(screen.getByRole('button', { name: 'Save this transcript to Chat' }))
     expect(await screen.findByText(/Saving to Chat is unavailable on this hub/)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Save this transcript to Chat' }).disabled).toBe(true)
+  })
+
+  // --- Automatic barge-in (openclaw-style interruption) ----------------------
+
+  it('hands-free: speaking over the assistant auto barge-ins (response.cancel + playback reset), then still commits', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    await user.click(screen.getByRole('button', { name: 'Hands-free mode' }))
+    await waitFor(() => expect(_FakeAudioContext.calls.length).toBeGreaterThan(0)) // capture mic open
+    const chunk = btoa('\x01\x02\x03\x04\x05\x06\x07\x08')
+    // The assistant is speaking (a response opened and audio is streaming).
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: chunk }) }) })
+    const contextsBefore = _FakeAudioContext.calls.length
+    socket.sent.length = 0
+    // The operator begins talking OVER the assistant: a loud mic frame crosses the
+    // VAD onset threshold and auto barge-ins.
+    await act(async () => { _fireLoudBlock() })
+    const types = socket.sent.map((raw) => JSON.parse(raw).type)
+    expect(types).toContain('response.cancel') // (a) server told to stop generating
+    // (b) local playback halted — a later delta builds a FRESH context from t=0.
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: chunk }) }) })
+    expect(_FakeAudioContext.calls.length).toBe(contextsBefore + 1)
+    expect(_FakeAudioContext.startTimes.at(-1)).toBe(0)
+    // (c) the new utterance still closes with a commit ONLY (never response.create).
+    socket.sent.length = 0
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'input_audio_buffer.speech_stopped' }) }) })
+    const closing = socket.sent.map((raw) => JSON.parse(raw).type)
+    expect(closing).toContain('input_audio_buffer.commit')
+    expect(closing).not.toContain('response.create')
+  })
+
+  it('hold-to-talk: pressing talk while the assistant is speaking auto barge-ins before capturing', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    const chunk = btoa('\x01\x02\x03\x04\x05\x06\x07\x08')
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: chunk }) }) })
+    expect(_FakeAudioContext.calls.length).toBe(1) // one playback context
+    socket.sent.length = 0
+    const hold = await screen.findByRole('button', { name: 'Hold to talk' })
+    await act(async () => { fireEvent.pointerDown(hold) })
+    // Pressing to talk cancels the assistant FIRST (before the mic opens).
+    expect(socket.sent.map((raw) => JSON.parse(raw).type)).toContain('response.cancel')
+    // Playback was reset (closed); the capture mic then opens its own context.
+    await waitFor(() => expect(_FakeAudioContext.calls.length).toBe(2))
+    await act(async () => { fireEvent.pointerUp(hold) })
+    const types = socket.sent.map((raw) => JSON.parse(raw).type)
+    expect(types).toContain('input_audio_buffer.commit') // new utterance commits cleanly
+    expect(types).not.toContain('response.create')
+    // A double-trigger does not double-cancel: manual Stop is now a no-op (nothing plays).
+    expect(screen.getByRole('button', { name: 'Stop the assistant' }).disabled).toBe(true)
+  })
+
+  // --- Live system prompt / instructions + personality presets ---------------
+
+  it('applies live instructions on Apply, persists them, and re-sends on reconnect', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    socket.sent.length = 0
+    const field = screen.getByRole('textbox', { name: 'Assistant instructions' })
+    await user.type(field, 'Answer in one sentence.')
+    await user.click(screen.getByRole('button', { name: 'Apply instructions' }))
+    const applied = socket.sent.map((raw) => JSON.parse(raw)).find((e) => e.type === 'session.update' && e.session?.instructions)
+    expect(applied.session.instructions).toBe('Answer in one sentence.')
+    expect(window.localStorage.getItem('workbench.voice.instructions')).toBe('Answer in one sentence.')
+    // Reconnecting re-sends the persisted instructions on the connect handshake.
+    await user.click(screen.getByRole('button', { name: 'Disconnect voice' }))
+    const socket2 = await connectVoice(user)
+    const onConnect = socket2.sent.map((raw) => JSON.parse(raw)).find((e) => e.type === 'session.update')
+    expect(onConnect.session.instructions).toBe('Answer in one sentence.')
+  })
+
+  it('loads a personality preset into the editable field and applies it; editing flips to Custom', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    socket.sent.length = 0
+    await user.click(screen.getByRole('button', { name: 'Concise' }))
+    // The preset prompt is applied on the wire...
+    const applied = socket.sent.map((raw) => JSON.parse(raw)).find((e) => e.type === 'session.update' && e.session?.instructions)
+    expect(applied.session.instructions).toMatch(/few words/i)
+    // ...and loaded into the still-editable field, with the chip marked selected.
+    const field = screen.getByRole('textbox', { name: 'Assistant instructions' })
+    expect(field.value).toMatch(/few words/i)
+    expect(screen.getByRole('button', { name: 'Concise' }).getAttribute('aria-pressed')).toBe('true')
+    // Editing after a preset flips the selection to Custom (a preset is a start point).
+    await user.type(field, ' Please.')
+    expect(screen.getByRole('button', { name: 'Concise' }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByText('Custom')).toBeTruthy()
+  })
+
+  // --- Voice selection -------------------------------------------------------
+
+  it('populates the voice picker from the hub and sends the chosen voice via session.update', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    await waitFor(() => expect(fetchVoiceCatalog).toHaveBeenCalled())
+    const select = await screen.findByRole('combobox', { name: 'Assistant voice' })
+    // Friendly labels are shown; the raw id stays the option value.
+    expect(within(select).getByRole('option', { name: 'Bella' })).toBeTruthy()
+    expect(within(select).getByRole('option', { name: /Emma \(British, female\)/ })).toBeTruthy()
+    socket.sent.length = 0
+    await user.selectOptions(select, 'bf_emma')
+    const sent = socket.sent.map((raw) => JSON.parse(raw)).find((e) => e.type === 'session.update' && e.session?.voice)
+    expect(sent.session.voice).toBe('bf_emma')
+    expect(window.localStorage.getItem('workbench.voice.voice')).toBe('bf_emma')
   })
 })
 

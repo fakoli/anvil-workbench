@@ -29,7 +29,7 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .redaction import redact_value
+from .redaction import redact_text, redact_value
 from .voice import (
     MAX_STT_DURATION_MS,
     MAX_STT_INPUT_BYTES,
@@ -53,6 +53,15 @@ _MAX_TRANSCRIPT_CHARS = 20_000
 #: A generous ceiling on the STT serve's small JSON transcript answer; anything
 #: larger is treated as a misbehaving upstream and fails closed.
 _MAX_STT_JSON_BYTES = 2_000_000
+
+#: Bounds on the TTS serve's voice-catalog answer.  The catalog is a small,
+#: enumerable list of voice ids; a larger body or an over-long id is a misbehaving
+#: (or spoofed) serve and is dropped.  The id is the ONLY value forwarded to the
+#: browser -- scrubbed, so a serve cannot smuggle a secret/path through a label.
+_MAX_VOICES_JSON_BYTES = 262_144
+_MAX_VOICE_CATALOG_ENTRIES = 500
+_MAX_VOICE_ID_CHARS = 128
+_MAX_VOICE_NAME_CHARS = 128
 
 class _NoRedirectHandler(HTTPRedirectHandler):
     """Refuse every HTTP redirect on the audio hop.
@@ -243,3 +252,78 @@ class DarkServingAudioTransport:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise VoiceServingError() from exc
+
+
+def _coerce_voice_entry(entry: Any) -> dict[str, str] | None:
+    """Map one upstream catalog entry to a bounded, scrubbed ``{id, name}``.
+
+    Accepts either a mapping (``{"id": ..., "name": ...}``) or a bare string id.
+    Every value is scrubbed with the transcript credential/path redaction and
+    length-bounded; an entry without a usable id is dropped (returns ``None``).
+    """
+    if isinstance(entry, str):
+        voice_id, name = entry, ""
+    elif isinstance(entry, Mapping):
+        raw_id = entry.get("id")
+        voice_id = raw_id if isinstance(raw_id, str) else ""
+        raw_name = entry.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+    else:
+        return None
+    voice_id = redact_text(voice_id).strip()[:_MAX_VOICE_ID_CHARS]
+    if not voice_id:
+        return None
+    name = redact_text(name).strip()[:_MAX_VOICE_NAME_CHARS]
+    result = {"id": voice_id}
+    if name:
+        result["name"] = name
+    return result
+
+
+def fetch_voice_catalog(url: str, *, timeout_s: float = _DEFAULT_TIMEOUT_S) -> list[dict[str, str]]:
+    """Enumerate the operator-declared TTS serve's voices; fail closed if unusable.
+
+    One bounded GET against the operator-declared voices URL (mirroring the two
+    audio serve URLs).  The serve answers ``{"voices": [{"id": ...}, ...]}`` (or a
+    bare list); the ids are scrubbed, length-bounded, and count-bounded before
+    they leave the hub.  Any non-200, transport error, oversize body, or parse
+    failure surfaces as :class:`VoiceServingError` -- there is no provider
+    fallback and the upstream body is never surfaced.  The relay boundary is
+    preserved: the browser never talks to the serve directly.
+    """
+    text = str(url or "").strip()
+    if not text or not (text.startswith("http://") or text.startswith("https://")):
+        raise VoiceServingError()
+    request = Request(text, method="GET", headers={"Accept": "application/json"})
+    try:
+        with _urlopen(request, timeout=float(timeout_s)) as response:  # nosec B310: operator-declared tailnet serve, redirect-free
+            if getattr(response, "status", 200) != 200:
+                raise VoiceServingError()
+            raw = response.read(_MAX_VOICES_JSON_BYTES + 1)
+    except VoiceServingError:
+        raise
+    except HTTPError as exc:
+        raise VoiceServingError() from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise VoiceServingError() from exc
+    if len(raw) > _MAX_VOICES_JSON_BYTES:
+        raise VoiceServingError()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VoiceServingError() from exc
+    if isinstance(payload, Mapping):
+        entries = payload.get("voices")
+    else:
+        entries = payload
+    if not isinstance(entries, list):
+        raise VoiceServingError()
+    catalog: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in entries[:_MAX_VOICE_CATALOG_ENTRIES]:
+        coerced = _coerce_voice_entry(entry)
+        if coerced is None or coerced["id"] in seen:
+            continue
+        seen.add(coerced["id"])
+        catalog.append(coerced)
+    return catalog

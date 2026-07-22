@@ -410,6 +410,24 @@
 .voice-mode-label{font-size:8px;text-transform:uppercase;letter-spacing:.09em;color:#5f767b;padding:0 6px 0 4px}
 .voice-mode-btn{border:0;background:transparent;color:#8fa8a4;border-radius:6px;padding:8px 12px;font-size:10px;font-weight:800}
 .voice-mode-btn.on{background:#17352f;color:#bff3e6;box-shadow:inset 0 0 0 1px #33665c}
+/* Session tuning: pick a personality, steer the live system prompt, choose a
+   voice. Full-width row within the wrapping control bar; quiet and disciplined so
+   the orb stays the signature. */
+.voice-tune{flex:1 1 100%;display:grid;gap:13px;padding:14px 16px;border:1px solid #223a3b;border-radius:12px;background:linear-gradient(180deg,#102524,#0c1b1a)}
+.voice-tune-eyebrow{display:block;font-size:8px;text-transform:uppercase;letter-spacing:.11em;color:#5f767b;font-weight:800;margin-bottom:6px}
+.voice-tune-presets{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.voice-tune-presets .voice-tune-eyebrow{margin:0 4px 0 0}
+.voice-preset-chip{border:1px solid #2a4a45;background:transparent;color:#9fc4bd;border-radius:999px;padding:6px 12px;font-size:10px;font-weight:700}
+.voice-preset-chip.on{background:#17352f;color:#bff3e6;border-color:#4a897c}
+.voice-preset-chip.is-custom{border-style:dashed;color:#c8b98a;border-color:#5b5232;cursor:default}
+.voice-instructions-row{display:flex;gap:8px;align-items:stretch}
+.voice-instructions-input{flex:1;min-height:44px;resize:vertical;border:1px solid #274643;background:#0b1a19;color:#dcefe9;border-radius:8px;padding:8px 10px;font:inherit;font-size:11px;line-height:1.5}
+.voice-instructions-input::placeholder{color:#5c7377}
+.voice-instructions-apply{border:1px solid #32665e;background:#13342f;color:#b9f4e5;border-radius:8px;padding:0 16px;font-size:10px;font-weight:800;white-space:nowrap;align-self:stretch}
+.voice-instructions-apply:disabled{border-color:#273a3d;background:#141f22;color:#5f767b;cursor:default}
+.voice-voice-field{display:block;max-width:340px}
+.voice-voice-select{width:100%;border:1px solid #274643;background:#0b1a19;color:#dcefe9;border-radius:8px;padding:9px 10px;font:inherit;font-size:11px;font-weight:700}
+.voice-preset-chip:focus-visible,.voice-instructions-input:focus-visible,.voice-instructions-apply:focus-visible,.voice-voice-select:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
 .voice-actions{display:inline-flex;align-items:center;gap:10px;flex-wrap:wrap}
 .voice-connect,.vp-ptt,.voice-handsfree{border:1px solid #397f72;background:#1a554b;color:#d3fff4;border-radius:8px;padding:11px 20px;font-size:11px;font-weight:800;touch-action:none;user-select:none}
 .vp-ptt.is-live,.voice-handsfree.is-live{background:var(--teal);border-color:#7ff0dd;color:#09211d}
