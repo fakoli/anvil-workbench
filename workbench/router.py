@@ -17,6 +17,13 @@ class RouterError(RuntimeError):
     """Anvil Serving could not complete a bounded Workbench request."""
 
 
+#: Hard ceiling on a single non-streaming router JSON response.  Bounds memory
+#: BEFORE the body is fully buffered, so a misbehaving/compromised upstream cannot
+#: smuggle a multi-GB blob through ``_request`` -- comfortably above the largest
+#: legitimate response (a ~24 MB base64 TTS audio payload, ``_MAX_SYNTH_AUDIO_B64``).
+_MAX_RESPONSE_BYTES = 32_000_000
+
+
 def _request(base_url: str, token: str, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
     if not base_url or not token:
         raise RouterError("Anvil Serving route access is not configured")
@@ -28,9 +35,14 @@ def _request(base_url: str, token: str, method: str, path: str, payload: dict[st
     request = Request(base_url.rstrip("/") + path, data=body, headers=headers, method=method)
     try:
         with urlopen(request, timeout=30) as response:  # nosec B310: operator-configured tailnet router
-            raw = response.read().decode("utf-8")
+            # Bounded read: cap memory at the ceiling+1 BEFORE decoding, so a
+            # misbehaving upstream cannot buffer an unbounded body here.
+            buffered = response.read(_MAX_RESPONSE_BYTES + 1)
+            if len(buffered) > _MAX_RESPONSE_BYTES:
+                raise RouterError("Anvil Serving returned an oversized response")
+            raw = buffered.decode("utf-8")
     except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        detail = exc.read(4096).decode("utf-8", errors="replace")[:300]
         raise RouterError(f"Anvil Serving rejected the request ({exc.code}): {detail}") from exc
     except URLError as exc:
         raise RouterError(f"Anvil Serving is unreachable: {exc.reason}") from exc
@@ -139,12 +151,24 @@ def route_resolution(decision: Any) -> dict[str, Any]:
     }
 
 
-#: Anvil Serving's declared audio surface.  Serving is the ONLY managed model
-#: path and owns model policy (AGENTS.md); these two operator-configured
-#: endpoints are the only places the voice relay reaches for STT/TTS.  There is
-#: deliberately no provider fallback and no raw-provider path (no external
-#: provider host, no provider API key): a Serving failure settles as a
-#: :class:`RouterError`, never a retry against another provider.
+#: Anvil Serving's declared unified audio gateway (anvil-serving#280).  Serving is
+#: the ONLY managed model path and owns model policy (AGENTS.md); these two
+#: operator-configured router endpoints are the only places the voice relay
+#: reaches for STT/TTS.  The hub talks ONLY to the router base -- never to a raw
+#: STT/TTS serve.  There is deliberately no provider fallback and no raw-provider
+#: path (no external provider host, no provider API key): a Serving failure
+#: settles as a :class:`RouterError`, never a retry against another provider.
+#:
+#: The wire contract, verified against the live router (#280):
+#:   STT  POST {base}/audio/transcriptions
+#:        -> {"purpose":"stt","audio_b64":<b64>,"format":"wav","is_final":true}
+#:        <- {"text","is_final","duration_ms","model","request_id","latency_ms"}
+#:   TTS  POST {base}/audio/speech
+#:        -> {"purpose":"tts","input":<text>,"response_format":"pcm16"}
+#:        <- {"audio_b64","format","sample_rate","model","request_id","latency_ms"}
+#: ``purpose`` is REQUIRED (the gateway 400s without it); the configured model id
+#: rides alongside (the gateway accepts it) so a deployment can pin the served
+#: STT/TTS model.
 _SERVING_TRANSCRIBE_PATH = "/audio/transcriptions"
 _SERVING_SPEECH_PATH = "/audio/speech"
 
@@ -165,18 +189,21 @@ def voice_transcribe(
     audio_format: str,
     is_final: bool,
 ) -> dict[str, Any]:
-    """Transcribe one in-memory audio chunk through Anvil Serving's STT surface.
+    """Transcribe one in-memory audio chunk through Anvil Serving's STT gateway.
 
-    The audio is relayed to Serving's declared ``/audio/transcriptions`` endpoint
-    only; the returned draft transcript is credential-scrubbed and bounded.  This
-    function persists nothing and returns no audio — it is a transient draft used
-    to seed an editable composer, never a committed turn.
+    The audio is relayed to Serving's declared ``/audio/transcriptions`` gateway
+    (anvil-serving#280) only, with the REQUIRED ``purpose="stt"`` discriminator
+    and the base64 audio under ``audio_b64``; the returned draft transcript is
+    credential-scrubbed and bounded.  This function persists nothing and returns
+    no audio — it is a transient draft used to seed an editable composer, never a
+    committed turn.
     """
     response = _request(base_url, token, "POST", _SERVING_TRANSCRIBE_PATH, {
+        "purpose": "stt",
         "model": model,
-        "audio": audio_b64,
+        "audio_b64": audio_b64,
         "format": audio_format,
-        "mode": "final" if is_final else "interim",
+        "is_final": is_final,
     })
     if not isinstance(response, dict):
         raise RouterError("Anvil Serving transcription result has an unexpected shape")
@@ -201,20 +228,24 @@ def voice_synthesize(
     text: str,
     output_format: str,
 ) -> dict[str, Any]:
-    """Synthesize playable audio for a message's text through Serving's TTS surface.
+    """Synthesize playable audio for a message's text through Serving's TTS gateway.
 
-    The text is relayed to Serving's declared ``/audio/speech`` endpoint only.
-    The returned audio is transient playback bytes (base64) the caller streams to
-    the browser and never persists; this function mutates no message state.
+    The text is relayed to Serving's declared ``/audio/speech`` gateway
+    (anvil-serving#280) only, with the REQUIRED ``purpose="tts"`` discriminator and
+    the requested ``response_format``.  The returned audio is transient playback
+    bytes (base64 under ``audio_b64``) the caller streams to the browser and never
+    persists; this function mutates no message state.  The gateway reports its own
+    ``sample_rate`` (24000 for the served TTS model) so playback is not garbled.
     """
     response = _request(base_url, token, "POST", _SERVING_SPEECH_PATH, {
+        "purpose": "tts",
         "model": model,
         "input": text,
-        "format": output_format,
+        "response_format": output_format,
     })
     if not isinstance(response, dict):
         raise RouterError("Anvil Serving speech result has an unexpected shape")
-    audio_b64 = response.get("audio")
+    audio_b64 = response.get("audio_b64")
     if not isinstance(audio_b64, str) or not audio_b64:
         raise RouterError("Anvil Serving speech result carried no audio")
     if len(audio_b64) > _MAX_SYNTH_AUDIO_B64:

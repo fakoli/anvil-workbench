@@ -39,17 +39,18 @@ services:
       ANVIL_VOICE_REALTIME_URL: ${ANVIL_VOICE_REALTIME_URL:-}
       ANVIL_VOICE_REALTIME_TOKEN: ${ANVIL_VOICE_REALTIME_TOKEN:-}
       WORKBENCH_VOICE_RETAIN_TRANSCRIPTS: ${WORKBENCH_VOICE_RETAIN_TRANSCRIPTS:-false}
-      # Request/response chat dictation (STT) + read-aloud (TTS) serves, consumed
-      # only by the hub-side voice relay (voice_relay_service). Both URLs are
-      # required when that surface is named in WORKBENCH_LIVE_SURFACES; the hub
-      # fails closed at startup if either is unset/invalid. Managed-serve URLs,
-      # never a raw provider; audio and transcripts never leave the relay.
-      ANVIL_VOICE_STT_URL: ${ANVIL_VOICE_STT_URL:-}
-      ANVIL_VOICE_TTS_URL: ${ANVIL_VOICE_TTS_URL:-}
-      ANVIL_VOICE_VOICES_URL: ${ANVIL_VOICE_VOICES_URL:-}
+      # Request/response chat dictation (STT) + read-aloud (TTS) relay
+      # (voice_relay_service) goes through Anvil Serving's unified audio gateway
+      # (anvil-serving#280) on ANVIL_ROUTER_BASE_URL/ANVIL_ROUTER_TOKEN above --
+      # the hub reaches ONLY the router, never a raw STT/TTS serve, so there are no
+      # per-serve URL/sample-rate settings (the gateway reports sample_rate). Only
+      # the served model ids are pinned. Audio and transcripts never leave the relay.
       ANVIL_VOICE_STT_MODEL: ${ANVIL_VOICE_STT_MODEL:-tdt-0.6b-v3}
       ANVIL_VOICE_TTS_MODEL: ${ANVIL_VOICE_TTS_MODEL:-kokoro}
-      ANVIL_VOICE_TTS_SAMPLE_RATE: ${ANVIL_VOICE_TTS_SAMPLE_RATE:-24000}
+      # Voice-tab PICKER catalog only (NOT the relay): #280 exposes no /audio/voices,
+      # so the selectable-voice list is still sourced from the TTS serve's own
+      # voices endpoint. Empty disables the picker (503); the browser never hits it.
+      ANVIL_VOICE_VOICES_URL: ${ANVIL_VOICE_VOICES_URL:-}
       WORKBENCH_EMBEDDING_MODEL: ${WORKBENCH_EMBEDDING_MODEL:-}
       WORKBENCH_RERANK_MODEL: ${WORKBENCH_RERANK_MODEL:-}
       # Operator-reviewed chat-route allowlist (closed chat-turn.v1 shape; no

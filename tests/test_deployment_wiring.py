@@ -489,24 +489,34 @@ def test_delivery_projection_surface_requires_a_seed_directory():
 
 
 # ---------------------------------------------------------------------------
-# (e) voice_relay_service wires the Dark Serving audio adapter, gated + closed
+# (e) voice_relay_service wires the #280 unified audio gateway, gated + closed
 # ---------------------------------------------------------------------------
 
 import base64 as _b64
 import json as _json
 
-_VOICE_STT_URL = "http://serving-stt.internal:30010/v1/audio/transcriptions"
-_VOICE_TTS_URL = "http://serving-tts.internal:30011/v1/audio/speech"
+_ROUTER_BASE = "http://serving.internal:8000/v1"
+_ROUTER_TOKEN = "deployment-wiring-router-token"
+_GW_TRANSCRIBE = _ROUTER_BASE + "/audio/transcriptions"
+_GW_SPEECH = _ROUTER_BASE + "/audio/speech"
+
+#: What the fake gateway hands back for each purpose (the verified #280 shapes).
+_GW_STT_TEXT = "wired draft words"
+_GW_TTS_PCM_B64 = _b64.b64encode(b"\x07\x08" * 64).decode()
 
 
-class _FakeAudioServeResponse:
-    """One canned serve answer for the monkeypatched ``urlopen`` context manager."""
+class _FakeGatewayResponse:
+    """One canned router answer for the monkeypatched ``urlopen`` context manager.
+
+    ``router._request`` reads the body with ``response.read()`` (no size arg) and
+    JSON-decodes it, so a full-body read is all this needs to model.
+    """
 
     def __init__(self, body: bytes) -> None:
         self.status = 200
         self._body = body
 
-    def __enter__(self) -> "_FakeAudioServeResponse":
+    def __enter__(self) -> "_FakeGatewayResponse":
         return self
 
     def __exit__(self, *_a: object) -> bool:
@@ -516,27 +526,37 @@ class _FakeAudioServeResponse:
         return self._body if (n is None or n < 0) else self._body[:n]
 
 
-def _stub_audio_serves(monkeypatch) -> None:
-    """Route the adapter's STT/TTS hop to canned answers -- no real serve is hit.
+def _stub_gateway(monkeypatch, *, capture=None) -> None:
+    """Route the ROUTER's audio-gateway hop to canned answers -- no network.
 
-    The STT URL answers the parakeet ``{"text"}`` shape; the TTS URL answers raw
-    PCM16 bytes (the kokoro shape). This exercises the WIRED deployment transport
-    end to end without a network.
+    Stubs ``workbench.router.urlopen`` so the REAL ServingVoiceTransport + router
+    wire is exercised end to end: the transport builds the #280 request, the router
+    POSTs it, and these canned gateway responses come back. Captured requests let a
+    test assert the exact wire contract (``purpose`` + ``audio_b64`` /
+    ``response_format``).
     """
     def fake_urlopen(request, timeout=None):  # noqa: ANN001
-        if request.full_url == _VOICE_TTS_URL:
-            return _FakeAudioServeResponse(b"\x07\x08" * 64)  # raw PCM16
-        return _FakeAudioServeResponse(_json.dumps({"text": "wired draft words"}).encode())
+        if capture is not None:
+            capture.append(request)
+        if request.full_url == _GW_SPEECH:
+            return _FakeGatewayResponse(_json.dumps({
+                "audio_b64": _GW_TTS_PCM_B64, "format": "pcm16", "sample_rate": 24000,
+                "model": "kokoro", "request_id": "aud_x", "latency_ms": 68,
+            }).encode())
+        return _FakeGatewayResponse(_json.dumps({
+            "text": _GW_STT_TEXT, "is_final": True, "duration_ms": 500,
+            "model": "tdt-0.6b-v3", "request_id": "aud_y", "latency_ms": 90,
+        }).encode())
 
-    monkeypatch.setattr("workbench.serving_audio._urlopen", fake_urlopen)
+    monkeypatch.setattr("workbench.router.urlopen", fake_urlopen)
 
 
 def _voice_env(**extra: str) -> dict[str, str]:
     return _base_env(
         WORKBENCH_LIVE_SURFACES="voice_relay_service",
         WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY,
-        ANVIL_VOICE_STT_URL=_VOICE_STT_URL,
-        ANVIL_VOICE_TTS_URL=_VOICE_TTS_URL,
+        ANVIL_ROUTER_BASE_URL=_ROUTER_BASE,
+        ANVIL_ROUTER_TOKEN=_ROUTER_TOKEN,
         **extra,
     )
 
@@ -551,10 +571,12 @@ def test_voice_relay_defaults_to_503_when_not_wired():
     assert r.status_code == 503
 
 
-def test_voice_relay_wired_serves_stt_and_tts_over_the_dark_serves(monkeypatch):
+def test_voice_relay_wired_serves_stt_and_tts_over_the_gateway(monkeypatch):
     # The wired relay goes 503 -> 200 through the REAL deployment composition and
-    # the REAL DarkServingAudioTransport (only the network hop is stubbed).
-    _stub_audio_serves(monkeypatch)
+    # the REAL ServingVoiceTransport + router over the #280 gateway (only the
+    # network hop is stubbed).
+    captured: list = []
+    _stub_gateway(monkeypatch, capture=captured)
     client = _wired_client(_voice_env())
 
     # Scope is authoritative: relay only for a conversation the actor OWNS. Create
@@ -563,45 +585,47 @@ def test_voice_relay_wired_serves_stt_and_tts_over_the_dark_serves(monkeypatch):
     assert created.status_code == 201, created.text
     conversation_id = created.json()["id"]
 
-    # STT: multipart upload -> editable draft (no turn created).
+    # STT: gateway transcribe -> editable draft (no turn created).
     stt = client.post("/api/chat/voice/transcribe", headers=_ACTOR, json={
         "conversation_id": conversation_id,
         "audio_base64": _b64.b64encode(b"RIFF____WAVE" + b"\x00" * 48).decode(),
         "audio_format": "wav", "is_final": True,
     })
     assert stt.status_code == 200, stt.text
-    # The 60-byte WAV body estimates to 0 ms (8 samples at 16 kHz): a concrete
-    # value, never self-referential.
-    assert stt.json() == {"draft": {"text": "wired draft words", "is_final": True, "duration_ms": 0}}
+    assert stt.json() == {"draft": {"text": _GW_STT_TEXT, "is_final": True, "duration_ms": 500}}
 
-    # TTS: raw PCM16 -> transient playback audio, reporting the serve sample rate.
+    # TTS: gateway speech -> transient playback audio, reporting the gateway rate.
     tts = client.post("/api/chat/voice/speak", headers=_ACTOR, json={
         "conversation_id": conversation_id, "message_ref": "m1",
         "text": "please read this back", "output_format": "pcm16",
     })
     assert tts.status_code == 200, tts.text
     payload = tts.json()
-    assert _b64.b64decode(payload["audio_base64"]) == b"\x07\x08" * 64
+    assert payload["audio_base64"] == _GW_TTS_PCM_B64
     assert payload["audio_format"] == "pcm16"
-    assert payload["sample_rate"] == 24000  # the default kokoro serve rate, honored
+    assert payload["sample_rate"] == 24000  # REPORTED by the gateway, forwarded verbatim
 
+    # The wire the REAL transport built is exactly the verified #280 contract:
+    # purpose + audio_b64 for STT, purpose + response_format for TTS, both to the
+    # router base (never a raw serve host), bearer-authenticated.
+    stt_req = next(r for r in captured if r.full_url == _GW_TRANSCRIBE)
+    stt_body = _json.loads(stt_req.data.decode())
+    assert stt_body["purpose"] == "stt"
+    assert "audio_b64" in stt_body and stt_body["format"] == "wav" and stt_body["is_final"] is True
+    assert "audio" not in stt_body  # not the retired raw-serve field name
+    assert dict(stt_req.header_items())["Authorization"] == "Bearer " + _ROUTER_TOKEN
 
-def test_voice_relay_sample_rate_env_is_honored(monkeypatch):
-    _stub_audio_serves(monkeypatch)
-    client = _wired_client(_voice_env(ANVIL_VOICE_TTS_SAMPLE_RATE="22050"))
-    created = client.post("/api/conversations", headers=_ACTOR, json={"title": "c"})
-    conversation_id = created.json()["id"]
-    tts = client.post("/api/chat/voice/speak", headers=_ACTOR, json={
-        "conversation_id": conversation_id, "message_ref": "m", "text": "hi", "output_format": "pcm16",
-    })
-    assert tts.status_code == 200
-    assert tts.json()["sample_rate"] == 22050
+    tts_req = next(r for r in captured if r.full_url == _GW_SPEECH)
+    tts_body = _json.loads(tts_req.data.decode())
+    assert tts_body["purpose"] == "tts"
+    assert tts_body["response_format"] == "pcm16" and tts_body["input"] == "please read this back"
+    assert "format" not in tts_body  # the field is response_format on the gateway
 
 
 def test_voice_relay_scope_refuses_a_conversation_the_actor_does_not_own(monkeypatch):
     # A second allowlisted actor may reach the endpoint, but the ownership scope
     # check (through the shared store) fails closed with 403 for someone else's id.
-    _stub_audio_serves(monkeypatch)
+    _stub_gateway(monkeypatch)
     client = _wired_client(_voice_env(WORKBENCH_APPROVERS="operator,intruder"))
     owned = client.post("/api/conversations", headers=_ACTOR, json={"title": "owners only"})
     conversation_id = owned.json()["id"]
@@ -613,21 +637,20 @@ def test_voice_relay_scope_refuses_a_conversation_the_actor_does_not_own(monkeyp
     assert r.status_code == 403
 
 
-def test_voice_relay_without_serve_urls_fails_closed_at_startup():
-    # Naming voice_relay_service but leaving the serve URLs unset fails the hub
-    # closed at startup, not a per-request 503 an operator cannot diagnose.
-    with pytest.raises(DeploymentConfigError, match="ANVIL_VOICE_STT_URL"):
+def test_voice_relay_without_router_config_fails_closed_at_startup():
+    # Naming voice_relay_service but leaving the router base/token unset fails the
+    # hub closed at startup, not a per-request 502 an operator cannot diagnose.
+    with pytest.raises(DeploymentConfigError, match="ANVIL_ROUTER_BASE_URL"):
         build_live_overrides(_base_env(
             WORKBENCH_LIVE_SURFACES="voice_relay_service",
             WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY,
         ))
-    # A non-http URL is also refused.
+    # A base URL without a token is likewise refused.
     with pytest.raises(DeploymentConfigError):
         build_live_overrides(_base_env(
             WORKBENCH_LIVE_SURFACES="voice_relay_service",
             WORKBENCH_CHAT_HASH_KEY=_CHAT_HASH_KEY,
-            ANVIL_VOICE_STT_URL="ftp://nope",
-            ANVIL_VOICE_TTS_URL=_VOICE_TTS_URL,
+            ANVIL_ROUTER_BASE_URL=_ROUTER_BASE,
         ))
 
 
@@ -637,6 +660,6 @@ def test_voice_relay_without_chat_persistence_fails_closed_at_startup():
     with pytest.raises(DeploymentConfigError):
         build_live_overrides(_base_env(
             WORKBENCH_LIVE_SURFACES="voice_relay_service",
-            ANVIL_VOICE_STT_URL=_VOICE_STT_URL,
-            ANVIL_VOICE_TTS_URL=_VOICE_TTS_URL,
+            ANVIL_ROUTER_BASE_URL=_ROUTER_BASE,
+            ANVIL_ROUTER_TOKEN=_ROUTER_TOKEN,
         ))

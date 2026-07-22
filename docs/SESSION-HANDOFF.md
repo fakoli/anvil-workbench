@@ -49,11 +49,20 @@ branch.
   the reviewed routes config.
 - **Voice realtime proxy** was brought up via a **session-local topology**; the
   operator topology was left untouched.
-- **Request/response voice** was wired live: `voice_relay_service` (in
-  `WORKBENCH_LIVE_SURFACES`) plus the gated hub-side adapter
-  `workbench/serving_audio.py` `DarkServingAudioTransport` to the Dark parakeet
-  STT `:30010` and kokoro TTS `:30011` serves — STT transcribe and TTS read-aloud
-  both verified 200 through the hub, no-leak, no-mutation.
+- **Request/response voice** is wired live through **Anvil Serving's unified audio
+  gateway** ([anvil-serving#280](https://github.com/fakoli/anvil-serving/issues/280)):
+  `voice_relay_service` (in `WORKBENCH_LIVE_SURFACES`) now uses the stock
+  `workbench/voice.py` `ServingVoiceTransport` over `workbench/router.py`
+  `voice_transcribe`/`voice_synthesize`, reaching ONLY the router base
+  (`ANVIL_ROUTER_BASE_URL` + `ANVIL_ROUTER_TOKEN`) — `POST {base}/audio/transcriptions`
+  and `POST {base}/audio/speech` with the required `purpose` discriminator. The
+  interim hub-side `DarkServingAudioTransport` that spoke the raw parakeet `:30010`
+  / kokoro `:30011` serves directly has been **retired** (the boundary deviation
+  #280 tracked is closed). STT transcribe and TTS read-aloud both verified 200
+  through the live gateway (STT → `{text,is_final,duration_ms}`; TTS → pcm16 @
+  `sample_rate=24000`), no-leak, no-mutation. The Voice-tab voice **picker** still
+  sources its list from the TTS serve's `/audio/voices` (`ANVIL_VOICE_VOICES_URL`),
+  which #280 does not supersede.
 
 ### Per-task live/blocked disposition (one line each)
 
@@ -61,10 +70,11 @@ branch.
   on Fast and Heavy routes; safe-metadata decisions; memory/cancel/live-region/
   keyboard proven). **Voice splits:** the **request/response** STT-dictation
   ("Hold to talk") + read-aloud ("Play audio") surfaces are now **LIVE** —
-  `voice_relay_service` is wired via `WORKBENCH_LIVE_SURFACES` plus a gated
-  hub-side adapter (`workbench/serving_audio.py` `DarkServingAudioTransport`) to
-  the Dark serves (parakeet STT `:30010`, kokoro TTS `:30011`, env-configured
-  `ANVIL_VOICE_STT_URL`/`TTS_URL`/models/`sample_rate`).
+  `voice_relay_service` is wired via `WORKBENCH_LIVE_SURFACES` through Anvil
+  Serving's unified audio gateway (anvil-serving#280) using the stock
+  `ServingVoiceTransport` over the router base (`ANVIL_ROUTER_BASE_URL` +
+  `ANVIL_ROUTER_TOKEN`, model ids `ANVIL_VOICE_STT_MODEL`/`ANVIL_VOICE_TTS_MODEL`);
+  the interim `DarkServingAudioTransport` to the raw Dark serves is retired.
   `POST /api/chat/voice/transcribe` → 200 with a real draft transcript, no
   conversation turn (`turns=0`); the rendered-browser "Read this response aloud"
   button fired `POST /api/chat/voice/speak` → 200, kokoro returned ~1.64 s PCM at
