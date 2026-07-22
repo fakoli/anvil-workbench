@@ -423,6 +423,19 @@ function VoicePage({ data, append }) {
   // Serializes turn persistence so appended turns keep transcript order even when
   // a user turn and the assistant's reply settle back-to-back on one utterance.
   const persistQueueRef = useRef(Promise.resolve())
+  // The OWNER of the in-flight exchange: the conversation a spoken utterance (and
+  // the reply it triggers) belongs to, captured when the utterance STARTS. Both
+  // the user turn and its assistant reply bind to this, so a mid-utterance switch
+  // can never split an exchange across two conversations or misattribute a
+  // straggler transcription to the newly-selected thread. `{ dest, id }`: `dest`
+  // is the bound destination promise (funnelled through the shared auto-create),
+  // `id` pins the concrete conversation id once known (incl. an auto-created one).
+  const utteranceRef = useRef(null)
+  // True while a user utterance is in flight (its STT has started but not
+  // completed). On a switch this decides whether the owner is a live straggler to
+  // preserve (keep, so its completed still routes to the origin) or a finished
+  // exchange's stale owner to drop (clear, so the next utterance re-binds).
+  const userUtteranceOpenRef = useRef(false)
 
   // The unified conversation rail — the SAME `/api/conversations` store as Chat.
   // `enabled` gates loading on a configured relay; `onOpen` loads a selected
@@ -437,14 +450,47 @@ function VoicePage({ data, append }) {
     ? 'Disconnected. Nothing was recorded — chat storage is unavailable, so this session was ephemeral.'
     : 'Disconnected. The live view cleared; saved conversations remain in your list.')
 
-  // Append ONE completed turn to the selected conversation AS TEXT (never audio).
-  // Auto-creates a conversation when none is selected so a first utterance is not
-  // lost, and is a no-op when the store is unavailable (voice runs ephemeral).
-  // Best-effort: a failed append is swallowed so the live session is never blocked.
-  const persistVoiceTurn = (role, text) => {
+  // Resolve the destination conversation NOW (at utterance/settle time), funnelled
+  // through the shared creatingRef auto-create so a first utterance's user and
+  // assistant turns share ONE new conversation. Unavailable store → no destination.
+  const resolveDestination = () => (rail.unavailable
+    ? Promise.resolve(null)
+    : rail.ensureConversation(`Voice · ${new Date().toLocaleString()}`))
+
+  // Bind the current exchange to its owner at utterance START (the first STT
+  // event). `id` snapshots the origin (or null while an auto-create is pending)
+  // and is pinned to the concrete id once the destination resolves, so the render
+  // guard can compare it against the live selection.
+  const beginUtterance = () => {
+    const dest = resolveDestination()
+    const owner = { dest, id: rail.selectedIdRef.current }
+    dest.then((resolved) => { if (resolved) owner.id = resolved }).catch(() => {})
+    utteranceRef.current = owner
+    userUtteranceOpenRef.current = true
+    return owner
+  }
+  const startUserUtterance = () => utteranceRef.current || beginUtterance()
+  // Does the in-flight utterance belong to the CURRENTLY VIEWED conversation? A
+  // straggler STT event that arrives after a switch is NOT owned by the new view:
+  // it must route to its origin and never render into the switched-to thread.
+  // While an auto-create is still pending (id unpinned) the origin is the current
+  // view only if nothing else has been selected yet.
+  const ownedByView = (owner) => {
+    if (!owner) return true
+    if (owner.id == null) return rail.selectedIdRef.current == null
+    return rail.selectedIdRef.current === owner.id
+  }
+
+  // Append ONE completed turn AS TEXT (never audio) to a destination CAPTURED at
+  // settle time (`dest`) — never re-read the live selection inside the drained
+  // task, so a switch mid-flight cannot misattribute the turn. No-op when the
+  // store is unavailable (voice runs ephemeral). Best-effort: a failed append is
+  // swallowed so the live session is never blocked.
+  const persistVoiceTurn = (role, text, dest) => {
     if (rail.unavailable) return
+    const target = dest || resolveDestination()
     persistQueueRef.current = persistQueueRef.current.then(async () => {
-      const id = await rail.ensureConversation(`Voice · ${new Date().toLocaleString()}`)
+      const id = await target
       if (!id) return
       try { await appendTurn(id, { role, status: 'complete', content: [{ kind: 'text', text }] }) }
       catch { /* best-effort; a persistence failure never blocks speaking */ }
@@ -549,8 +595,6 @@ function VoicePage({ data, append }) {
       setTranscript((current) => [...current, { id, role: 'user', text, status: final ? 'complete' : 'partial' }])
     }
     setAnnounce(`You said: ${text}`)
-    // Persist the settled user turn as TEXT (only a non-empty final transcript).
-    if (final && text.trim()) persistVoiceTurn('user', text.trim())
   }
   const beginAssistantTurn = () => {
     const id = `voice-assistant-${(turnSeqRef.current += 1)}`
@@ -563,13 +607,16 @@ function VoicePage({ data, append }) {
     setAnnounce('Assistant is replying by voice.')
   }
   // A spoken reply has settled: mark its bubble complete and persist an audio-only
-  // TEXT placeholder (never the audio) to the selected conversation.
+  // TEXT placeholder (never the audio) to the SAME conversation the triggering
+  // utterance was bound to — captured at settle time, so a switch cannot split the
+  // exchange. Then close the exchange so the next utterance re-binds.
   const completeAssistantTurn = () => {
     const id = currentAssistantRef.current
     if (!id) return
     setTranscript((current) => current.map((turn) => (turn.id === id ? { ...turn, status: 'complete' } : turn)))
     currentAssistantRef.current = null
-    persistVoiceTurn('assistant', VOICE_SPOKEN_PLACEHOLDER)
+    persistVoiceTurn('assistant', VOICE_SPOKEN_PLACEHOLDER, utteranceRef.current?.dest)
+    utteranceRef.current = null
   }
   // Load a selected conversation's stored turns into the transcript (or clear it
   // for a fresh/removed one). Settle any in-flight playback from the PREVIOUS
@@ -581,6 +628,11 @@ function VoicePage({ data, append }) {
       if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response.cancel' }))
     }
     currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map()
+    // Keep the owner ONLY while a user utterance is still open — its completed STT
+    // is a straggler that must still route to the origin conversation. A finished
+    // exchange's owner is stale here and is dropped so the next utterance in the
+    // switched-to conversation re-binds instead of inheriting the old destination.
+    if (!userUtteranceOpenRef.current) utteranceRef.current = null
     setTranscript(voiceTurnsFromStored(turns))
     setAnnounce(id ? 'Switched conversation. New turns save here.' : 'Started a new conversation.')
   }
@@ -598,8 +650,31 @@ function VoicePage({ data, append }) {
     }
     if (type === 'response.created') { beginAssistantTurn(); return }
     if (type === 'response.done' || type === 'response.completed') { completeAssistantTurn(); return }
-    if (type === 'conversation.item.input_audio_transcription.delta') { upsertUserTurn(message.delta || message.transcript || '', false); return }
-    if (type === 'conversation.item.input_audio_transcription.completed') { upsertUserTurn(message.transcript || message.text || '', true); return }
+    if (type === 'conversation.item.input_audio_transcription.delta') {
+      // Capture the utterance's owner at its first STT event; render the partial
+      // ONLY into the view it belongs to (a straggler for a switched-away
+      // conversation neither renders here nor starts a bubble in the new thread).
+      const owner = startUserUtterance()
+      if (ownedByView(owner)) upsertUserTurn(message.delta || message.transcript || '', false)
+      return
+    }
+    if (type === 'conversation.item.input_audio_transcription.completed') {
+      const owner = startUserUtterance()
+      const text = message.transcript || message.text || ''
+      if (ownedByView(owner)) {
+        upsertUserTurn(text, true) // owned by the current view: render the final turn
+      } else {
+        // Straggler after a switch: do NOT render into the new thread. Drop the
+        // dangling partial and close this exchange so the next utterance re-binds.
+        currentUserRef.current = null
+        utteranceRef.current = null
+      }
+      userUtteranceOpenRef.current = false // user side settled; owner survives for the reply
+      // Persist to the destination BOUND at utterance start — the origin
+      // conversation — never the live selection at drain time.
+      if (text.trim()) persistVoiceTurn('user', text.trim(), owner.dest)
+      return
+    }
     // The server emits speech_stopped only as a byproduct of a commit, but honor
     // it: if one ever arrives while hands-free, close the utterance with a commit
     // (never response.create). The primary hands-free driver is the client VAD.

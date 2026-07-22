@@ -1642,6 +1642,57 @@ describe('Voice page (speech-to-speech) dedicated tab (live-qualification)', () 
     await waitFor(() => expect(appendTurn).toHaveBeenCalledWith('conv_active', expect.objectContaining({ role: 'user' })))
   })
 
+  it('does not split an exchange when a switch lands mid-append (race #1: settle-time destination)', async () => {
+    // Two conversations in the rail; the exchange happens entirely in A (conv_active).
+    listConversations.mockResolvedValue({ conversations: [activeConversation, secondConversation] })
+    const user = await renderVoice()
+    await user.click(await screen.findByRole('button', { name: 'Open Router planning' }))
+    const socket = await connectVoice(user)
+    // Park the FIRST append (the user turn) in-flight so the persist queue is still
+    // draining when the operator switches away — the exact window that split turns.
+    let releaseUserAppend
+    appendTurn.mockImplementationOnce(() => new Promise((resolve) => { releaseUserAppend = () => resolve({ id: 'turn_user' }) }))
+    // A full exchange settles while A is selected (user transcription + spoken reply).
+    await act(async () => { socket.onmessage?.(transcription('what is pending')) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.done' }) }) })
+    // The user append is parked; the assistant append is queued behind it.
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(1))
+    // Switch to a DIFFERENT conversation while the queue is mid-drain.
+    getConversation.mockResolvedValueOnce({ conversation: secondConversation, turns: [] })
+    await user.click(screen.getByRole('button', { name: 'Open Second thread' }))
+    // Release the parked append; the queued assistant append drains AFTER the switch.
+    await act(async () => { releaseUserAppend() })
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(2))
+    // BOTH turns landed in the ORIGIN conversation — not split, not in the new one.
+    expect(appendTurn.mock.calls.every((call) => call[0] === 'conv_active')).toBe(true)
+    const roles = appendTurn.mock.calls.map((call) => call[1].role)
+    expect(roles).toContain('user'); expect(roles).toContain('assistant')
+  })
+
+  it('routes a post-switch transcription straggler to its ORIGIN, not the live selection (race #2: user-path guard)', async () => {
+    listConversations.mockResolvedValue({ conversations: [activeConversation, secondConversation] })
+    const user = await renderVoice()
+    await user.click(await screen.findByRole('button', { name: 'Open Router planning' })) // origin A = conv_active
+    const socket = await connectVoice(user)
+    // The utterance STARTS in A: a partial transcription arrives while A is viewed.
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.delta', delta: 'spoken in A' }) }) })
+    const log = screen.getByRole('log', { name: 'Live transcript' })
+    expect(await within(log).findByText('spoken in A')).toBeTruthy()
+    // Switch to B BEFORE the transcription completes.
+    getConversation.mockResolvedValueOnce({ conversation: secondConversation, turns: [] })
+    await user.click(screen.getByRole('button', { name: 'Open Second thread' }))
+    // The straggler `completed` for A's audio now arrives while B is selected.
+    await act(async () => { socket.onmessage?.(transcription('spoken in A, finished later')) })
+    // It persists to the ORIGIN (A) — never the live selection (B).
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledWith('conv_active', expect.objectContaining({ role: 'user' })))
+    expect(appendTurn.mock.calls.every((call) => call[0] === 'conv_active')).toBe(true)
+    // ...and it does NOT render into B's view (neither the partial nor the final).
+    expect(within(log).queryByText(/finished later/)).toBeNull()
+    expect(within(log).queryByText('spoken in A')).toBeNull()
+  })
+
   it('degrades to ephemeral when the conversation store is unavailable (503)', async () => {
     listConversations.mockRejectedValue(new Error('Conversations are unavailable'))
     const user = await renderVoice()
