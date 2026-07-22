@@ -46,6 +46,7 @@ services:
       # never a raw provider; audio and transcripts never leave the relay.
       ANVIL_VOICE_STT_URL: ${ANVIL_VOICE_STT_URL:-}
       ANVIL_VOICE_TTS_URL: ${ANVIL_VOICE_TTS_URL:-}
+      ANVIL_VOICE_VOICES_URL: ${ANVIL_VOICE_VOICES_URL:-}
       ANVIL_VOICE_STT_MODEL: ${ANVIL_VOICE_STT_MODEL:-tdt-0.6b-v3}
       ANVIL_VOICE_TTS_MODEL: ${ANVIL_VOICE_TTS_MODEL:-kokoro}
       ANVIL_VOICE_TTS_SAMPLE_RATE: ${ANVIL_VOICE_TTS_SAMPLE_RATE:-24000}

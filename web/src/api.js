@@ -94,6 +94,20 @@ export function voiceSocketUrl(sessionId) {
   return `${protocol}//${window.location.host}/api/sessions/${sessionId}/voice/realtime`
 }
 
+// The selectable TTS voices for the Voice tab, sourced server-side from the
+// operator-declared voice catalog (workbench/api.py GET /api/chat/voice/voices).
+// The browser never hits the TTS serve directly; the hub scrubs every id/label.
+// Returns the bounded `[{id, name?}]` array. A 503 (unconfigured or serve
+// unavailable) throws so the Voice tab degrades to the serve's default voice
+// rather than showing a broken picker.
+export async function fetchVoiceCatalog() {
+  const response = await fetch('/api/chat/voice/voices')
+  if (response.status === 503) throw new Error('Voice selection is not configured for this hub')
+  if (!response.ok) throw new Error('Voice options are unavailable')
+  const body = await response.json()
+  return Array.isArray(body.voices) ? body.voices : []
+}
+
 // --- Actor-scoped conversation API client (chat-first-voice T004.1) ----------
 //
 // The browser half of the merged `/api/conversations` surface. Every request is

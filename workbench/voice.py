@@ -22,6 +22,8 @@ from typing import Any, Iterator, Mapping, Protocol, runtime_checkable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from .redaction import redact_text
+
 
 class VoiceRelayError(ValueError):
     """The client attempted an unsupported Realtime operation."""
@@ -31,10 +33,38 @@ _CLIENT_EVENT_TYPES = frozenset({
     "session.update", "input_audio_buffer.append", "input_audio_buffer.commit",
     "input_audio_buffer.clear", "response.create", "response.cancel",
 })
+#: Session fields a browser may set on its OWN realtime session.  ``instructions``
+#: is a communication-STYLE control (a live system prompt), not a tool, model
+#: route, or privilege, so it is admitted -- but only bounded and scrubbed (see
+#: :data:`MAX_INSTRUCTIONS_CHARS` and the ``session.update`` branch below).  Every
+#: other field here is a small, closed enum/format the upstream already validates.
 _SESSION_FIELDS = frozenset({
     "modalities", "voice", "input_audio_format", "output_audio_format", "turn_detection",
+    "instructions",
 })
 _MAX_AUDIO_EVENT_BYTES = 2_000_000
+
+#: Upper bound on a browser-supplied live system prompt.  A realtime system prompt
+#: is short by nature; this ceiling keeps a pasted document (or a smuggled blob)
+#: out of the upstream session config.  The relay FAILS CLOSED on an oversize or
+#: non-string value rather than silently truncating a possibly-split credential.
+MAX_INSTRUCTIONS_CHARS = 6_000
+
+
+def _sanitize_instructions(value: Any) -> str:
+    """Bound + scrub a browser-supplied live system prompt; fail closed on abuse.
+
+    ``instructions`` is the actor's own communication-style control, but the relay
+    still refuses a non-string or an oversize value (a pasted document or a
+    smuggled blob) and scrubs recognizable secrets/paths with the SAME redaction
+    every retained transcript passes through -- so a credential pasted into the
+    prompt can never ride upstream in the session config.
+    """
+    if not isinstance(value, str):
+        raise VoiceRelayError("voice instructions must be a string")
+    if len(value) > MAX_INSTRUCTIONS_CHARS:
+        raise VoiceRelayError("voice instructions exceed the Workbench limit")
+    return redact_text(value)
 
 
 def sanitize_client_event(raw: str) -> dict[str, Any]:
@@ -52,7 +82,15 @@ def sanitize_client_event(raw: str) -> dict[str, Any]:
         session = event.get("session")
         if not isinstance(session, dict):
             raise VoiceRelayError("session.update requires a session object")
-        return {"type": event_type, "session": {key: value for key, value in session.items() if key in _SESSION_FIELDS}}
+        cleaned_session: dict[str, Any] = {}
+        for key, value in session.items():
+            if key not in _SESSION_FIELDS:
+                continue
+            # ``instructions`` is the one free-text session field; it is bounded and
+            # scrubbed (fail closed on abuse).  Every other allowed field is a
+            # small closed enum/format forwarded verbatim for the upstream to check.
+            cleaned_session[key] = _sanitize_instructions(value) if key == "instructions" else value
+        return {"type": event_type, "session": cleaned_session}
     if event_type == "input_audio_buffer.append":
         audio = event.get("audio")
         if not isinstance(audio, str) or not audio:

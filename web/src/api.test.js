@@ -22,6 +22,7 @@ import {
   fetchPreferences, fetchPreference, writePreference, resetPreference,
   previewPolicyOperation, policyApprovalBinding,
 } from './api'
+import { fetchVoiceCatalog } from './api'
 import { describeConversation, selectChatRoute, successorTurnBody, toTurnContent } from './chat-api'
 
 describe('Workbench browser API', () => {
@@ -52,6 +53,22 @@ describe('Workbench browser API', () => {
 function ok(json) {
   return { ok: true, json: async () => json }
 }
+
+describe('voice catalog client', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('returns the bounded voices array from the actor-gated hub endpoint', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(ok({ voices: [{ id: 'af_bella', name: 'Bella' }, { id: 'am_adam' }] }))
+    const voices = await fetchVoiceCatalog()
+    expect(fetch).toHaveBeenCalledWith('/api/chat/voice/voices')
+    expect(voices).toEqual([{ id: 'af_bella', name: 'Bella' }, { id: 'am_adam' }])
+  })
+
+  it('throws a distinct not-configured error on 503 so the picker degrades to the default voice', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 503, json: async () => ({}) })
+    await expect(fetchVoiceCatalog()).rejects.toThrow(/not configured/i)
+  })
+})
 
 // A newline-delimited-JSON stream body from a list of relay frames, exposed
 // through the same `getReader()` contract `sendMessage` consumes.

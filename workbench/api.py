@@ -94,12 +94,14 @@ from .store import (
     UnknownPreferenceError, WorkbenchStore,
 )
 from .system_health import SystemHealthService, UnknownIntegrationError
+from .serving_audio import fetch_voice_catalog
 from .voice import (
     MAX_STT_INPUT_BYTES,
     STT_INPUT_FORMATS,
     TTS_OUTPUT_FORMATS,
     VoiceRelayService,
     VoiceRequestError,
+    VoiceServingError,
     relay_realtime,
 )
 
@@ -2366,6 +2368,30 @@ def create_app(
                 "retains_transcripts": settings.voice_retain_transcripts,
             },
         }
+
+    @app.get("/api/chat/voice/voices")
+    def voice_voices(_: str = Depends(actor)) -> dict[str, Any]:
+        """Enumerate the selectable TTS voices for the Voice tab, actor-gated.
+
+        The list is sourced server-side from the operator-declared TTS voice
+        catalog (``settings.anvil_voice_voices_url``) so the browser never talks to
+        the serve directly; every id/label is scrubbed before it leaves the hub.
+        Fails closed with 503 when unconfigured or when the serve is unavailable --
+        the Voice tab then falls back to the serve's default voice.
+        """
+        if not settings.anvil_voice_voices_url:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="voice catalog is not configured",
+            )
+        try:
+            voices = fetch_voice_catalog(settings.anvil_voice_voices_url)
+        except VoiceServingError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="voice catalog is unavailable",
+            ) from None
+        return {"voices": voices}
 
     @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
     def create_project(payload: ProjectInput, _: str = Depends(owner)) -> dict[str, Any]:

@@ -6,7 +6,7 @@ import {
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
-  transcribeVoice, speakMessage, fetchPreferences,
+  transcribeVoice, speakMessage, fetchPreferences, fetchVoiceCatalog,
   fetchAdvancedRoutes, runAdvancedBranch, ADVANCED_NOT_CONFIGURED,
   fetchAdvancedPresets, resolveAdvancedPreset, buildAdvancedComparison,
   fetchAdvancedTemplates, resolveAdvancedTemplate, renderAdvancedDeclaredInstructions,
@@ -84,6 +84,63 @@ function encodePcm16(samples) {
   let binary = ''
   for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
   return window.btoa(binary)
+}
+
+// --- Voice tab session tuning (voice control bar additions) ------------------
+//
+// The Voice tab lets the operator steer HOW the assistant responds (a live system
+// prompt) and WHICH voice it speaks in, both applied on the fly via the realtime
+// relay's session.update. The relay bounds+scrubs `instructions` and already
+// allows `voice`, so this is a communication-style control, never a privilege.
+// The last values persist locally so a reload keeps the operator's setup.
+const VOICE_INSTRUCTIONS_KEY = 'workbench.voice.instructions'
+const VOICE_VOICE_KEY = 'workbench.voice.voice'
+const VOICE_PRESET_KEY = 'workbench.voice.preset'
+// Mirror the relay ceiling (workbench/voice.py MAX_INSTRUCTIONS_CHARS) so the
+// field clamps before the relay would ever fail closed on an oversize prompt.
+const VOICE_MAX_INSTRUCTIONS = 6000
+
+// Curated personality presets. Each is a STARTING POINT: selecting one loads its
+// prompt into the still-editable Instructions field and applies it; any edit
+// after that flips the selection to a "Custom" state. Client-side constant — no
+// new endpoint, and the same bound + relay scrub apply to the loaded text.
+const VOICE_PRESETS = [
+  { id: 'default', label: 'Default', instructions: 'You are a helpful, natural-sounding voice assistant. Answer clearly and directly.' },
+  { id: 'concise', label: 'Concise', instructions: 'Answer in as few words as possible. Prefer one or two short sentences. No preamble, no filler.' },
+  { id: 'friendly', label: 'Friendly', instructions: 'Speak warmly and encouragingly, like a supportive colleague. Keep it upbeat and human, but stay useful.' },
+  { id: 'professional', label: 'Professional', instructions: 'Respond formally and precisely, in a measured, businesslike tone. Avoid slang and hedging.' },
+  { id: 'socratic', label: 'Socratic', instructions: 'Guide the person to the answer by asking one focused clarifying question at a time before offering a direct conclusion.' },
+  { id: 'storyteller', label: 'Storyteller', instructions: 'Answer with a light, playful, storytelling flair. Use vivid, concrete images, but still get to the point.' },
+]
+
+// Best-effort read/write of a small persisted voice setting. A private-mode or
+// unavailable localStorage never breaks the tab — it just does not persist.
+function loadVoicePref(key, fallback = '') {
+  try { const value = window.localStorage?.getItem(key); return value == null ? fallback : value }
+  catch { return fallback }
+}
+function saveVoicePref(key, value) {
+  try { window.localStorage?.setItem(key, value) } catch { /* persistence is best-effort */ }
+}
+
+// Kokoro-style voice ids encode accent + gender as a two-letter prefix
+// (`af_bella` = US female, `bm_george` = British male). Prettify to a friendly
+// label for the picker while the raw id is still what gets sent upstream.
+const VOICE_ACCENTS = { a: 'US', b: 'British', e: 'Spanish', f: 'French', h: 'Hindi', i: 'Italian', j: 'Japanese', p: 'Portuguese', z: 'Chinese' }
+const VOICE_GENDERS = { f: 'female', m: 'male' }
+function prettifyVoice(voice) {
+  const id = voice.id || ''
+  // Prefer a distinct human label; many serves (e.g. Kokoro) set name === id, in
+  // which case prettify the id itself rather than echo the raw token.
+  if (voice.name && voice.name !== id) return voice.name
+  const underscore = id.indexOf('_')
+  const prefix = underscore > 0 ? id.slice(0, underscore) : ''
+  const rest = underscore > 0 ? id.slice(underscore + 1) : id
+  const name = rest ? rest.charAt(0).toUpperCase() + rest.slice(1) : id
+  const accent = VOICE_ACCENTS[prefix.charAt(0)]
+  const gender = VOICE_GENDERS[prefix.charAt(1)]
+  const trait = [accent, gender].filter(Boolean).join(', ')
+  return trait ? `${name} (${trait})` : name
 }
 
 // The chat DICTATION (STT) and READ-ALOUD (TTS) request/response lanes speak a
@@ -171,8 +228,21 @@ function VoicePage({ data, append }) {
   const [transcript, setTranscript] = useState([]) // ephemeral {id, role, text, kind}
   const [announce, setAnnounce] = useState('')
   const [saveState, setSaveState] = useState({ status: 'idle', message: '' }) // idle|saving|saved|unavailable
+  // Session tuning: the live system prompt (draft + last-applied) and the chosen
+  // TTS voice, both persisted and re-sent on (re)connect. `preset` names the
+  // curated personality that seeded the draft, or 'custom' once the operator
+  // edits it. `voices` is the picker's options, fetched from the hub.
+  const [instructionsDraft, setInstructionsDraft] = useState(() => loadVoicePref(VOICE_INSTRUCTIONS_KEY))
+  const [instructionsApplied, setInstructionsApplied] = useState(() => loadVoicePref(VOICE_INSTRUCTIONS_KEY))
+  const [preset, setPreset] = useState(() => loadVoicePref(VOICE_PRESET_KEY, 'custom') || 'custom')
+  const [voice, setVoice] = useState(() => loadVoicePref(VOICE_VOICE_KEY))
+  const [voices, setVoices] = useState([])
 
   const socketRef = useRef(null)
+  // Refs mirror the applied instructions and voice so the async socket.onopen
+  // (and any later Apply) always reads the CURRENT value, not a stale closure.
+  const instructionsRef = useRef(instructionsApplied)
+  const voiceRef = useRef(voice)
   const captureRef = useRef(null)
   // A SINGLE persistent playback context with a running playhead. A streamed
   // response arrives as many `response.output_audio.delta` chunks; a fresh
@@ -197,6 +267,17 @@ function VoicePage({ data, append }) {
   const utterancePendingRef = useRef(false)
 
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; teardownAll(); socketRef.current?.close?.(); socketRef.current = null } }, [])
+
+  // Populate the voice picker from the hub (never the TTS serve directly). A
+  // missing/unconfigured catalog degrades quietly to the serve's default voice.
+  useEffect(() => {
+    if (!configured) return undefined
+    let alive = true
+    fetchVoiceCatalog()
+      .then((list) => { if (alive) setVoices(Array.isArray(list) ? list : []) })
+      .catch(() => { if (alive) setVoices([]) })
+    return () => { alive = false }
+  }, [configured])
 
   const closePlayback = () => {
     const pb = playbackRef.current
@@ -249,10 +330,24 @@ function VoicePage({ data, append }) {
     catch { setAnnounce('Voice output could not be replayed in this browser.') }
   }
 
-  // Barge-in Stop: halt local playback IMMEDIATELY (close + drop the scheduled
-  // queue so nextStart resets on the next chunk) AND tell the server to stop
-  // generating (`response.cancel` is in the relay allowlist). Never response.create.
+  // Barge-in: halt local playback IMMEDIATELY (close + drop the scheduled queue so
+  // nextStart resets on the next chunk) AND tell the server to stop generating
+  // (`response.cancel` is in the relay allowlist; never response.create). Gating on
+  // the SYNCHRONOUS playbackRef makes it idempotent — once the assistant audio is
+  // torn down, a second trigger in the same instant sends no duplicate cancel, so
+  // an auto barge-in and a manual Stop can never double-cancel. Returns whether it
+  // actually interrupted a playing assistant.
+  const bargeIn = (reason) => {
+    if (!playbackRef.current && pendingSourcesRef.current === 0) return false
+    closePlayback(); if (mountedRef.current) setSpeaking(false)
+    if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+    if (reason) setAnnounce(reason)
+    return true
+  }
+  // Manual Stop always halts and cancels, even if playback already drained — the
+  // operator asked for silence, so honor it unconditionally.
   const bargeInStop = () => {
+    if (bargeIn('Stopped the assistant. You can speak again.')) return
     closePlayback(); if (mountedRef.current) setSpeaking(false)
     if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response.cancel' }))
     setAnnounce('Stopped the assistant. You can speak again.')
@@ -305,7 +400,13 @@ function VoicePage({ data, append }) {
     setConnection('connecting'); setSaveState({ status: 'idle', message: '' }); setAnnounce('Connecting to the voice relay.')
     const socket = new WebSocket(voiceSocketUrl(session.id)); socketRef.current = socket
     socket.onopen = () => {
-      socket.send(JSON.stringify({ type: 'session.update', session: { modalities: ['audio', 'text'] } }))
+      // Apply the operator's session tuning on connect (and again on every
+      // reconnect): the chosen voice and the live system prompt. The relay bounds
+      // and scrubs `instructions` and already allows `voice`.
+      const sessionConfig = { modalities: ['audio', 'text'] }
+      if (voiceRef.current) sessionConfig.voice = voiceRef.current
+      if (instructionsRef.current) sessionConfig.instructions = instructionsRef.current
+      socket.send(JSON.stringify({ type: 'session.update', session: sessionConfig }))
       setConnection('ready'); setAnnounce('Connected and ready. Choose hold-to-talk or hands-free to speak.')
       if (captureMode === 'handsfree') openMic('handsfree')
     }
@@ -349,7 +450,12 @@ function VoicePage({ data, append }) {
     let sum = 0
     for (let index = 0; index < frame.length; index += 1) sum += frame[index] * frame[index]
     const rms = Math.sqrt(sum / (frame.length || 1))
-    if (rms > 0.012) { heardSpeechRef.current = true; utterancePendingRef.current = true; silenceStartRef.current = 0; return }
+    if (rms > 0.012) {
+      // Speech ONSET (silence -> speech) while the assistant is playing is an
+      // automatic barge-in: the operator can just talk over it and be heard.
+      if (!heardSpeechRef.current) bargeIn('You started talking; the assistant stopped.')
+      heardSpeechRef.current = true; utterancePendingRef.current = true; silenceStartRef.current = 0; return
+    }
     if (!heardSpeechRef.current) return
     const now = Date.now()
     if (silenceStartRef.current === 0) { silenceStartRef.current = now; return }
@@ -366,7 +472,9 @@ function VoicePage({ data, append }) {
     utterancePendingRef.current = false
   }
 
-  const startHold = () => { if (connection === 'ready') openMic('hold') }
+  // Pressing the talk control while the assistant is playing is an automatic
+  // barge-in too: interrupt, then open the mic for the new utterance.
+  const startHold = () => { if (connection !== 'ready') return; bargeIn('You pressed to talk; the assistant stopped.'); openMic('hold') }
   const finishHold = () => {
     if (captureRef.current?.mode !== 'hold') return
     releaseCapture(); setCapturing(false)
@@ -382,6 +490,43 @@ function VoicePage({ data, append }) {
     if (mode === 'hold' && captureRef.current?.mode === 'handsfree') { releaseCapture(); setCapturing(false) }
     if (mode === 'handsfree' && connection === 'ready' && !captureRef.current) openMic('handsfree')
     setAnnounce(mode === 'hold' ? 'Hold-to-talk mode.' : 'Hands-free mode.')
+  }
+
+  // Push the live system prompt to the session (bounded to the relay ceiling) and
+  // persist it. When the socket is open it applies immediately; otherwise it is
+  // sent on the next connect. Clamps to VOICE_MAX_INSTRUCTIONS so the relay never
+  // has to fail closed on an oversize prompt.
+  const applySessionInstructions = (text) => {
+    const value = (text ?? '').slice(0, VOICE_MAX_INSTRUCTIONS)
+    setInstructionsApplied(value); instructionsRef.current = value; saveVoicePref(VOICE_INSTRUCTIONS_KEY, value)
+    if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'session.update', session: { instructions: value } }))
+  }
+  const applyInstructions = () => {
+    applySessionInstructions(instructionsDraft)
+    setAnnounce('Updated how the assistant should respond.')
+  }
+  // Editing the field after a preset makes the selection "Custom" — a preset is
+  // only ever a starting point.
+  const editInstructions = (text) => {
+    setInstructionsDraft(text)
+    if (preset !== 'custom') { setPreset('custom'); saveVoicePref(VOICE_PRESET_KEY, 'custom') }
+  }
+  // Selecting a preset loads its prompt into the still-editable field AND applies
+  // it, so a pick takes effect at once but stays a starting point.
+  const choosePreset = (id) => {
+    const found = VOICE_PRESETS.find((item) => item.id === id)
+    if (!found) return
+    setPreset(id); saveVoicePref(VOICE_PRESET_KEY, id)
+    setInstructionsDraft(found.instructions)
+    applySessionInstructions(found.instructions)
+    setAnnounce(`Personality set to ${found.label}.`)
+  }
+  const changeVoice = (id) => {
+    setVoice(id); voiceRef.current = id; saveVoicePref(VOICE_VOICE_KEY, id)
+    // Only a concrete id is sent upstream; the empty "Default voice" choice just
+    // leaves the serve's own default in place.
+    if (id && socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'session.update', session: { voice: id } }))
+    setAnnounce(id ? `Voice set to ${prettifyVoice({ id })}.` : 'Using the default voice.')
   }
 
   // Save to Chat: the ONE explicit, opt-in move from an ephemeral voice session
@@ -463,6 +608,43 @@ function VoicePage({ data, append }) {
               <button type="button" className={`voice-mode-btn ${captureMode === 'hold' ? 'on' : ''}`} aria-label="Hold-to-talk mode" aria-pressed={captureMode === 'hold'} onClick={() => chooseMode('hold')}>Hold to talk</button>
               <button type="button" className={`voice-mode-btn ${captureMode === 'handsfree' ? 'on' : ''}`} aria-label="Hands-free mode" aria-pressed={captureMode === 'handsfree'} onClick={() => chooseMode('handsfree')}>Hands-free</button>
             </div>
+
+            <section className="voice-tune" aria-label="Assistant voice and personality">
+              <div className="voice-tune-presets" role="group" aria-label="Personality preset">
+                <span className="voice-tune-eyebrow">Personality</span>
+                {VOICE_PRESETS.map((item) => (
+                  <button key={item.id} type="button" className={`voice-preset-chip ${preset === item.id ? 'on' : ''}`} aria-pressed={preset === item.id} onClick={() => choosePreset(item.id)}>{item.label}</button>
+                ))}
+                {preset === 'custom' && <span className="voice-preset-chip is-custom" aria-hidden="true">Custom</span>}
+              </div>
+
+              <form className="voice-instructions" onSubmit={(event) => { event.preventDefault(); applyInstructions() }}>
+                <label htmlFor="voice-instructions-input" className="voice-tune-eyebrow">How should it respond?</label>
+                <div className="voice-instructions-row">
+                  <textarea
+                    id="voice-instructions-input"
+                    className="voice-instructions-input"
+                    aria-label="Assistant instructions"
+                    rows={2}
+                    maxLength={VOICE_MAX_INSTRUCTIONS}
+                    value={instructionsDraft}
+                    onChange={(event) => editInstructions(event.target.value)}
+                    placeholder="e.g. Answer briefly, in a warm tone."
+                  />
+                  <button type="submit" className="voice-instructions-apply" aria-label="Apply instructions" disabled={instructionsDraft === instructionsApplied}>
+                    {instructionsDraft === instructionsApplied ? 'Applied' : 'Apply'}
+                  </button>
+                </div>
+              </form>
+
+              <label className="voice-voice-field">
+                <span className="voice-tune-eyebrow">Voice</span>
+                <select className="voice-voice-select" aria-label="Assistant voice" value={voice} onChange={(event) => changeVoice(event.target.value)}>
+                  <option value="">Default voice</option>
+                  {voices.map((item) => <option key={item.id} value={item.id}>{prettifyVoice(item)}</option>)}
+                </select>
+              </label>
+            </section>
 
             <div className="voice-actions">
               {connection === 'disconnected' || connection === 'connecting'

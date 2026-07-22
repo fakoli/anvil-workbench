@@ -293,6 +293,40 @@ def test_voice_relay_filters_model_and_tool_controls_and_never_summarizes_audio(
     assert summarize_server_event('{"type":"conversation.item.input_audio_transcription.completed","transcript":"private note"}') == ("voice.utterance.final", {"characters": 12})
 
 
+def test_voice_relay_forwards_instructions_bounded_and_scrubbed():
+    from workbench.voice import MAX_INSTRUCTIONS_CHARS
+
+    # A live system prompt is forwarded (it is the actor's own communication-style
+    # control), alongside the already-allowed voice — and nothing else.
+    cleaned = sanitize_client_event(
+        '{"type":"session.update","session":{"instructions":"Answer briefly.","voice":"af_bella","model":"other","tools":[{}]}}'
+    )
+    assert cleaned == {"type": "session.update", "session": {"instructions": "Answer briefly.", "voice": "af_bella"}}
+
+    # A secret pasted into the prompt is scrubbed with the SAME redaction retained
+    # transcripts pass through, so it can never ride upstream in the session config.
+    scrubbed = sanitize_client_event(
+        '{"type":"session.update","session":{"instructions":"use token=sk-abcdef0123456789 now"}}'
+    )
+    assert "sk-abcdef0123456789" not in scrubbed["session"]["instructions"]
+    assert "[REDACTED]" in scrubbed["session"]["instructions"]
+
+    # Oversize fails closed (never silently truncated -> a split credential fragment).
+    with pytest.raises(VoiceRelayError):
+        sanitize_client_event(
+            '{"type":"session.update","session":{"instructions":' + json.dumps("x" * (MAX_INSTRUCTIONS_CHARS + 1)) + "}}"
+        )
+
+    # A non-string instructions is rejected.
+    with pytest.raises(VoiceRelayError):
+        sanitize_client_event('{"type":"session.update","session":{"instructions":{"nested":"object"}}}')
+
+    # No NEW field is newly allowed: an unknown session key is still dropped.
+    assert sanitize_client_event(
+        '{"type":"session.update","session":{"temperature":0.9,"instructions":"be terse"}}'
+    ) == {"type": "session.update", "session": {"instructions": "be terse"}}
+
+
 def test_voice_relay_returns_an_explicit_error_for_a_rejected_browser_event(monkeypatch):
     class Browser:
         sent: list[dict[str, object]] = []
