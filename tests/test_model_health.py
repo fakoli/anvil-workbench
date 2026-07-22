@@ -292,3 +292,26 @@ def test_route_tier_signals_scrubs_and_bounds_the_reason(monkeypatch):
     signals = route_tier_signals(_ROUTER_BASE, "server-held", 10)
     reason = signals["records"][0]["attempts"][0]["reason"]
     assert "100.64.0.9" not in (reason or "")
+
+
+def test_route_tier_signals_preserves_an_rfc3339_created_at(monkeypatch):
+    # The colon-bearing timestamp must survive the reader (a plain token
+    # validator drops it, killing last_seen and the recency sort).
+    class _Resp:
+        def __init__(self, body):
+            self._body = body.encode("utf-8")
+
+        def read(self, *args):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    body = ('{"records":[{"work_class":"chat","created_at":"2026-07-22T10:00:00Z",'
+            '"attempts":[{"tier_id":"heavy-local","outcome":"served","verifier_passed":true}]}]}')
+    monkeypatch.setattr("workbench.router.urlopen", lambda request, timeout=0: _Resp(body))
+    signals = route_tier_signals(_ROUTER_BASE, "server-held", 10)
+    assert signals["records"][0]["created_at"] == "2026-07-22T10:00:00Z"

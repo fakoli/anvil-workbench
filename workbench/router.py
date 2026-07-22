@@ -119,6 +119,21 @@ def _safe_token(value: Any) -> str | None:
     return None
 
 
+#: An RFC3339-ish timestamp is the ONE signal field that legitimately carries
+#: ``:``/``+``/``T``/``Z`` (``2026-07-22T10:00:00Z``), so ``_safe_token`` (which
+#: excludes ``:``) would drop it -- killing ``last_seen`` and the recency sort.
+#: This validator admits only those extra timestamp characters, still length- and
+#: shape-bounded; the value is re-scrubbed at the API last hop regardless.
+_SIGNAL_TIMESTAMP = re.compile(r"^[0-9][0-9T:.+\-]{0,39}Z?$")
+
+
+def _safe_timestamp(value: Any) -> str | None:
+    """A bounded, safe RFC3339-ish timestamp string, or ``None``."""
+    if isinstance(value, str) and _SIGNAL_TIMESTAMP.match(value):
+        return value[:_MAX_SIGNAL_TOKEN_CHARS]
+    return None
+
+
 def _safe_count_map(value: Any) -> dict[str, int]:
     """A bounded ``{safe_token: non-negative int}`` projection of a totals map."""
     out: dict[str, int] = {}
@@ -206,7 +221,7 @@ def route_tier_signals(base_url: str, token: str, limit: int = 50) -> dict[str, 
                 })
         records.append({
             "work_class": _safe_token(row.get("work_class")),
-            "created_at": _safe_token(row.get("created_at") or row.get("timestamp")),
+            "created_at": _safe_timestamp(row.get("created_at") or row.get("timestamp")),
             "attempts": attempts,
         })
 
