@@ -922,17 +922,19 @@ def test_system_health_surface_is_get_only_with_no_mutation_execution_or_approva
         paths = client_.app.openapi()["paths"]
         system_paths = {path: ops for path, ops in paths.items() if path.startswith("/api/system")}
         assert set(system_paths) == {
-            "/api/system/health", "/api/system/health/{integration_id}", "/api/system/posture",
+            "/api/system/health", "/api/system/health/{integration_id}",
+            "/api/system/posture", "/api/system/configuration",
         }
         for path, operations in system_paths.items():
             assert set(operations) <= {"get"}, f"{path} declares non-GET operations: {sorted(operations)}"
         # Behavioral proof: a write verb against EVERY declared route -- the
-        # collection, the per-integration detail, and the posture audit -- is
-        # refused with 405, never served.
+        # collection, the per-integration detail, the posture audit, and the
+        # configuration observation -- is refused with 405, never served.
         for verb in (client_.post, client_.put, client_.patch, client_.delete):
             assert verb("/api/system/health", headers=SYS_ACTOR).status_code == 405
             assert verb("/api/system/health/anvil_serving", headers=SYS_ACTOR).status_code == 405
             assert verb("/api/system/posture", headers=SYS_ACTOR).status_code == 405
+            assert verb("/api/system/configuration", headers=SYS_ACTOR).status_code == 405
 
 
 def test_system_health_one_integration_detail_and_unknown_and_malformed_ids():
@@ -2467,3 +2469,197 @@ def test_amp_surfaces_fail_closed_when_unconfigured():
     assert client.get("/api/chat/advanced/ratings/aggregates", headers=_AMP_ACTOR).status_code == 503
     assert client.post("/api/chat/advanced/ratings", headers=_AMP_ACTOR,
                        json={"route_id": "route.chat-fast", "criterion_id": "latency", "score": 4}).status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# preferences-configuration T003 / T003.3 - the safe deployment-CONFIGURATION
+# observation projection, PROVEN through the REAL wired create_app router.
+# These drive /api/system/configuration (and re-affirm the whole /api/system
+# surface) so every criterion is proven end-to-end, never on a hand-built object.
+# ---------------------------------------------------------------------------
+
+from _support import SYSTEM_CONFIGURATION_DESCRIPTOR_FIELDS as _SYS_CFG_FIELDS
+from workbench.system_health import (
+    CONFIG_KINDS as _SH_CONFIG_KINDS,
+    CONFIGURATION_SETTING_IDS as _SH_CONFIG_IDS,
+)
+
+_BS_CFG = chr(92)
+
+
+def _rogue_sys_settings(**overrides) -> Settings:
+    """A deployment whose every string config field holds a dangerous value.
+
+    Seeds the full adversarial corpus -- secrets, an AWS key with no separator, a
+    JWT, a PEM, a DB URL, dotless ``host:port``, a tailnet host, a Bearer header,
+    Windows/POSIX/home paths -- across the Settings so the wired responses can be
+    asserted value-free. ``plugin_capability_file`` is left unset so the plugin
+    host stays unconfigured (no file open at app construction); the catalog path
+    is still seeded to prove ``plugins.catalog_configured`` reads only a boolean.
+    """
+    base = dict(
+        database_url="postgres://wb:supersecretpw@db.internal:5432/wb",
+        neo4j_uri="bolt://neo4j.tail1234.ts.net:7687",
+        neo4j_user="neo4j",
+        neo4j_password="/etc/anvil/secret.conf",
+        owner="operator",
+        approvers=frozenset({"operator", "akia_member_supersecret"}),
+        bridge_bootstrap_token="ghp_DEADBEEFsupersecrettoken123456",
+        anvil_router_base_url="https://serving.tail1234.ts.net:8443/v1",
+        anvil_router_token="sk-live-supersecretDEADBEEF",
+        anvil_voice_realtime_url="wss://100.64.0.5:8443/rt",
+        anvil_voice_realtime_token="Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dozjgNryP4",
+        voice_retain_transcripts=True,
+        embedding_model="text-embed",
+        rerank_model="serving:8443",
+        identity_header="X-Secret-supersecret",
+        allow_insecure_dev_actor=True,
+        chat_content_hash_key="AKIAIOSFODNN7EXAMPLE",
+        chat_routes="serving:8443",
+        sandbox_models=frozenset({"model-a", "-----BEGIN RSA PRIVATE KEY-----MIIEpQ-----END RSA PRIVATE KEY-----"}),
+        plugin_catalog_file="C:" + _BS_CFG + "Users" + _BS_CFG + "me" + _BS_CFG + "creds.json",
+        plugin_capability_file="",
+        plugin_openapi_document_file="/opt/anvil/private.pem",
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+#: Every dangerous token seeded into the rogue Settings above. NONE may appear in
+#: ANY /api/system response -- a value-free (boolean/enum/count) projection.
+_SYS_CFG_LEAK_TOKENS = (
+    "supersecretpw", "db.internal", "neo4j.tail1234", "ts.net", "/etc/anvil",
+    "ghp_DEADBEEF", "serving.tail1234", ":8443", "sk-live", "DEADBEEF",
+    "100.64.0.5", "eyJhbGci", "supersecret", "AKIAIOSFODNN7EXAMPLE",
+    "creds.json", "private.pem", "MIIEpQ", "://", "Bearer ",
+    "akia_member_supersecret", "X-Secret",
+)
+
+
+def test_system_configuration_projects_settings_as_safe_booleans_enums_and_counts():
+    # T003/T003.3: the wired /configuration endpoint returns one closed-field
+    # observation per declared setting, each a boolean/enum/count whose value TYPE
+    # agrees with its kind -- no raw config value is representable.
+    with _sys_client(_sys_settings()) as client_:
+        response = client_.get("/api/system/configuration", headers=SYS_ACTOR)
+        assert response.status_code == 200, response.text
+        settings_out = response.json()["settings"]
+        assert {s["setting_id"] for s in settings_out} == set(_SH_CONFIG_IDS)
+        for setting in settings_out:
+            assert set(setting) - _SYS_CFG_FIELDS == set(), setting  # closed field set
+            assert setting["non_canonical"] is True
+            assert setting["schema_version"] == "workbench-system-configuration/v1"
+            kind, value = setting["kind"], setting["value"]
+            assert kind in _SH_CONFIG_KINDS
+            if kind == "boolean":
+                assert isinstance(value, bool)
+            elif kind == "count":
+                assert isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else:  # enum
+                assert isinstance(value, str) and value in {"default", "custom"}
+
+
+def test_system_configuration_response_never_leaks_a_raw_config_value_from_rogue_settings():
+    # T003.3 headline (no-leak, WIRED): even when EVERY string config field holds a
+    # secret/URL/path/host, no dangerous token reaches ANY /api/system response --
+    # the surface is a value-free projection, not an echo of Settings.
+    settings = _rogue_sys_settings()
+    with _sys_client(settings) as client_:
+        raws = {
+            path: client_.get(path, headers=SYS_ACTOR).text
+            for path in (
+                "/api/system/configuration",
+                "/api/system/health",
+                "/api/system/health/anvil_serving",
+                "/api/system/posture",
+            )
+        }
+        for path, raw in raws.items():
+            for token in _SYS_CFG_LEAK_TOKENS:
+                assert token not in raw, f"{path} leaked {token!r} from rogue Settings"
+        # The configuration surface still answered truthfully (values not empty).
+        cfg = _json.loads(raws["/api/system/configuration"])["settings"]
+        by_id = {s["setting_id"]: s for s in cfg}
+        # A dangerous approver member and a PEM sandbox model project only as a count.
+        assert by_id["approvals.approver_count"]["value"] == 2
+        assert by_id["sandbox.model_count"]["value"] == 2
+        # A custom (dangerous) identity header projects only the enum token.
+        assert by_id["security.identity_header"]["value"] == "custom"
+        # A set-but-dangerous catalog path projects only a boolean.
+        assert by_id["plugins.catalog_configured"]["value"] is True
+
+
+def test_system_configuration_reports_truthful_flags_never_fabricated():
+    # T003.3 (truthful states): an all-default deployment reports the honest
+    # booleans/counts, and a configured one flips them -- never a fabricated value.
+    # The default identity-header source is "Tailscale-User-Login", so this client
+    # must authenticate under THAT header name (SYS_ACTOR uses the test override).
+    off = _sys_settings(
+        allow_insecure_dev_actor=False, identity_header="Tailscale-User-Login",
+        voice_retain_transcripts=False, chat_routes="", rerank_model="",
+        sandbox_models=frozenset(), approvers=frozenset({"operator"}),
+        plugin_catalog_file="", plugin_capability_file="",
+    )
+    with _sys_client(off) as client_:
+        by_id = {s["setting_id"]: s for s in client_.get(
+            "/api/system/configuration", headers={"Tailscale-User-Login": "operator"}).json()["settings"]}
+        assert by_id["security.insecure_dev_actor"]["value"] is False
+        assert by_id["security.identity_header"]["value"] == "default"
+        assert by_id["voice.retain_transcripts"]["value"] is False
+        assert by_id["chat.routes_configured"]["value"] is False
+        assert by_id["sandbox.model_count"]["value"] == 0
+        assert by_id["plugins.catalog_configured"]["value"] is False
+
+    on = _sys_settings(
+        allow_insecure_dev_actor=True, identity_header="X-Custom-Auth",
+        voice_retain_transcripts=True, chat_routes="[]", rerank_model="rr",
+        sandbox_models=frozenset({"m1", "m2", "m3"}),
+    )
+    with _sys_client(on) as client_:
+        by_id = {s["setting_id"]: s for s in client_.get(
+            "/api/system/configuration", headers=SYS_ACTOR).json()["settings"]}
+        assert by_id["security.insecure_dev_actor"]["value"] is True
+        assert by_id["security.identity_header"]["value"] == "custom"
+        assert by_id["voice.retain_transcripts"]["value"] is True
+        assert by_id["chat.routes_configured"]["value"] is True
+        assert by_id["retrieval.rerank_configured"]["value"] is True
+        assert by_id["sandbox.model_count"]["value"] == 3
+
+
+def test_system_configuration_is_observational_only_no_approve_or_execute():
+    # T003.3 (observational-only, WIRED): the configuration route is GET-only --
+    # every write verb is refused 405 -- and the response body exposes no approval,
+    # execution, or mutation field through which it could actuate a change.
+    with _sys_client(_sys_settings()) as client_:
+        for verb in (client_.post, client_.put, client_.patch, client_.delete):
+            assert verb("/api/system/configuration", headers=SYS_ACTOR).status_code == 405
+        # No response-object KEY names an approval, execution, or mutation surface
+        # (scanning KEYS, not values: an observed ``approvals.approver_count`` value
+        # is a count, never an approval capability). The closed field set carries
+        # only observational descriptors, so the surface cannot actuate a change.
+        body = client_.get("/api/system/configuration", headers=SYS_ACTOR).json()
+        keys: set[str] = set()
+
+        def _collect_keys(node):
+            if isinstance(node, dict):
+                for key, item in node.items():
+                    keys.add(key.lower())
+                    _collect_keys(item)
+            elif isinstance(node, list):
+                for item in node:
+                    _collect_keys(item)
+
+        _collect_keys(body)
+        for actuator in ("approve", "approval", "execute", "exec", "mutate",
+                         "action", "command", "argv", "verb", "effect"):
+            assert not any(actuator in key for key in keys), \
+                f"configuration surface exposed a {actuator!r} key: {sorted(keys)}"
+
+
+def test_system_configuration_requires_a_trusted_allowlisted_actor():
+    # Behind the same trusted actor dependency as the rest of the hub.
+    settings = _sys_settings(approvers=frozenset({"operator"}), allow_insecure_dev_actor=False)
+    with _sys_client(settings) as client_:
+        assert client_.get("/api/system/configuration").status_code == 401
+        assert client_.get("/api/system/configuration",
+                           headers={"X-Workbench-Actor": "intruder"}).status_code == 403

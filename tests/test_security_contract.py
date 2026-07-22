@@ -2648,3 +2648,140 @@ def test_amp_rating_note_free_text_is_scrubbed_on_export():
     # Including the short-bearer TOKEN VALUE (xyz) — not just the label — is gone.
     for marker in ("ghp_", "AKIA", "/etc/passwd", "Bearer ", "authorization", "xyz"):
         assert marker not in blob, marker
+
+
+# ---------------------------------------------------------------------------
+# preferences-configuration T003 / T003.3 - the deployment-CONFIGURATION
+# observation is a closed, value-free record: its field set and value TYPES are
+# a closed set per setting, it cannot carry a raw config value (a boolean/count
+# kind rejects a string, an enum rejects a non-token), construction is read-only
+# with no approval/execution surface, and a rogue Settings cannot leak a secret,
+# URL, or path through the projection. Appended at EOF (keep-both).
+# ---------------------------------------------------------------------------
+
+from _support import SYSTEM_CONFIGURATION_DESCRIPTOR_FIELDS as _SHC_FIELDS
+
+from workbench.system_health import (
+    CONFIG_KINDS as _SHC_KINDS,
+    CONFIGURATION_SETTING_IDS as _SHC_IDS,
+    MAX_CONFIG_COUNT as _SHC_MAX_COUNT,
+    ConfigurationSetting as _SHConfigSetting,
+    build_configuration_settings as _shc_build,
+)
+
+_BS_SHC = chr(92)
+
+#: A field NAME here would betray a credential, endpoint, path, or an
+#: approval/execution surface -- a config observation must expose none of them.
+_SHC_FORBIDDEN_FIELD_MARKERS = (
+    "token", "secret", "password", "credential", "api_key", "apikey", "bearer",
+    "url", "uri", "endpoint", "host", "path", "argv", "command", "cmd",
+    "approve", "approval", "execute", "exec", "mutate", "action",
+)
+
+
+def _shc_settings(**overrides) -> _SHSettings:
+    base = dict(
+        database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
+        owner="operator", approvers=frozenset({"operator"}), bridge_bootstrap_token="",
+        anvil_router_base_url="", anvil_router_token="",
+        identity_header="Tailscale-User-Login", allow_insecure_dev_actor=False,
+    )
+    base.update(overrides)
+    return _SHSettings(**base)
+
+
+def test_configuration_setting_exposes_a_closed_field_set_and_typed_value():
+    # T003.3: every declared configuration setting serializes exactly the closed
+    # field set (no leak-by-addition), its kind is a bounded enum, and its value
+    # TYPE agrees with the kind -- a structurally value-free projection.
+    settings = _shc_settings(sandbox_models=frozenset({"a", "b"}))
+    observed = _shc_build(settings)
+    assert {s.setting_id for s in observed} == set(_SHC_IDS)
+    for setting in observed:
+        data = setting.as_dict()
+        extra = set(data) - _SHC_FIELDS
+        assert not extra, f"configuration setting leaked field(s) by addition: {sorted(extra)}"
+        assert {"setting_id", "title", "kind", "value", "non_canonical", "schema_version"} <= set(data)
+        assert data["kind"] in _SHC_KINDS
+        for key in data:
+            lowered = key.lower()
+            for marker in _SHC_FORBIDDEN_FIELD_MARKERS:
+                assert marker not in lowered, f"field {key!r} looks like a {marker!r} surface"
+        value = data["value"]
+        if data["kind"] == "boolean":
+            assert isinstance(value, bool)
+        elif data["kind"] == "count":
+            assert isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _SHC_MAX_COUNT
+        else:
+            assert isinstance(value, str) and value in {"default", "custom"}
+
+
+def test_configuration_setting_rejects_a_raw_value_or_smuggled_field():
+    # T003.3: the record structurally refuses a raw config value -- a boolean or
+    # count kind rejects a string value, an enum kind rejects a value that is not
+    # a short reviewed token (a URL/path/secret can never masquerade as one), and
+    # an unknown setting_id or a command-shaped id is refused.
+    with pytest.raises(ValueError, match="boolean setting value"):
+        _SHConfigSetting(setting_id="voice.retain_transcripts", title="x", kind="boolean",
+                         value="https://serving.tail1234.ts.net:8443/v1")
+    with pytest.raises(ValueError, match="count setting value"):
+        _SHConfigSetting(setting_id="sandbox.model_count", title="x", kind="count",
+                         value="/etc/anvil/secret.conf")
+    with pytest.raises(ValueError, match="count setting value"):
+        # bool is a subclass of int, but a count is a real integer, never a flag.
+        _SHConfigSetting(setting_id="sandbox.model_count", title="x", kind="count", value=True)
+    with pytest.raises(ValueError, match="enum setting value"):
+        _SHConfigSetting(setting_id="security.identity_header", title="x", kind="enum",
+                         value="X-Secret-supersecret")
+    with pytest.raises(ValueError, match="enum setting value"):
+        _SHConfigSetting(setting_id="security.identity_header", title="x", kind="enum",
+                         value="serving:8443")
+    with pytest.raises(ValueError, match="unknown setting_id"):
+        _SHConfigSetting(setting_id="security.run_codex", title="x", kind="boolean", value=True)
+    with pytest.raises(ValueError, match="setting_id is invalid"):
+        _SHConfigSetting(setting_id="run_codex", title="x", kind="boolean", value=True)
+
+
+def test_configuration_setting_construction_is_read_only_and_has_no_effect_surface():
+    # T003.3 (observational-only): the frozen record cannot be mutated after
+    # construction, so reading it can neither trigger nor approve a change.
+    setting = _shc_build(_shc_settings())[0]
+    with pytest.raises(Exception):
+        setting.value = True  # frozen: cannot mutate the observed value
+    with pytest.raises(Exception):
+        setting.kind = "enum"
+
+
+def test_configuration_projection_never_leaks_a_secret_url_or_path_from_rogue_settings():
+    # T003.3 headline (no-leak, projection level): a Settings whose every string
+    # field carries a secret/URL/path/host projects to booleans/enums/counts only,
+    # so no dangerous token survives into the serialized observation.
+    rogue = _shc_settings(
+        neo4j_password="/etc/anvil/secret.conf",
+        anvil_router_base_url="https://serving.tail1234.ts.net:8443/v1",
+        anvil_router_token="sk-live-supersecretDEADBEEF",
+        bridge_bootstrap_token="ghp_DEADBEEFsupersecrettoken123456",
+        identity_header="X-Secret-supersecret",
+        chat_content_hash_key="AKIAIOSFODNN7EXAMPLE",
+        chat_routes="serving:8443",
+        rerank_model="serving:8443",
+        voice_retain_transcripts=True,
+        sandbox_models=frozenset({"-----BEGIN RSA PRIVATE KEY-----MIIEpQ-----END RSA PRIVATE KEY-----"}),
+        approvers=frozenset({"operator", "akia_member_supersecret"}),
+        plugin_catalog_file="C:" + _BS_SHC + "Users" + _BS_SHC + "me" + _BS_SHC + "creds.json",
+        allow_insecure_dev_actor=True,
+    )
+    blob = json.dumps([s.as_dict() for s in _shc_build(rogue)])
+    for token in (
+        "supersecret", "DEADBEEF", "serving.tail1234", "ts.net", ":8443", "://",
+        "/etc/anvil", "sk-live", "ghp_", "AKIAIOSFODNN7EXAMPLE", "MIIEpQ",
+        "creds.json", "X-Secret", "akia_member_supersecret",
+    ):
+        assert token not in blob, f"configuration projection leaked {token!r}"
+    # And it is still truthful: the counts and flags reflect the (dangerous) config.
+    by_id = {s.setting_id: s for s in _shc_build(rogue)}
+    assert by_id["security.identity_header"].value == "custom"
+    assert by_id["approvals.approver_count"].value == 2
+    assert by_id["sandbox.model_count"].value == 1
+    assert by_id["plugins.catalog_configured"].value is True
