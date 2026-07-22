@@ -17,6 +17,13 @@ class RouterError(RuntimeError):
     """Anvil Serving could not complete a bounded Workbench request."""
 
 
+#: Hard ceiling on a single non-streaming router JSON response.  Bounds memory
+#: BEFORE the body is fully buffered, so a misbehaving/compromised upstream cannot
+#: smuggle a multi-GB blob through ``_request`` -- comfortably above the largest
+#: legitimate response (a ~24 MB base64 TTS audio payload, ``_MAX_SYNTH_AUDIO_B64``).
+_MAX_RESPONSE_BYTES = 32_000_000
+
+
 def _request(base_url: str, token: str, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
     if not base_url or not token:
         raise RouterError("Anvil Serving route access is not configured")
@@ -28,9 +35,14 @@ def _request(base_url: str, token: str, method: str, path: str, payload: dict[st
     request = Request(base_url.rstrip("/") + path, data=body, headers=headers, method=method)
     try:
         with urlopen(request, timeout=30) as response:  # nosec B310: operator-configured tailnet router
-            raw = response.read().decode("utf-8")
+            # Bounded read: cap memory at the ceiling+1 BEFORE decoding, so a
+            # misbehaving upstream cannot buffer an unbounded body here.
+            buffered = response.read(_MAX_RESPONSE_BYTES + 1)
+            if len(buffered) > _MAX_RESPONSE_BYTES:
+                raise RouterError("Anvil Serving returned an oversized response")
+            raw = buffered.decode("utf-8")
     except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        detail = exc.read(4096).decode("utf-8", errors="replace")[:300]
         raise RouterError(f"Anvil Serving rejected the request ({exc.code}): {detail}") from exc
     except URLError as exc:
         raise RouterError(f"Anvil Serving is unreachable: {exc.reason}") from exc
