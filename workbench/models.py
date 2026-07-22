@@ -1046,6 +1046,17 @@ OPERATION_REFUSAL_CODES = frozenset({
     # new digest is always required, so a drifted skill fails closed rather than
     # riding the stale adoption.
     "skill.digest_changed",
+    # --- state-context-operations:T008 verification-script drift gate ---
+    # A packet-declared verification command resolves to a LOCAL SCRIPT FILE it
+    # would execute (`bash verify.sh`, `python scripts/check.py`, `./run.sh`),
+    # and that script drifted from its reviewed baseline (its working-tree
+    # content differs from the committed HEAD content) WITHOUT the task declaring
+    # the change in its changed-files set.  The verification is refused BEFORE the
+    # script runs, so a task cannot smuggle a mutated/malicious verification
+    # script past the gate.  A script whose change IS declared (in the task's
+    # changed-files) is allowed; a command with no resolvable script operand
+    # (`python -m pytest`, `npm test`) has nothing to drift-check and runs.
+    "verification.script_drift",
 })
 
 #: The credential-class token guard mirrored from the ``error.safe_summary``

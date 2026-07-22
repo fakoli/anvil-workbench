@@ -4235,3 +4235,188 @@ def test_t006_import_apply_is_audited_and_reset_isolates_scopes():
     assert store.stored_values("project", "proj_1") == before_proj
     assert store.stored_values("policy", "policy") == before_policy
     assert any(a["action"] == "configuration.reset" for a in service.audit_records())
+
+
+# ---------------------------------------------------------------------------
+# state-context-operations:T008 -- undeclared verification-script drift gate
+# ---------------------------------------------------------------------------
+#
+# A packet-declared verification command whose argument resolves to a LOCAL
+# SCRIPT FILE (`bash verify.sh`, `python scripts/check.py`, `./run.sh`) is
+# refused BEFORE execution, with the stable ``verification.script_drift`` code,
+# when that script drifted from its reviewed baseline (working-tree content !=
+# committed HEAD) WITHOUT the task declaring the change.  A script whose change
+# IS declared (in the task's changed-files, including a test file) is allowed,
+# and a command with no resolvable script operand (`python -m pytest`,
+# `npm test`) is wholly unaffected.  Proven through the REAL verification
+# entrypoint ``VerificationRunner.run`` -- the bridge path that runs the command.
+
+import subprocess as _sco_sp
+
+from workbench import bridge as _sco_bridge
+from workbench.bridge import BridgeSettings as _ScoSettings
+from workbench.bridge import VerificationRunner as _ScoVerifier
+from workbench.bridge import _resolve_script_operand as _sco_resolve_operand
+from workbench.models import TypedOperationError as _ScoTypedError
+
+
+class _ScoState:
+    """Minimal StateReader stand-in recording verification capture calls."""
+
+    def __init__(self) -> None:
+        self.captured: list[tuple] = []
+
+    def capture_verification(self, *args) -> None:
+        self.captured.append(args)
+
+
+def _sco_settings(root, commands):
+    return _ScoSettings(
+        hub="https://workbench.tailnet.example", bridge_id="bridge_1", token="t",
+        project_root=root, project_id="project_1", state_events=None,
+        cursor_file=root / ".workbench" / "cursor",
+        state_status_command="anvil status", state_claim_command="anvil claim",
+        state_work_packet_command="anvil packet", state_hook_command="anvil hook",
+        state_submit_command="anvil submit", state_apply_command="",
+        codex_binary="codex", router_base_url="", router_token_env="ROUTER_TOKEN",
+        codex_config=(), verification_commands=tuple(commands),
+    )
+
+
+def _sco_git_worktree(root, committed):
+    """Init a real git repo at ``root`` and commit ``{relpath: content}``."""
+    def git(*args):
+        result = _sco_sp.run(("git", *args), cwd=root, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    git("init")
+    git("config", "user.email", "t008@example.test")
+    git("config", "user.name", "T008")
+    git("config", "commit.gpgsign", "false")
+    for rel, content in committed.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-m", "baseline")
+    return root
+
+
+def _sco_packet(command, likely_files=()):
+    return {
+        "task": {
+            "verification": {"commands": [command]},
+            "likely_files": list(likely_files),
+        }
+    }
+
+
+# A verification script that leaves an observable side effect IFF it executes.
+_SCO_SENTINEL_SCRIPT = (
+    "import pathlib\n"
+    "pathlib.Path('sentinel.txt').write_text('ran', encoding='utf-8')\n"
+)
+
+
+def test_sco_t008_undeclared_script_drift_refuses_before_execution(tmp_path):
+    root = _sco_git_worktree(tmp_path, {"drift_check.py": _SCO_SENTINEL_SCRIPT, "notes.md": "x\n"})
+    # Undeclared mutation of the committed verification script.
+    (root / "drift_check.py").write_text(_SCO_SENTINEL_SCRIPT + "# mutated\n", encoding="utf-8")
+    command = '"' + sys.executable + '" drift_check.py'
+    verifier = _ScoVerifier(_sco_settings(root, [command]), lambda _r, _c: None, root)
+
+    with pytest.raises(_ScoTypedError) as excinfo:
+        verifier.run(_sco_packet(command, likely_files=["notes.md"]), _ScoState(), "actor")
+
+    # Stable typed refusal code, refused BEFORE the script ran (no side effect).
+    assert excinfo.value.code == "verification.script_drift"
+    assert not (root / "sentinel.txt").exists()
+
+
+def test_sco_t008_declared_script_change_including_test_file_is_not_refused(tmp_path):
+    # A test file the task legitimately edits: drifted AND declared -> runs.
+    root = _sco_git_worktree(
+        tmp_path, {"tests/run_checks.py": _SCO_SENTINEL_SCRIPT, "notes.md": "x\n"}
+    )
+    (root / "tests" / "run_checks.py").write_text(
+        _SCO_SENTINEL_SCRIPT + "# legit declared edit\n", encoding="utf-8"
+    )
+    command = '"' + sys.executable + '" tests/run_checks.py'
+    verifier = _ScoVerifier(_sco_settings(root, [command]), lambda _r, _c: None, root)
+
+    results = verifier.run(
+        _sco_packet(command, likely_files=["tests/run_checks.py"]), _ScoState(), "actor"
+    )
+
+    # No false refusal: the declared script executed and produced its result.
+    assert len(results) == 1 and results[0].exit_code == 0
+    assert (root / "sentinel.txt").read_text(encoding="utf-8") == "ran"
+
+
+def test_sco_t008_unmodified_committed_script_is_not_refused(tmp_path):
+    # A script that matches its reviewed baseline (no drift) is never refused,
+    # even when it is NOT in the declared changed-files.
+    root = _sco_git_worktree(tmp_path, {"verify.py": _SCO_SENTINEL_SCRIPT})
+    command = '"' + sys.executable + '" verify.py'
+    verifier = _ScoVerifier(_sco_settings(root, [command]), lambda _r, _c: None, root)
+
+    results = verifier.run(_sco_packet(command, likely_files=[]), _ScoState(), "actor")
+
+    assert len(results) == 1 and results[0].exit_code == 0
+    assert (root / "sentinel.txt").read_text(encoding="utf-8") == "ran"
+
+
+def test_sco_t008_no_script_operand_command_runs_unaffected(tmp_path):
+    # `python -c "..."` resolves NO script file operand -> the drift gate does not
+    # engage (and no git repo is required, mirroring the shipped module runs).
+    command = '"' + sys.executable + '" -c "print(1)"'
+    state = _ScoState()
+    verifier = _ScoVerifier(_sco_settings(tmp_path, [command]), lambda _r, _c: None, tmp_path)
+
+    results = verifier.run(_sco_packet(command), state, "actor")
+
+    assert len(results) == 1 and results[0].exit_code == 0
+    assert state.captured and state.captured[0][0] == command
+
+
+def test_sco_t008_resolve_script_operand_distinguishes_scripts_from_modules(tmp_path):
+    (tmp_path / "verify.sh").write_text("echo ok\n", encoding="utf-8")
+    (tmp_path / "run-checks.sh").write_text("echo ok\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "check.py").write_text("print(1)\n", encoding="utf-8")
+
+    def resolve(cmd):
+        return _sco_resolve_operand(tuple(cmd), tmp_path)
+
+    # Interpreter + script-file operand resolves to the worktree-relative path.
+    assert resolve(["bash", "verify.sh"]) == "verify.sh"
+    assert resolve(["python", "scripts/check.py"]) == "scripts/check.py"
+    # Direct execution of a path-like script leader.
+    assert resolve(["./run-checks.sh"]) == "run-checks.sh"
+    # Interpreter flags are skipped; the script file is still found.
+    assert resolve(["python", "-O", "scripts/check.py"]) == "scripts/check.py"
+    # Module / inline-program / stdin invocations have NO script operand.
+    assert resolve(["python", "-m", "pytest"]) is None
+    assert resolve(["python", "-c", "print(1)"]) is None
+    assert resolve(["node", "-e", "console.log(1)"]) is None
+    assert resolve(["python", "-"]) is None
+    # Plain subcommands / bare program names are not scripts.
+    assert resolve(["npm", "test"]) is None
+    assert resolve(["pytest"]) is None
+    # An interpreter operand that is not an existing file is nothing to check.
+    assert resolve(["bash", "nope.sh"]) is None
+    assert resolve(()) is None
+
+
+def test_sco_t008_drift_gate_does_not_disturb_module_runs_without_git(tmp_path, monkeypatch):
+    # Belt-and-braces: a no-operand command must not even touch the git snapshot
+    # (so a non-repo worktree still verifies), proving the gate is inert without
+    # a resolvable script operand.
+    def _fail_snapshot(_root):
+        raise AssertionError("git snapshot must not run for a no-operand command")
+
+    monkeypatch.setattr(_sco_bridge, "_git_snapshot", _fail_snapshot)
+    command = '"' + sys.executable + '" -c "print(2)"'
+    verifier = _ScoVerifier(_sco_settings(tmp_path, [command]), lambda _r, _c: None, tmp_path)
+
+    results = verifier.run(_sco_packet(command), _ScoState(), "actor")
+    assert results[0].exit_code == 0
