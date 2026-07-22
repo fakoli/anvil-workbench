@@ -342,21 +342,98 @@
 .composer-actions .voice-ptt .ptt-button{padding:8px 11px}
 .composer-actions .voice-ptt-caption,.composer-actions .voice-ptt-status{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 
-/* Realtime voice (speech-to-speech): its OWN labeled panel/region, distinct from
-   the inline dictation control and per-message read-aloud. Own heading,
-   connection state, and session binding — not a cramped inline dock. */
-.realtime-voice{margin-top:15px;padding:14px 15px;border:1px solid #294b48;border-radius:9px;background:linear-gradient(90deg,#0d2423,#0c1b1f);display:grid;gap:9px}
-.realtime-voice-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
-.realtime-voice-head h2{margin:0;font-size:12px;color:#b7ede1}
-.realtime-voice-head small{display:block;margin-top:4px;font-size:8px;color:#75908c;line-height:1.45;max-width:520px}
-.realtime-voice-binding{font-size:9px;color:#8fb0ac}.realtime-voice-binding code{font-family:'DM Mono',monospace;font-size:8px;color:#6f8f8b}
-.realtime-voice-controls{display:flex;align-items:center;gap:10px}
-.realtime-voice-controls button{border:1px solid #397f72;background:#1a554b;color:#d3fff4;border-radius:6px;padding:8px 12px;font-size:9px;font-weight:800;touch-action:none;user-select:none}
-.realtime-voice-controls button:disabled{border-color:#2a3c3e;background:#182226;color:#637a7b;cursor:default}
-.realtime-voice-controls .speaking{background:#bd6a48;border-color:#eea371;color:#fff}
-.realtime-voice-controls .voice-close{border-color:#344749;background:transparent;color:#92aaa7}
-.realtime-voice-controls button:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
-.realtime-voice-status{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+/* ============================================================================
+   VOICE — a dedicated speech-to-speech page (its own top-level tab).
+   Extends the same teal-on-near-black system, but deliberately voice-first, not a
+   form: a full-height console whose SIGNATURE element is a "presence orb" whose
+   concentric rings encode whose turn it is (idle / ready / listening / speaking),
+   sitting above the focal LIVE TRANSCRIPT. Everything else stays quiet.
+   ==========================================================================*/
+.voice-grid{min-height:calc(100vh - 64px)}
+.voice-page{display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:0;min-height:calc(100vh - 64px);max-width:1100px;margin:0 auto;width:100%;padding:0 40px}
+.voice-head{display:flex;justify-content:space-between;align-items:flex-start;gap:26px;padding:34px 4px 22px;border-bottom:1px solid var(--line-soft)}
+.voice-head-titles{max-width:560px}
+.voice-head h1{margin:9px 0 10px;font-size:30px;letter-spacing:-.055em;font-weight:800}
+.voice-privacy{margin:0;color:#7f9a95;font-size:11px;line-height:1.6}
+.voice-head-meta{display:grid;gap:11px;justify-items:end;text-align:right}
+.voice-meta-grid{margin:0;display:grid;gap:8px}
+.voice-meta-grid div{display:grid;gap:3px}
+.voice-meta-grid dt{margin:0;color:#5f767b;font-size:8px;text-transform:uppercase;letter-spacing:.1em}
+.voice-meta-grid dd{margin:0;color:#c6dbd6;font-size:10px;display:flex;align-items:center;gap:7px;justify-content:flex-end}
+.voice-meta-grid dd code{font-family:'DM Mono',monospace;font-size:8px;color:#6f8f8b}
+.voice-ro{font-family:'DM Mono',monospace;font-size:7px;text-transform:uppercase;letter-spacing:.08em;color:#5e7b76;border:1px solid #234540;border-radius:3px;padding:1px 4px}
+
+/* The stage: presence orb + the scrolling live transcript (the focal element). */
+.voice-stage{display:grid;grid-template-rows:auto minmax(0,1fr);gap:18px;padding:26px 0 18px;min-height:0}
+.voice-unconfigured{display:grid;place-content:center;justify-items:center;gap:12px;text-align:center;padding:60px 20px}
+.voice-unconfigured h2{margin:6px 0 0;font-size:19px;letter-spacing:-.03em}
+.voice-unconfigured p{margin:0;max-width:430px;color:#7f9a95;font-size:12px;line-height:1.6}
+.voice-unconfigured button{margin-top:6px;border:1px solid #2a3c3e;background:#182226;color:#637a7b;border-radius:7px;padding:9px 14px;font-size:10px;font-weight:800;cursor:default}
+
+/* Signature: the presence orb. Three concentric rings; state recolours + animates
+   them so whose-turn-it-is is legible at a glance (paired with the aria-live text,
+   never colour-alone). */
+.voice-orb{justify-self:center;position:relative;width:96px;height:96px;display:grid;place-items:center}
+.voice-orb i{position:absolute;border-radius:50%;border:1.5px solid var(--teal);opacity:.5}
+.voice-orb i:nth-child(1){width:34px;height:34px;opacity:.9;background:radial-gradient(circle,#123330,transparent 70%)}
+.voice-orb i:nth-child(2){width:62px;height:62px}
+.voice-orb i:nth-child(3){width:92px;height:92px;opacity:.28}
+.voice-orb.orb-idle i{border-color:#37514f;opacity:.4}
+.voice-orb.orb-idle i:nth-child(1){opacity:.6}
+.voice-orb.orb-ready i{border-color:var(--teal)}
+.voice-orb.orb-listening i{border-color:var(--teal);animation:orbPulse 1.5s ease-out infinite}
+.voice-orb.orb-listening i:nth-child(2){animation-delay:.25s}
+.voice-orb.orb-listening i:nth-child(3){animation-delay:.5s}
+.voice-orb.orb-speaking i{border-color:#eea371;animation:orbPulse 1.15s ease-out infinite}
+.voice-orb.orb-speaking i:nth-child(1){background:radial-gradient(circle,#3a2318,transparent 70%)}
+.voice-orb.orb-speaking i:nth-child(2){animation-delay:.2s}
+.voice-orb.orb-speaking i:nth-child(3){animation-delay:.4s}
+@keyframes orbPulse{0%{transform:scale(.86);opacity:.15}45%{opacity:.55}100%{transform:scale(1.12);opacity:0}}
+
+.voice-transcript{list-style:none;margin:0;padding:6px 6px 6px 2px;display:grid;gap:12px;align-content:start;overflow-y:auto;min-height:0}
+.voice-transcript-empty{display:grid;gap:6px;justify-items:center;text-align:center;color:#7f9a95;padding:34px 20px}
+.voice-transcript-empty b{color:#b7ede1;font-size:13px}
+.voice-transcript-empty span{font-size:11px;line-height:1.6;max-width:400px}
+.voice-turn{display:grid;gap:5px;max-width:74%;padding:11px 13px;border-radius:10px;border:1px solid #1d3338}
+.voice-turn-user{justify-self:end;background:#132126;border-color:#274046}
+.voice-turn-assistant{justify-self:start;background:#0e1b1f;border-color:#26433f}
+.voice-turn.is-partial{opacity:.72;border-style:dashed}
+.voice-turn-role{font-size:8px;text-transform:uppercase;letter-spacing:.07em;color:#7c9591}
+.voice-turn-assistant .voice-turn-role{color:#d0a488}
+.voice-turn-text{margin:0;font-size:12px;line-height:1.55;color:#cddad8}
+.voice-turn-assistant .voice-turn-text{color:#b9cbc9;font-style:italic}
+.voice-replay{justify-self:start;margin-top:2px;border:1px solid #4a6b58;background:#163530;color:#a9e9dc;border-radius:5px;padding:5px 9px;font-size:8px;font-weight:800}
+
+/* Bottom control bar: mode toggle, primary capture control, Stop, Connect. */
+.voice-controls{display:flex;flex-wrap:wrap;align-items:center;gap:14px;padding:16px 0 26px;border-top:1px solid var(--line-soft)}
+.voice-mode{display:inline-flex;align-items:center;gap:4px;border:1px solid #223a3b;border-radius:8px;padding:4px}
+.voice-mode-label{font-size:8px;text-transform:uppercase;letter-spacing:.09em;color:#5f767b;padding:0 6px 0 4px}
+.voice-mode-btn{border:0;background:transparent;color:#8fa8a4;border-radius:6px;padding:8px 12px;font-size:10px;font-weight:800}
+.voice-mode-btn.on{background:#17352f;color:#bff3e6;box-shadow:inset 0 0 0 1px #33665c}
+.voice-actions{display:inline-flex;align-items:center;gap:10px;flex-wrap:wrap}
+.voice-connect,.vp-ptt,.voice-handsfree{border:1px solid #397f72;background:#1a554b;color:#d3fff4;border-radius:8px;padding:11px 20px;font-size:11px;font-weight:800;touch-action:none;user-select:none}
+.vp-ptt.is-live,.voice-handsfree.is-live{background:var(--teal);border-color:#7ff0dd;color:#09211d}
+.voice-stop{border:1px solid #7a4433;background:#5a2f2f;color:#f4d6d6;border-radius:8px;padding:11px 16px;font-size:11px;font-weight:800}
+.voice-stop:disabled{border-color:#2c3a3b;background:#182226;color:#5c7377;cursor:default}
+.voice-disconnect{border:1px solid #344749;background:transparent;color:#92aaa7;border-radius:8px;padding:11px 16px;font-size:11px;font-weight:800}
+.voice-connect:disabled{border-color:#2a3c3e;background:#182226;color:#637a7b;cursor:default}
+.voice-save{margin-left:auto;display:grid;gap:5px;justify-items:end;text-align:right;max-width:300px}
+.voice-save-btn{border:1px solid #32665e;background:#13342f;color:#b9f4e5;border-radius:7px;padding:9px 14px;font-size:10px;font-weight:800;white-space:nowrap}
+.voice-save-btn:disabled{border-color:#273a3d;background:#172226;color:#60777a;cursor:default}
+.voice-save-note{font-size:8px;color:#6f8884;line-height:1.5}
+.voice-connect:focus-visible,.vp-ptt:focus-visible,.voice-handsfree:focus-visible,.voice-stop:focus-visible,.voice-disconnect:focus-visible,.voice-mode-btn:focus-visible,.voice-replay:focus-visible,.voice-save-btn:focus-visible{outline:2px solid #4fd6c0;outline-offset:2px}
+.voice-live{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+/* Voice route reflow: stack the rail into a top bar like the other full-width
+   routes so the console owns the full width. */
+.app-shell.voice-active{flex-direction:column}
+.app-shell.voice-active .rail{position:static;inset:auto;width:100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:12px 16px}
+.app-shell.voice-active .rail nav{grid-auto-flow:column;grid-template-columns:none;display:flex;flex-wrap:wrap;gap:4px}
+.app-shell.voice-active .rail .brand{padding:0 12px 0 0}
+.app-shell.voice-active .rail-footer{margin:0 0 0 auto}
+.app-shell.voice-active .workspace{margin-left:0;width:100%}
+.app-shell.voice-active .toast{left:16px;right:16px}
+@media(prefers-reduced-motion:reduce){.voice-orb i{animation:none!important}}
 
 /* Reviewed capability catalog / permission review / tool dispatch (reviewed-tools-plugins T006).
    Skills / plugins / tools / routes / delivery operations render as distinct,
@@ -539,13 +616,13 @@
   .deliver-start,.deliver-actions .secondary-button,
   .query-form button,.query-form input,.sandbox-form button,
   .setting-save-btn,.setting-preview-btn,.setting-reset-btn,
-  .voice-ptt .ptt-button,.realtime-voice-controls button,
+  .voice-ptt .ptt-button,.vp-ptt,.voice-handsfree,.voice-connect,.voice-stop,.voice-disconnect,.voice-mode-btn,.voice-save-btn,
   .chat-route select{min-height:44px}
   .composer button,.chat-composer button,.session-action,.ghost-button,
   .inline-action,.explorer-open-prd,.conv-new,.advanced-toggle,
   .deliver-start,.query-form button,.sandbox-form button,
   .setting-save-btn,.setting-preview-btn,.setting-reset-btn,
-  .voice-ptt .ptt-button,.realtime-voice-controls button{display:inline-flex;align-items:center;justify-content:center}
+  .voice-ptt .ptt-button,.vp-ptt,.voice-handsfree,.voice-connect,.voice-stop,.voice-disconnect,.voice-save-btn{display:inline-flex;align-items:center;justify-content:center}
   /* Tappable list/nav rows: give the whole row a comfortable minimum. */
   .data-list article,.session-list article,.run-row,
   .explorer-project,.explorer-task button,.conv-open,.pc-tool-select{min-height:44px}
@@ -574,8 +651,9 @@
   .project-header,.view-heading,.chat-header{flex-direction:column;gap:10px}
   .project-header-actions{align-items:flex-start;flex-direction:row;flex-wrap:wrap}
   .chat-controls,.composer>div,.composer-bar,.query-form,
-  .realtime-voice-head,.explorer-prd-head,.explorer-detail-topbar,
+  .voice-head,.voice-controls,.voice-actions,.explorer-prd-head,.explorer-detail-topbar,
   .pc-plugin-head{flex-wrap:wrap}
+  .voice-page{padding:0 16px}.voice-save{margin-left:0}
   .composer>div,.composer-bar{gap:8px}
   .query-form input{min-width:0}
 

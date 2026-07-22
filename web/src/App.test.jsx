@@ -5,7 +5,7 @@ import App from './App'
 import {
   addDirective, approve, bootstrap, createProject, createSession, fetchRoutes, probeSkills,
   runSandbox, searchEvidence, startWorkflow, taskLineage,
-  archiveConversation, branchTurn, createConversation, deleteConversation, fetchChatRoutes,
+  archiveConversation, branchTurn, createConversation, appendTurn, deleteConversation, fetchChatRoutes,
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
@@ -22,7 +22,7 @@ vi.mock('./api', () => ({
   addDirective: vi.fn(), approve: vi.fn(), bootstrap: vi.fn(), createProject: vi.fn(), createSession: vi.fn(),
   fetchRoutes: vi.fn(), probeSkills: vi.fn(), runSandbox: vi.fn(), searchEvidence: vi.fn(), startWorkflow: vi.fn(), taskLineage: vi.fn(),
   voiceSocketUrl: vi.fn(() => 'ws://workbench.test/api/sessions/session_1/voice/realtime'),
-  archiveConversation: vi.fn(), branchTurn: vi.fn(), createConversation: vi.fn(), deleteConversation: vi.fn(),
+  archiveConversation: vi.fn(), branchTurn: vi.fn(), createConversation: vi.fn(), appendTurn: vi.fn(), deleteConversation: vi.fn(),
   fetchChatRoutes: vi.fn(), getConversation: vi.fn(), listConversations: vi.fn(), renameConversation: vi.fn(),
   retryTurn: vi.fn(), searchConversations: vi.fn(), sendMessage: vi.fn(), unarchiveConversation: vi.fn(),
   fetchPrdContent: vi.fn(), fetchPrdTasks: vi.fn(), fetchTaskReference: vi.fn(), fetchTaskEligibility: vi.fn(),
@@ -128,6 +128,7 @@ function resetChatMocks() {
   searchConversations.mockResolvedValue({ conversations: [activeConversation] })
   getConversation.mockResolvedValue({ conversation: activeConversation, turns: [] })
   createConversation.mockResolvedValue({ id: 'conv_new', title: 'Untitled conversation', status: 'active', tags: [] })
+  appendTurn.mockResolvedValue({ id: 'turn_saved', status: 'complete' })
   renameConversation.mockImplementation((id, title) => Promise.resolve({ id, title, status: 'active', tags: [] }))
   archiveConversation.mockResolvedValue({})
   unarchiveConversation.mockResolvedValue({})
@@ -291,11 +292,12 @@ describe('Workbench delivery cockpit', () => {
     await user.click(screen.getByRole('button', { name: 'Authorize selected action' })); expect(approve).toHaveBeenCalledWith('approval_1'); expect(approve).not.toHaveBeenCalledWith('approval_decoy')
   })
 
-  it('does not offer voice capture without a configured private relay, in its own labeled area', async () => {
-    await renderLive()
-    // The realtime speech-to-speech surface is its own labeled region, even when
-    // unconfigured — not a cramped inline dock.
-    const region = screen.getByRole('region', { name: /realtime voice/i })
+  it('does not offer voice capture without a configured private relay, on its own Voice page', async () => {
+    // The speech-to-speech surface is now its OWN top-level Voice tab (moved out
+    // of Delivery). Even unconfigured, it degrades truthfully to a disabled state.
+    const user = userEvent.setup(); render(<App />)
+    await user.click(await screen.findByRole('button', { name: 'Voice' }))
+    const region = await screen.findByRole('region', { name: 'Voice not configured' })
     expect(within(region).getByRole('button', { name: 'Voice not configured' }).disabled).toBe(true)
     expect(within(region).getByText(/Configure a private Anvil Voice Realtime endpoint/)).toBeTruthy()
   })
@@ -1335,14 +1337,18 @@ describe('Chat voice push-to-talk and read-aloud (chat-first-voice T005)', () =>
   })
 })
 
-// --- Realtime voice (speech-to-speech): its own dedicated interface -----------
+// --- Voice: a dedicated speech-to-speech page (its own top-level tab) ----------
 //
-// The realtime relay is the ONE session-bound speech-to-speech surface, moved out
-// of a cramped inline dock into its own labeled region (heading + connection
-// state + session binding). These tests pin two live-qualification invariants:
+// The realtime relay is the ONE session-bound speech-to-speech surface, promoted
+// out of the Delivery view into its OWN top-level Voice tab (a voice-first page).
+// These tests pin the live-qualification invariants that must not regress:
 // (1) BOTH the playback and capture AudioContexts construct at the 16 kHz relay
-// contract rate (a 24k mismatch garbled the live test), and (2) the S2S interface
-// is a distinct labeled region, separate from the chat composer.
+// contract rate (a 24k mismatch garbled the live test); (2) hold-to-talk releases
+// with input_audio_buffer.commit and NEVER response.create (VAD server auto-
+// responds on commit); (3) a multi-chunk response plays through ONE AudioContext
+// scheduled gaplessly (not a fresh context per chunk). Plus the new Voice-page
+// surface: capture-mode toggle, hands-free commit, barge-in, the live transcript,
+// and Save-to-Chat.
 
 class _FakeAudioContext {
   constructor(options) { _FakeAudioContext.calls.push(options); this.sampleRate = options?.sampleRate; this.destination = {}; this.currentTime = 0; _FakeAudioContext.lastContext = this }
@@ -1365,7 +1371,7 @@ class _FakeRealtimeSocket {
 }
 _FakeRealtimeSocket.OPEN = 1
 
-describe('Realtime voice (speech-to-speech) dedicated interface (live-qualification)', () => {
+describe('Voice page (speech-to-speech) dedicated tab (live-qualification)', () => {
   const voiceFixture = { ...fixture, voice: { available: true, transport: 'realtime', retains_transcripts: false } }
   let originalAudioContext, originalWebSocket, originalMediaDevices
 
@@ -1396,37 +1402,46 @@ describe('Realtime voice (speech-to-speech) dedicated interface (live-qualificat
     Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: originalMediaDevices })
   })
 
-  async function renderRealtime() {
+  async function renderVoice() {
     const user = userEvent.setup()
     render(<App />)
-    await user.click(await screen.findByRole('button', { name: 'Delivery' }))
-    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    await user.click(await screen.findByRole('button', { name: 'Voice' }))
+    await screen.findByRole('heading', { name: 'Voice', level: 1 })
     return user
   }
+  // Connect the relay and open the socket for the configured-voice tests.
+  async function connectVoice(user) {
+    await user.click(screen.getByRole('button', { name: 'Connect' }))
+    const socket = _FakeRealtimeSocket.last
+    await act(async () => { socket.onopen?.() })
+    return socket
+  }
 
-  it('is a distinct labeled region, separate from the chat composer', async () => {
-    await renderRealtime()
-    const region = screen.getByRole('region', { name: /realtime voice/i })
-    expect(within(region).getByRole('heading', { name: /realtime voice/i })).toBeTruthy()
-    // It is NOT the composer: no message composer / Send live inside it.
-    expect(within(region).queryByRole('textbox', { name: 'Message composer' })).toBeNull()
-    expect(region.querySelector('.chat-composer')).toBeNull()
-    // It is session-bound (relay-only), the security semantic that must survive.
-    expect(within(region).getByText(/session_1/)).toBeTruthy()
+  it('is its own top-level Voice tab, separate from the Delivery view and chat composer', async () => {
+    const user = await renderVoice()
+    // The Voice page owns the heading + a read-only route + the session binding.
+    expect(screen.getByRole('heading', { name: 'Voice', level: 1 })).toBeTruthy()
+    expect(screen.getByText(/audio stays on the tailnet|nothing is recorded/i)).toBeTruthy()
+    expect(screen.getByText('read-only')).toBeTruthy() // read-only route indicator
+    expect(screen.getByText(/session_1/)).toBeTruthy() // session-bound (relay-only)
+    // It is NOT chat: no message composer lives on this page.
+    expect(screen.queryByRole('textbox', { name: 'Message composer' })).toBeNull()
+    // Delivery no longer renders the realtime panel (it moved here).
+    await user.click(screen.getByRole('button', { name: 'Delivery' }))
+    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    expect(screen.queryByRole('button', { name: 'Hold to talk' })).toBeNull()
+    expect(document.querySelector('.realtime-voice')).toBeNull()
   })
 
   it('constructs BOTH the playback and capture AudioContexts at the 16 kHz relay rate', async () => {
-    const user = await renderRealtime()
-    const region = screen.getByRole('region', { name: /realtime voice/i })
-    await user.click(within(region).getByRole('button', { name: 'Connect voice' }))
-    const socket = _FakeRealtimeSocket.last
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
     expect(socket).toBeTruthy()
-    await act(async () => { socket.onopen?.() })
     // Playback direction: an output-audio delta decodes + plays PCM16 back.
     const pcm = btoa('\x01\x02\x03\x04') // 4 bytes -> 2 PCM16 samples
     await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: pcm }) }) })
     // Capture direction: hold-to-talk opens the mic AudioContext.
-    const hold = await within(region).findByRole('button', { name: 'Hold to talk' })
+    const hold = await screen.findByRole('button', { name: 'Hold to talk' })
     await act(async () => { fireEvent.pointerDown(hold) })
     await waitFor(() => expect(_FakeAudioContext.calls.length).toBe(2))
     // BOTH constructions pin the 16 kHz relay contract (24000 -> garbled audio).
@@ -1436,29 +1451,22 @@ describe('Realtime voice (speech-to-speech) dedicated interface (live-qualificat
     expect(_FakeAudioContext.bufferCalls.every((call) => call.rate === 16000)).toBe(true)
   })
 
-  it('releases with input_audio_buffer.commit and NEVER response.create (VAD server auto-responds)', async () => {
-    const user = await renderRealtime()
-    const region = screen.getByRole('region', { name: /realtime voice/i })
-    await user.click(within(region).getByRole('button', { name: 'Connect voice' }))
-    const socket = _FakeRealtimeSocket.last
-    await act(async () => { socket.onopen?.() })
-    const hold = await within(region).findByRole('button', { name: 'Hold to talk' })
+  it('hold-to-talk releases with input_audio_buffer.commit and NEVER response.create (VAD server auto-responds)', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    const hold = await screen.findByRole('button', { name: 'Hold to talk' })
     await act(async () => { fireEvent.pointerDown(hold) })
     await act(async () => { fireEvent.pointerUp(hold) })
     const types = socket.sent.map((raw) => JSON.parse(raw).type)
     // Commit is what makes the VAD server transcribe+respond; response.create
-    // races ahead of the already-consumed buffer and errors ("no pending input"),
-    // which the UI shows as a spurious relay rejection on every turn.
+    // races ahead of the already-consumed buffer and errors ("no pending input").
     expect(types).toContain('input_audio_buffer.commit')
     expect(types).not.toContain('response.create')
   })
 
   it('plays a multi-chunk response through ONE AudioContext, scheduled gaplessly', async () => {
-    const user = await renderRealtime()
-    const region = screen.getByRole('region', { name: /realtime voice/i })
-    await user.click(within(region).getByRole('button', { name: 'Connect voice' }))
-    const socket = _FakeRealtimeSocket.last
-    await act(async () => { socket.onopen?.() })
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
     const chunk = btoa('\x01\x02\x03\x04\x05\x06\x07\x08') // 8 bytes -> 4 PCM16 samples
     for (let i = 0; i < 5; i += 1) {
       await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: chunk }) }) })
@@ -1466,11 +1474,118 @@ describe('Realtime voice (speech-to-speech) dedicated interface (live-qualificat
     // A fresh context per chunk (the bug) would be 5 playback contexts and would
     // exhaust the browser's context cap; ONE reused context is the fix.
     expect(_FakeAudioContext.calls.length).toBe(1)
-    // Five chunks scheduled; each starts at or after the previous — never all at 0.
     expect(_FakeAudioContext.startTimes.length).toBe(5)
     const monotonic = _FakeAudioContext.startTimes.every((t, i, a) => i === 0 || t >= a[i - 1])
     expect(monotonic).toBe(true)
     expect(_FakeAudioContext.startTimes.at(-1)).toBeGreaterThan(0)
+  })
+
+  it('offers BOTH capture modes and switches between them (no forced choice)', async () => {
+    const user = await renderVoice()
+    await connectVoice(user)
+    // Hold is the default; the capture control is the press-hold button.
+    expect(screen.getByRole('button', { name: 'Hold-to-talk mode' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: 'Hold to talk' })).toBeTruthy()
+    // Switch to hands-free: the capture control becomes an open-mic toggle.
+    await user.click(screen.getByRole('button', { name: 'Hands-free mode' }))
+    expect(screen.getByRole('button', { name: 'Hands-free mode' }).getAttribute('aria-pressed')).toBe('true')
+    expect(await screen.findByRole('button', { name: /hands-free listening/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Hold to talk' })).toBeNull()
+  })
+
+  it('hands-free commits on a server speech_stopped event and NEVER sends response.create', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    await user.click(screen.getByRole('button', { name: 'Hands-free mode' }))
+    // Entering hands-free opens the open mic (its AudioContext constructs).
+    await waitFor(() => expect(_FakeAudioContext.calls.length).toBeGreaterThan(0))
+    socket.sent.length = 0 // isolate the commit from the session.update handshake
+    // The server VAD signals end-of-speech; the client closes the utterance with a
+    // commit (never response.create). (Live: the server emits speech_stopped only
+    // as a byproduct of commit, so the client VAD is the primary driver; this
+    // pins the event-honoring path and the never-response.create invariant.)
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'input_audio_buffer.speech_stopped' }) }) })
+    const types = socket.sent.map((raw) => JSON.parse(raw).type)
+    expect(types).toContain('input_audio_buffer.commit')
+    expect(types).not.toContain('response.create')
+  })
+
+  it('barge-in Stop sends response.cancel and resets the playback context (nextStart)', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    const chunk = btoa('\x01\x02\x03\x04\x05\x06\x07\x08')
+    // Assistant starts speaking: a response opens and audio streams (ONE context).
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: chunk }) }) })
+    expect(_FakeAudioContext.calls.length).toBe(1)
+    const stop = await screen.findByRole('button', { name: 'Stop the assistant' })
+    expect(stop.disabled).toBe(false) // enabled while the assistant is speaking
+    socket.sent.length = 0
+    await act(async () => { fireEvent.click(stop) })
+    // (a) the server is told to stop generating.
+    expect(socket.sent.map((raw) => JSON.parse(raw).type)).toContain('response.cancel')
+    // (b) local playback halts: the context was closed. A subsequent delta builds a
+    // FRESH context and schedules from t=0 — proving nextStart reset (no overlap
+    // onto a stale playhead).
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: chunk }) }) })
+    expect(_FakeAudioContext.calls.length).toBe(2) // a new playback context was built
+    expect(_FakeAudioContext.startTimes.at(-1)).toBe(0) // scheduled from a reset playhead
+  })
+
+  it('renders a user turn from a transcription.completed event and an assistant spoken-reply bubble from an audio delta', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    // USER turn: rendered as text from the server transcription.
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'summarize the delivery status' }) }) })
+    const log = screen.getByRole('log', { name: 'Live transcript' })
+    expect(await within(log).findByText('summarize the delivery status')).toBeTruthy()
+    // ASSISTANT turn: an audio-only reply renders a "spoken reply" bubble WITH a
+    // Replay control (the server sends no assistant text).
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
+    expect(within(log).getByText(/spoken reply/i)).toBeTruthy()
+    expect(within(log).getByRole('button', { name: 'Replay this spoken reply' })).toBeTruthy()
+  })
+
+  it('clears the ephemeral transcript on disconnect', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'a passing thought' }) }) })
+    expect(await screen.findByText('a passing thought')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'Disconnect voice' }))
+    expect(screen.queryByText('a passing thought')).toBeNull() // ephemeral: gone on disconnect
+  })
+
+  it('Save to Chat persists the transcript as TEXT turns via the conversations API — never audio', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    // One user turn (text) and one assistant turn (audio-only spoken reply).
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'what is pending' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
+    await user.click(screen.getByRole('button', { name: 'Save this transcript to Chat' }))
+    await waitFor(() => expect(createConversation).toHaveBeenCalled())
+    // A durable conversation is created, then each turn is appended as TEXT.
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(2))
+    const userCall = appendTurn.mock.calls.find((call) => call[1].role === 'user')
+    const asstCall = appendTurn.mock.calls.find((call) => call[1].role === 'assistant')
+    expect(userCall[1].content).toEqual([{ kind: 'text', text: 'what is pending' }])
+    // Assistant is a TEXT placeholder (audio-only reply) — never raw audio.
+    expect(asstCall[1].content[0].kind).toBe('text')
+    expect(asstCall[1].content[0].text).toMatch(/spoken reply/i)
+    const serialized = JSON.stringify(appendTurn.mock.calls)
+    expect(serialized).not.toMatch(/audio_base64|audio_format|"audio"/)
+    expect(await screen.findByText(/moved into storage as text/)).toBeTruthy()
+  })
+
+  it('degrades honestly when Save to Chat is unavailable (503) — disables with a note', async () => {
+    createConversation.mockRejectedValueOnce(new Error('Conversation could not be created'))
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'save me' }) }) })
+    await user.click(screen.getByRole('button', { name: 'Save this transcript to Chat' }))
+    expect(await screen.findByText(/Saving to Chat is unavailable on this hub/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Save this transcript to Chat' }).disabled).toBe(true)
   })
 })
 

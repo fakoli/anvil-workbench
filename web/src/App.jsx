@@ -2,7 +2,7 @@ import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import {
   addDirective, approve, bootstrap, createProject, createSession, fetchRoutes, probeSkills,
   runSandbox, searchEvidence, startWorkflow, taskLineage, voiceSocketUrl,
-  archiveConversation, branchTurn, createConversation, deleteConversation, fetchChatRoutes,
+  archiveConversation, branchTurn, createConversation, appendTurn, deleteConversation, fetchChatRoutes,
   getConversation, listConversations, renameConversation, retryTurn, searchConversations,
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
@@ -41,7 +41,7 @@ const emptyData = {
 // Chat is first and selected by default; Delivery stays reachable directly below
 // it (chat-first-voice T004.4). The order here IS the rendered nav order.
 const nav = [
-  ['Chat', '◇'], ['Delivery', '⌘'], ['Explorer', '▦'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'], ['Settings', '⚙'],
+  ['Chat', '◇'], ['Voice', '⏺'], ['Delivery', '⌘'], ['Explorer', '▦'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'], ['Settings', '⚙'],
   ['Evidence', '◈'], ['Skills', '✦'], ['Plugins', '⧉'], ['Sandbox', '□'],
 ]
 
@@ -130,116 +130,374 @@ function pcm16Base64ToWavDataUri(pcmBase64, sampleRate) {
   return `data:audio/wav;base64,${_bytesToBase64(_wrapPcm16Wav(_base64ToBytes(pcmBase64), sampleRate))}`
 }
 
-// --- Realtime voice (speech-to-speech) — its OWN dedicated interface ----------
+// --- Voice: a dedicated speech-to-speech page (its OWN top-level tab) ----------
 //
-// This is the ONE realtime relay surface: a session-bound `voice/realtime`
-// websocket that streams mic audio up and plays synthesized audio back. It is
-// deliberately SEPARATE from the two request/response voice uses (chat dictation
-// STT via PushToTalk, per-message read-aloud TTS via ReadAloud) — the operator
-// asked for realtime speech-to-speech to have its own clearly-labeled area, not
-// a cramped inline dock. Rendered as a labeled region with its own heading,
-// connection state, and session binding. Security semantics are unchanged: it is
-// session-bound and relay-only, and NO delivery action can be started from voice.
-function RealtimeVoice({ data, append }) {
+// The ONE realtime relay surface, promoted from a panel bolted onto Delivery into
+// its own voice-first page: a session-bound `voice/realtime` websocket that
+// streams mic audio up and plays synthesized audio back. It is a conversational
+// modality, not a delivery action — session-bound and relay-only, and NO delivery
+// action can be started from voice. It is content-free by default: no raw audio
+// and no durable transcript are persisted; the live transcript is ephemeral and
+// clears on disconnect. Save to Chat is the ONE explicit, opt-in exit from that
+// no-recording default, and it persists TEXT only (never audio).
+//
+// Two capture modes, both operator-switchable:
+//   * Hold to talk — press-hold streams `input_audio_buffer.append`; on release
+//     send `input_audio_buffer.commit` (never response.create). The relay's server
+//     is voice-activity-driven: committing the buffer is what makes it transcribe
+//     and respond; a `response.create` races ahead of the already-consumed buffer
+//     and errors ("no pending input"). Verified live: commit-only → one clean
+//     response, 0 errors.
+//   * Hands-free (open mic) — continuously stream `append` while listening and
+//     close each utterance with a CLIENT-driven `commit`. EMPIRICAL NOTE: the live
+//     realtime server does NOT emit `input_audio_buffer.speech_stopped`
+//     autonomously from the append stream — it emits speech_started/speech_stopped
+//     only as a byproduct of a client commit (append-only, even with real speech +
+//     trailing silence, yields zero events and zero responses). So a design that
+//     waits for the server's speech_stopped before committing would deadlock. The
+//     end-of-utterance boundary is therefore detected CLIENT-side (energy VAD) and
+//     drives the commit; a server-sent speech_stopped, if one ever arrives, ALSO
+//     triggers the commit. Never response.create. Verified live (real kokoro
+//     speech, resampled to 16 kHz): one clean response per utterance, correct
+//     transcript, 0 errors, across multiple utterances on one persistent socket.
+function VoicePage({ data, append }) {
   const session = data.sessions?.[0]
   const configured = Boolean(data.voice?.available && session)
-  const [state, setState] = useState('disconnected')
+  const routeLabel = data.voice?.route || 'realtime · fast route'
+  const [connection, setConnection] = useState('disconnected') // disconnected | connecting | ready
+  const [captureMode, setCaptureMode] = useState('hold') // hold | handsfree
+  const [capturing, setCapturing] = useState(false) // mic hot (either mode)
+  const [speaking, setSpeaking] = useState(false) // assistant audio playing
+  const [transcript, setTranscript] = useState([]) // ephemeral {id, role, text, kind}
+  const [announce, setAnnounce] = useState('')
+  const [saveState, setSaveState] = useState({ status: 'idle', message: '' }) // idle|saving|saved|unavailable
+
   const socketRef = useRef(null)
   const captureRef = useRef(null)
   // A SINGLE persistent playback context with a running playhead. A streamed
   // response arrives as many `response.output_audio.delta` chunks; a fresh
   // AudioContext per chunk (a) starts every chunk at t=0 so they overlap and
   // (b) exhausts the browser's ~6-context cap mid-response, which threw and cut
-  // playback off. Instead decode each chunk into the one context and schedule it
-  // at `nextStart` so the chunks play back gaplessly in order.
+  // playback off. Decode each chunk into the ONE context and schedule it at
+  // `nextStart` so the chunks play back gaplessly in order.
   const playbackRef = useRef(null)
+  const pendingSourcesRef = useRef(0)
+  // Buffered assistant audio, keyed by assistant turn id, so each "spoken reply"
+  // bubble can Replay its own turn's audio. This is transient in-memory only —
+  // never persisted, never sent to Save to Chat.
+  const chunkBufRef = useRef(new Map())
+  const currentAssistantRef = useRef(null)
+  const currentUserRef = useRef(null)
+  const turnSeqRef = useRef(0)
+  const mountedRef = useRef(true)
+  // Client-side end-of-utterance VAD state for hands-free (the server does not
+  // stream autonomous VAD — see the note above).
+  const heardSpeechRef = useRef(false)
+  const silenceStartRef = useRef(0)
+  const utterancePendingRef = useRef(false)
+
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; teardownAll(); socketRef.current?.close?.(); socketRef.current = null } }, [])
+
   const closePlayback = () => {
     const pb = playbackRef.current
     if (!pb) return
-    pb.context.close().catch(() => undefined); playbackRef.current = null
+    pb.context.close?.().catch?.(() => undefined); playbackRef.current = null; pendingSourcesRef.current = 0
   }
   const releaseCapture = () => {
     const capture = captureRef.current
     if (!capture) return
-    capture.processor.disconnect(); capture.source.disconnect(); capture.stream.getTracks().forEach((track) => track.stop())
-    capture.context.close().catch(() => undefined); captureRef.current = null
+    try { capture.processor.disconnect() } catch { /* already gone */ }
+    try { capture.source.disconnect() } catch { /* already gone */ }
+    capture.stream?.getTracks?.().forEach((track) => { try { track.stop() } catch { /* already stopped */ } })
+    try { capture.context.close?.() } catch { /* already closing */ }
+    captureRef.current = null
   }
-  const playAudio = (encoded) => {
+  const teardownAll = () => { releaseCapture(); closePlayback(); if (mountedRef.current) { setCapturing(false); setSpeaking(false) } }
+
+  const ensurePlayback = () => {
+    // Playback direction of the 16 kHz relay contract: one shared context at the
+    // SAME rate the capture and relay use. A rate mismatch garbles playback.
+    if (!playbackRef.current) playbackRef.current = { context: new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE }), nextStart: 0 }
+    return playbackRef.current
+  }
+  const decodeChunk = (context, encoded) => {
+    const binary = window.atob(encoded)
+    const buffer = context.createBuffer(1, binary.length / 2, VOICE_RELAY_SAMPLE_RATE); const channel = buffer.getChannelData(0)
+    const bytes = new Uint8Array(binary.length); for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+    const view = new DataView(bytes.buffer); for (let index = 0; index < channel.length; index += 1) channel[index] = view.getInt16(index * 2, true) / 0x8000
+    return buffer
+  }
+  const scheduleBuffer = (context, buffer) => {
+    const pb = playbackRef.current
+    const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination)
+    pendingSourcesRef.current += 1
+    if (mountedRef.current) setSpeaking(true)
+    source.onended = () => { pendingSourcesRef.current = Math.max(0, pendingSourcesRef.current - 1); if (pendingSourcesRef.current === 0 && mountedRef.current) setSpeaking(false) }
+    const startAt = Math.max(context.currentTime, pb.nextStart)
+    source.start(startAt); pb.nextStart = startAt + buffer.duration
+  }
+  const playChunk = (encoded) => {
     if (typeof encoded !== 'string' || !encoded || !window.AudioContext) return
-    try {
-      // Playback direction of the 16 kHz relay contract: decode the relay's
-      // PCM16 at VOICE_RELAY_SAMPLE_RATE and play it back at the SAME rate,
-      // through the ONE shared context created on connect.
-      if (!playbackRef.current) playbackRef.current = { context: new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE }), nextStart: 0 }
-      const pb = playbackRef.current; const context = pb.context
-      const binary = window.atob(encoded)
-      const buffer = context.createBuffer(1, binary.length / 2, VOICE_RELAY_SAMPLE_RATE); const channel = buffer.getChannelData(0)
-      const bytes = new Uint8Array(binary.length); for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-      const view = new DataView(bytes.buffer); for (let index = 0; index < channel.length; index += 1) channel[index] = view.getInt16(index * 2, true) / 0x8000
-      const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination)
-      // Schedule contiguously: never before the context's own clock, never
-      // before the previously-queued chunk ends. Gapless, in-order playback.
-      const startAt = Math.max(context.currentTime, pb.nextStart)
-      source.start(startAt); pb.nextStart = startAt + buffer.duration
-    } catch { append('Voice output could not be played in this browser.') }
+    try { const pb = ensurePlayback(); scheduleBuffer(pb.context, decodeChunk(pb.context, encoded)) }
+    catch { setAnnounce('Voice output could not be played in this browser.') }
   }
+  // Replay one assistant turn's buffered audio through the shared context.
+  const replayTurn = (turnId) => {
+    const chunks = chunkBufRef.current.get(turnId) || []
+    if (!chunks.length || !window.AudioContext) return
+    try { const pb = ensurePlayback(); chunks.forEach((chunk) => scheduleBuffer(pb.context, decodeChunk(pb.context, chunk))); setAnnounce('Replaying the assistant reply.') }
+    catch { setAnnounce('Voice output could not be replayed in this browser.') }
+  }
+
+  // Barge-in Stop: halt local playback IMMEDIATELY (close + drop the scheduled
+  // queue so nextStart resets on the next chunk) AND tell the server to stop
+  // generating (`response.cancel` is in the relay allowlist). Never response.create.
+  const bargeInStop = () => {
+    closePlayback(); if (mountedRef.current) setSpeaking(false)
+    if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+    setAnnounce('Stopped the assistant. You can speak again.')
+  }
+
+  const upsertUserTurn = (text, final) => {
+    if (currentUserRef.current) {
+      const id = currentUserRef.current
+      setTranscript((current) => current.map((turn) => (turn.id === id ? { ...turn, text, status: final ? 'complete' : 'partial' } : turn)))
+      if (final) currentUserRef.current = null
+    } else {
+      const id = `voice-user-${(turnSeqRef.current += 1)}`
+      if (!final) currentUserRef.current = id
+      setTranscript((current) => [...current, { id, role: 'user', text, status: final ? 'complete' : 'partial' }])
+    }
+    setAnnounce(`You said: ${text}`)
+  }
+  const beginAssistantTurn = () => {
+    const id = `voice-assistant-${(turnSeqRef.current += 1)}`
+    currentAssistantRef.current = id
+    chunkBufRef.current.set(id, [])
+    setTranscript((current) => [...current, { id, role: 'assistant', text: 'Spoken reply', status: 'streaming' }])
+    setAnnounce('Assistant is replying by voice.')
+  }
+
+  const handleMessage = (event) => {
+    let message
+    try { message = JSON.parse(event.data) } catch { append('Voice relay returned an unreadable event; no delivery action was started.'); return }
+    const type = message.type
+    if (type === 'response.output_audio.delta') {
+      if (!currentAssistantRef.current) beginAssistantTurn()
+      const bucket = chunkBufRef.current.get(currentAssistantRef.current)
+      if (bucket && typeof message.delta === 'string') bucket.push(message.delta)
+      playChunk(message.delta)
+      return
+    }
+    if (type === 'response.created') { beginAssistantTurn(); return }
+    if (type === 'response.done' || type === 'response.completed') { currentAssistantRef.current = null; return }
+    if (type === 'conversation.item.input_audio_transcription.delta') { upsertUserTurn(message.delta || message.transcript || '', false); return }
+    if (type === 'conversation.item.input_audio_transcription.completed') { upsertUserTurn(message.transcript || message.text || '', true); return }
+    // The server emits speech_stopped only as a byproduct of a commit, but honor
+    // it: if one ever arrives while hands-free, close the utterance with a commit
+    // (never response.create). The primary hands-free driver is the client VAD.
+    if (type === 'input_audio_buffer.speech_stopped') { if (captureRef.current?.mode === 'handsfree') sendCommit(true); return }
+    if (type === 'error') { append('Voice relay rejected an event; no delivery action was started.'); return }
+  }
+
   const connect = () => {
     if (!configured) return
-    setState('connecting')
+    setConnection('connecting'); setSaveState({ status: 'idle', message: '' }); setAnnounce('Connecting to the voice relay.')
     const socket = new WebSocket(voiceSocketUrl(session.id)); socketRef.current = socket
-    socket.onopen = () => { socket.send(JSON.stringify({ type: 'session.update', session: { modalities: ['audio', 'text'] } })); setState('ready') }
-    socket.onmessage = (event) => { try { const message = JSON.parse(event.data); if (message.type === 'response.output_audio.delta') playAudio(message.delta); if (message.type === 'error') append('Voice relay rejected an event; no delivery action was started.') } catch { append('Voice relay returned an unreadable event; no delivery action was started.') } }
-    socket.onclose = () => { releaseCapture(); closePlayback(); setState('disconnected') }
-    socket.onerror = () => append('Voice relay is unavailable. The session and workflow remain unchanged.')
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ type: 'session.update', session: { modalities: ['audio', 'text'] } }))
+      setConnection('ready'); setAnnounce('Connected and ready. Choose hold-to-talk or hands-free to speak.')
+      if (captureMode === 'handsfree') openMic('handsfree')
+    }
+    socket.onmessage = handleMessage
+    socket.onclose = () => { teardownAll(); currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map(); setTranscript([]); setConnection('disconnected'); setAnnounce('Disconnected. The live transcript was cleared; nothing was recorded.') }
+    socket.onerror = () => setAnnounce('Voice relay is unavailable. The session and workflow remain unchanged.')
   }
-  const startCapture = async () => {
-    if (state !== 'ready' || socketRef.current?.readyState !== WebSocket.OPEN) return
+  const disconnect = () => {
+    teardownAll(); socketRef.current?.close(); socketRef.current = null
+    currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map()
+    setTranscript([]); setConnection('disconnected'); setAnnounce('Disconnected. The live transcript was cleared; nothing was recorded.')
+  }
+
+  // Capture direction of the SAME 16 kHz relay contract: the mic AudioContext MUST
+  // match VOICE_RELAY_SAMPLE_RATE so the relay's STT reads real-time, not slowed,
+  // audio. `mode` decides how an utterance is CLOSED (hold: on release; handsfree:
+  // on client-detected end-of-speech).
+  const openMic = async (mode) => {
+    if (socketRef.current?.readyState !== WebSocket.OPEN) return
+    if (captureRef.current) return // already open
     if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) { append('This browser cannot capture microphone audio for the Workbench voice relay.'); return }
     try {
-      // Capture direction of the SAME 16 kHz relay contract: the mic AudioContext
-      // MUST match VOICE_RELAY_SAMPLE_RATE so the relay's STT reads real-time,
-      // not slowed, audio. The 4096-frame ScriptProcessor and encodePcm16 are
-      // rate-agnostic (frames/samples, not Hz), so only this rate is coupled.
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); const context = new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE })
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const context = new window.AudioContext({ sampleRate: VOICE_RELAY_SAMPLE_RATE })
       const source = context.createMediaStreamSource(stream); const processor = context.createScriptProcessor(4096, 1, 1)
-      processor.onaudioprocess = (event) => { if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: encodePcm16(event.inputBuffer.getChannelData(0)) })) }
-      source.connect(processor); processor.connect(context.destination); captureRef.current = { stream, context, source, processor }; setState('listening')
+      heardSpeechRef.current = false; silenceStartRef.current = 0; utterancePendingRef.current = mode === 'handsfree'
+      processor.onaudioprocess = (event) => {
+        const frame = event.inputBuffer.getChannelData(0)
+        if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: encodePcm16(frame) }))
+        if (mode === 'handsfree') runClientVad(frame)
+      }
+      source.connect(processor); processor.connect(context.destination)
+      captureRef.current = { stream, context, source, processor, mode }
+      setCapturing(true); setAnnounce(mode === 'handsfree' ? 'Hands-free listening. Speak, then pause to send.' : 'Listening. Release to send.')
     } catch { append('Microphone access was not granted. No audio left this browser.') }
   }
-  // On release, COMMIT the captured audio and stop. The relay's realtime server
-  // is voice-activity-driven: committing the buffer is what makes it transcribe
-  // and respond. Do NOT also send `response.create` — the server has already
-  // consumed the buffer by the time it would arrive, so it errors with "no
-  // pending input to respond to" (surfaced to the user as a spurious relay
-  // rejection on every turn) while the real response streams anyway. Verified
-  // against the live server: commit-only yields exactly one clean response.
-  const finishCapture = () => { if (state !== 'listening') return; releaseCapture(); if (socketRef.current?.readyState === WebSocket.OPEN) { socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' })) }; setState('ready') }
-  const disconnect = () => { releaseCapture(); closePlayback(); socketRef.current?.close(); socketRef.current = null; setState('disconnected') }
-  const connectionLabel = { disconnected: 'Disconnected', connecting: 'Connecting…', ready: 'Connected · ready', listening: 'Listening…' }[state] || state
-  return <section className="realtime-voice" aria-labelledby="realtime-voice-heading">
-    <header className="realtime-voice-head">
-      <div>
-        <h2 id="realtime-voice-heading">Realtime voice</h2>
-        <small>Session-bound speech-to-speech through the private Anvil Voice Realtime relay. This is separate from chat dictation and read-aloud; a delivery action still requires the bridge and an approval — voice cannot start one.</small>
+  // Energy-based end-of-utterance detection for hands-free: mark speech when the
+  // frame's RMS crosses a threshold, and close the utterance with a commit once a
+  // short trailing silence follows detected speech.
+  const runClientVad = (frame) => {
+    let sum = 0
+    for (let index = 0; index < frame.length; index += 1) sum += frame[index] * frame[index]
+    const rms = Math.sqrt(sum / (frame.length || 1))
+    if (rms > 0.012) { heardSpeechRef.current = true; utterancePendingRef.current = true; silenceStartRef.current = 0; return }
+    if (!heardSpeechRef.current) return
+    const now = Date.now()
+    if (silenceStartRef.current === 0) { silenceStartRef.current = now; return }
+    if (now - silenceStartRef.current >= 650) { sendCommit(false); heardSpeechRef.current = false; silenceStartRef.current = 0 }
+  }
+  // Close an utterance: send commit ONLY, never response.create. `force` (a server
+  // speech_stopped) commits regardless of the client pending flag; the client-VAD
+  // path only commits when an utterance is actually pending, so an all-silence
+  // stretch never commits an empty buffer.
+  const sendCommit = (force) => {
+    if (socketRef.current?.readyState !== WebSocket.OPEN) return
+    if (!force && !utterancePendingRef.current) return
+    socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
+    utterancePendingRef.current = false
+  }
+
+  const startHold = () => { if (connection === 'ready') openMic('hold') }
+  const finishHold = () => {
+    if (captureRef.current?.mode !== 'hold') return
+    releaseCapture(); setCapturing(false)
+    if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
+    setAnnounce('Sent. Waiting for the assistant.')
+  }
+  const toggleHandsFree = () => { if (captureRef.current) { releaseCapture(); setCapturing(false); setAnnounce('Hands-free paused.') } else openMic('handsfree') }
+  const chooseMode = (mode) => {
+    if (mode === captureMode) return
+    setCaptureMode(mode)
+    // Switching away from an open mic stops it cleanly; switching into hands-free
+    // while connected opens the mic immediately.
+    if (mode === 'hold' && captureRef.current?.mode === 'handsfree') { releaseCapture(); setCapturing(false) }
+    if (mode === 'handsfree' && connection === 'ready' && !captureRef.current) openMic('handsfree')
+    setAnnounce(mode === 'hold' ? 'Hold-to-talk mode.' : 'Hands-free mode.')
+  }
+
+  // Save to Chat: the ONE explicit, opt-in move from an ephemeral voice session
+  // into durable Chat storage. It persists TEXT only — user turns as their
+  // transcribed text; assistant turns (audio-only) as a placeholder noting the
+  // reply was spoken (no assistant text exists yet, and raw audio is NEVER
+  // persisted). A 503/unconfigured conversations API degrades honestly: Save
+  // disables with a truthful note.
+  const saveToChat = async () => {
+    if (!transcript.length || saveState.status === 'saving' || saveState.status === 'unavailable') return
+    setSaveState({ status: 'saving', message: 'Saving this transcript to Chat…' }); setAnnounce('Saving this transcript to Chat.')
+    try {
+      const conversation = await createConversation({ title: `Voice session · ${new Date().toLocaleString()}` })
+      for (const turn of transcript) {
+        const text = turn.role === 'assistant'
+          ? '[Spoken reply — the assistant replied by voice; audio was not recorded.]'
+          : (turn.text || '')
+        await appendTurn(conversation.id, { role: turn.role, status: 'complete', content: [{ kind: 'text', text }] })
+      }
+      setSaveState({ status: 'saved', message: 'Saved to Chat as a durable conversation. This ephemeral session was moved into storage as text.' })
+      setAnnounce('Saved to Chat as a durable conversation.')
+    } catch {
+      setSaveState({ status: 'unavailable', message: 'Saving to Chat is unavailable on this hub. Nothing was recorded; the transcript stays ephemeral.' })
+      setAnnounce('Saving to Chat is unavailable.')
+    }
+  }
+
+  const connected = connection === 'ready'
+  const statusLabel = connection === 'disconnected' ? 'Disconnected'
+    : connection === 'connecting' ? 'Connecting'
+    : speaking ? 'Assistant speaking'
+    : capturing ? 'Listening'
+    : 'Connected · ready'
+  const orbState = connection === 'disconnected' || connection === 'connecting' ? 'idle' : speaking ? 'speaking' : capturing ? 'listening' : 'ready'
+
+  return <main className="voice-page" aria-labelledby="voice-heading">
+    <header className="voice-head">
+      <div className="voice-head-titles">
+        <span className="crumb">Voice / speech-to-speech</span>
+        <h1 id="voice-heading">Voice</h1>
+        <p className="voice-privacy">Session-bound and relay-only. Audio stays on the tailnet and nothing is recorded — the live transcript is ephemeral and clears on disconnect. Voice cannot start a delivery action.</p>
       </div>
-      <Status tone={state === 'ready' || state === 'listening' ? 'green' : 'amber'}>{connectionLabel}</Status>
+      <div className="voice-head-meta">
+        <Status tone={connected ? 'green' : 'amber'}>{statusLabel}</Status>
+        <dl className="voice-meta-grid">
+          <div><dt>Route</dt><dd>{routeLabel}<span className="voice-ro">read-only</span></dd></div>
+          <div><dt>Session</dt><dd>{configured ? <>{session.title} <code>{session.id}</code></> : 'not configured'}</dd></div>
+        </dl>
+      </div>
     </header>
-    <p className="realtime-voice-binding">{configured ? <>Bound to session <b>{session.title}</b> <code>{session.id}</code></> : 'Configure a private Anvil Voice Realtime endpoint to enable session-bound speech-to-speech.'}</p>
-    <div className="realtime-voice-controls">
-      {!configured
-        ? <button disabled aria-label="Voice not configured">Voice unavailable</button>
-        : state === 'disconnected' || state === 'connecting'
-        ? <button onClick={connect} disabled={state === 'connecting'}>{state === 'connecting' ? 'Connecting…' : 'Connect voice'}</button>
-        : <>
-            <button className={state === 'listening' ? 'speaking' : ''} onPointerDown={startCapture} onPointerUp={finishCapture} onPointerCancel={finishCapture} aria-label="Hold to talk">{state === 'listening' ? 'Listening… release to send' : 'Hold to talk'}</button>
-            <button className="voice-close" onClick={disconnect}>Disconnect</button>
-          </>}
-    </div>
-    {/* A visually-collapsed live region mirrors the connection state to a screen
-        reader on every transition. It uses aria-live WITHOUT the ARIA status role
-        so it does not collide with the app's role="status" toast/notification. */}
-    <span className="realtime-voice-status" aria-live="polite">Realtime voice {connectionLabel}</span>
-  </section>
+
+    {!configured
+      ? <section className="voice-unconfigured" aria-label="Voice not configured">
+          <div className={`voice-orb orb-idle`} aria-hidden="true"><i /><i /><i /></div>
+          <h2>Voice is not configured</h2>
+          <p>Configure a private Anvil Voice Realtime endpoint and an active session to enable session-bound speech-to-speech. No audio leaves this browser until then.</p>
+          <button disabled aria-label="Voice not configured">Voice unavailable</button>
+        </section>
+      : <>
+          <section className="voice-stage" aria-label="Live voice transcript">
+            <div className={`voice-orb orb-${orbState}`} aria-hidden="true"><i /><i /><i /></div>
+            <ol className="voice-transcript" role="log" aria-live="polite" aria-label="Live transcript">
+              {transcript.length === 0
+                ? <li className="voice-transcript-empty">
+                    <b>Live, not saved.</b>
+                    <span>Connect and speak. Your words and the assistant’s spoken replies appear here as they happen, and clear when you disconnect.</span>
+                  </li>
+                : transcript.map((turn) => <li key={turn.id} className={`voice-turn voice-turn-${turn.role} ${turn.status === 'partial' ? 'is-partial' : ''}`}>
+                    <span className="voice-turn-role">{turn.role === 'user' ? 'You' : 'Assistant · spoken reply'}</span>
+                    <p className="voice-turn-text">{turn.role === 'assistant' ? 'The assistant replied by voice.' : (turn.text || (turn.status === 'partial' ? '…' : ''))}</p>
+                    {turn.role === 'assistant' && <button className="voice-replay" aria-label="Replay this spoken reply" onClick={() => replayTurn(turn.id)}>Replay</button>}
+                  </li>)}
+            </ol>
+          </section>
+
+          <div className="voice-controls">
+            <div className="voice-mode" role="group" aria-label="Capture mode">
+              <span className="voice-mode-label">Mode</span>
+              <button type="button" className={`voice-mode-btn ${captureMode === 'hold' ? 'on' : ''}`} aria-label="Hold-to-talk mode" aria-pressed={captureMode === 'hold'} onClick={() => chooseMode('hold')}>Hold to talk</button>
+              <button type="button" className={`voice-mode-btn ${captureMode === 'handsfree' ? 'on' : ''}`} aria-label="Hands-free mode" aria-pressed={captureMode === 'handsfree'} onClick={() => chooseMode('handsfree')}>Hands-free</button>
+            </div>
+
+            <div className="voice-actions">
+              {connection === 'disconnected' || connection === 'connecting'
+                ? <button className="voice-connect" onClick={connect} disabled={connection === 'connecting'}>{connection === 'connecting' ? 'Connecting…' : 'Connect'}</button>
+                : <>
+                    {captureMode === 'hold'
+                      ? <button
+                          type="button"
+                          className={`vp-ptt ${capturing ? 'is-live' : ''}`}
+                          aria-label="Hold to talk"
+                          aria-pressed={capturing}
+                          onPointerDown={startHold} onPointerUp={finishHold} onPointerCancel={finishHold} onPointerLeave={finishHold}
+                          onKeyDown={(event) => { if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) { event.preventDefault(); startHold() } }}
+                          onKeyUp={(event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); finishHold() } }}
+                        >{capturing ? 'Listening… release to send' : 'Hold to talk'}</button>
+                      : <button type="button" className={`voice-handsfree ${capturing ? 'is-live' : ''}`} aria-label={capturing ? 'Pause hands-free listening' : 'Start hands-free listening'} aria-pressed={capturing} onClick={toggleHandsFree}>{capturing ? 'Listening — pause' : 'Start listening'}</button>}
+                    <button type="button" className="voice-stop" aria-label="Stop the assistant" onClick={bargeInStop} disabled={!speaking}>Stop</button>
+                    <button type="button" className="voice-disconnect" aria-label="Disconnect voice" onClick={disconnect}>Disconnect</button>
+                  </>}
+            </div>
+
+            <div className="voice-save">
+              <button type="button" className="voice-save-btn" aria-label="Save this transcript to Chat" onClick={saveToChat} disabled={!transcript.length || saveState.status === 'saving' || saveState.status === 'unavailable'}>
+                {saveState.status === 'saving' ? 'Saving…' : 'Save to Chat'}
+              </button>
+              <small className="voice-save-note">{saveState.message || 'Optional. Moves this ephemeral session into durable Chat storage as text — never audio.'}</small>
+            </div>
+          </div>
+        </>}
+
+    {/* One polite live region announces connection/turn changes for a screen
+        reader. role="status" keeps it off the region tree so it never collides
+        with the page region's name. */}
+    <div className="voice-live" role="status" aria-live="polite">{announce}</div>
+  </main>
 }
 
 function Delivery({ data, append, onDirective, onGuide, onDeliverNext }) {
@@ -253,7 +511,7 @@ function Delivery({ data, append, onDirective, onGuide, onDeliverNext }) {
   return <main className="delivery"><header className="project-header"><div><span className="crumb">Delivery / {project.name}</span><h1>{run?.task_id ? `Task ${run.task_id}` : 'No active task'}</h1><p>PRD → State plan → local Codex run → evidence → approved PR</p></div><div className="project-header-actions"><button className="session-action" onClick={onDeliverNext}>Deliver next task</button><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'ready for session'}</Status></div></header>
     <section className="flow-card"><div className="flow-top"><span className="thread-avatar">A</span><div><strong>Delivery operator</strong><small>{run ? `${run.model} through Anvil Serving` : 'Waiting for a bridge-supervised run'}</small></div><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'idle'}</Status></div><ol className="steps"><li className={run ? 'complete' : 'current'}><span>{run ? '✓' : '1'}</span><div><b>{run ? 'State work packet requested' : 'Create a session'}</b><small>{run ? `${run.id} is bound to the bridge and its configured worktree.` : 'A session creates a durable workflow and lease boundary.'}</small></div></li><li className={run?.status === 'evidenced' ? 'complete' : run ? 'current' : ''}><span>{run?.status === 'evidenced' ? '✓' : '2'}</span><div><b>Bridge edits and verifies locally</b><small>Redacted transcripts and State evidence return through the bridge.</small></div></li><li className={run?.status === 'evidenced' ? 'current' : ''}><span>3</span><div><b>Review evidence and authorize a hash-bound action</b><small>GitHub remains local to the bridge and requires approval.</small></div></li></ol></section>
     <section className="conversation" aria-label="Delivery directions">{messages.length ? messages.map((message) => <article className="message human" key={message.id}><div className="message-head"><span>OP</span><b>Recorded direction</b><small>event {message.sequence}</small></div><p>{message.data?.content}</p></article>) : <p className="evidence-empty">No recorded delivery directions for this session yet.</p>}</section>
-    <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!session} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={session ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!session || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form><RealtimeVoice data={data} append={append} />
+    <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!session} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={session ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!session || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form>
   </main>
 }
 
@@ -1783,13 +2041,15 @@ function App() {
   const addDirection = async (sessionId, text) => { const result = await addDirective(sessionId, text); if (result.recorded && result.event) { setData((current) => ({ ...current, directives: [...current.directives, result.event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.') } else { setNotice(`Direction was not recorded (${result.outcome}). No future work packet was changed.`) } await load() }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
   const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
-  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
+  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Voice' ? ' voice-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
     <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
     <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
       {notificationsOpen && <Notifications audit={data.audit || []} read={notificationsRead} onRead={() => setNotificationsRead(true)} />}
       {active === 'Chat'
         ? <div className="chat-grid"><ChatView append={setNotice} /></div>
+        : active === 'Voice'
+        ? <div className="voice-grid"><VoicePage data={data} append={setNotice} /></div>
         : active === 'Settings'
         ? <div className="settings-grid"><SettingsView data={data} append={setNotice} /><ConfigurationView data={data} append={setNotice} /></div>
         : active === 'Explorer'
