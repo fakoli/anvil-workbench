@@ -1,0 +1,38 @@
+{
+  "schema_version": "workbench-advanced-template/v1",
+  "template_id": "strict_reviewer",
+  "actor": {
+    "actor_id": "operator_example",
+    "kind": "operator"
+  },
+  "name": {
+    "content_trust": "untrusted_task_data",
+    "text": "Strict reviewer"
+  },
+  "body": {
+    "content_trust": "untrusted_task_data",
+    "text": "You are a strict reviewer. Review the {{target}} and report only high-confidence issues. Answer in {{style}}."
+  },
+  "substitutions": [
+    {
+      "name": "target",
+      "description": {
+        "content_trust": "untrusted_task_data",
+        "text": "The artifact under review"
+      }
+    },
+    {
+      "name": "style",
+      "description": {
+        "content_trust": "untrusted_task_data",
+        "text": "The desired answer style"
+      }
+    }
+  ],
+  "repair": {
+    "status": "ready"
+  },
+  "created_at": "2026-07-21T10:03:00Z",
+  "updated_at": "2026-07-21T10:03:00Z",
+  "template_digest": "sha256:a90105364595c4590717845ae9dabc0d80f789520abd899c1ee1ecd8070c9afa"
+}

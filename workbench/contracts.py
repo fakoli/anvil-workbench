@@ -340,6 +340,88 @@ def _reset_advanced_trace_contract_validator_cache() -> None:
     _advanced_trace_contract_validator_cache = None
 
 
+_ADVANCED_COMPARISON_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "advanced-comparison.v1.schema.json"
+)
+_advanced_comparison_contract_validator_cache: Draft202012Validator | None = None
+
+
+def advanced_comparison_contract_validator() -> Draft202012Validator:
+    """Load the advanced-comparison contract schema once; fail closed if absent.
+
+    The advanced-comparison.v1 schema is closed and FACTUAL-only: metrics are
+    bounded integer counters, all prose is ``untrusted_task_data``, and a ranking
+    (a winner) is representable ONLY alongside a declared criterion (a root
+    ``allOf`` requires ``criterion`` whenever ``ranking`` is present).  The
+    closed-root guard refuses a schema edit that would reopen the comparison to
+    an unreviewed extension field through which a synthesized/merged answer or an
+    un-criteria'd winner could ride in.
+    """
+    global _advanced_comparison_contract_validator_cache
+    if _advanced_comparison_contract_validator_cache is None:
+        try:
+            schema = json.loads(_ADVANCED_COMPARISON_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "advanced-comparison contract schema is unavailable; refusing to validate comparisons"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-comparison contract schema no longer closes its root object; "
+                "refusing to validate comparisons"
+            )
+        _advanced_comparison_contract_validator_cache = Draft202012Validator(schema)
+    return _advanced_comparison_contract_validator_cache
+
+
+def _reset_advanced_comparison_contract_validator_cache() -> None:
+    """Test hook: force the next comparison validation to reload the on-disk schema."""
+    global _advanced_comparison_contract_validator_cache
+    _advanced_comparison_contract_validator_cache = None
+
+
+_ADVANCED_TEMPLATE_CONTRACT_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "contracts" / "schemas" / "advanced-template.v1.schema.json"
+)
+_advanced_template_contract_validator_cache: Draft202012Validator | None = None
+
+
+def advanced_template_contract_validator() -> Draft202012Validator:
+    """Load the advanced-template contract schema once; fail closed if absent.
+
+    An advanced-template is a named, actor-private, digest-pinned instruction
+    template.  Its ``body`` text and its declared ``substitutions`` are DECLARED,
+    inspectable instructions (``content_trust=untrusted_task_data``) — never a
+    covert prompt — and the closed-root guard refuses a schema edit that would
+    reopen the record to an unreviewed extension field (through which a hidden
+    prompt, credential, or path could ride in).  The template is
+    contract-digest-bearing (``template_digest``) for tamper evidence and drift
+    detection; a live digest drift or removal opens repair mode, never a silent
+    substitution.
+    """
+    global _advanced_template_contract_validator_cache
+    if _advanced_template_contract_validator_cache is None:
+        try:
+            schema = json.loads(_ADVANCED_TEMPLATE_CONTRACT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ContractValidationError(
+                "advanced-template contract schema is unavailable; refusing to validate templates"
+            ) from exc
+        if schema.get("additionalProperties") is not False:
+            raise ContractValidationError(
+                "advanced-template contract schema no longer closes its root object; "
+                "refusing to validate templates"
+            )
+        _advanced_template_contract_validator_cache = Draft202012Validator(schema)
+    return _advanced_template_contract_validator_cache
+
+
+def _reset_advanced_template_contract_validator_cache() -> None:
+    """Test hook: force the next template validation to reload the on-disk schema."""
+    global _advanced_template_contract_validator_cache
+    _advanced_template_contract_validator_cache = None
+
+
 def validate_advanced_trace(trace: Mapping[str, Any]) -> None:
     """Fail closed when a redacted Advanced-mode trace violates its contract.
 
@@ -1126,6 +1208,7 @@ _PREFIXES = {
     "prd-content": b"anvil-workbench/prd-content/v1\0",
     "settings-descriptor": b"anvil-workbench/settings-descriptor/v1\0",
     "advanced-preset": b"anvil-workbench/advanced-preset/v1\0",
+    "advanced-template": b"anvil-workbench/advanced-template/v1\0",
     "deliver-intent": b"anvil-workbench/deliver-intent/v1\0",
     "plugin-catalog": b"anvil-workbench/plugin-catalog/v1\0",
     "plugin": b"anvil-workbench/plugin/v1\0",
@@ -1261,6 +1344,19 @@ def canonical_contract_payload(kind: str, value: Mapping[str, Any]) -> dict[str,
         if isinstance(tools, list):
             payload["tools"] = sorted(
                 copy.deepcopy(tools), key=lambda item: str(item.get("tool_id", ""))
+            )
+    elif kind == "advanced-template":
+        # Exclude the digest itself, the volatile updated_at, and the volatile
+        # repair block: the template body + declared substitutions are the pinned
+        # identity, so the same content hashes identically regardless of the
+        # current live-drift state and a body edit recomputes to a new digest.
+        # Sort the declared substitution names so a reorder never changes the
+        # digest (the substitution set is order-independent by construction).
+        payload = _without(value, "template_digest", "updated_at", "repair")
+        substitutions = payload.get("substitutions")
+        if isinstance(substitutions, list):
+            payload["substitutions"] = sorted(
+                copy.deepcopy(substitutions), key=lambda item: str(item.get("name", ""))
             )
     elif kind == "deliver-intent":
         # Exclude the digest: the same intent content must hash identically so
@@ -1767,6 +1863,134 @@ def validate_advanced_preset(
             )
     elif status != "ready":
         raise ContractValidationError("advanced preset without digest drift must be ready")
+
+
+def validate_advanced_comparison(comparison: Mapping[str, Any]) -> None:
+    """Fail closed when a side-by-side comparison is not factual/criterion-bound.
+
+    JSON Schema pins the closed, factual shape (bounded integer metrics, no
+    merge/synthesizer field, a ranking only alongside a declared criterion).
+    These are the cross-field rules the criteria depend on that the schema alone
+    cannot express:
+
+    * **No inferred winner (T006 criterion 2).**  A ``ranking`` may appear ONLY
+      with a declared ``criterion``; every ranked ``turn_id`` must name one of the
+      compared attempts, and each attempt may be ranked at most once — a winner is
+      never invented over turns that were not compared.
+    * **Non-qualification (T010).**  When a criterion is present it MUST carry the
+      ``non_qualification: true`` normative flag (the schema ``const`` pins it, and
+      this is the belt-and-braces runtime check), so a comparison preference can
+      never masquerade as model qualification or delivery evidence.
+    """
+    try:
+        advanced_comparison_contract_validator().validate(dict(comparison))
+    except ValidationError as exc:
+        raise ContractValidationError(f"advanced comparison is not schema valid: {exc.message}") from exc
+
+    attempt_turns = {
+        str(attempt.get("turn_id"))
+        for attempt in comparison.get("attempts", [])
+        if isinstance(attempt, Mapping)
+    }
+    criterion = comparison.get("criterion")
+    ranking = comparison.get("ranking")
+    if ranking is not None:
+        if not isinstance(criterion, Mapping):
+            raise ContractValidationError(
+                "an advanced comparison ranking (a winner) requires a declared evaluation criterion"
+            )
+        seen_ranked: set[str] = set()
+        for entry in ranking:
+            if not isinstance(entry, Mapping):
+                raise ContractValidationError("an advanced comparison ranking entry must be an object")
+            turn_id = str(entry.get("turn_id"))
+            if turn_id not in attempt_turns:
+                raise ContractValidationError(
+                    "an advanced comparison ranking can only rank a compared attempt"
+                )
+            if turn_id in seen_ranked:
+                raise ContractValidationError(
+                    "an advanced comparison ranking cannot rank the same attempt twice"
+                )
+            seen_ranked.add(turn_id)
+    if isinstance(criterion, Mapping) and criterion.get("non_qualification") is not True:
+        raise ContractValidationError(
+            "an advanced comparison criterion must be labelled non_qualification (never delivery evidence)"
+        )
+
+
+def _advanced_template_drift(
+    template: Mapping[str, Any], live_digests: Mapping[str, str],
+) -> dict[str, str]:
+    """Return the drifted (template_id -> pinned digest) map for a pinned template.
+
+    A template drifts when the live digest for its id is MISSING (the template was
+    removed) or DIFFERS from the digest the record pinned.  The key is the
+    ``template_id`` and the value is the pinned digest, so a caller can compare it
+    byte-for-byte with a declared repair block.
+    """
+    template_id = str(template.get("template_id"))
+    pinned = template.get("template_digest")
+    if not isinstance(pinned, str):
+        return {}
+    live = live_digests.get(template_id) if isinstance(live_digests, Mapping) else None
+    if live != pinned:
+        return {template_id: pinned}
+    return {}
+
+
+def validate_advanced_template(
+    template: Mapping[str, Any], live_digests: Mapping[str, str] | None = None,
+) -> None:
+    """Fail closed when an Advanced instruction template is tampered or misreports drift.
+
+    The template ``body`` and its declared ``substitutions`` are DECLARED,
+    inspectable instructions, never a covert prompt.  This validator (a) pins the
+    closed, redaction-only schema, (b) recomputes the tamper-evident
+    ``template_digest`` over the content minus the volatile repair block, and (c)
+    when ``live_digests`` is supplied, requires the declared repair state to equal
+    the computed drift EXACTLY — a drifted or removed template MUST be
+    ``repair_required``, never silently substituted.  Each declared substitution
+    name must be unique so a hidden second binding can never shadow a declared one.
+    """
+    try:
+        advanced_template_contract_validator().validate(dict(template))
+    except ValidationError as exc:
+        raise ContractValidationError(f"advanced template is not schema valid: {exc.message}") from exc
+
+    if template.get("template_digest") != contract_digest("advanced-template", template):
+        raise ContractValidationError("advanced template digest mismatch")
+
+    names: set[str] = set()
+    for entry in template.get("substitutions", []):
+        if isinstance(entry, Mapping):
+            name = str(entry.get("name"))
+            if name in names:
+                raise ContractValidationError(
+                    "an advanced template declares a duplicate substitution name"
+                )
+            names.add(name)
+
+    if live_digests is None:
+        return
+    drift = _advanced_template_drift(template, live_digests)
+    repair = template.get("repair", {})
+    status = repair.get("status") if isinstance(repair, Mapping) else None
+    declared: dict[str, str] = {}
+    for entry in repair.get("drifted_refs", []) if isinstance(repair, Mapping) else []:
+        if isinstance(entry, Mapping):
+            declared[str(entry.get("id"))] = str(entry.get("pinned_digest"))
+    if drift:
+        if status != "repair_required":
+            raise ContractValidationError(
+                "advanced template with a drifted or removed digest must open in repair mode"
+            )
+        if declared != drift:
+            raise ContractValidationError(
+                "advanced template repair drifted_refs do not match the computed digest drift"
+            )
+    elif status is not None and status != "ready":
+        raise ContractValidationError("advanced template without digest drift must be ready")
 
 
 _DELIVERY_ELIGIBILITY_STATES = ("eligible", "blocked", "stale")

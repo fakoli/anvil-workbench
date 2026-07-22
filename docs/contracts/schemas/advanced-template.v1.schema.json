@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fakoli.dev/anvil-workbench/contracts/advanced-template.v1.schema.json",
+  "title": "Anvil Workbench advanced chat instruction template v1",
+  "description": "A named, actor-private, digest-pinned Advanced-mode instruction template (advanced-model-playground T009). The body text and its declared substitutions are DECLARED, inspectable instructions (content_trust=untrusted_task_data) — never a covert prompt: a preset references a template by id + digest, the template's full text and substitutions are visible pre-send, and selecting it records the resolved text as declared run instructions. The template is contract-digest-bearing (template_digest) for tamper evidence; a live digest drift or removal is detectable and deterministic and opens the volatile repair block into repair_required, never a silent substitution. No credential, endpoint, url, header, path, or hidden-reasoning field is representable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "template_id", "actor", "name", "body", "template_digest", "created_at"],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "token": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}
+  },
+  "properties": {
+    "schema_version": {"const": "workbench-advanced-template/v1"},
+    "template_id": {"$ref": "#/$defs/token"},
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor_id", "kind"],
+      "properties": {
+        "actor_id": {"type": "string", "pattern": "^[a-zA-Z0-9._-]{1,128}$"},
+        "kind": {"const": "operator"}
+      }
+    },
+    "name": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "text"],
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "text": {"type": "string", "maxLength": 200}
+      }
+    },
+    "body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_trust", "text"],
+      "description": "The full declared instruction text. content_trust marks it as untrusted task data that becomes declared, inspectable run instructions — never a covert injected prompt.",
+      "properties": {
+        "content_trust": {"const": "untrusted_task_data"},
+        "text": {"type": "string", "maxLength": 20000}
+      }
+    },
+    "substitutions": {
+      "type": "array",
+      "maxItems": 32,
+      "description": "The declared, named substitution slots the body exposes. Each is named and inspectable pre-send; a value bound to an undeclared name is refused, so no hidden binding can shadow a declared one.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": {"$ref": "#/$defs/token"},
+          "description": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["content_trust", "text"],
+            "properties": {
+              "content_trust": {"const": "untrusted_task_data"},
+              "text": {"type": "string", "maxLength": 200}
+            }
+          }
+        }
+      }
+    },
+    "template_digest": {"$ref": "#/$defs/digest"},
+    "repair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "description": "The volatile drift/repair state. Excluded from the template_digest so the same content hashes identically regardless of current live-drift state.",
+      "properties": {
+        "status": {"enum": ["ready", "repair_required"]},
+        "drifted_refs": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ref_kind", "id", "pinned_digest"],
+            "properties": {
+              "ref_kind": {"const": "template"},
+              "id": {"$ref": "#/$defs/token"},
+              "pinned_digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        }
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  }
+}

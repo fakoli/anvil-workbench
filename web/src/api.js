@@ -409,6 +409,103 @@ export async function runAdvancedBranch({
   return { ...state, trace, turnId, branchId: settledBranchId }
 }
 
+// --- Advanced model playground: presets + comparison (T006), instruction
+// templates (T009), declared-criterion route ratings (T010) -------------------
+//
+// The browser half of the actor-private playground surfaces
+// (workbench/api.py build_advanced_preset_router / build_advanced_template_router
+// / build_advanced_rating_router). Every request is actor-scoped server-side from
+// the trusted tailnet identity, so this client assembles NO actor, token, or
+// endpoint. Each surface fails closed with 503 until wired; that is surfaced as
+// this SHARED sentinel so the panel degrades truthfully while the transcript
+// stays usable (the view keys its degrade branch off value equality).
+export const ADVANCED_PLAYGROUND_NOT_CONFIGURED = 'The advanced playground surfaces are not configured for this hub'
+
+async function playgroundGet(path, failure) {
+  const response = await fetch(path)
+  if (response.status === 503) throw new Error(ADVANCED_PLAYGROUND_NOT_CONFIGURED)
+  if (!response.ok) throw new Error(failure)
+  return response.json()
+}
+
+async function playgroundPost(path, body, failure) {
+  const response = await jsonPost(path, body)
+  if (response.status === 503) throw new Error(ADVANCED_PLAYGROUND_NOT_CONFIGURED)
+  if (!response.ok) throw new Error(failure)
+  return response.json()
+}
+
+const ADV_PRESETS = '/api/chat/advanced/presets'
+const ADV_TEMPLATES = '/api/chat/advanced/templates'
+const ADV_RATINGS = '/api/chat/advanced/ratings'
+
+// The actor's saved presets: `{presets:[advanced-preset.v1 records]}` — each a
+// digest-pinned selection, never an endpoint/credential/raw-prompt field.
+export async function fetchAdvancedPresets() {
+  return playgroundGet(ADV_PRESETS, 'Advanced presets are unavailable')
+}
+
+// Resolve a preset against the CURRENT live digests. Returns `{status:"ready",
+// preset}` or, on ANY drift, `{status:"repair_required", preset_id, drifted_refs}`
+// with NO `preset` — the server never substitutes a drifted route/tool, so the UI
+// opens repair mode instead of silently selecting a stale/substitute preset.
+export async function resolveAdvancedPreset(presetId, liveDigests = {}) {
+  return playgroundPost(`${ADV_PRESETS}/${encodeURIComponent(presetId)}/resolve`,
+    { live_digests: liveDigests }, 'The preset could not be resolved')
+}
+
+// The actor's CLOSED, size-bounded, redaction-enveloped preset export.
+export async function exportAdvancedPresets() {
+  return playgroundGet(`${ADV_PRESETS}/export`, 'The preset export is unavailable')
+}
+
+// A FACTUAL side-by-side comparison. The server admits a ranking (a winner) ONLY
+// alongside a declared, non-qualification criterion, so the returned record never
+// carries an inferred winner.
+export async function buildAdvancedComparison(comparison) {
+  return playgroundPost(`${ADV_PRESETS}/comparison`, { comparison }, 'The comparison is not valid')
+}
+
+// The actor's saved instruction templates: `{templates:[advanced-template.v1]}`
+// with the FULL body text + declared substitutions visible pre-send.
+export async function fetchAdvancedTemplates() {
+  return playgroundGet(ADV_TEMPLATES, 'Advanced templates are unavailable')
+}
+
+// Resolve a pinned template reference; a removed or digest-drifted template
+// returns `{status:"repair_required", ...}` with NO `template` (no substitution).
+export async function resolveAdvancedTemplate(templateId, pinnedDigest) {
+  return playgroundPost(`${ADV_TEMPLATES}/${encodeURIComponent(templateId)}/resolve`,
+    { pinned_digest: pinnedDigest }, 'The template could not be resolved')
+}
+
+// Render a template as DECLARED, pre-send-visible instructions: the resolved full
+// text + the named substitution bindings, marked `provenance:"declared"`. A value
+// bound to an undeclared substitution is refused server-side (422).
+export async function renderAdvancedDeclaredInstructions(templateId, bindings = {}) {
+  return playgroundPost(`${ADV_TEMPLATES}/${encodeURIComponent(templateId)}/declared-instructions`,
+    { bindings }, 'The template instructions could not be rendered')
+}
+
+// The CLOSED set of declared criteria a rating may name (no free-text rating).
+export async function fetchRatingCriteria() {
+  return playgroundGet(`${ADV_RATINGS}/criteria`, 'Rating criteria are unavailable')
+}
+
+// Record an actor-local, non-qualification rating. The server refuses a rating
+// that names no declared criterion (422).
+export async function recordAdvancedRating({ routeId, criterionId, score, note } = {}) {
+  const body = { route_id: routeId, criterion_id: criterionId, score }
+  if (note) body.note = note
+  return playgroundPost(ADV_RATINGS, body, 'The rating could not be recorded')
+}
+
+// Per route/criterion aggregates, each carrying the non_qualification label +
+// disclaimer — never model qualification or delivery evidence.
+export async function fetchRatingAggregates() {
+  return playgroundGet(`${ADV_RATINGS}/aggregates`, 'Rating aggregates are unavailable')
+}
+
 // --- Chat voice relay client (chat-first-voice T005.2 / T005.3) ---------------
 //
 // The browser half of the STT/TTS relay (workbench/api.py build_voice_relay_router

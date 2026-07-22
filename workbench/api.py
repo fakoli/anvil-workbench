@@ -18,6 +18,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .advanced_playground import (
+    AdvancedPlaygroundError,
+    AdvancedPlaygroundNotFound,
+    AdvancedPresetStore,
+    AdvancedRatingStore,
+    AdvancedTemplateStore,
+    DECLARED_RATING_CRITERIA,
+    UNKNOWN_ITEM_DETAIL,
+    build_comparison,
+)
 from .config import Settings
 from .configuration_transfer import (
     ConfigurationTransferError,
@@ -1530,6 +1540,292 @@ def build_configuration_transfer_router(
     return router
 
 
+# --------------------------------------------------------------------------- #
+# Advanced model playground: presets + comparison (T006), templates (T009),
+# ratings (T010).  Each surface is an injectable, actor-private supervision
+# model that fails closed (503) until wired, mirroring the other hub read-models.
+# --------------------------------------------------------------------------- #
+
+
+class AdvancedPresetSaveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preset: dict[str, Any]
+    live_digests: dict[str, Any] = Field(default_factory=dict)
+
+
+class AdvancedResolveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    live_digests: dict[str, Any] = Field(default_factory=dict)
+
+
+class AdvancedComparisonBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    comparison: dict[str, Any]
+
+
+class AdvancedTemplateSaveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    template: dict[str, Any]
+
+
+class AdvancedTemplateResolveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pinned_digest: str = Field(max_length=128)
+    live_digests: dict[str, str] | None = None
+
+
+class AdvancedTemplateRenderBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bindings: dict[str, Any] = Field(default_factory=dict)
+
+
+class AdvancedRatingBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    route_id: str = Field(max_length=128)
+    criterion_id: str = Field(max_length=64)
+    score: int
+    note: str | None = Field(default=None, max_length=200)
+
+
+#: The fixed 404 body an unknown preset/template lookup returns, so the surface is
+#: never a cross-actor existence oracle for an unknown or foreign id.
+_ADVANCED_ITEM_404 = {"detail": UNKNOWN_ITEM_DETAIL}
+
+
+def _advanced_error(exc: AdvancedPlaygroundError) -> HTTPException:
+    """Map an advanced-playground refusal to a typed no-leak HTTP error."""
+    if isinstance(exc, AdvancedPlaygroundNotFound):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=UNKNOWN_ITEM_DETAIL)
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+
+
+def build_advanced_preset_router(
+    actor_dependency: Callable[..., str],
+    advanced_preset_store: "AdvancedPresetStore | None",
+) -> APIRouter:
+    """Build the actor-private Advanced preset + comparison browser surface (T006).
+
+    A saved preset is digest-pinned; RESOLVING it against the current live digests
+    returns a ready selection or opens REPAIR MODE naming exactly the drifted
+    references — the surface never substitutes a route or tool.  A comparison is
+    FACTUAL: a ranking (a winner) is representable only alongside a declared,
+    non-qualification criterion.  The export is a CLOSED, size-bounded,
+    redaction-enveloped serialization; every response is scrubbed on the last hop.
+    Fails closed with 503 until a store is injected.
+    """
+    router = APIRouter(prefix="/api/chat/advanced/presets")
+
+    def store() -> "AdvancedPresetStore":
+        if advanced_preset_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="advanced presets are not configured",
+            )
+        return advanced_preset_store
+
+    @router.post("", status_code=status.HTTP_201_CREATED)
+    def save_preset(body: AdvancedPresetSaveBody, actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            record = store().save(actor, body.preset, body.live_digests)
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+        return scrub_config_payload(record)
+
+    @router.get("")
+    def list_presets(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        return scrub_config_payload({"presets": store().list(actor)})
+
+    @router.get("/export")
+    def export_presets(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(store().export(actor))
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    @router.post("/comparison")
+    def compare(body: AdvancedComparisonBody, actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(build_comparison(body.comparison))
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    @router.post("/{preset_id}/resolve")
+    def resolve_preset(
+        body: AdvancedResolveBody,
+        preset_id: str = Path(max_length=160),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(store().resolve(actor, preset_id, body.live_digests))
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    @router.delete("/{preset_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_preset(preset_id: str = Path(max_length=160), actor: str = Depends(actor_dependency)) -> None:
+        try:
+            store().delete(actor, preset_id)
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    return router
+
+
+def build_advanced_template_router(
+    actor_dependency: Callable[..., str],
+    advanced_template_store: "AdvancedTemplateStore | None",
+) -> APIRouter:
+    """Build the actor-private Advanced instruction-template browser surface (T009).
+
+    A template's full body + declared substitutions are visible PRE-SEND; the
+    declared-instructions endpoint renders the resolved text plus the declared
+    bindings and marks them ``provenance=declared`` — never a covert injected
+    prompt, and a value bound to an undeclared name is refused.  RESOLVING a pinned
+    template reference whose digest drifted or was removed opens REPAIR MODE.
+    Templates are private per actor.  Fails closed with 503 until injected.
+    """
+    router = APIRouter(prefix="/api/chat/advanced/templates")
+
+    def store() -> "AdvancedTemplateStore":
+        if advanced_template_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="advanced templates are not configured",
+            )
+        return advanced_template_store
+
+    @router.post("", status_code=status.HTTP_201_CREATED)
+    def save_template(body: AdvancedTemplateSaveBody, actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            record = store().save(actor, body.template)
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+        return scrub_config_payload(record)
+
+    @router.get("")
+    def list_templates(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        return scrub_config_payload({"templates": store().list(actor)})
+
+    @router.get("/export")
+    def export_templates(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(store().export(actor))
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    @router.get("/{template_id}")
+    def get_template(template_id: str = Path(max_length=64), actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(store().get(actor, template_id))
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    @router.post("/{template_id}/resolve")
+    def resolve_template(
+        body: AdvancedTemplateResolveBody,
+        template_id: str = Path(max_length=64),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(
+                store().resolve(actor, template_id, body.pinned_digest, body.live_digests)
+            )
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    @router.post("/{template_id}/declared-instructions")
+    def declared_instructions(
+        body: AdvancedTemplateRenderBody,
+        template_id: str = Path(max_length=64),
+        actor: str = Depends(actor_dependency),
+    ) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(store().declared_instructions(actor, template_id, body.bindings))
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    @router.delete("/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_template(template_id: str = Path(max_length=64), actor: str = Depends(actor_dependency)) -> None:
+        try:
+            store().delete(actor, template_id)
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    return router
+
+
+def build_advanced_rating_router(
+    actor_dependency: Callable[..., str],
+    advanced_rating_store: "AdvancedRatingStore | None",
+) -> APIRouter:
+    """Build the actor-private Advanced route-rating browser surface (T010).
+
+    A rating cannot be recorded without naming a DECLARED criterion; aggregates are
+    per (route, criterion) and carry the ``non_qualification`` label, and this
+    surface is deliberately DISJOINT from every delivery-evidence / qualification
+    projection.  Ratings are actor-local and export ONLY inside the redaction
+    envelope.  Fails closed with 503 until injected.
+    """
+    router = APIRouter(prefix="/api/chat/advanced/ratings")
+
+    def store() -> "AdvancedRatingStore":
+        if advanced_rating_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="advanced ratings are not configured",
+            )
+        return advanced_rating_store
+
+    @router.get("/criteria")
+    def list_criteria(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        """The closed set of DECLARED criteria a rating may name (no free-text)."""
+        store()
+        return scrub_config_payload({
+            "non_qualification": True,
+            "criteria": [
+                {"criterion_id": cid, "label": {"content_trust": "untrusted_task_data", "text": text}}
+                for cid, text in sorted(DECLARED_RATING_CRITERIA.items())
+            ],
+        })
+
+    @router.post("", status_code=status.HTTP_201_CREATED)
+    def record_rating(body: AdvancedRatingBody, actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            record = store().record(
+                actor,
+                route_id=body.route_id,
+                criterion_id=body.criterion_id,
+                score=body.score,
+                note=body.note,
+            )
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+        return scrub_config_payload(record)
+
+    @router.get("")
+    def list_ratings(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        return scrub_config_payload({"ratings": store().list(actor)})
+
+    @router.get("/aggregates")
+    def rating_aggregates(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        return scrub_config_payload(store().aggregates(actor))
+
+    @router.get("/export")
+    def export_ratings(actor: str = Depends(actor_dependency)) -> dict[str, Any]:
+        try:
+            return scrub_config_payload(store().export(actor))
+        except AdvancedPlaygroundError as exc:
+            raise _advanced_error(exc) from exc
+
+    return router
+
+
 def create_app(
     settings: Settings | None = None,
     store: WorkbenchStore | None = None,
@@ -1550,6 +1846,9 @@ def create_app(
     policy_gate_service: PolicyGateService | None = None,
     voice_relay_service: VoiceRelayService | None = None,
     configuration_transfer_service: ConfigurationTransferService | None = None,
+    advanced_preset_store: "AdvancedPresetStore | None" = None,
+    advanced_template_store: "AdvancedTemplateStore | None" = None,
+    advanced_rating_store: "AdvancedRatingStore | None" = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or _store(settings)
@@ -1627,6 +1926,13 @@ def create_app(
     # bridge poll loop; it stays ``None`` unless injected, so the browser surface
     # fails closed (503).
     app.state.configuration_transfer_service = configuration_transfer_service
+    # The advanced-model-playground preset/template/rating stores are hub-side
+    # actor-private supervision read/write models. Like the other injectable
+    # surfaces they are deliberately NOT wired into the live bridge poll loop; they
+    # stay ``None`` unless injected, so each browser surface fails closed (503).
+    app.state.advanced_preset_store = advanced_preset_store
+    app.state.advanced_template_store = advanced_template_store
+    app.state.advanced_rating_store = advanced_rating_store
     # The chat push-to-talk / read-aloud voice relay is a hub-side supervision
     # surface that is deliberately NOT wired into the live poll loop; it stays
     # ``None`` unless a service is injected, so the browser surface fails closed
@@ -1806,6 +2112,12 @@ def create_app(
     # validate/preview/apply, and a scoped reset preview/apply over the reviewed
     # preference spine. Fails closed (503) until a service is injected.
     app.include_router(build_configuration_transfer_router(actor, configuration_transfer_service))
+    # Advanced model playground surfaces: presets + comparison (T006), instruction
+    # templates (T009), and declared-criterion route ratings (T010). Each is
+    # actor-private and fails closed (503) until its store is injected.
+    app.include_router(build_advanced_preset_router(actor, advanced_preset_store))
+    app.include_router(build_advanced_template_router(actor, advanced_template_store))
+    app.include_router(build_advanced_rating_router(actor, advanced_rating_store))
     # Chat push-to-talk (STT) + read-aloud (TTS) relay (chat-first-voice T005):
     # authenticated by the same trusted ``actor`` dependency, relaying in-memory
     # audio through Anvil Serving ONLY, and fail-closed (503) until a relay

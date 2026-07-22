@@ -8,6 +8,10 @@ import {
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
   transcribeVoice, speakMessage, fetchPreferences,
   fetchAdvancedRoutes, runAdvancedBranch, ADVANCED_NOT_CONFIGURED,
+  fetchAdvancedPresets, resolveAdvancedPreset, buildAdvancedComparison,
+  fetchAdvancedTemplates, resolveAdvancedTemplate, renderAdvancedDeclaredInstructions,
+  fetchRatingCriteria, recordAdvancedRating, fetchRatingAggregates,
+  ADVANCED_PLAYGROUND_NOT_CONFIGURED,
 } from './api'
 import {
   describeConversation, selectChatRoute, successorTurnBody, terminalToStatus,
@@ -20,6 +24,7 @@ import SettingsView from './settings-view'
 import ConfigurationView from './configuration-view'
 import PluginCatalogView from './plugin-catalog-view'
 import AdvancedPanel from './advanced-chat-view'
+import AdvancedPlaygroundPanel from './advanced-playground-view'
 import {
   deliverBlockReason, describeEligibility, describePrdContent, describeTaskReference,
   filterDescribedTasks, freshnessLabel, nextDeliverCandidate, progressSummaryLabel,
@@ -848,6 +853,15 @@ function ChatView({ append }) {
   const [advBranches, setAdvBranches] = useState([])
   const [advInspectingId, setAdvInspectingId] = useState(null)
   const [advCompareIds, setAdvCompareIds] = useState([])
+  // Advanced playground extensions (advanced-model-playground T006/T009/T010):
+  // actor-private presets, instruction templates, and declared-criterion route
+  // ratings. Each surface fails closed (503) to a shared truthful unavailable
+  // sentinel and the ordinary transcript stays usable.
+  const [playgroundUnavailable, setPlaygroundUnavailable] = useState('')
+  const [advPresets, setAdvPresets] = useState([])
+  const [advTemplates, setAdvTemplates] = useState([])
+  const [ratingCriteria, setRatingCriteria] = useState([])
+  const [ratingAggregates, setRatingAggregates] = useState(null)
   const [draft, setDraft] = useState('')
   const [streamingTurn, setStreamingTurn] = useState(null)
   const [lifecycle, setLifecycle] = useState('')
@@ -924,6 +938,87 @@ function ChatView({ append }) {
         setAdvUnavailable(error?.message === ADVANCED_NOT_CONFIGURED ? ADVANCED_NOT_CONFIGURED : 'Advanced controls are unavailable for this hub.')
       })
   }, [])
+
+  // Load the actor-private playground surfaces (presets / templates / rating
+  // criteria + aggregates). Each fails closed with 503 → a truthful unavailable
+  // sentinel; the transcript is never blocked. Read-only on mount; writes happen
+  // through the callbacks below.
+  const refreshRatingAggregates = () => {
+    fetchRatingAggregates().then(setRatingAggregates).catch(() => {})
+  }
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([
+      fetchAdvancedPresets().then((value) => value.presets || []),
+      fetchAdvancedTemplates().then((value) => value.templates || []),
+      fetchRatingCriteria().then((value) => value.criteria || []),
+      fetchRatingAggregates(),
+    ])
+      .then(([presets, templates, criteria, aggregates]) => {
+        if (cancelled) return
+        setAdvPresets(presets); setAdvTemplates(templates)
+        setRatingCriteria(criteria); setRatingAggregates(aggregates)
+        setPlaygroundUnavailable('')
+      })
+      .catch((error) => {
+        if (cancelled) return
+        setAdvPresets([]); setAdvTemplates([]); setRatingCriteria([]); setRatingAggregates(null)
+        setPlaygroundUnavailable(
+          error?.message === ADVANCED_PLAYGROUND_NOT_CONFIGURED
+            ? ADVANCED_PLAYGROUND_NOT_CONFIGURED
+            : 'The advanced playground extensions are unavailable for this hub.',
+        )
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  // Resolve a preset against the current live route/profile digests: a drifted
+  // pin opens repair mode server-side (no substitution). Tools/response-schema
+  // digests are not in the browser route projection, so only route/profile are
+  // supplied — the server still refuses any drift it can detect.
+  const resolvePlaygroundPreset = (presetId) => {
+    const live = { route: {}, profile: {} }
+    for (const route of advRoutes) {
+      if (route.route_id) {
+        if (route.route_digest) live.route[route.route_id] = route.route_digest
+        if (route.profile_digest) live.profile[route.route_id] = route.profile_digest
+      }
+    }
+    return resolveAdvancedPreset(presetId, live)
+  }
+
+  // Build a FACTUAL comparison from the settled advanced branches. A ranking is
+  // representable only alongside a declared criterion (server-enforced), so this
+  // assembles metrics only and never an inferred winner.
+  const buildPlaygroundComparison = () => {
+    const attempts = advBranches.slice(0, 4).map((branch) => ({
+      turn_id: branch.turnId,
+      route: {
+        provider: 'anvil-serving',
+        route_id: branch.trace?.route_decision?.route_id,
+        route_digest: branch.trace?.route_decision?.route_digest,
+      },
+      status: 'complete',
+      metrics: {
+        output_tokens: branch.trace?.usage?.output_tokens || 0,
+        latency_ms: branch.trace?.usage?.latency_ms || 0,
+      },
+    }))
+    const record = {
+      schema_version: 'workbench-advanced-comparison/v1',
+      comparison_id: `advcompare_local_${Date.now()}`,
+      conversation_id: selectedId,
+      fork_point: { parent_turn_id: advBranches[0]?.trace?.branch_ref?.turn_id },
+      attempts,
+      created_at: new Date().toISOString(),
+    }
+    return buildAdvancedComparison(record)
+  }
+
+  const resolvePlaygroundTemplate = (templateId, pinnedDigest) => resolveAdvancedTemplate(templateId, pinnedDigest)
+  const previewPlaygroundDeclared = (templateId, bindings) => renderAdvancedDeclaredInstructions(templateId, bindings)
+  const recordPlaygroundRating = (payload) =>
+    recordAdvancedRating(payload).then((result) => { refreshRatingAggregates(); return result })
 
   // Focus a sensible target after a row leaves the rail (a11y #6): the first
   // remaining conversation, else the "New" affordance — never <body>.
@@ -1124,6 +1219,12 @@ function ChatView({ append }) {
         onInspect={setAdvInspectingId} inspectingId={advInspectingId}
         onSave={saveAdvancedBranch} onReopen={reopenAdvancedBranch}
         onToggleCompare={toggleAdvancedCompare} compareIds={advCompareIds} />}
+      {advanced && <AdvancedPlaygroundPanel
+        unavailable={playgroundUnavailable} routes={advRoutes}
+        presets={advPresets} templates={advTemplates} criteria={ratingCriteria} aggregates={ratingAggregates}
+        onResolvePreset={resolvePlaygroundPreset} onBuildComparison={buildPlaygroundComparison}
+        onResolveTemplate={resolvePlaygroundTemplate} onDeclaredInstructions={previewPlaygroundDeclared}
+        onRecordRating={recordPlaygroundRating} />}
       <div className="transcript-scroll"><Transcript selected={selected} turns={turns} streamingTurn={streamingTurn} onRetry={retry} onBranch={branch} conversationId={selectedId} autoplayPreference={voicePreferences} /></div>
       <div className="chat-live" role="status" aria-live="polite">{lifecycle}</div>
       {/* Push-to-talk drops an EDITABLE transcript into the composer; a turn is
