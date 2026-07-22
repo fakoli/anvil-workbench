@@ -19,7 +19,7 @@ import {
   initialPlaybackState, playbackReducer, playbackLabel, isPlaybackActiveFor, shouldAutoplay,
   voiceAutoplayFromPreferences,
 } from './chat-api'
-import { submittedControls } from './advanced-chat'
+import { submittedControls, isBranchSettled, comparisonAttemptStatus } from './advanced-chat'
 import SettingsView from './settings-view'
 import ConfigurationView from './configuration-view'
 import PluginCatalogView from './plugin-catalog-view'
@@ -972,33 +972,30 @@ function ChatView({ append }) {
     return () => { cancelled = true }
   }, [])
 
-  // Resolve a preset against the current live route/profile digests: a drifted
-  // pin opens repair mode server-side (no substitution). Tools/response-schema
-  // digests are not in the browser route projection, so only route/profile are
-  // supplied — the server still refuses any drift it can detect.
-  const resolvePlaygroundPreset = (presetId) => {
-    const live = { route: {}, profile: {} }
-    for (const route of advRoutes) {
-      if (route.route_id) {
-        if (route.route_digest) live.route[route.route_id] = route.route_digest
-        if (route.profile_digest) live.profile[route.route_id] = route.profile_digest
-      }
-    }
-    return resolveAdvancedPreset(presetId, live)
-  }
+  // Resolve a preset for selection. The server derives the live route / profile /
+  // tool / response-schema digests from its OWN registry and decides ready /
+  // repair / unverifiable; the browser supplies NO digests, so it cannot spoof a
+  // drifted pin to "ready" nor produce false drift from its partial route view.
+  const resolvePlaygroundPreset = (presetId) => resolveAdvancedPreset(presetId)
 
   // Build a FACTUAL comparison from the settled advanced branches. A ranking is
   // representable only alongside a declared criterion (server-enforced), so this
-  // assembles metrics only and never an inferred winner.
+  // assembles metrics only and never an inferred winner. Only SETTLED branches
+  // that produced a trace are real, comparable attempts: an in-flight/unsettled
+  // branch (or one that never settled a trace) is EXCLUDED rather than fabricated
+  // as `complete`, and each included attempt carries the branch's REAL settled
+  // status (complete / cancelled / interrupted / failed), so the labels stay
+  // factual — a cancelled or failed attempt is never mislabelled a completed one.
   const buildPlaygroundComparison = () => {
-    const attempts = advBranches.slice(0, 4).map((branch) => ({
+    const settled = advBranches.filter((branch) => isBranchSettled(branch) && branch.trace)
+    const attempts = settled.slice(0, 4).map((branch) => ({
       turn_id: branch.turnId,
       route: {
         provider: 'anvil-serving',
         route_id: branch.trace?.route_decision?.route_id,
         route_digest: branch.trace?.route_decision?.route_digest,
       },
-      status: 'complete',
+      status: comparisonAttemptStatus(branch.status),
       metrics: {
         output_tokens: branch.trace?.usage?.output_tokens || 0,
         latency_ms: branch.trace?.usage?.latency_ms || 0,
@@ -1008,7 +1005,7 @@ function ChatView({ append }) {
       schema_version: 'workbench-advanced-comparison/v1',
       comparison_id: `advcompare_local_${Date.now()}`,
       conversation_id: selectedId,
-      fork_point: { parent_turn_id: advBranches[0]?.trace?.branch_ref?.turn_id },
+      fork_point: { parent_turn_id: settled[0]?.trace?.branch_ref?.turn_id },
       attempts,
       created_at: new Date().toISOString(),
     }

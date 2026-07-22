@@ -39,7 +39,7 @@ import copy
 import json
 import re
 import threading
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .redaction import redact_config_text
 from .contracts import (
@@ -132,8 +132,19 @@ def _bounded(envelope: Mapping[str, Any]) -> dict[str, Any]:
 #: (a preset name, a template body, a rating note).  The config scrub already
 #: closes the credential / path / URL / host classes; this is the header
 #: last-mile so an export passes the secret/path/header scan in full.
+#:
+#: The authorization rule consumes the header VALUE THROUGH an optional
+#: ``Bearer <token>``: the ``(?:bearer\s+)?`` lets ``[^\s,;]*`` reach the real
+#: token rather than stopping at the literal ``Bearer`` label (which would leave a
+#: short token like ``xyz`` behind — the token value, not just the label, must
+#: die).  It stays anchored to the token (stops at the next space/segment
+#: boundary), so it does not over-redact the whole line.  ``(?:proxy-)?`` covers
+#: ``proxy-authorization`` and the standalone-``Bearer`` rule catches a bare
+#: ``Bearer <token>`` that no ``authorization`` keyword precedes.  Covers
+#: ``authorization:``, ``authorization: Bearer``, ``authorization:Bearer`` (no
+#: space), and ``proxy-authorization:``.
 _EXPORT_HEADER_PATTERNS = (
-    re.compile(r"(?i)\bauthorization\b\s*[:=]?\s*[^\s,;]*"),
+    re.compile(r"(?i)\b(?:proxy-)?authorization\b\s*[:=]?\s*(?:bearer\s+)?[^\s,;]*"),
     re.compile(r"(?i)\bBearer\s+[^\s,;]+"),
     re.compile(r"(?i)\bx-(?:api-)?(?:key|auth|token)[a-z0-9-]*\b\s*[:=]?\s*[^\s,;]*"),
 )
@@ -185,17 +196,30 @@ class AdvancedPresetStore:
 
     Save validates the preset against the current live digests (a preset stored
     ready must not already be drifting).  :meth:`resolve` recomputes drift against
-    the live digests at SELECTION time and, on any drift, returns a REPAIR-mode
-    result naming exactly the drifted references — it never returns a substitute
-    route or tool.  Export ranges only over the actor's presets and wraps them in
-    a closed, size-bounded, redaction-enveloped serialization.
+    the SERVER-DERIVED live digests at SELECTION time and, on any drift, returns a
+    REPAIR-mode result naming exactly the drifted references — it never returns a
+    substitute route or tool.  Export ranges only over the actor's presets and
+    wraps them in a closed, size-bounded, redaction-enveloped serialization.
+
+    ``live_digests_provider`` is the server's authority for the CURRENT advanced
+    route/profile/tool/response-schema registry — a callable returning
+    ``{ref_kind: {id: digest}}``.  Resolve derives readiness ONLY from this
+    server-side source and NEVER from a client-supplied override, so a browser can
+    neither spoof a drifted pin to "ready" nor produce false drift by omitting a
+    tool/response-schema digest the server actually knows.  When the provider is
+    absent (the surface is not wired to a registry) resolve reports an explicit
+    ``unverifiable`` status rather than defaulting a missing digest to drift.
     """
 
-    def __init__(self, *, audit_key: bytes) -> None:
+    def __init__(
+        self, *, audit_key: bytes,
+        live_digests_provider: "Callable[[], Mapping[str, Mapping[str, str]]] | None" = None,
+    ) -> None:
         self._audit_key = require_pref_audit_key(audit_key)
         self._lock = threading.RLock()
         # actor -> {preset_id -> preset record}
         self._by_actor: dict[str, dict[str, dict[str, Any]]] = {}
+        self._live_digests_provider = live_digests_provider
 
     def save(
         self, actor: str, preset: Mapping[str, Any], live_digests: Mapping[str, Mapping[str, str]],
@@ -235,27 +259,77 @@ class AdvancedPresetStore:
                 raise AdvancedPlaygroundNotFound(UNKNOWN_ITEM_DETAIL)
             return copy.deepcopy(record)
 
-    def resolve(
-        self, actor: str, preset_id: str, live_digests: Mapping[str, Mapping[str, str]],
-    ) -> dict[str, Any]:
-        """Resolve a preset for selection against the CURRENT live digests.
+    def _server_live_digests(self) -> dict[str, Mapping[str, str]] | None:
+        """The server's OWN current live digests, or ``None`` if none is wired.
 
-        Returns ``{"status": "ready", "preset": <record>}`` when every pinned
-        digest still matches, else ``{"status": "repair_required", "drifted_refs":
-        [...], "preset_id": ...}`` — and NEVER a substituted route or tool.  The
-        drifted set is the deterministic ``contracts._advanced_preset_drift`` map.
+        Derived only from the injected registry provider — never from a caller /
+        client, so readiness cannot be spoofed from the browser.
+        """
+        if self._live_digests_provider is None:
+            return None
+        live = self._live_digests_provider()
+        if not isinstance(live, Mapping):
+            return None
+        return {
+            str(kind): value
+            for kind, value in live.items()
+            if isinstance(value, Mapping)
+        }
+
+    def resolve(self, actor: str, preset_id: str) -> dict[str, Any]:
+        """Resolve a preset for selection against the SERVER-DERIVED live digests.
+
+        The live digests come exclusively from the server's own registry provider,
+        never from the caller, so a client cannot mark a drifted pin "ready".
+
+        * ``{"status": "ready", "preset": <record>}`` when every pinned digest the
+          server can verify still matches.
+        * ``{"status": "repair_required", "preset_id", "drifted_refs": [...]}`` when
+          a ref whose kind the server DOES know has genuinely drifted — NEVER a
+          substituted route or tool.  The drifted set is the deterministic
+          ``contracts._advanced_preset_drift`` map, filtered to verifiable kinds.
+        * ``{"status": "unverifiable", "preset_id", "unverifiable_refs"?}`` when a
+          referenced digest's kind is NOT in the server registry (the surface is
+          not fully wired).  A missing digest is reported as unverifiable, never
+          defaulted to drift and never asserted ready.
         """
         record = self.get(actor, preset_id)
-        drift = _advanced_preset_drift(record, live_digests)
-        if drift:
+        server_live = self._server_live_digests()
+        if server_live is None:
+            # No registry is wired: readiness cannot be verified server-side. Do
+            # not assert ready, do not fabricate drift, do not substitute.
+            return {
+                "status": "unverifiable",
+                "preset_id": preset_id,
+                "reason": "live_digests_unavailable",
+            }
+        drift = _advanced_preset_drift(record, server_live)
+        # A ref-kind the server registry carries at all is VERIFIABLE; a kind it
+        # does not carry is unverifiable (surface not fully configured), so its
+        # missing digest is reported as such rather than defaulted to drift.
+        verifiable_kinds = set(server_live)
+        real_drift = {ref: pinned for ref, pinned in drift.items() if ref[0] in verifiable_kinds}
+        unverifiable = {ref: pinned for ref, pinned in drift.items() if ref[0] not in verifiable_kinds}
+        if real_drift:
             drifted_refs = [
                 {"ref_kind": ref_kind, "id": ref_id, "pinned_digest": pinned}
-                for (ref_kind, ref_id), pinned in sorted(drift.items())
+                for (ref_kind, ref_id), pinned in sorted(real_drift.items())
             ]
             return {
                 "status": "repair_required",
                 "preset_id": preset_id,
                 "drifted_refs": drifted_refs,
+            }
+        if unverifiable:
+            unverifiable_refs = [
+                {"ref_kind": ref_kind, "id": ref_id, "pinned_digest": pinned}
+                for (ref_kind, ref_id), pinned in sorted(unverifiable.items())
+            ]
+            return {
+                "status": "unverifiable",
+                "preset_id": preset_id,
+                "reason": "live_digests_unavailable",
+                "unverifiable_refs": unverifiable_refs,
             }
         return {"status": "ready", "preset": record}
 

@@ -2431,10 +2431,16 @@ _AMPS_KEY = b"advanced-playground-audit-key-000"
 _AMPS_ACTOR = {"X-Workbench-Actor": "operator"}
 _AMPS_EXAMPLES = _AmpsPath(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
 
-# The full dangerous corpus a preset/template export must neutralize.
+# The full dangerous corpus a preset/template export must neutralize. The
+# authorization/Bearer cases carry SHORT tokens (xyz/topsec/s3cr3t, all < 8 chars)
+# specifically because the shared config scrub's Bearer rule demands an 8+ char
+# token: a short bearer token that survives the label scrub is the exact leak the
+# export header last-mile must close, so the markers assert the TOKEN VALUE — not
+# merely the `authorization`/`Bearer` LABEL — is absent from the export blob.
 _AMPS_CORPUS = (
     "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB sk-0123456789abcdefghij "
     "AKIAIOSFODNN7EXAMPLE Bearer abcdef0123456789 authorization: Bearer xyz "
+    "authorization:Bearer topsec proxy-authorization: s3cr3t "
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc "
     "postg://user:pass@db.tail1234.ts.net:5432/prod serving:8443 "
     "-----BEGIN RSA PRIVATE KEY-----MIIabc-----END RSA PRIVATE KEY----- "
@@ -2444,6 +2450,9 @@ _AMPS_MARKERS = (
     "ghp_", "sk-0123", "AKIA", "Bearer ", "authorization", "eyJhbGc",
     "db.tail1234.ts.net", "serving:8443", "BEGIN RSA", "prod.pem",
     "/etc/passwd", "supersecret", "user:pass",
+    # The bearer/authorization TOKEN VALUES themselves — a `[REDACTED] xyz` that
+    # scrubbed only the label is still a credential leak, so these must be absent.
+    "xyz", "topsec", "s3cr3t",
 )
 
 
@@ -2509,7 +2518,10 @@ def test_amp_preset_export_scrubs_corpus_and_is_enveloped():
                 json={"preset": preset, "live_digests": _amps_live_for(preset)})
     export = client.get("/api/chat/advanced/presets/export", headers=_AMPS_ACTOR).json()
     blob = _amps_json.dumps(export)
-    for marker in ("ghp_", "sk-0123", "AKIA", "serving:8443", "prod.pem"):
+    # Labels AND the short-bearer TOKEN VALUES (xyz/topsec) within the [:190] name
+    # must both be gone — a scrub that ate only the `authorization`/`Bearer` label
+    # would leave the token behind.
+    for marker in ("ghp_", "sk-0123", "AKIA", "Bearer ", "authorization", "xyz", "topsec"):
         assert marker not in blob, marker
     assert export["schema_version"] == "workbench-advanced-preset-export/v1"
     assert export["source"]["actor_ref"].startswith("actorref:")
@@ -2582,11 +2594,22 @@ def test_amp_template_declared_instructions_are_visible_never_a_hidden_prompt():
 def test_amp_ratings_are_excluded_from_delivery_and_qualification_surfaces():
     # A playground rating is informal preference evidence only; it must be
     # STRUCTURALLY disjoint from every delivery-evidence / qualification surface.
+    # The exclusion is architectural, not filtered: ratings live in their OWN
+    # AdvancedRatingStore, which the delivery projection is never handed, so a
+    # rating cannot reach a delivery/qualification read-model by construction.
+    # (A driven "build a projection over a store containing ratings and assert none
+    # appear" check is intentionally omitted — the two are SEPARATE stores, so
+    # there is no populated store that carries both; the load-bearing guard is that
+    # delivery_projection has no rating symbol AND no import of the rating store.)
     import workbench.delivery_projection as _dp
     dp_source = _AmpsPath(_dp.__file__).read_text(encoding="utf-8").lower()
     # The delivery/qualification read-model carries no notion of a playground rating.
     assert "advrating" not in dp_source
     assert "advanced_rating" not in dp_source and "advanced_playground" not in dp_source
+    # Driven (rename-proof): the delivery projection module does not even bind the
+    # rating store symbol, so no future rename can wire a rating into delivery.
+    assert not hasattr(_dp, "AdvancedRatingStore")
+    assert not hasattr(_dp, "AdvancedPresetStore")
     # Every rating record and aggregate carries the non-qualification label, so it
     # can never be read as acceptance/qualification evidence.
     store = _AmpsRatingStore(audit_key=_AMPS_KEY)
@@ -2618,9 +2641,10 @@ def test_amp_rating_note_free_text_is_scrubbed_on_export():
     client = _amps_client(advanced_rating_store=_AmpsRatingStore(audit_key=_AMPS_KEY))
     client.post("/api/chat/advanced/ratings", headers=_AMPS_ACTOR, json={
         "route_id": "route.chat-fast", "criterion_id": "latency", "score": 3,
-        "note": "leak ghp_0123456789abcdefghij AKIAIOSFODNN7EXAMPLE /etc/passwd",
+        "note": "leak ghp_0123456789abcdefghij AKIAIOSFODNN7EXAMPLE authorization: Bearer xyz /etc/passwd",
     })
     export = client.get("/api/chat/advanced/ratings/export", headers=_AMPS_ACTOR).json()
     blob = _amps_json.dumps(export)
-    for marker in ("ghp_", "AKIA", "/etc/passwd"):
+    # Including the short-bearer TOKEN VALUE (xyz) — not just the label — is gone.
+    for marker in ("ghp_", "AKIA", "/etc/passwd", "Bearer ", "authorization", "xyz"):
         assert marker not in blob, marker

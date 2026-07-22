@@ -1554,12 +1554,6 @@ class AdvancedPresetSaveBody(BaseModel):
     live_digests: dict[str, Any] = Field(default_factory=dict)
 
 
-class AdvancedResolveBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    live_digests: dict[str, Any] = Field(default_factory=dict)
-
-
 class AdvancedComparisonBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1575,8 +1569,10 @@ class AdvancedTemplateSaveBody(BaseModel):
 class AdvancedTemplateResolveBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # No client-supplied live_digests: the server derives the live template
+    # registry from its OWN stored templates, so a browser cannot spoof a drifted
+    # pin to "ready" or fabricate drift from a partial view.
     pinned_digest: str = Field(max_length=128)
-    live_digests: dict[str, str] | None = None
 
 
 class AdvancedTemplateRenderBody(BaseModel):
@@ -1658,12 +1654,13 @@ def build_advanced_preset_router(
 
     @router.post("/{preset_id}/resolve")
     def resolve_preset(
-        body: AdvancedResolveBody,
         preset_id: str = Path(max_length=160),
         actor: str = Depends(actor_dependency),
     ) -> dict[str, Any]:
+        # Readiness is resolved against the SERVER's own live-digest registry; any
+        # client-supplied live_digests body is ignored (no authority to the caller).
         try:
-            return scrub_config_payload(store().resolve(actor, preset_id, body.live_digests))
+            return scrub_config_payload(store().resolve(actor, preset_id))
         except AdvancedPlaygroundError as exc:
             raise _advanced_error(exc) from exc
 
@@ -1732,9 +1729,11 @@ def build_advanced_template_router(
         template_id: str = Path(max_length=64),
         actor: str = Depends(actor_dependency),
     ) -> dict[str, Any]:
+        # Drift is resolved against the server's OWN stored-template registry
+        # (store.live_digests); no client override is accepted.
         try:
             return scrub_config_payload(
-                store().resolve(actor, template_id, body.pinned_digest, body.live_digests)
+                store().resolve(actor, template_id, body.pinned_digest)
             )
         except AdvancedPlaygroundError as exc:
             raise _advanced_error(exc) from exc

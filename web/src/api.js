@@ -445,18 +445,16 @@ export async function fetchAdvancedPresets() {
   return playgroundGet(ADV_PRESETS, 'Advanced presets are unavailable')
 }
 
-// Resolve a preset against the CURRENT live digests. Returns `{status:"ready",
-// preset}` or, on ANY drift, `{status:"repair_required", preset_id, drifted_refs}`
-// with NO `preset` — the server never substitutes a drifted route/tool, so the UI
-// opens repair mode instead of silently selecting a stale/substitute preset.
-export async function resolveAdvancedPreset(presetId, liveDigests = {}) {
+// Resolve a preset against the SERVER's own current live digests. The browser
+// sends NO live_digests: the server derives readiness from its own advanced
+// route/tool/template registry, so the client can neither spoof a drifted pin to
+// "ready" nor fabricate drift from a partial view. Returns `{status:"ready",
+// preset}`, `{status:"repair_required", preset_id, drifted_refs}` (NO `preset` —
+// the server never substitutes a drifted route/tool), or `{status:"unverifiable",
+// ...}` when the server cannot verify a referenced digest.
+export async function resolveAdvancedPreset(presetId) {
   return playgroundPost(`${ADV_PRESETS}/${encodeURIComponent(presetId)}/resolve`,
-    { live_digests: liveDigests }, 'The preset could not be resolved')
-}
-
-// The actor's CLOSED, size-bounded, redaction-enveloped preset export.
-export async function exportAdvancedPresets() {
-  return playgroundGet(`${ADV_PRESETS}/export`, 'The preset export is unavailable')
+    {}, 'The preset could not be resolved')
 }
 
 // A FACTUAL side-by-side comparison. The server admits a ranking (a winner) ONLY

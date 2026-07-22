@@ -1937,6 +1937,39 @@ describe('Advanced playground extensions (presets, comparison, templates, rating
     expect(within(region).getByText(/rank 1/)).toBeTruthy()
   })
 
+  it('assembles the comparison with each branch REAL settled status — never a fabricated complete (T006)', async () => {
+    // This request-side assembly (App.buildPlaygroundComparison → buildAdvancedComparison)
+    // was previously untested, which is how a hardcoded status:'complete' slipped
+    // through. Run two branches — one that settles COMPLETE and one CANCELLED, both
+    // with a trace — then assert the record handed to the client carries the REAL
+    // statuses, not a blanket 'complete', and excludes any unsettled/traceless one.
+    const user = await openPlayground()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'first attempt')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer') // branch 1 settled complete (with trace)
+    // Fork a second branch whose run settles CANCELLED (still producing a trace).
+    runAdvancedBranch.mockResolvedValueOnce({ text: 'stopped attempt', terminal: 'cancelled', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv_c', branchId: 'advbranch_c' })
+    await user.click(screen.getByRole('button', { name: /Fork/ }))
+    await screen.findByText('stopped attempt')
+    // Capture the ASSEMBLED record the request-side assembly hands to the client.
+    buildAdvancedComparison.mockResolvedValue({
+      schema_version: 'workbench-advanced-comparison/v1', comparison_id: 'advcompare_z_0001',
+      conversation_id: 'conv_' + 'a'.repeat(10), fork_point: { parent_turn_id: 'turn_' + 'b'.repeat(10) },
+      attempts: [], created_at: '2026-07-21T10:02:00Z',
+    })
+    await user.click(screen.getByRole('button', { name: 'Build comparison' }))
+    expect(buildAdvancedComparison).toHaveBeenCalled()
+    const record = buildAdvancedComparison.mock.calls.at(-1)[0]
+    const statuses = record.attempts.map((attempt) => attempt.status)
+    // The cancelled attempt is labelled with its REAL status — not fabricated as complete.
+    expect(record.attempts).toHaveLength(2)
+    expect(statuses).toContain('complete')
+    expect(statuses).toContain('cancelled')
+    expect(statuses).not.toEqual(['complete', 'complete'])
+    // Every assembled attempt is a genuinely settled branch that produced a trace.
+    expect(record.attempts.every((attempt) => attempt.route.route_id === 'route.chat-fast')).toBe(true)
+  })
+
   it('shows a template full body text and a DECLARED instructions preview pre-send (T009)', async () => {
     resolveAdvancedTemplate.mockResolvedValue({ status: 'ready', template: templateFixture.templates[0] })
     renderAdvancedDeclaredInstructions.mockResolvedValue({

@@ -2174,16 +2174,24 @@ _AMP_ACTOR2 = {"X-Workbench-Actor": "reviewer"}
 _AMP_EXAMPLES = _amp_Path(__file__).resolve().parents[1] / "docs" / "contracts" / "examples"
 
 
-def _amp_client(*, presets=True, templates=True, ratings=True):
+def _amp_client(*, presets=True, templates=True, ratings=True, preset_registry=None):
+    # ``preset_registry`` is the SERVER's live-digest registry ({ref_kind: {id:
+    # digest}}) the preset store resolves against; None means no registry is wired
+    # (resolve then reports ``unverifiable``). Mutating the passed dict in a test
+    # simulates a live digest changing under the server's feet.
     settings = Settings(
         database_url="unused", neo4j_uri="unused", neo4j_user="neo4j", neo4j_password="",
         owner="operator", approvers=frozenset({"operator", "reviewer"}), bridge_bootstrap_token="",
         anvil_router_base_url="http://x/v1", anvil_router_token="",
         identity_header="X-Workbench-Actor", allow_insecure_dev_actor=True,
     )
+    preset_store = None
+    if presets:
+        provider = (lambda: preset_registry) if preset_registry is not None else None
+        preset_store = _AmpPresetStore(audit_key=_AMP_KEY, live_digests_provider=provider)
     return TestClient(create_app(
         settings=settings, store=MemoryStore(), graph=NullGraph(),
-        advanced_preset_store=_AmpPresetStore(audit_key=_AMP_KEY) if presets else None,
+        advanced_preset_store=preset_store,
         advanced_template_store=_AmpTemplateStore(audit_key=_AMP_KEY) if templates else None,
         advanced_rating_store=_AmpRatingStore(audit_key=_AMP_KEY) if ratings else None,
     ))
@@ -2225,22 +2233,71 @@ def test_amp_preset_save_list_roundtrip():
 
 
 def test_amp_preset_drift_opens_repair_never_substitutes():
-    client = _amp_client()
     preset = _amp_preset()
+    # The server's OWN live-digest registry (matches the pinned preset at first).
+    registry = _amp_live_for(preset)
+    client = _amp_client(preset_registry=registry)
     client.post("/api/chat/advanced/presets", headers=_AMP_ACTOR,
                 json={"preset": preset, "live_digests": _amp_live_for(preset)})
     ready = client.post("/api/chat/advanced/presets/" + preset["preset_id"] + "/resolve",
-                        headers=_AMP_ACTOR, json={"live_digests": _amp_live_for(preset)}).json()
+                        headers=_AMP_ACTOR, json={}).json()
     assert ready["status"] == "ready" and ready["preset"]["preset_id"] == preset["preset_id"]
-    drift = _amp_copy.deepcopy(_amp_live_for(preset))
-    drift["tool"]["echo_fixture"] = "sha256:" + "9f" * 32
+    # A live tool digest changes under the server's feet — server-side drift.
+    registry["tool"]["echo_fixture"] = "sha256:" + "9f" * 32
     repaired = client.post("/api/chat/advanced/presets/" + preset["preset_id"] + "/resolve",
-                           headers=_AMP_ACTOR, json={"live_digests": drift}).json()
+                           headers=_AMP_ACTOR, json={}).json()
     assert repaired["status"] == "repair_required"
     assert "preset" not in repaired  # no silent substitution: no usable selection returned
     assert repaired["drifted_refs"] == [
         {"ref_kind": "tool", "id": "echo_fixture", "pinned_digest": preset["tools"][0]["tool_digest"]}
     ]
+
+
+def test_amp_preset_resolve_is_server_derived_ready_and_ignores_client_override():
+    # SHOULD (acceptance): resolve derives live digests SERVER-SIDE. A tool-bearing
+    # preset with NO real drift reaches READY because the server knows the live
+    # tool/response-schema digests the browser never sends (closing the false-drift
+    # gap), AND a client cannot override a server-side drift to "ready".
+    preset = _amp_preset()
+    registry = _amp_live_for(preset)
+    client = _amp_client(preset_registry=registry)
+    client.post("/api/chat/advanced/presets", headers=_AMP_ACTOR,
+                json={"preset": preset, "live_digests": _amp_live_for(preset)})
+    pid = preset["preset_id"]
+    ready = client.post("/api/chat/advanced/presets/" + pid + "/resolve",
+                        headers=_AMP_ACTOR, json={}).json()
+    assert ready["status"] == "ready" and ready["preset"]["preset_id"] == pid
+    # Drift the server registry, then have the client POST a live_digests body that
+    # claims everything still matches (a spoof of "ready"). The server IGNORES it.
+    registry["tool"]["echo_fixture"] = "sha256:" + "11" * 32
+    spoofed = client.post("/api/chat/advanced/presets/" + pid + "/resolve",
+                          headers=_AMP_ACTOR, json={"live_digests": _amp_live_for(preset)}).json()
+    assert spoofed["status"] == "repair_required"  # authority stays server-side
+    assert "preset" not in spoofed
+    assert [r["id"] for r in spoofed["drifted_refs"]] == ["echo_fixture"]
+
+
+def test_amp_preset_resolve_reports_unverifiable_not_drift():
+    # SHOULD: a missing digest whose KIND the server registry does not carry is
+    # reported UNVERIFIABLE, never defaulted to drift and never asserted ready.
+    preset = _amp_preset()
+    registry = _amp_live_for(preset)
+    del registry["response_schema"]  # this surface is not wired server-side
+    client = _amp_client(preset_registry=registry)
+    client.post("/api/chat/advanced/presets", headers=_AMP_ACTOR,
+                json={"preset": preset, "live_digests": _amp_live_for(preset)})
+    res = client.post("/api/chat/advanced/presets/" + preset["preset_id"] + "/resolve",
+                      headers=_AMP_ACTOR, json={}).json()
+    assert res["status"] == "unverifiable"
+    assert "preset" not in res  # never asserted ready on an unverifiable digest
+    assert [r["ref_kind"] for r in res["unverifiable_refs"]] == ["response_schema"]
+    # With NO registry wired at all, resolve is unverifiable rather than ready.
+    bare = _amp_client()
+    bare.post("/api/chat/advanced/presets", headers=_AMP_ACTOR,
+              json={"preset": preset, "live_digests": _amp_live_for(preset)})
+    none_res = bare.post("/api/chat/advanced/presets/" + preset["preset_id"] + "/resolve",
+                         headers=_AMP_ACTOR, json={}).json()
+    assert none_res["status"] == "unverifiable" and "preset" not in none_res
 
 
 def test_amp_preset_save_refuses_an_already_drifting_preset():
