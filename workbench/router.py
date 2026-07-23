@@ -520,15 +520,19 @@ _SERVING_RESPONSES_PATH = "/responses"
 
 #: The ONLY request fields Anvil Serving's ``/v1/responses`` accepts.  The hub's
 #: bounded request (:func:`workbench.chat_stream.build_bounded_request` and the
-#: advanced-mode equivalent) also carries internal correlation fields -- notably
-#: ``route_id`` -- for hub-side audit/keying; those are NOT part of the Serving
-#: Responses schema, and Serving fail-closes an unknown field with a 400
-#: ``unsupported_feature`` (rejecting the whole request, not ignoring the field).
-#: The transport therefore projects the outbound body to exactly this allowlist so
-#: an internal field can never leak to Serving and break the stream.  Extend this
-#: set (never send outside it) if Serving's Responses schema gains a field.
+#: advanced-mode :func:`workbench.advanced_runtime.build_advanced_request`) also
+#: carries an internal correlation field -- ``route_id`` -- for hub-side
+#: audit/keying; it is NOT part of the Serving Responses schema, and Serving
+#: fail-closes an unknown field with a 400 ``unsupported_feature`` (rejecting the
+#: whole request, not ignoring the field).  The transport therefore projects the
+#: outbound body to exactly this allowlist so an internal field can never leak to
+#: Serving and break the stream.  This MUST list every field the request builders
+#: legitimately send -- notably advanced mode's ``instructions`` (R003: the system
+#: prompt, kept separate from the user ``input``) -- or a real field would be
+#: silently stripped.  Extend this set (never send outside it) if a builder gains a
+#: Serving-supported field.
 _SERVING_RESPONSES_FIELDS = frozenset(
-    {"model", "input", "stream", "max_output_tokens", "temperature", "reasoning"}
+    {"model", "input", "instructions", "stream", "max_output_tokens", "temperature", "reasoning"}
 )
 
 #: Hard ceilings on the relayed Serving Responses SSE stream, mirroring the
