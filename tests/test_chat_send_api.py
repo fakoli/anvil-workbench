@@ -351,6 +351,10 @@ def test_happy_path_streams_frames_persists_exact_text_and_pins_the_request():
         assert _content_text(user) == "plan the demo"
         assert _content_text(assistant) == "Hello"  # EXACT concat of the streamed deltas
         assert assistant["status"] == "complete" and assistant["committed"] is True
+        # The terminal carries the persisted assistant turn_id so the client adopts
+        # it over its optimistic local id -- a follow-on fork (Branch/Retry/advanced
+        # Run) from a just-sent turn must reference THIS real turn, not a local id.
+        assert frames[2]["turn_id"] == assistant["id"]
         assert transport.closed is True
 
 

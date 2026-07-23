@@ -35,7 +35,7 @@ export function needsSnapshotRefresh(lastSeq, frameSeq) {
 
 // The client's initial stream-consumption state.
 export function initialStreamState() {
-  return { lastSeq: 0, text: '', terminal: null, needsRefresh: false, routeResolution: null }
+  return { lastSeq: 0, text: '', terminal: null, needsRefresh: false, routeResolution: null, turnId: null }
 }
 
 // Pure reducer for one arriving sequenced frame. A stale frame is ignored (no
@@ -52,6 +52,10 @@ export function reduceStreamState(state, frame) {
   const next = { ...state, lastSeq: frame.seq, needsRefresh: false }
   if (frame.kind === 'delta') next.text = state.text + (frame.text || '')
   if (frame.kind === 'terminal') next.terminal = frame.outcome ?? null
+  // The terminal carries the persisted assistant turn_id; adopt it so a follow-on
+  // fork (Branch/Retry/advanced Run) references the real server turn, not the
+  // client's optimistic local id.
+  if (frame.turn_id) next.turnId = frame.turn_id
   // A `resolution` frame carries the route-resolution mark Serving REPORTED
   // (requested vs served route + provenance). The client only records it; it
   // never picks a route (chat-first-voice T010 / no failover in Workbench).

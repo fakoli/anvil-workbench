@@ -53,6 +53,7 @@ from .chat_stream import (
     MAX_PROMPT_CHARS,
     CancellationToken,
     ChatStreamRelay,
+    RelayEvent,
     ServingStreamTransport,
     ServingStreamUnavailable,
     StreamOutcome,
@@ -132,6 +133,27 @@ _LIFECYCLE_STATE_FOR_STATE: dict[AdvancedState, str] = {
     AdvancedState.serving_unavailable: "interrupted",
 }
 
+#: The wire ``outcome`` string each settled advanced state maps to for the browser
+#: stream reducer.  The vocabulary is exactly the chat ``StreamOutcome`` value set
+#: that ``web/src/chat-api.js`` ``reduceStreamState`` + ``OUTCOME_TO_STATUS`` already
+#: render: ``complete``/``streamed`` are the ONLY states that reach ``"completed"``
+#: (the sole clean-success value the reducer renders as ``complete``); every
+#: interrupted/failed state maps to a value the reducer renders as
+#: cancelled/interrupted/failed.  So a schema-invalid, malformed, timed-out, or
+#: unavailable attempt can NEVER render as a completed response: ``timed_out`` renders
+#: ``interrupted``; ``schema_invalid`` renders ``failed``; a ``malformed_stream`` is
+#: surfaced as ``serving_unavailable`` (the reducer has no ``malformed`` key, so this
+#: is the closest failed-terminal it renders) as is ``serving_unavailable`` itself.
+_WIRE_OUTCOME_FOR_STATE: dict[AdvancedState, str] = {
+    AdvancedState.complete: "completed",
+    AdvancedState.streamed: "completed",
+    AdvancedState.cancelled: "cancelled",
+    AdvancedState.timed_out: "timed_out",  # reducer -> interrupted
+    AdvancedState.schema_invalid: "failed",  # reducer -> failed (never a clean success)
+    AdvancedState.malformed_stream: "serving_unavailable",  # reducer -> failed
+    AdvancedState.serving_unavailable: "serving_unavailable",  # reducer -> failed
+}
+
 #: The terminal error code for each failure/interruption state.
 _TERMINAL_ERROR_CODE: dict[AdvancedState, str] = {
     AdvancedState.timed_out: "serving_timeout",
@@ -140,6 +162,19 @@ _TERMINAL_ERROR_CODE: dict[AdvancedState, str] = {
     AdvancedState.serving_unavailable: "serving_unavailable",
 }
 _RETRYABLE_STATE = {AdvancedState.timed_out, AdvancedState.serving_unavailable}
+
+
+def wire_outcome_for_state(state: AdvancedState) -> str:
+    """The browser stream-reducer ``outcome`` string for a settled advanced state.
+
+    PUBLIC accessor over :data:`_WIRE_OUTCOME_FOR_STATE` so the router surface maps a
+    settled attempt to the wire vocabulary without importing a private name -- the
+    private table stays this module's single source of truth (mirroring the
+    ``SAFE_SUMMARY_RE`` public-alias precedent below).  Only ``complete``/``streamed``
+    map to ``"completed"``; every other state maps to a value the reducer renders as
+    cancelled/interrupted/failed, never a clean success.
+    """
+    return _WIRE_OUTCOME_FOR_STATE[state]
 
 
 def _ts() -> str:
@@ -283,13 +318,12 @@ def run_advanced_stream(
     -- distinct from a genuine completion and never rendered as complete.  Builds
     and schema-validates the redacted advanced-trace.v1 record before returning.
     """
-    if structured_output_mode not in ("text", "json_schema"):
-        raise AdvancedRuntimeError(f"unsupported structured output mode: {structured_output_mode!r}")
-    request = build_advanced_request(selection, prompt, instructions=instructions)
-    classifier = _ClassifyingTransport(transport)
-    relay = ChatStreamRelay.for_prepared_request(request, classifier, cancel)
-
-    lifecycle_store.begin(actor, conversation_id, request_id)
+    relay, classifier = _prepare_advanced_stream(
+        selection=selection, prompt=prompt, transport=transport, instructions=instructions,
+        cancel=cancel, structured_output_mode=structured_output_mode,
+        lifecycle_store=lifecycle_store, actor=actor, conversation_id=conversation_id,
+        request_id=request_id,
+    )
     delta_count = 0
     terminal_seq = 0
     for event in relay.stream():
@@ -302,6 +336,138 @@ def run_advanced_stream(
         else:  # the single terminal frame draws the highest seq for the terminal commit
             terminal_seq = seq
 
+    return _settle_advanced_attempt(
+        relay=relay, classifier=classifier, delta_count=delta_count, terminal_seq=terminal_seq,
+        lifecycle_store=lifecycle_store, actor=actor, request_id=request_id, selection=selection,
+        prompt=prompt, branch_id=branch_id, conversation_id=conversation_id, turn_id=turn_id,
+        structured_output_mode=structured_output_mode, output_validator=output_validator,
+        usage=usage, instructions=instructions, route_request_id=route_request_id, summary=summary,
+    )
+
+
+def stream_advanced_attempt(
+    *,
+    selection: AdvancedRouteSelection,
+    prompt: str,
+    transport: ServingStreamTransport,
+    branch_id: str,
+    conversation_id: str,
+    turn_id: str,
+    lifecycle_store: Any,
+    actor: ConversationActor,
+    request_id: str,
+    instructions: str | None = None,
+    cancel: CancellationToken | None = None,
+    structured_output_mode: str = "text",
+    output_validator: Callable[[str], bool] | None = None,
+    route_request_id: str | None = None,
+    usage: SafeUsage | None = None,
+    summary: str | None = None,
+) -> Iterator[RelayEvent]:
+    """Stream one Advanced attempt, yielding each delta as it arrives.
+
+    The STREAMING variant of :func:`run_advanced_stream`: it yields every ``delta``
+    :class:`~workbench.chat_stream.RelayEvent` from the shared relay as it arrives
+    (so a router can emit live wire deltas) while performing the SAME durable
+    lifecycle heartbeat/seq logic, then settles the attempt through the SAME
+    seven-state machine and RETURNS the settled :class:`AdvancedTurnResult` as the
+    generator's return value -- retrievable via ``StopIteration.value`` or
+    ``yield from``.  Because it shares :func:`_prepare_advanced_stream` and
+    :func:`_settle_advanced_attempt` with :func:`run_advanced_stream`, the two
+    settle a given scripted stream to the identical state, lifecycle terminal, and
+    redacted trace; only the live-delta emission differs.
+
+    The single terminal RelayEvent is consumed internally (its refined outcome is
+    the returned result's ``state``, mapped to the wire vocabulary by the router),
+    so a caller sees only the intermediate deltas plus the settled result -- a
+    cancelled/timed-out/malformed/unavailable/schema-invalid attempt never reaches
+    the caller as a completed frame.
+    """
+    relay, classifier = _prepare_advanced_stream(
+        selection=selection, prompt=prompt, transport=transport, instructions=instructions,
+        cancel=cancel, structured_output_mode=structured_output_mode,
+        lifecycle_store=lifecycle_store, actor=actor, conversation_id=conversation_id,
+        request_id=request_id,
+    )
+    delta_count = 0
+    terminal_seq = 0
+    for event in relay.stream():
+        seq = lifecycle_store.next_seq(actor, request_id)
+        if event.kind == "delta":
+            delta_count += 1
+            # Heartbeat the durable lifecycle, then emit the delta live so the
+            # router can relay it to the browser as it streams.
+            lifecycle_store.advance(actor, request_id, "in_progress", seq=seq)
+            yield event
+        else:  # the single terminal frame draws the highest seq for the terminal commit
+            terminal_seq = seq
+
+    return _settle_advanced_attempt(
+        relay=relay, classifier=classifier, delta_count=delta_count, terminal_seq=terminal_seq,
+        lifecycle_store=lifecycle_store, actor=actor, request_id=request_id, selection=selection,
+        prompt=prompt, branch_id=branch_id, conversation_id=conversation_id, turn_id=turn_id,
+        structured_output_mode=structured_output_mode, output_validator=output_validator,
+        usage=usage, instructions=instructions, route_request_id=route_request_id, summary=summary,
+    )
+
+
+def _prepare_advanced_stream(
+    *,
+    selection: AdvancedRouteSelection,
+    prompt: str,
+    transport: ServingStreamTransport,
+    instructions: str | None,
+    cancel: CancellationToken | None,
+    structured_output_mode: str,
+    lifecycle_store: Any,
+    actor: ConversationActor,
+    conversation_id: str,
+    request_id: str,
+) -> tuple[ChatStreamRelay, _ClassifyingTransport]:
+    """Build the bounded request, classifying relay, and begin the durable lifecycle.
+
+    Shared by the blocking and streaming entry points so both open the stream
+    identically -- same bounded request, same malformed-frame classifier, same
+    single ``begin`` on the reconnect-safe lifecycle store.
+    """
+    if structured_output_mode not in ("text", "json_schema"):
+        raise AdvancedRuntimeError(f"unsupported structured output mode: {structured_output_mode!r}")
+    request = build_advanced_request(selection, prompt, instructions=instructions)
+    classifier = _ClassifyingTransport(transport)
+    relay = ChatStreamRelay.for_prepared_request(request, classifier, cancel)
+    lifecycle_store.begin(actor, conversation_id, request_id)
+    return relay, classifier
+
+
+def _settle_advanced_attempt(
+    *,
+    relay: ChatStreamRelay,
+    classifier: _ClassifyingTransport,
+    delta_count: int,
+    terminal_seq: int,
+    lifecycle_store: Any,
+    actor: ConversationActor,
+    request_id: str,
+    selection: AdvancedRouteSelection,
+    prompt: str,
+    branch_id: str,
+    conversation_id: str,
+    turn_id: str,
+    structured_output_mode: str,
+    output_validator: Callable[[str], bool] | None,
+    usage: SafeUsage | None,
+    instructions: str | None,
+    route_request_id: str | None,
+    summary: str | None,
+) -> AdvancedTurnResult:
+    """Refine the settled relay outcome into one :class:`AdvancedState`, advance the
+    durable lifecycle terminal, build the redacted trace, and return the result.
+
+    This is the single implementation of the seven-state machine: both
+    :func:`run_advanced_stream` (blocking) and :func:`stream_advanced_attempt`
+    (streaming) drive the same relay loop and then delegate the settle here, so a
+    given scripted stream settles identically through either path.
+    """
     outcome = relay.outcome
     if outcome is None:  # pragma: no cover - stream() always settles an outcome
         raise AdvancedRuntimeError("advanced stream did not settle a terminal outcome")

@@ -307,6 +307,13 @@ _PROBE_BODY_BY_SUFFIX: dict[str, dict | None] = {
     # The live send/stream join: ownership is checked before route/serving, so a
     # foreign or missing id is the fixed 404 identically -- no existence oracle.
     "/send": {"route_id": "chat.heavy", "prompt": "hi", "controls": {}},
+    # The Advanced-mode run/stream join: ownership is likewise checked before the
+    # advanced selection or any Serving call, so a foreign or missing id is the
+    # fixed 404 identically -- no existence oracle.
+    "/advanced/run": {
+        "parent_turn_id": "turn_absent", "branch_id": "branch_probe",
+        "route_id": "chat.heavy", "prompt": "hi", "controls": {},
+    },
     "/turns": {"role": "assistant", "status": "complete"},
     "/turns/{turn_id}/retry": {"role": "assistant", "status": "complete"},
     "/turns/{turn_id}/branch": {"role": "assistant", "status": "complete"},

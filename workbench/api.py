@@ -50,6 +50,7 @@ from .conversation_transfer import (
 )
 from .contracts import settings_actor_view
 from .conversation_api import (
+    build_advanced_run_router,
     build_chat_send_router,
     build_conversation_router,
     build_hub_retention_router,
@@ -2222,6 +2223,19 @@ def create_app(
     app.include_router(build_chat_send_router(
         actor, conversation_store, response_lifecycle_store,
         lambda: discover_chat_routes(parse_chat_routes_config(settings.chat_routes)),
+        chat_stream_transport_factory,
+    ))
+    # Advanced mode's live "Run branch" join (advanced-model-playground): the same
+    # streaming relay-frame contract as chat send, forking an ordinary streaming
+    # mode="advanced" sibling under the existing parent and settling the refined
+    # advanced state. Route/control selection is validated fail-closed against the
+    # operator-discovered ADVANCED routes BEFORE any Serving call or durable write;
+    # the terminal frame carries the settled turn_id/branch_id + redacted trace.
+    # Model traffic flows ONLY through the same Serving Responses stream transport --
+    # no provider fallback, and the router URL/token never leak.
+    app.include_router(build_advanced_run_router(
+        actor, conversation_store, response_lifecycle_store,
+        lambda: discover_advanced_routes(parse_advanced_routes_config(settings.advanced_routes)),
         chat_stream_transport_factory,
     ))
     # Off-read-path retention (chat-first-voice T009): the preview + explicit

@@ -68,6 +68,16 @@ from .chat_routes import (
     DiscoveredChatRoutes,
     validate_chat_route_selection,
 )
+from .advanced_routes import (
+    AdvancedRouteError,
+    DiscoveredAdvancedRoutes,
+    validate_advanced_selection,
+)
+from .advanced_runtime import (
+    AdvancedTurnResult,
+    stream_advanced_attempt,
+    wire_outcome_for_state,
+)
 from .chat_stream import (
     CancellationToken,
     ChatStreamError,
@@ -215,6 +225,29 @@ class SendMessageInput(_ChatInput):
     prompt: str = Field(min_length=1, max_length=MAX_CONTENT_TEXT_CHARS)
     controls: dict[str, Any] = Field(default_factory=dict)
     route_selection: str | None = Field(default=None, max_length=64)
+
+
+class AdvancedRunInput(_ChatInput):
+    """The browser's advanced "Run branch" body (``web/src/api.js`` ``runAdvancedBranch``).
+
+    A closed field set matching exactly what the client posts: the existing
+    ``parent_turn_id`` to fork under, the client-local ``branch_id`` (echoed back on
+    the terminal frame), the reviewed ``route_id`` and its tuned ``controls`` (a
+    ``{name: value}`` mapping or a ``submitted_controls`` array -- both accepted and
+    validated fail-closed by ``validate_advanced_selection`` before any Serving call),
+    the bounded ``prompt``, an optional separate ``instructions`` system prompt (R003),
+    and the ``structured_output_mode`` (default ``text``).  ``controls`` is typed
+    ``Any`` so either submitted shape passes the edge and the fail-closed route
+    validator -- not this model -- is the single allowlist authority.
+    """
+
+    parent_turn_id: str = Field(min_length=1, max_length=133)
+    branch_id: str = Field(min_length=1, max_length=128)
+    route_id: str = Field(min_length=1, max_length=128)
+    controls: Any = Field(default_factory=dict)
+    prompt: str = Field(min_length=1, max_length=MAX_CONTENT_TEXT_CHARS)
+    instructions: str | None = Field(default=None, max_length=MAX_CONTENT_TEXT_CHARS)
+    structured_output_mode: str = Field(default="text", pattern=r"^(text|json_schema)$")
 
 
 # --- typed-value conversion (validation errors fail closed as 409) ----------
@@ -997,12 +1030,13 @@ def build_chat_send_router(
             _release_stream_slot(actor.actor_id)
             raise
 
-        def _persist_assistant(text: str, turn_status: str) -> None:
-            store.append_turn(
+        def _persist_assistant(text: str, turn_status: str) -> str:
+            turn = store.append_turn(
                 actor, conversation_id, role="assistant", status=turn_status,
                 lineage=TurnLineage(user_turn.id, 0, "initial"),
                 redaction=_SEND_REDACTION, content=_content_blocks(redact_text(text)),
             )
+            return turn.id
 
         def _pull() -> Any:
             try:
@@ -1043,7 +1077,7 @@ def build_chat_send_router(
                         # NOT left ``completed`` with zero durable turns -- it settles
                         # ``interrupted`` and the wire reports serving_unavailable.
                         try:
-                            _persist_assistant("".join(parts), relay.terminal_turn_status())
+                            assistant_turn_id = _persist_assistant("".join(parts), relay.terminal_turn_status())
                         except ConversationStoreError:
                             lifecycle.advance(
                                 actor, request_id,
@@ -1060,7 +1094,15 @@ def build_chat_send_router(
                             actor, request_id, LIFECYCLE_STATE_FOR_OUTCOME[frame.outcome.value], seq=frame.seq,
                         )
                         settled = True
-                        yield _ndjson({"seq": frame.seq, "kind": "terminal", "outcome": frame.outcome.value})
+                        # Carry the persisted assistant turn_id so the client can
+                        # adopt it in place of its optimistic local id -- otherwise a
+                        # follow-on fork (Branch/Retry/advanced Run branch) from a
+                        # just-sent turn would reference a non-existent local id and
+                        # fail closed (404/409).  Mirrors the advanced-run terminal.
+                        yield _ndjson({
+                            "seq": frame.seq, "kind": "terminal",
+                            "outcome": frame.outcome.value, "turn_id": assistant_turn_id,
+                        })
             finally:
                 if not settled:
                     # Torn down before a terminal (client disconnect / abort).
@@ -1085,6 +1127,239 @@ def build_chat_send_router(
                         _persist_assistant("".join(parts), turn_status)
                     except ConversationStoreError:
                         pass  # best-effort; lifecycle already reflects the non-complete terminal
+                _release_stream_slot(actor.actor_id)
+
+        return StreamingResponse(_frames(), media_type="application/x-ndjson")
+
+    return router
+
+
+#: The redaction posture every advanced fork carries: the durable turn holds only a
+#: status + the redacted advanced-trace.v1 summary, never raw assistant text (mirrors
+#: ``open_advanced_branch`` / ``dispatch_parallel``).
+_ADVANCED_REDACTION = TurnRedaction("redacted", "advanced-trace-v1")
+
+
+def build_advanced_run_router(
+    actor_dependency: Callable[..., str],
+    conversation_store: ConversationStore | None,
+    lifecycle_store: ResponseLifecycleStore | None,
+    advanced_routes_provider: Callable[[], DiscoveredAdvancedRoutes],
+    transport_factory: Callable[[Any], ServingStreamTransport],
+) -> APIRouter:
+    """Mount ``POST /api/conversations/{id}/advanced/run`` -- Advanced mode's live run.
+
+    The streaming sibling of ``build_chat_send_router``: the browser client
+    (``web/src/api.js`` ``runAdvancedBranch``) POSTs
+    ``{parent_turn_id, branch_id, route_id, controls, prompt, instructions?,
+    structured_output_mode?}`` and reads the same newline-delimited relay-frame
+    stream (``delta`` / ``terminal``), except the terminal additionally carries the
+    settled ``turn_id``, the echoed ``branch_id``, and the redacted
+    advanced-trace.v1 record for the inspector.
+
+    The discipline mirrors the chat send join, in order and fail-closed:
+
+    * Ownership first: a missing OR foreign conversation id raises
+      ``UnknownConversationError``, rendered as the same fixed 404 as a truly
+      missing id (no existence oracle) -- BEFORE any Serving call or write.
+    * The ``{route_id, controls}`` selection is validated against the operator-
+      discovered ADVANCED routes; an unknown route or undeclared/out-of-range
+      control is a typed 422, strictly BEFORE any Serving call or durable write.
+      A provider that itself fails (unconfigured advanced routes) is a 503.
+    * A per-actor concurrent-stream ceiling refuses (429) beyond
+      :data:`MAX_CONCURRENT_STREAMS_PER_ACTOR`, before the sibling turn is forked.
+    * The advanced attempt is forked as an ordinary streaming ``mode="advanced"``
+      sibling under the existing parent (``branch_turn``, exactly as
+      ``dispatch_parallel``) -- no advanced-branch.v1 record is synthesized and no
+      new conversation identity is minted.  The durable turn carries a status + the
+      redacted trace summary only, never raw assistant text.
+    * The response is streamed as NDJSON relay frames.  Frame pulls run in a
+      threadpool with a per-frame await boundary, so a client disconnect cancels
+      the pull and the stream settles the turn ``cancelled`` via the ``finally`` --
+      the terminal-complete branch runs ONLY when a terminal is actually reached
+      while the client is connected, so a torn-down stream never renders complete.
+    * On the settled result the durable turn advances to the state's terminal
+      status; the wire terminal carries the reducer-vocabulary ``outcome`` mapped
+      from the refined state, so a schema-invalid / malformed / timed-out /
+      unavailable attempt is never presented as a clean completion.
+
+    When ``conversation_store`` or ``lifecycle_store`` is ``None`` the endpoint
+    refuses with 503, matching the sibling chat send surface.
+    """
+    router = APIRouter(prefix="/api/conversations")
+
+    active_streams: dict[str, int] = {}
+    active_lock = threading.Lock()
+
+    def _acquire_stream_slot(actor_id: str) -> bool:
+        with active_lock:
+            if active_streams.get(actor_id, 0) >= MAX_CONCURRENT_STREAMS_PER_ACTOR:
+                return False
+            active_streams[actor_id] = active_streams.get(actor_id, 0) + 1
+            return True
+
+    def _release_stream_slot(actor_id: str) -> None:
+        with active_lock:
+            remaining = active_streams.get(actor_id, 0) - 1
+            if remaining <= 0:
+                active_streams.pop(actor_id, None)
+            else:
+                active_streams[actor_id] = remaining
+
+    def stores() -> tuple[ConversationStore, ResponseLifecycleStore]:
+        if conversation_store is None or lifecycle_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="chat persistence is not configured; set WORKBENCH_CHAT_HASH_KEY",
+            )
+        return conversation_store, lifecycle_store
+
+    def advanced_actor(current_actor: str = Depends(actor_dependency)) -> ConversationActor:
+        return conversation_actor(current_actor)
+
+    @router.post("/{conversation_id}/advanced/run")
+    async def run_advanced(
+        conversation_id: str,
+        payload: AdvancedRunInput,
+        actor: ConversationActor = Depends(advanced_actor),
+    ) -> StreamingResponse:
+        store, lifecycle = stores()
+        # (1) Ownership: a missing OR foreign id raises UnknownConversationError,
+        # rendered as the fixed 404 -- strictly before any write or Serving call.
+        store.get_conversation_with_turns(actor, conversation_id)
+
+        # (2) Fail-closed route/control validation, strictly before any Serving
+        # request or durable write.  An unconfigured provider -> 503; an unknown
+        # route or undeclared/out-of-range control -> typed 422.
+        try:
+            discovered = advanced_routes_provider()
+        except AdvancedRouteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="advanced routes are not configured",
+            ) from exc
+        try:
+            selection = validate_advanced_selection(payload.route_id, payload.controls, discovered)
+        except AdvancedRouteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="advanced route selection is not allowed",
+            ) from exc
+
+        # (3) Per-actor concurrency ceiling, before any durable write (so a refusal
+        # leaves no orphan sibling turn).
+        if not _acquire_stream_slot(actor.actor_id):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="too many concurrent chat streams are active for this actor",
+            )
+
+        try:
+            # (4) Fork the advanced attempt as an ordinary streaming mode="advanced"
+            # sibling under the existing parent -- exactly as dispatch_parallel; the
+            # store proves the parent exists in this conversation and prior turns are
+            # untouched.  No advanced-branch.v1 record and no new identity.
+            turn = store.branch_turn(
+                actor, conversation_id, payload.parent_turn_id,
+                role="assistant", status="streaming", redaction=_ADVANCED_REDACTION, mode="advanced",
+            )
+            turn_id = turn.id
+            cancel = CancellationToken()
+            transport = transport_factory(selection)
+            request_id = new_id("resp")
+            # The AUTHORITATIVE branch id is minted server-side (like
+            # dispatch_parallel), never the client's: the durable advanced-trace.v1
+            # record pins branch_id to the ``advbranch_`` grammar, so trusting a
+            # client-supplied value would fail the trace schema on every completed
+            # attempt.  The client's ``payload.branch_id`` is an advisory local
+            # label only; the terminal frame returns THIS id and the browser adopts
+            # it (web/src/api.js settles ``branchId`` from ``frame.branch_id``).
+            branch_id = new_id("advbranch")
+            # Per-STREAM wire seq starting at 1 (the FE reducer resets per run, so a
+            # first frame above 1 reads as a dropped-frame gap).  The durable
+            # lifecycle heartbeat inside stream_advanced_attempt draws its OWN
+            # per-conversation seqs; this counter is the browser wire sequence.
+            stream_seq = itertools.count(1)
+            attempt_gen = stream_advanced_attempt(
+                selection=selection, prompt=payload.prompt, transport=transport,
+                branch_id=branch_id, conversation_id=conversation_id, turn_id=turn_id,
+                lifecycle_store=lifecycle, actor=actor, request_id=request_id,
+                instructions=payload.instructions, cancel=cancel,
+                structured_output_mode=payload.structured_output_mode,
+            )
+        except Exception:
+            _release_stream_slot(actor.actor_id)
+            raise
+
+        result_box: dict[str, AdvancedTurnResult] = {}
+
+        def _pull() -> Any:
+            try:
+                return next(attempt_gen)
+            except StopIteration as stop:
+                if isinstance(stop.value, AdvancedTurnResult):
+                    result_box["result"] = stop.value
+                return _PULL_DONE
+
+        async def _frames() -> AsyncIterator[bytes]:
+            settled = False
+            try:
+                while True:
+                    # The raw frame pull runs in a threadpool with
+                    # ``abandon_on_cancel``: on a client disconnect the await is
+                    # cancelled immediately and the ``finally`` fires, tripping
+                    # ``cancel`` so the relay tears down and no terminal is PROCESSED
+                    # after the client is gone (the settle-as-complete race D4/G1).
+                    frame = await anyio.to_thread.run_sync(_pull, abandon_on_cancel=True)
+                    if frame is _PULL_DONE:
+                        result = result_box.get("result")
+                        if result is None:
+                            # The generator ended without a settled result (only
+                            # reachable if it was torn down); let the finally settle
+                            # the turn cancelled rather than emit a completion.
+                            break
+                        # Persist the settled terminal turn status FIRST, then emit
+                        # the wire terminal carrying the settled ids + redacted trace.
+                        store.advance_turn_status(actor, conversation_id, turn_id, result.turn_status)
+                        settled = True
+                        yield _ndjson({
+                            "seq": next(stream_seq), "kind": "terminal",
+                            "outcome": wire_outcome_for_state(result.state),
+                            "turn_id": turn_id, "branch_id": branch_id,
+                            "trace": result.trace,
+                        })
+                        break
+                    # Every yielded frame is a delta RelayEvent (the terminal is
+                    # consumed inside stream_advanced_attempt).  The wire delta is
+                    # redacted per fragment; the durable trace carries only the
+                    # redacted summary, never the raw text.
+                    yield _ndjson({
+                        "seq": next(stream_seq), "kind": "delta", "text": redact_text(frame.text),
+                    })
+            finally:
+                if not settled:
+                    # Torn down before a terminal (client disconnect / abort): trip
+                    # the cancel so the relay/transport tear down and close the
+                    # generator.  Closing it raises GeneratorExit AT the suspended
+                    # ``yield`` inside stream_advanced_attempt, so its own tail settle
+                    # never runs -- settle BOTH the durable turn AND the
+                    # reconnect-safe lifecycle record here (mirroring send_message),
+                    # never a completion after cancel.  A terminal advance takes no
+                    # seq (the in_progress->terminal transition is seq-independent),
+                    # so it can't be refused as a stale frame.
+                    cancel.cancel()
+                    try:
+                        attempt_gen.close()
+                    except Exception:  # noqa: BLE001 - a pull may still execute it; cancel tears it down
+                        pass
+                    try:
+                        lifecycle.advance(actor, request_id, "cancelled")
+                    except ResponseLifecycleError:
+                        pass  # already terminal (a race settled it); leave it stable
+                    try:
+                        store.advance_turn_status(actor, conversation_id, turn_id, "cancelled")
+                    except ConversationStoreError:
+                        pass  # already settled by a race; leave the terminal stable
                 _release_stream_slot(actor.actor_id)
 
         return StreamingResponse(_frames(), media_type="application/x-ndjson")

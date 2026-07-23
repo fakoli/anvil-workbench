@@ -2043,7 +2043,10 @@ function ChatView({ append }) {
       const resolution = state.routeResolution ?? null
       // `fresh` marks this as a newly-arrived response so ReadAloud may autoplay
       // it (when the saved preference opts in); historical turns never carry it.
-      setTurns((current) => [...current, { ...assistant, content: [{ text: state.text }], status, fresh: true, routeResolution: resolution }])
+      // Adopt the server's persisted assistant turn_id (the terminal carries it)
+      // so an immediate fork -- Branch / Retry / advanced Run branch -- references
+      // the real turn, not this optimistic local id (which the server 404/409s).
+      setTurns((current) => [...current, { ...assistant, id: state.turnId || assistant.id, content: [{ text: state.text }], status, fresh: true, routeResolution: resolution }])
       setStreamingTurn(null)
       setLifecycle(LIFECYCLE[status] || LIFECYCLE.complete)
       // Show the divergence notice EXACTLY ONCE per episode: the pure decision
