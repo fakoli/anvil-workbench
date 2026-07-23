@@ -12,7 +12,7 @@ import {
   transcribeVoice, speakMessage, fetchPreferences, fetchVoiceCatalog,
   fetchConfigurationExport, previewConfigurationImport, applyConfigurationImport,
   previewConfigurationReset, applyConfigurationReset,
-  fetchAdvancedRoutes, runAdvancedBranch,
+  fetchAdvancedRoutes, runAdvancedBranch, runAdvancedDispatch,
   fetchAdvancedPresets, resolveAdvancedPreset, buildAdvancedComparison,
   fetchAdvancedTemplates, resolveAdvancedTemplate, renderAdvancedDeclaredInstructions,
   fetchRatingCriteria, recordAdvancedRating, fetchRatingAggregates,
@@ -29,7 +29,7 @@ vi.mock('./api', () => ({
   transcribeVoice: vi.fn(), speakMessage: vi.fn(), fetchPreferences: vi.fn(), fetchVoiceCatalog: vi.fn(),
   fetchConfigurationExport: vi.fn(), previewConfigurationImport: vi.fn(), applyConfigurationImport: vi.fn(),
   previewConfigurationReset: vi.fn(), applyConfigurationReset: vi.fn(),
-  fetchAdvancedRoutes: vi.fn(), runAdvancedBranch: vi.fn(),
+  fetchAdvancedRoutes: vi.fn(), runAdvancedBranch: vi.fn(), runAdvancedDispatch: vi.fn(),
   fetchAdvancedPresets: vi.fn(), resolveAdvancedPreset: vi.fn(), buildAdvancedComparison: vi.fn(),
   fetchAdvancedTemplates: vi.fn(), resolveAdvancedTemplate: vi.fn(), renderAdvancedDeclaredInstructions: vi.fn(),
   fetchRatingCriteria: vi.fn(), recordAdvancedRating: vi.fn(), fetchRatingAggregates: vi.fn(),
@@ -152,6 +152,9 @@ function resetChatMocks() {
   // degrades truthfully; the advanced-flow tests opt into a configured runtime.
   fetchAdvancedRoutes.mockRejectedValue(new Error('The advanced playground is not configured for this hub'))
   runAdvancedBranch.mockResolvedValue({ text: 'tuned answer', terminal: 'completed', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv', branchId: 'advbranch_srv' })
+  // Parallel multi-route dispatch is inert by default; the dispatch-flow tests
+  // install a mockImplementation that drives onDispatch/onBranchState.
+  runAdvancedDispatch.mockResolvedValue([])
   // The playground extension surfaces are unconfigured BY DEFAULT (503 sentinel)
   // so the panel degrades truthfully; the playground-flow tests opt into a
   // configured runtime with mockResolvedValue.
@@ -732,6 +735,87 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     expect(screen.getAllByRole('article', { name: /Comparison/ })).toHaveLength(2)
     // Still one transcript.
     expect(screen.getAllByRole('list', { name: 'Transcript' })).toHaveLength(1)
+  })
+
+  // --- LIVE parallel multi-route dispatch (advanced-model-playground) ----------
+
+  it('enables "Run on N routes" only with >=2 routes checked AND a prompt (multi-route dispatch)', async () => {
+    const user = await openAdvanced()
+    const runN = () => screen.getByRole('button', { name: /^Run on \d+ routes$/ })
+    expect(runN().disabled).toBe(true) // 0 checked, no prompt
+    await user.click(screen.getByRole('checkbox', { name: /Include Chat fast in the parallel dispatch/ }))
+    expect(runN().disabled).toBe(true) // only 1 checked — a single route is just Run branch
+    await user.click(screen.getByRole('checkbox', { name: /Include Chat heavy in the parallel dispatch/ }))
+    expect(runN().disabled).toBe(true) // 2 checked but the prompt is still empty
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'compare these')
+    expect(runN().disabled).toBe(false) // 2 routes + a prompt -> enabled
+  })
+
+  // A dispatch mock that drives the same onDispatch/onBranchState contract the real
+  // client exposes: announce N branches, stream each to a completed terminal, and
+  // return the per-branch settled results.
+  function dispatchAllComplete({ idPrefix = 'srv' } = {}) {
+    runAdvancedDispatch.mockImplementation(async ({ routes, onDispatch, onBranchState }) => {
+      const branches = routes.map((route, index) => ({
+        branch_id: `advbranch_${idPrefix}_${index}`, route_id: route.route_id, turn_id: `turn_${idPrefix}_${index}`,
+      }))
+      onDispatch(branches)
+      return branches.map((branch, index) => {
+        const text = `dispatched answer ${index}`
+        onBranchState(branch.branch_id, { text, terminal: 'completed', lastSeq: 2 }, { turnId: branch.turn_id, trace: advancedTrace })
+        return { branchId: branch.branch_id, routeId: branch.route_id, turnId: branch.turn_id, trace: advancedTrace, text, terminal: 'completed' }
+      })
+    })
+  }
+
+  it('runs a parallel dispatch that renders N branch rows and settles them in ONE transcript (multi-route dispatch)', async () => {
+    dispatchAllComplete()
+    const user = await openAdvanced()
+    await user.click(screen.getByRole('checkbox', { name: /Include Chat fast in the parallel dispatch/ }))
+    await user.click(screen.getByRole('checkbox', { name: /Include Chat heavy in the parallel dispatch/ }))
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'compare these')
+    await user.click(screen.getByRole('button', { name: /Run on 2 routes/ }))
+
+    // Both branches' streamed text lands in the SAME transcript as sibling turns.
+    expect(await screen.findByText('dispatched answer 0')).toBeTruthy()
+    expect(await screen.findByText('dispatched answer 1')).toBeTruthy()
+    // Two dispatch branch rows appear, keyed by the server branch ids.
+    expect(screen.getAllByText(/Dispatch \d+\.\d/).length).toBe(2)
+    // No second transcript was spawned by the fan-out.
+    expect(screen.getAllByRole('list', { name: 'Transcript' })).toHaveLength(1)
+    // The single POST carried exactly the two checked routes.
+    const call = runAdvancedDispatch.mock.calls.at(-1)[0]
+    expect(call.routes.map((route) => route.route_id)).toEqual(['route.chat-fast', 'route.chat-heavy'])
+  })
+
+  it('feeds the N dispatched branches into Build comparison unchanged (multi-route dispatch)', async () => {
+    dispatchAllComplete({ idPrefix: 'cmp' })
+    buildAdvancedComparison.mockResolvedValue({
+      schema_version: 'workbench-advanced-comparison/v1', comparison_id: 'advcompare_d_0001',
+      conversation_id: 'conv_' + 'a'.repeat(10), fork_point: { parent_turn_id: 'turn_' + 'b'.repeat(10) },
+      attempts: [], created_at: '2026-07-21T10:02:00Z',
+    })
+    // Configure the playground surfaces so the "Build comparison" affordance renders
+    // (openPlayground lives in a sibling describe; configure inline here).
+    fetchAdvancedPresets.mockResolvedValue({ presets: [] })
+    fetchAdvancedTemplates.mockResolvedValue({ templates: [] })
+    fetchRatingCriteria.mockResolvedValue({ criteria: [] })
+    fetchRatingAggregates.mockResolvedValue(null)
+    const user = await openAdvanced()
+    await screen.findByRole('button', { name: 'Build comparison' })
+    await user.click(screen.getByRole('checkbox', { name: /Include Chat fast in the parallel dispatch/ }))
+    await user.click(screen.getByRole('checkbox', { name: /Include Chat heavy in the parallel dispatch/ }))
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'compare these')
+    await user.click(screen.getByRole('button', { name: /Run on 2 routes/ }))
+    await screen.findByText('dispatched answer 0')
+
+    // The existing "Build comparison" assembles a record over the two settled,
+    // traced dispatch siblings without any dispatch-specific plumbing.
+    await user.click(screen.getByRole('button', { name: 'Build comparison' }))
+    expect(buildAdvancedComparison).toHaveBeenCalled()
+    const record = buildAdvancedComparison.mock.calls.at(-1)[0]
+    expect(record.attempts).toHaveLength(2)
+    expect(record.attempts.every((attempt) => attempt.status === 'complete')).toBe(true)
   })
 
   it('saves and reopens a branch without leaving the chat shell', async () => {
