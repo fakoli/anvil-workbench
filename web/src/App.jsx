@@ -59,10 +59,11 @@ function tone(status) { return ['reconciliation', 'pending', 'not_configured', '
 function titleCase(value) { return value ? value.charAt(0).toUpperCase() + value.slice(1) : value }
 function runTitle(run, session) { const intent = titleCase(run.model) || 'Delivery'; if (session?.title) return `${intent} · ${session.title}`; if (run.task_id) return `${intent} run for task ${run.task_id}`; return `${intent} run` }
 
-function Rail({ active, setActive, onNewDelivery, onProfile }) {
+function Rail({ active, setActive, onNewDelivery, onProfile, closeNav }) {
+  const go = (label) => { setActive(label); closeNav?.() }
   return <aside className="rail">
     <div className="brand"><Mark /><span>Anvil<br /><em>Workbench</em></span></div>
-    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} title={label} aria-current={active === label ? 'page' : undefined} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => setActive(label)}><b aria-hidden="true">{glyph}</b><span className="nav-label">{label}</span></button>)}</nav>
+    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} title={label} aria-current={active === label ? 'page' : undefined} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => go(label)}><b aria-hidden="true">{glyph}</b><span className="nav-label">{label}</span></button>)}</nav>
     <div className="rail-footer"><button className="new-run" onClick={onNewDelivery}><span aria-hidden="true">+</span> New delivery</button><button className="profile" aria-label="Operator menu" onClick={onProfile}><span>AW</span><div><strong>Operator</strong><small>tailnet owner</small></div><b aria-hidden="true">···</b></button></div>
   </aside>
 }
@@ -2620,7 +2621,7 @@ function ExplorerView({ data, append }) {
 }
 
 function App() {
-  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false); const [deliverOpen, setDeliverOpen] = useState(false)
+  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false); const [deliverOpen, setDeliverOpen] = useState(false); const [navOpen, setNavOpen] = useState(false)
   const load = async () => { const value = await bootstrap(); setData({ ...emptyData, ...value, sandbox: { ...emptyData.sandbox, ...(value.sandbox || {}) }, voice: { ...emptyData.voice, ...(value.voice || {}) } }); return value }
   useEffect(() => { load().catch(() => setNotice('Workbench hub is unavailable; no local mock delivery is shown.')) }, [])
   const createDelivery = async (payload) => { try { const project = await createProject(payload); setData((current) => ({ ...current, projects: [project, ...current.projects] })); setNewDeliveryOpen(false); setNotice(`Created ${project.name}. Register its bridge locally before starting a run.`); await load() } catch { setNotice('Project could not be created. No bridge or run was started.') } }
@@ -2641,10 +2642,11 @@ function App() {
   const addDirection = async (sessionId, text) => { const result = await addDirective(sessionId, text); if (result.recorded && result.event) { setData((current) => ({ ...current, directives: [...current.directives, result.event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.') } else { setNotice(`Direction was not recorded (${result.outcome}). No future work packet was changed.`) } await load() }
   const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
   const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
-  return <div className={`app-shell${active === 'Chat' ? ' chat-active' : ''}${active === 'Voice' ? ' voice-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
-    <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} />
+  return <div className={`app-shell${navOpen ? ' nav-open' : ''}${active === 'Chat' ? ' chat-active' : ''}${active === 'Voice' ? ' voice-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
+    <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} closeNav={() => setNavOpen(false)} />
+    <div className="nav-overlay" aria-hidden="true" onClick={() => setNavOpen(false)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
-    <div className="workspace"><header className="topbar"><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><ModelHealthIndicator /><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
+    <div className="workspace"><header className="topbar"><button className="nav-toggle" aria-label="Open navigation" aria-expanded={navOpen} onClick={() => setNavOpen(true)}><span aria-hidden="true">☰</span></button><span>{context}</span><div><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router not configured'}</Status><ModelHealthIndicator /><button className="help" aria-label="Help" onClick={() => setGuideOpen(true)}>?</button><button className="bell" aria-label="Notifications" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen(!notificationsOpen)}>♢</button></div></header>
       {notificationsOpen && <Notifications audit={data.audit || []} read={notificationsRead} onRead={() => setNotificationsRead(true)} />}
       {active === 'Chat'
         ? <div className="chat-grid"><ChatView append={setNotice} /></div>

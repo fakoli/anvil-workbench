@@ -741,36 +741,40 @@
    here lives inside a media query, so the desktop layout is untouched. Nav items
    and action buttons keep their aria-label/title, so nothing loses its name.
    ==========================================================================*/
+.nav-toggle{display:none;border:0;background:transparent;color:#9fb1b5;font-size:21px;line-height:1;padding:2px 6px;margin-right:4px}
+.nav-overlay{display:none}
 .nav-label,.btn-label{display:inline}
 @media(max-width:900px){
-  /* The rail collapses to a compact top strip on EVERY page (previously only
-     Chat/Voice/Explorer/Settings; the workspace pages kept the fixed 230px
-     sidebar and forced a horizontal scroll on a phone). */
-  .app-shell{flex-direction:column}
-  .rail{position:static;inset:auto;width:100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:10px 14px;border-right:0;border-bottom:1px solid var(--line-soft)}
-  .rail nav{grid-auto-flow:column;grid-template-columns:none;display:flex;flex-wrap:wrap;gap:4px}
-  .rail .brand{padding:0 10px 0 0}
-  .rail-footer{margin:0 0 0 auto;display:flex;gap:8px;align-items:center}
-  .rail-footer .new-run{width:auto;padding:8px 12px}
-  .rail-footer .profile{margin:0;padding:0;border:0;grid-template-columns:27px auto}
-  .rail-footer .profile>div,.rail-footer .profile>b{display:none}
-  .workspace{margin-left:0;width:100%}
+  /* The nav is a proper OFF-CANVAS DRAWER on every page: a menu button in the
+     topbar reveals the vertical rail, which slides over a dimming overlay;
+     picking an item or tapping the overlay closes it. `!important` beats the
+     older per-page horizontal-bar rules without editing those dense blocks. */
+  .nav-toggle{display:inline-flex;align-items:center}
+  .app-shell{flex-direction:row!important}
+  .rail{position:fixed!important;inset:0 auto 0 0!important;width:min(84vw,300px)!important;flex-direction:column!important;flex-wrap:nowrap!important;gap:4px!important;padding:22px 14px 18px!important;transform:translateX(-100%);transition:transform .22s ease;z-index:20;box-shadow:0 0 50px #000c;border-right:1px solid var(--line-soft)!important;border-bottom:0!important}
+  .app-shell.nav-open .rail{transform:translateX(0)}
+  .rail nav{display:grid!important;grid-auto-flow:row!important;grid-template-columns:none!important;gap:4px!important}
+  .rail .brand{padding:0 12px 22px!important}
+  .rail-footer{margin:auto 0 0!important;display:block!important}
+  .rail-footer .new-run{width:100%!important}
+  .nav-overlay{display:block;position:fixed;inset:0;background:#020708cc;z-index:15;opacity:0;pointer-events:none;transition:opacity .2s ease}
+  .app-shell.nav-open .nav-overlay{opacity:1;pointer-events:auto}
+  .workspace{margin-left:0!important;width:100%!important}
   /* Wide two-column layouts stack instead of forcing a min-width scroll. */
   .main-grid{min-width:0;grid-template-columns:1fr}
   .main-grid>.trace{border-left:0;border-top:1px solid var(--line-soft)}
-  .workspace-view,.empty-view{padding:28px 18px}
-  .delivery{padding:24px 18px}
+  .workspace-view,.empty-view{padding:26px 18px}
+  .delivery{padding:22px 18px}
   .data-list article{grid-template-columns:1fr}
   .toast{left:16px;right:16px}
-  .nav-item{padding:9px 11px}
+  .topbar{padding:0 16px}
+  /* The fixed *-live status labels sit beside the desktop rail (left:262px); the
+     rail is off-canvas on mobile, so pin them to the screen edge instead. */
+  .settings-live,.configuration-live,.explorer-live,.pc-live,.voice-live{left:16px!important}
 }
 @media(max-width:560px){
-  /* Phones: the nav is icon-only and repeated action buttons drop their text
-     label -- the aria-label/title still names each one for a screen reader and
-     on hover, so nothing becomes a mystery glyph. */
-  .nav-label,.btn-label{display:none}
-  .rail .brand span{display:none}
-  .nav-item{padding:9px;gap:0}
-  .nav-item b{width:auto}
+  /* The drawer keeps full nav labels (it has room); repeated action buttons
+     become compact icons -- aria-label/title still name each one. */
+  .btn-label{display:none}
   .turn-actions button{min-width:36px;justify-content:center}
 }
