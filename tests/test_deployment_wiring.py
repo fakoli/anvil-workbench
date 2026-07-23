@@ -416,6 +416,72 @@ def test_chat_routes_empty_config_is_the_honest_empty_allowlist():
     assert response.json() == {"routes": []}
 
 
+# ---------------------------------------------------------------------------
+# (d2) /api/chat/advanced/routes mirrors /api/chat/routes for the richer
+#      advanced-branch.v1 shape: configured projection, actor-gated, fail-closed
+#      on malformed, honest empty allowlist when unset (the web client calls it
+#      via fetchAdvancedRoutes; a missing endpoint 404s Advanced mode's picker).
+# ---------------------------------------------------------------------------
+
+#: A valid reviewed advanced route in the closed WORKBENCH_ADVANCED_ROUTES shape.
+_ADVANCED_ROUTE = {
+    "route_id": "route.chat-fast",
+    "display_name": "Fast chat",
+    "route_digest": "sha256:" + "a1" * 32,
+    "profile_digest": "sha256:" + "b2" * 32,
+    "serving_contract_version": "1.0.0",
+    "model_profile": "chat-fast",
+    "supported_controls": [
+        {"name": "temperature_milli", "type": "int", "bounds": {"min": 0, "max": 2000}, "default": 700},
+    ],
+}
+
+
+def test_advanced_routes_serves_configured_catalog_without_leaking_config_internals():
+    env = _base_env(WORKBENCH_ADVANCED_ROUTES=json.dumps([_ADVANCED_ROUTE]))
+    client = _wired_client(env)
+    response = client.get("/api/chat/advanced/routes", headers=_ACTOR)
+    assert response.status_code == 200
+    payload = response.json()
+    assert [route["route_id"] for route in payload["routes"]] == ["route.chat-fast"]
+    route = payload["routes"][0]
+    assert route["display_name"] == "Fast chat"
+    assert route["route_digest"] == "sha256:" + "a1" * 32
+    # No endpoint/host/token config internal is representable or present.
+    blob = json.dumps(payload)
+    for forbidden in ("base_url", "endpoint", "token", "://", "credential", "password"):
+        assert forbidden not in blob
+
+
+def test_advanced_routes_actor_gated():
+    env = _base_env(
+        WORKBENCH_ALLOW_INSECURE_DEV_ACTOR="0",
+        WORKBENCH_ADVANCED_ROUTES=json.dumps([_ADVANCED_ROUTE]),
+    )
+    settings = Settings.from_env(env)
+    client = TestClient(create_app(settings=settings, store=MemoryStore(), graph=NullGraph()))
+    # No trusted identity header, dev actor off => 401 before any projection.
+    assert client.get("/api/chat/advanced/routes").status_code == 401
+
+
+def test_advanced_routes_malformed_config_fails_closed():
+    env = _base_env(WORKBENCH_ADVANCED_ROUTES="{ not a json array")
+    client = _wired_client(env)
+    response = client.get("/api/chat/advanced/routes", headers=_ACTOR)
+    assert response.status_code == 503
+    # A malformed catalog never serves a partial route list.
+    assert "routes" not in response.json()
+
+
+def test_advanced_routes_empty_config_is_the_honest_empty_allowlist():
+    # Unset WORKBENCH_ADVANCED_ROUTES => 200 {"routes": []}, exactly the degrade
+    # fetchAdvancedRoutes expects (never a 404); Advanced mode renders no routes.
+    client = _wired_client(_base_env())  # WORKBENCH_ADVANCED_ROUTES unset
+    response = client.get("/api/chat/advanced/routes", headers=_ACTOR)
+    assert response.status_code == 200
+    assert response.json() == {"routes": []}
+
+
 def test_create_live_app_default_produces_no_overrides():
     # The composition seam with an empty switch selects nothing to wire.
     assert build_live_overrides(_base_env()) == {}

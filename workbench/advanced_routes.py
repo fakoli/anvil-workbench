@@ -46,6 +46,7 @@ wired into the live bridge loop here.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -484,6 +485,35 @@ def _supported_controls(entry: Mapping[str, Any], route_id: str) -> tuple[Advanc
         seen.add(descriptor.name)
         controls.append(descriptor)
     return tuple(controls)
+
+
+def parse_advanced_routes_config(raw: str) -> tuple[Mapping[str, Any], ...]:
+    """Parse the raw ``WORKBENCH_ADVANCED_ROUTES`` JSON document, fail closed.
+
+    An empty setting means the Advanced route allowlist is not configured: it
+    parses to an empty tuple, and the resulting discovery publishes no route.
+    Mirrors :func:`workbench.chat_routes.parse_chat_routes_config`.
+    """
+    if not raw.strip():
+        return ()
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AdvancedRouteError(
+            "configured advanced routes are not valid JSON", reason=REASON_MALFORMED
+        ) from exc
+    if not isinstance(document, list):
+        raise AdvancedRouteError(
+            "configured advanced routes must be a JSON array", reason=REASON_MALFORMED
+        )
+    entries: list[Mapping[str, Any]] = []
+    for entry in document:
+        if not isinstance(entry, Mapping):
+            raise AdvancedRouteError(
+                "each configured advanced route must be a JSON object", reason=REASON_MALFORMED
+            )
+        entries.append(entry)
+    return tuple(entries)
 
 
 def discover_advanced_routes(configured_routes: Sequence[Mapping[str, Any]]) -> DiscoveredAdvancedRoutes:

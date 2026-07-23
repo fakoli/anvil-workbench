@@ -28,6 +28,11 @@ from .advanced_playground import (
     UNKNOWN_ITEM_DETAIL,
     build_comparison,
 )
+from .advanced_routes import (
+    AdvancedRouteError,
+    discover_advanced_routes,
+    parse_advanced_routes_config,
+)
 from .chat_routes import (
     ChatRouteError,
     ChatRouteSelection,
@@ -2345,6 +2350,27 @@ def create_app(
                 detail="chat routes are not configured",
             ) from exc
         return scrub_config_payload(discovered.as_dict())
+
+    @app.get("/api/chat/advanced/routes")
+    def advanced_routes(_actor: str = Depends(actor)) -> dict[str, Any]:
+        """The operator-reviewed Advanced-mode route allowlist for the browser.
+
+        Mirrors ``/api/chat/routes`` for the richer ``advanced-branch.v1``
+        route_capability shape (each control declares its type, bounds/allowed
+        values, default, and policy-owned flag). An UNSET/empty
+        ``WORKBENCH_ADVANCED_ROUTES`` is the honest empty allowlist
+        (``{"routes": []}``, 200); a MALFORMED config fails closed (503, fixed
+        detail). The projection carries identifiers, digests, and declared
+        control metadata ONLY -- never an endpoint, URL, token, or credential.
+        """
+        try:
+            discovered = discover_advanced_routes(parse_advanced_routes_config(settings.advanced_routes))
+        except AdvancedRouteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="advanced routes are not configured",
+            ) from exc
+        return scrub_config_payload(discovered.browser_projection())
 
     @app.get("/healthz")
     def health() -> dict[str, Any]:
