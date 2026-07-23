@@ -299,6 +299,27 @@ def test_non_conforming_client_branch_id_still_completes():
         assert terminal["trace"]["status"] == "complete"
 
 
+def test_trace_carries_reported_token_usage_and_latency():
+    # Serving reports token usage on the completion event; the trace (and thus the
+    # comparison) must carry those real counts + a wall-clock latency, not zeros.
+    completed_with_usage = {
+        "type": "response.completed",
+        "response": {"id": "resp_1", "usage": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19}},
+    }
+    transport = ScriptedTransport([_delta("hello there"), completed_with_usage])
+    with _client(transport) as client:
+        conversation_id = _create_conversation(client)
+        parent = _create_parent_turn(client, conversation_id)
+        response = _run(client, conversation_id, parent)
+        assert response.status_code == 200, response.text
+        terminal = _frames(response.text)[-1]
+        assert terminal["outcome"] == "completed"
+        usage = terminal["trace"]["usage"]
+        assert usage["input_tokens"] == 12 and usage["output_tokens"] == 7
+        # Wall-clock latency is stamped (a non-negative int); no longer a fixed zero.
+        assert isinstance(usage["latency_ms"], int) and usage["latency_ms"] >= 0
+
+
 def test_no_url_or_token_appears_in_any_streamed_byte():
     transport = ScriptedTransport([_delta("secretless"), _COMPLETED])
     with _client(transport) as client:

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Iterator, Mapping
@@ -62,7 +63,7 @@ from .contracts import validate_advanced_trace
 from .conversation_models import ConversationActor, TurnRedaction
 from .models import new_id, now_utc
 from .redaction import redact_config_text
-from .response_lifecycle_store import SafeUsage
+from .response_lifecycle_store import MAX_USAGE_DURATION_MS, MAX_USAGE_TOKENS, SafeUsage
 
 #: A per-attempt advanced trace is preference/experiment evidence only, never a
 #: model qualification or a delivery claim.  This module refuses to let one cross
@@ -318,7 +319,7 @@ def run_advanced_stream(
     -- distinct from a genuine completion and never rendered as complete.  Builds
     and schema-validates the redacted advanced-trace.v1 record before returning.
     """
-    relay, classifier = _prepare_advanced_stream(
+    relay, classifier, started = _prepare_advanced_stream(
         selection=selection, prompt=prompt, transport=transport, instructions=instructions,
         cancel=cancel, structured_output_mode=structured_output_mode,
         lifecycle_store=lifecycle_store, actor=actor, conversation_id=conversation_id,
@@ -341,7 +342,8 @@ def run_advanced_stream(
         lifecycle_store=lifecycle_store, actor=actor, request_id=request_id, selection=selection,
         prompt=prompt, branch_id=branch_id, conversation_id=conversation_id, turn_id=turn_id,
         structured_output_mode=structured_output_mode, output_validator=output_validator,
-        usage=usage, instructions=instructions, route_request_id=route_request_id, summary=summary,
+        usage=usage, started=started, instructions=instructions,
+        route_request_id=route_request_id, summary=summary,
     )
 
 
@@ -383,7 +385,7 @@ def stream_advanced_attempt(
     cancelled/timed-out/malformed/unavailable/schema-invalid attempt never reaches
     the caller as a completed frame.
     """
-    relay, classifier = _prepare_advanced_stream(
+    relay, classifier, started = _prepare_advanced_stream(
         selection=selection, prompt=prompt, transport=transport, instructions=instructions,
         cancel=cancel, structured_output_mode=structured_output_mode,
         lifecycle_store=lifecycle_store, actor=actor, conversation_id=conversation_id,
@@ -407,7 +409,8 @@ def stream_advanced_attempt(
         lifecycle_store=lifecycle_store, actor=actor, request_id=request_id, selection=selection,
         prompt=prompt, branch_id=branch_id, conversation_id=conversation_id, turn_id=turn_id,
         structured_output_mode=structured_output_mode, output_validator=output_validator,
-        usage=usage, instructions=instructions, route_request_id=route_request_id, summary=summary,
+        usage=usage, started=started, instructions=instructions,
+        route_request_id=route_request_id, summary=summary,
     )
 
 
@@ -423,12 +426,13 @@ def _prepare_advanced_stream(
     actor: ConversationActor,
     conversation_id: str,
     request_id: str,
-) -> tuple[ChatStreamRelay, _ClassifyingTransport]:
+) -> tuple[ChatStreamRelay, _ClassifyingTransport, float]:
     """Build the bounded request, classifying relay, and begin the durable lifecycle.
 
     Shared by the blocking and streaming entry points so both open the stream
     identically -- same bounded request, same malformed-frame classifier, same
-    single ``begin`` on the reconnect-safe lifecycle store.
+    single ``begin`` on the reconnect-safe lifecycle store.  Also returns the
+    monotonic start time so the settle can stamp the attempt's wall-clock latency.
     """
     if structured_output_mode not in ("text", "json_schema"):
         raise AdvancedRuntimeError(f"unsupported structured output mode: {structured_output_mode!r}")
@@ -436,7 +440,26 @@ def _prepare_advanced_stream(
     classifier = _ClassifyingTransport(transport)
     relay = ChatStreamRelay.for_prepared_request(request, classifier, cancel)
     lifecycle_store.begin(actor, conversation_id, request_id)
-    return relay, classifier
+    return relay, classifier, time.monotonic()
+
+
+def _usage_from_relay(relay: ChatStreamRelay, started: float) -> SafeUsage:
+    """Build a bounded :class:`SafeUsage` from the relay's reported tokens + latency.
+
+    The tokens come from the completion event Serving reports (``relay.usage_tokens``,
+    None for a non-completed attempt -> zero), and ``duration_ms`` is this attempt's
+    wall-clock (``time.monotonic`` since the stream opened).  Both are clamped to the
+    SafeUsage ceilings so a hostile/oversized count can never overflow the durable
+    record -- this is the ONLY content-free usage metadata the trace carries.
+    """
+    tokens = relay.usage_tokens
+    input_tokens, output_tokens = tokens if tokens is not None else (0, 0)
+    duration_ms = min(max(int((time.monotonic() - started) * 1000), 0), MAX_USAGE_DURATION_MS)
+    return SafeUsage(
+        input_tokens=min(input_tokens, MAX_USAGE_TOKENS),
+        output_tokens=min(output_tokens, MAX_USAGE_TOKENS),
+        duration_ms=duration_ms,
+    )
 
 
 def _settle_advanced_attempt(
@@ -456,6 +479,7 @@ def _settle_advanced_attempt(
     structured_output_mode: str,
     output_validator: Callable[[str], bool] | None,
     usage: SafeUsage | None,
+    started: float,
     instructions: str | None,
     route_request_id: str | None,
     summary: str | None,
@@ -488,7 +512,11 @@ def _settle_advanced_attempt(
     # complete, so it persists ``interrupted`` and a reconnecting client never sees
     # ``completed`` for a settled-failed attempt (T003 criterion 1).
     lifecycle_state = _LIFECYCLE_STATE_FOR_STATE[state]
-    settled_usage = usage if usage is not None else SafeUsage()
+    # An explicit caller-supplied usage wins (tests/callers that pre-measure);
+    # otherwise derive the real usage from the relay's reported tokens + this
+    # attempt's wall-clock latency, so the trace/comparison shows true numbers
+    # instead of zeros.
+    settled_usage = usage if usage is not None else _usage_from_relay(relay, started)
     lifecycle_store.advance(
         actor, request_id, lifecycle_state, usage=settled_usage, seq=terminal_seq,
     )
