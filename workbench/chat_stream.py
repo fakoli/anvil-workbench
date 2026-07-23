@@ -115,6 +115,28 @@ _COMPLETED_EVENT = "response.completed"
 _FAILURE_EVENTS = frozenset({"response.failed", "response.incomplete", "response.error", "error"})
 
 
+def _parse_completed_usage(event: Mapping[str, Any]) -> tuple[int, int] | None:
+    """Extract ``(input_tokens, output_tokens)`` from a ``response.completed`` event.
+
+    Serving reports token usage only on the completion event
+    (``response.usage: {input_tokens, output_tokens, total_tokens}``).  Read
+    defensively: only a non-negative int is taken (anything else -> 0), and the
+    counts are content-free integers -- never a string, so no credential can ride
+    through.  Returns ``None`` when the event carries no usage block.  The caller
+    (the advanced runtime) clamps to the ``SafeUsage`` bound before persisting.
+    """
+    response = event.get("response")
+    usage = response.get("usage") if isinstance(response, Mapping) else None
+    if not isinstance(usage, Mapping):
+        return None
+
+    def _count(key: str) -> int:
+        value = usage.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    return (_count("input_tokens"), _count("output_tokens"))
+
+
 class CancellationToken:
     """A one-way cancel flag the caller trips to stop an in-flight relay.
 
@@ -282,6 +304,9 @@ class ChatStreamRelay:
         self._outcome: StreamOutcome | None = None
         self._parts: list[str] = []
         self._chars = 0
+        #: Token usage reported on the completion event, or None until/unless a
+        #: ``response.completed`` carrying a usage block arrives.
+        self._usage_tokens: tuple[int, int] | None = None
 
     @classmethod
     def for_prepared_request(
@@ -324,6 +349,15 @@ class ChatStreamRelay:
     @property
     def partial_text(self) -> str:
         return "".join(self._parts)
+
+    @property
+    def usage_tokens(self) -> tuple[int, int] | None:
+        """``(input_tokens, output_tokens)`` reported on completion, or None.
+
+        Only set when a ``response.completed`` event carried a usage block; a
+        cancelled/failed/timed-out stream never reports usage, so this stays None.
+        """
+        return self._usage_tokens
 
     def terminal_turn_status(self) -> str:
         """The chat-turn.v1 lifecycle status for the settled outcome.
@@ -438,6 +472,9 @@ class ChatStreamRelay:
             text = delta if isinstance(delta, str) else ""
             return RelayEvent(kind="delta", text=text)
         if event_type == _COMPLETED_EVENT:
+            # Capture the reported token usage before settling; it rides only on
+            # the completion event and is otherwise discarded.
+            self._usage_tokens = _parse_completed_usage(event)
             return RelayEvent(kind="terminal", outcome=StreamOutcome.completed)
         if event_type in _FAILURE_EVENTS:
             return RelayEvent(kind="terminal", outcome=StreamOutcome.serving_unavailable)
