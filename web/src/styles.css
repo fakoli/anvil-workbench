@@ -735,3 +735,42 @@
 .mh-note{margin:11px 0 0;padding-top:9px;border-top:1px solid #1b2a30;font-size:9px;color:#7f989c;line-height:1.5}
 .mh-checked{display:block;margin-top:6px;font-family:'DM Mono',monospace;font-size:8px;color:#556a6f}
 @media(max-width:720px){.mh-tag{display:none}.mh-cluster{gap:5px;padding:5px 7px}}
+
+/* ============================================================================
+   Mobile pass: a compact, UNIFIED nav + stacked content on phones. Every rule
+   here lives inside a media query, so the desktop layout is untouched. Nav items
+   and action buttons keep their aria-label/title, so nothing loses its name.
+   ==========================================================================*/
+.nav-label,.btn-label{display:inline}
+@media(max-width:900px){
+  /* The rail collapses to a compact top strip on EVERY page (previously only
+     Chat/Voice/Explorer/Settings; the workspace pages kept the fixed 230px
+     sidebar and forced a horizontal scroll on a phone). */
+  .app-shell{flex-direction:column}
+  .rail{position:static;inset:auto;width:100%;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px;padding:10px 14px;border-right:0;border-bottom:1px solid var(--line-soft)}
+  .rail nav{grid-auto-flow:column;grid-template-columns:none;display:flex;flex-wrap:wrap;gap:4px}
+  .rail .brand{padding:0 10px 0 0}
+  .rail-footer{margin:0 0 0 auto;display:flex;gap:8px;align-items:center}
+  .rail-footer .new-run{width:auto;padding:8px 12px}
+  .rail-footer .profile{margin:0;padding:0;border:0;grid-template-columns:27px auto}
+  .rail-footer .profile>div,.rail-footer .profile>b{display:none}
+  .workspace{margin-left:0;width:100%}
+  /* Wide two-column layouts stack instead of forcing a min-width scroll. */
+  .main-grid{min-width:0;grid-template-columns:1fr}
+  .main-grid>.trace{border-left:0;border-top:1px solid var(--line-soft)}
+  .workspace-view,.empty-view{padding:28px 18px}
+  .delivery{padding:24px 18px}
+  .data-list article{grid-template-columns:1fr}
+  .toast{left:16px;right:16px}
+  .nav-item{padding:9px 11px}
+}
+@media(max-width:560px){
+  /* Phones: the nav is icon-only and repeated action buttons drop their text
+     label -- the aria-label/title still names each one for a screen reader and
+     on hover, so nothing becomes a mystery glyph. */
+  .nav-label,.btn-label{display:none}
+  .rail .brand span{display:none}
+  .nav-item{padding:9px;gap:0}
+  .nav-item b{width:auto}
+  .turn-actions button{min-width:36px;justify-content:center}
+}
