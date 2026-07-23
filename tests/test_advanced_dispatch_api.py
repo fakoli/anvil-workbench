@@ -682,6 +682,18 @@ def test_client_disconnect_settles_all_branches_cancelled_not_complete():
                     break
                 time.sleep(0.05)
 
+            # Transport teardown is not atomically ordered with the turn-status
+            # update the loop above waits on: a branch can read `cancelled` a beat
+            # before its transport flips `.closed`. Wait for closure here too, while
+            # the server is still running so teardown can progress, rather than
+            # asserting it synchronously below — a bare assert raced the teardown
+            # under CI load and flaked, unrelated to the behavior under test.
+            close_deadline = time.time() + 5
+            while time.time() < close_deadline and not all(
+                t.closed for t in transports.values()
+            ):
+                time.sleep(0.05)
+
     assert len(settled) == 3, "the disconnect settle path never settled all three siblings"
     assert all(a["status"] == "cancelled" for a in settled)
     assert all(a["committed"] is False for a in settled)
