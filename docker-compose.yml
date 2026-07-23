@@ -57,6 +57,11 @@ services:
       # endpoint/URL/token/policy field). Empty serves the honest empty allowlist;
       # a malformed value fails GET /api/chat/routes closed (503).
       WORKBENCH_CHAT_ROUTES: ${WORKBENCH_CHAT_ROUTES:-}
+      # Operator-reviewed Advanced-mode route allowlist (advanced-branch.v1
+      # route_capability shape; each control declares type/bounds/policy-owned).
+      # Empty serves the honest empty allowlist; a malformed value fails
+      # GET /api/chat/advanced/routes closed (503).
+      WORKBENCH_ADVANCED_ROUTES: ${WORKBENCH_ADVANCED_ROUTES:-}
       # Explicit live-surface opt-in. Empty keeps every injectable supervision
       # surface None -> 503 (the hermetic default). An unknown name fails the hub
       # closed at startup. Each named surface needs its reviewed dependency below.
