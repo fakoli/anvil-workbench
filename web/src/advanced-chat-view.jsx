@@ -453,20 +453,20 @@ export default function AdvancedPanel({
               <small>{branch.routeId}{branch.saved ? ' · saved' : ''}</small>
             </div>
             <div className="adv-branch-actions">
-              <button type="button" aria-label={`Inspect ${branch.label}`} disabled={!ops.inspect} onClick={(event) => openInspector(event, branch.id)}>Inspect</button>
-              <button type="button" aria-label={`Retry ${branch.label}`} disabled={!ops.retry} onClick={() => onRerun?.(branch, 'retry')}>Retry</button>
-              <button type="button" aria-label={`Fork ${branch.label}`} disabled={!ops.fork} onClick={() => onRerun?.(branch, 'fork')}>Fork</button>
-              <button type="button" aria-label={`Compare ${branch.label}`} aria-pressed={comparing} disabled={!ops.compare && !comparing} onClick={(event) => clickCompare(event, branch)}>{comparing ? 'Comparing' : 'Compare'}</button>
+              <button type="button" title="Inspect" aria-label={`Inspect ${branch.label}`} disabled={!ops.inspect} onClick={(event) => openInspector(event, branch.id)}><span aria-hidden="true">◎</span><span className="btn-label">Inspect</span></button>
+              <button type="button" title="Retry" aria-label={`Retry ${branch.label}`} disabled={!ops.retry} onClick={() => onRerun?.(branch, 'retry')}><span aria-hidden="true">↻</span><span className="btn-label">Retry</span></button>
+              <button type="button" title="Fork" aria-label={`Fork ${branch.label}`} disabled={!ops.fork} onClick={() => onRerun?.(branch, 'fork')}><span aria-hidden="true">⋔</span><span className="btn-label">Fork</span></button>
+              <button type="button" title="Compare" aria-label={`Compare ${branch.label}`} aria-pressed={comparing} disabled={!ops.compare && !comparing} onClick={(event) => clickCompare(event, branch)}><span aria-hidden="true">⇄</span><span className="btn-label">{comparing ? 'Comparing' : 'Compare'}</span></button>
               {/* Save's accessible name tracks its state so the visible "Saved"
                   always matches the name (WCAG 2.5.3); aria-pressed carries the
                   saved state. On save, focus moves to Reopen (MUST-2). */}
-              <button type="button" aria-label={branch.saved ? `Saved ${branch.label}` : `Save ${branch.label}`} aria-pressed={branch.saved ? true : undefined} disabled={!ops.save} onClick={() => clickSave(branch)}>{branch.saved ? 'Saved' : 'Save'}</button>
+              <button type="button" title={branch.saved ? 'Saved' : 'Save'} aria-label={branch.saved ? `Saved ${branch.label}` : `Save ${branch.label}`} aria-pressed={branch.saved ? true : undefined} disabled={!ops.save} onClick={() => clickSave(branch)}><span aria-hidden="true">{branch.saved ? '★' : '☆'}</span><span className="btn-label">{branch.saved ? 'Saved' : 'Save'}</span></button>
               {reopenConfirm === branch.id
                 ? <>
                     <button type="button" className="adv-reopen-confirm" aria-label={`Confirm reopen ${branch.label}`} onClick={() => reopen(branch)}>Confirm reopen</button>
                     <button type="button" aria-label={`Keep editing instead of reopening ${branch.label}`} onClick={() => { setReopenConfirm(null); setAnnounce('Kept your current editor content.') }}>Keep editing</button>
                   </>
-                : <button type="button" ref={(el) => { if (el) reopenRefs.current[branch.id] = el; else delete reopenRefs.current[branch.id] }} aria-label={`Reopen ${branch.label}`} disabled={!ops.reopen} onClick={() => requestReopen(branch)}>Reopen</button>}
+                : <button type="button" title="Reopen" ref={(el) => { if (el) reopenRefs.current[branch.id] = el; else delete reopenRefs.current[branch.id] }} aria-label={`Reopen ${branch.label}`} disabled={!ops.reopen} onClick={() => requestReopen(branch)}><span aria-hidden="true">↺</span><span className="btn-label">Reopen</span></button>}
             </div>
           </li>
         })}

@@ -933,9 +933,11 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     // The save is announced in the panel's role=status live region.
     const live = document.querySelector('.adv-live')
     expect(live.textContent).toMatch(/saved/i)
-    // The saved control's accessible name matches its visible text (WCAG 2.5.3).
+    // The saved control's accessible name matches its VISIBLE LABEL (WCAG 2.5.3).
+    // The button carries a decorative aria-hidden icon plus a `.btn-label` span;
+    // the label text (not the icon) is what must match the accessible name.
     const saved = screen.getByRole('button', { name: /^Saved/ })
-    expect(saved.textContent).toBe('Saved')
+    expect(saved.querySelector('.btn-label').textContent).toBe('Saved')
   })
 
   it('S1: the Retry control re-runs the SAME branch config as a sibling in the one transcript', async () => {
