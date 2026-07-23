@@ -875,6 +875,23 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     expect(call.prompt).toBe('retry me')
   })
 
+  it('adopts the server turn_id so a chained Run forks from the real turn, not a local id', async () => {
+    // After an advanced run settles (server turnId 'turn_adv'), the settled
+    // transcript turn must carry that id -- not the optimistic local-adv id --
+    // so a follow-on Run/Branch/Retry references the real server turn. A chained
+    // Run forks from turns[last], so its parent_turn_id proves the adoption.
+    const user = await openAdvanced()
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'first')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('tuned answer')
+    runAdvancedBranch.mockResolvedValueOnce({ text: 'second answer', terminal: 'completed', needsRefresh: false, trace: advancedTrace, turnId: 'turn_adv2', branchId: 'advbranch_srv2' })
+    await user.type(screen.getByRole('textbox', { name: 'Advanced prompt' }), 'second')
+    await user.click(screen.getByRole('button', { name: 'Run advanced branch' }))
+    await screen.findByText('second answer')
+    const chained = runAdvancedBranch.mock.calls.at(-1)[0]
+    expect(chained.parentTurnId).toBe('turn_adv') // the first run's SERVER id, not local-adv
+  })
+
   it('S3: Reopen confirms before clobbering DIFFERENT in-progress editor content, then loads on confirm', async () => {
     const user = await openAdvanced()
     const promptField = screen.getByRole('textbox', { name: 'Advanced prompt' })
