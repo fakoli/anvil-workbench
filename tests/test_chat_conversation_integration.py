@@ -314,6 +314,17 @@ _PROBE_BODY_BY_SUFFIX: dict[str, dict | None] = {
         "parent_turn_id": "turn_absent", "branch_id": "branch_probe",
         "route_id": "chat.heavy", "prompt": "hi", "controls": {},
     },
+    # The LIVE parallel multi-route dispatch join: ownership is likewise checked
+    # before the per-route advanced preflight or any Serving call, so a foreign or
+    # missing id is the fixed 404 identically -- no existence oracle. The body must
+    # be pydantic-valid (>=2 routes) to reach the ownership gate rather than a 422.
+    "/advanced/dispatch": {
+        "parent_turn_id": "turn_absent", "prompt": "hi",
+        "routes": [
+            {"route_id": "chat.heavy", "controls": {}},
+            {"route_id": "chat.fast", "controls": {}},
+        ],
+    },
     "/turns": {"role": "assistant", "status": "complete"},
     "/turns/{turn_id}/retry": {"role": "assistant", "status": "complete"},
     "/turns/{turn_id}/branch": {"role": "assistant", "status": "complete"},

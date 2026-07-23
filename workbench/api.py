@@ -50,6 +50,7 @@ from .conversation_transfer import (
 )
 from .contracts import settings_actor_view
 from .conversation_api import (
+    build_advanced_dispatch_router,
     build_advanced_run_router,
     build_chat_send_router,
     build_conversation_router,
@@ -2234,6 +2235,19 @@ def create_app(
     # Model traffic flows ONLY through the same Serving Responses stream transport --
     # no provider fallback, and the router URL/token never leak.
     app.include_router(build_advanced_run_router(
+        actor, conversation_store, response_lifecycle_store,
+        lambda: discover_advanced_routes(parse_advanced_routes_config(settings.advanced_routes)),
+        chat_stream_transport_factory,
+    ))
+    # LIVE parallel multi-route dispatch (advanced-model-playground): fan one shared
+    # prompt out across 2..MAX_DISPATCH_ROUTES reviewed advanced routes concurrently,
+    # forking N mode="advanced" siblings under one parent and multiplexing their live
+    # progress onto ONE NDJSON stream tagged by branch_id. Same fail-closed discipline
+    # as the single-branch run (ownership 404, per-route preflight 422/503) with an
+    # all-routes-validated-before-any-fork ordering, ONE actor slot for the whole
+    # batch, per-branch request_id/cancel/seq isolation, and an N-way disconnect
+    # settle. Uses the SAME Serving stream transport factory -- no provider fallback.
+    app.include_router(build_advanced_dispatch_router(
         actor, conversation_store, response_lifecycle_store,
         lambda: discover_advanced_routes(parse_advanced_routes_config(settings.advanced_routes)),
         chat_stream_transport_factory,

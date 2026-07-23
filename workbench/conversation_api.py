@@ -26,6 +26,7 @@ values, maps errors, and serializes responses:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import json
@@ -248,6 +249,52 @@ class AdvancedRunInput(_ChatInput):
     prompt: str = Field(min_length=1, max_length=MAX_CONTENT_TEXT_CHARS)
     instructions: str | None = Field(default=None, max_length=MAX_CONTENT_TEXT_CHARS)
     structured_output_mode: str = Field(default="text", pattern=r"^(text|json_schema)$")
+
+
+#: Hard bound on how many reviewed routes one live parallel dispatch may fan out
+#: across.  The lower bound is 2 (a single route is exactly ``/advanced/run``); the
+#: upper bound mirrors the advanced-branch.v1 concurrency cap so a browser batch can
+#: never request an unbounded fan-out.
+MAX_DISPATCH_ROUTES = 4
+
+#: Concurrent dispatch BATCHES per actor. A batch already fans out to up to
+#: :data:`MAX_DISPATCH_ROUTES` real concurrent Serving streams inside one request,
+#: so one batch at a time bounds a single actor's dispatch-driven model traffic to
+#: MAX_DISPATCH_ROUTES streams -- an explicit, documented cap rather than letting
+#: the per-stream ceiling (which a batch holds only ONE of) understate the true
+#: fan-out load. A second concurrent batch from the same actor fails closed (429).
+MAX_CONCURRENT_DISPATCH_BATCHES_PER_ACTOR = 1
+
+
+class RouteControlInput(_ChatInput):
+    """One route + its tuned controls in a multi-route dispatch batch.
+
+    ``controls`` is typed ``Any`` so either submitted shape (a ``{name: value}``
+    mapping or a ``submitted_controls`` array) passes the edge; the fail-closed
+    :func:`~workbench.advanced_routes.validate_advanced_selection` -- not this
+    model -- is the single allowlist authority for the route and its controls.
+    """
+
+    route_id: str = Field(min_length=1, max_length=128)
+    controls: Any = Field(default_factory=dict)
+
+
+class MultiDispatchInput(_ChatInput):
+    """The browser's LIVE parallel multi-route dispatch body (``runAdvancedDispatch``).
+
+    One shared prompt fanned out across 2..:data:`MAX_DISPATCH_ROUTES` reviewed
+    advanced routes as concurrent ``mode="advanced"`` siblings under one parent
+    turn.  The field set is closed (``extra="forbid"``); the batch bound is a
+    422 below 2 or above the cap, and every route in the batch is preflight-
+    validated fail-closed BEFORE a single sibling is forked or a Serving request
+    is opened.
+    """
+
+    parent_turn_id: str = Field(min_length=1, max_length=133)
+    routes: list[RouteControlInput] = Field(min_length=2, max_length=MAX_DISPATCH_ROUTES)
+    prompt: str = Field(min_length=1, max_length=MAX_CONTENT_TEXT_CHARS)
+    instructions: str | None = Field(default=None, max_length=MAX_CONTENT_TEXT_CHARS)
+    structured_output_mode: str | None = Field(default=None, pattern=r"^(text|json_schema)$")
 
 
 # --- typed-value conversion (validation errors fail closed as 409) ----------
@@ -1360,6 +1407,296 @@ def build_advanced_run_router(
                         store.advance_turn_status(actor, conversation_id, turn_id, "cancelled")
                     except ConversationStoreError:
                         pass  # already settled by a race; leave the terminal stable
+                _release_stream_slot(actor.actor_id)
+
+        return StreamingResponse(_frames(), media_type="application/x-ndjson")
+
+    return router
+
+
+def build_advanced_dispatch_router(
+    actor_dependency: Callable[..., str],
+    conversation_store: ConversationStore | None,
+    lifecycle_store: ResponseLifecycleStore | None,
+    advanced_routes_provider: Callable[[], DiscoveredAdvancedRoutes],
+    transport_factory: Callable[[Any], ServingStreamTransport],
+) -> APIRouter:
+    """Mount ``POST /api/conversations/{id}/advanced/dispatch`` -- LIVE multi-route fan-out.
+
+    The parallel sibling of ``build_advanced_run_router``: the browser client
+    (``web/src/api.js`` ``runAdvancedDispatch``) POSTs one shared prompt plus a
+    batch of 2..:data:`MAX_DISPATCH_ROUTES` reviewed routes and reads a single
+    newline-delimited stream that MULTIPLEXES every branch, each frame tagged by
+    ``branch_id`` so the browser renders N live side-by-side columns.  Each branch
+    is an ordinary streaming ``mode="advanced"`` sibling forked under the SAME
+    parent turn -- exactly as ``dispatch_parallel`` / the single-branch run -- so the
+    existing "Build comparison" works over them unchanged.
+
+    The discipline is fail-closed and mirrors the single-branch join, in THIS order:
+
+    * Ownership first: a missing OR foreign conversation id raises
+      ``UnknownConversationError``, rendered as the same fixed 404 as a truly missing
+      id (no existence oracle) -- BEFORE any Serving call or fork.
+    * Preflight EVERY route against the operator-discovered ADVANCED routes: an
+      unconfigured provider is a 503; an unknown route, an undeclared/out-of-range
+      control, a policy-owned override, or a duplicate route id in the batch is a
+      typed 422 -- and this completes for ALL routes with NO fork and NO Serving
+      effect, so an invalid batch leaves not one sibling turn (mirrors
+      ``advanced_dispatch._preflight``'s "nothing forked on refusal").
+    * A single per-actor concurrency slot is acquired for the WHOLE batch (the
+      fan-out is internal), refusing 429 beyond the ceiling -- so a batch consumes
+      ONE slot, not N.
+    * The N siblings are forked SEQUENTIALLY up front on the single-threaded store,
+      so each draws a distinct ``sibling_index``; a fork that raises after some
+      succeeded settles the already-forked siblings and releases the slot.
+    * The branches stream concurrently under anyio structured concurrency; each
+      branch owns a DISTINCT ``request_id`` (its own durable lifecycle record), a
+      DISTINCT ``CancellationToken``, and a DISTINCT per-branch wire ``seq`` counter
+      (the FE reducer resets per branch and reads a first seq>1 as a gap), so no
+      branch can regress or duplicate another.  A branch crash is isolated to its
+      own sibling (settled failed) and never cancels a sibling.
+    * A client disconnect cancels the task group: every branch's teardown trips its
+      cancel, closes its generator, and settles its sibling cancelled (durable turn
+      AND lifecycle), so a disconnect settles ALL N, never emits a completion after
+      cancel, and leaves no streaming turn or in_progress lifecycle.
+
+    When ``conversation_store`` or ``lifecycle_store`` is ``None`` the endpoint
+    refuses with 503, matching the sibling advanced-run surface.
+    """
+    router = APIRouter(prefix="/api/conversations")
+
+    active_streams: dict[str, int] = {}
+    active_lock = threading.Lock()
+
+    def _acquire_stream_slot(actor_id: str) -> bool:
+        with active_lock:
+            # A dispatch batch fans out to up to MAX_DISPATCH_ROUTES concurrent
+            # Serving streams, so its ceiling is per-BATCH (default 1) -- bounding a
+            # single actor's dispatch model traffic explicitly, not the per-stream 2.
+            if active_streams.get(actor_id, 0) >= MAX_CONCURRENT_DISPATCH_BATCHES_PER_ACTOR:
+                return False
+            active_streams[actor_id] = active_streams.get(actor_id, 0) + 1
+            return True
+
+    def _release_stream_slot(actor_id: str) -> None:
+        with active_lock:
+            remaining = active_streams.get(actor_id, 0) - 1
+            if remaining <= 0:
+                active_streams.pop(actor_id, None)
+            else:
+                active_streams[actor_id] = remaining
+
+    def stores() -> tuple[ConversationStore, ResponseLifecycleStore]:
+        if conversation_store is None or lifecycle_store is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="chat persistence is not configured; set WORKBENCH_CHAT_HASH_KEY",
+            )
+        return conversation_store, lifecycle_store
+
+    def dispatch_actor(current_actor: str = Depends(actor_dependency)) -> ConversationActor:
+        return conversation_actor(current_actor)
+
+    @router.post("/{conversation_id}/advanced/dispatch")
+    async def dispatch_advanced(
+        conversation_id: str,
+        payload: MultiDispatchInput,
+        actor: ConversationActor = Depends(dispatch_actor),
+    ) -> StreamingResponse:
+        store, lifecycle = stores()
+        # (1) Ownership: a missing OR foreign id raises UnknownConversationError,
+        # rendered as the fixed 404 -- strictly before any fork or Serving call.
+        store.get_conversation_with_turns(actor, conversation_id)
+
+        # (2) Preflight EVERY route fail-closed, with NO fork and NO Serving effect:
+        # an unconfigured provider -> 503; an unknown route, undeclared/out-of-range
+        # control, policy-owned override, or a duplicate route id -> typed 422.
+        try:
+            discovered = advanced_routes_provider()
+        except AdvancedRouteError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="advanced routes are not configured",
+            ) from exc
+        seen_route_ids: set[str] = set()
+        selections = []
+        for route in payload.routes:
+            if route.route_id in seen_route_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="advanced dispatch batch declares a duplicate route",
+                )
+            seen_route_ids.add(route.route_id)
+            try:
+                selections.append(validate_advanced_selection(route.route_id, route.controls, discovered))
+            except AdvancedRouteError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="advanced route selection is not allowed",
+                ) from exc
+
+        # (3) One per-actor concurrency slot for the WHOLE batch (the fan-out is
+        # internal; it holds one slot, not N), before any durable write.
+        if not _acquire_stream_slot(actor.actor_id):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="too many concurrent chat streams are active for this actor",
+            )
+
+        structured_output_mode = payload.structured_output_mode or "text"
+        branches: list[dict[str, Any]] = []
+        try:
+            # (4) Fork the N siblings SEQUENTIALLY up front on the single-threaded
+            # store so each draws a distinct sibling_index; only the streaming below
+            # runs concurrently.  A fork that raises after some succeeded settles the
+            # already-forked siblings (fail closed) before re-raising.
+            for index, selection in enumerate(selections):
+                turn = store.branch_turn(
+                    actor, conversation_id, payload.parent_turn_id,
+                    role="assistant", status="streaming", redaction=_ADVANCED_REDACTION, mode="advanced",
+                )
+                # (5) Each branch owns a DISTINCT request_id, cancel token, and a
+                # PER-BRANCH wire seq counter -- a shared counter would make the FE
+                # reducer read a branch's first frame (seq>1) as a dropped-frame gap.
+                branch_id = new_id("advbranch")
+                request_id = new_id("resp")
+                cancel = CancellationToken()
+                transport = transport_factory(selection)
+                attempt_gen = stream_advanced_attempt(
+                    selection=selection, prompt=payload.prompt, transport=transport,
+                    branch_id=branch_id, conversation_id=conversation_id, turn_id=turn.id,
+                    lifecycle_store=lifecycle, actor=actor, request_id=request_id,
+                    instructions=payload.instructions, cancel=cancel,
+                    structured_output_mode=structured_output_mode,
+                )
+                branches.append({
+                    "route_id": selection.route.route_id,
+                    "turn_id": turn.id,
+                    "branch_id": branch_id,
+                    "request_id": request_id,
+                    "cancel": cancel,
+                    "wire_seq": itertools.count(1),
+                    "gen": attempt_gen,
+                    "result": None,
+                    "settled": False,
+                })
+        except Exception:
+            # Settle any siblings already forked before the failure, then release the
+            # slot -- nothing is left streaming and the batch fails closed.
+            for branch in branches:
+                with contextlib.suppress(Exception):
+                    branch["gen"].close()
+                with contextlib.suppress(Exception):
+                    branch["cancel"].cancel()
+                with contextlib.suppress(ConversationStoreError):
+                    store.advance_turn_status(actor, conversation_id, branch["turn_id"], "failed")
+            _release_stream_slot(actor.actor_id)
+            raise
+
+        async def _branch_task(branch: dict[str, Any], sender: Any) -> None:
+            gen = branch["gen"]
+
+            def _pull() -> Any:
+                try:
+                    return next(gen)
+                except StopIteration as stop:
+                    if isinstance(stop.value, AdvancedTurnResult):
+                        branch["result"] = stop.value
+                    return _PULL_DONE
+
+            async with sender:
+                try:
+                    while True:
+                        # abandon_on_cancel: a client disconnect cancels the await
+                        # immediately (the blocked read is abandoned) so the finally
+                        # settles this branch cancelled -- no terminal is PROCESSED
+                        # after the client is gone.
+                        frame = await anyio.to_thread.run_sync(_pull, abandon_on_cancel=True)
+                        if frame is _PULL_DONE:
+                            result = branch["result"]
+                            if result is None:
+                                break  # torn down without a settled result; finally settles cancelled
+                            # Persist the settled terminal status FIRST, then emit the
+                            # wire terminal carrying the settled ids + redacted trace.
+                            store.advance_turn_status(
+                                actor, conversation_id, branch["turn_id"], result.turn_status,
+                            )
+                            branch["settled"] = True
+                            await sender.send({
+                                "branch_id": branch["branch_id"], "seq": next(branch["wire_seq"]),
+                                "kind": "terminal", "outcome": wire_outcome_for_state(result.state),
+                                "turn_id": branch["turn_id"], "trace": result.trace,
+                            })
+                            break
+                        # Every yielded frame is a delta (the terminal is consumed
+                        # inside stream_advanced_attempt); the wire delta is redacted
+                        # per fragment, the durable trace carries only the summary.
+                        await sender.send({
+                            "branch_id": branch["branch_id"], "seq": next(branch["wire_seq"]),
+                            "kind": "delta", "text": redact_text(frame.text),
+                        })
+                except Exception:  # noqa: BLE001 - isolate THIS branch's crash from siblings
+                    # A genuine crash (not a Serving failure, which the runtime settles
+                    # internally) settles this branch failed and is swallowed so it
+                    # never cancels the task group / a sibling.  anyio's cancellation
+                    # derives from BaseException, so a real disconnect is NOT caught
+                    # here -- it falls through to the finally settle-cancelled path.
+                    if not branch["settled"]:
+                        with contextlib.suppress(ConversationStoreError):
+                            store.advance_turn_status(actor, conversation_id, branch["turn_id"], "failed")
+                        with contextlib.suppress(ResponseLifecycleError):
+                            lifecycle.advance(actor, branch["request_id"], "interrupted")
+                        branch["settled"] = True
+                        with contextlib.suppress(Exception):
+                            await sender.send({
+                                "branch_id": branch["branch_id"], "seq": next(branch["wire_seq"]),
+                                "kind": "terminal", "outcome": StreamOutcome.serving_unavailable.value,
+                                "turn_id": branch["turn_id"],
+                            })
+                finally:
+                    if not branch["settled"]:
+                        # Torn down before a terminal (client disconnect / batch
+                        # cancel): trip the cancel so the relay/transport tear down,
+                        # close the generator so its own tail settle never runs, and
+                        # settle BOTH the durable turn AND the lifecycle record here --
+                        # never a completion after cancel.
+                        branch["cancel"].cancel()
+                        with contextlib.suppress(Exception):
+                            gen.close()
+                        with contextlib.suppress(ResponseLifecycleError):
+                            lifecycle.advance(actor, branch["request_id"], "cancelled")
+                        with contextlib.suppress(ConversationStoreError):
+                            store.advance_turn_status(actor, conversation_id, branch["turn_id"], "cancelled")
+                        branch["settled"] = True
+
+        async def _frames() -> AsyncIterator[bytes]:
+            try:
+                # (6) Announce the branches first so the FE renders N columns before a
+                # single delta arrives.
+                yield _ndjson({
+                    "kind": "dispatch",
+                    "branches": [
+                        {"branch_id": b["branch_id"], "route_id": b["route_id"], "turn_id": b["turn_id"]}
+                        for b in branches
+                    ],
+                })
+                # (7) Multiplex every branch onto one wire under anyio structured
+                # concurrency.  Each branch task pulls its own generator in a thread and
+                # sends dict frames onto a shared memory stream; the parent drains and
+                # NDJSON-encodes them.  A finite buffer gives natural backpressure.  On
+                # a client disconnect this generator is aclosed -> the task group scope
+                # is cancelled -> every branch task's finally settles it cancelled.
+                send_stream, receive_stream = anyio.create_memory_object_stream(64)
+                async with anyio.create_task_group() as task_group:
+                    for branch in branches:
+                        task_group.start_soon(_branch_task, branch, send_stream.clone())
+                    send_stream.close()  # each task closes its own clone; receive ends when all do
+                    async with receive_stream:
+                        async for item in receive_stream:
+                            yield _ndjson(item)
+            finally:
+                # (8) Release the ONE batch slot in the outermost finally, once, after
+                # the task group has fully torn down (so every branch settled first).
                 _release_stream_slot(actor.actor_id)
 
         return StreamingResponse(_frames(), media_type="application/x-ndjson")

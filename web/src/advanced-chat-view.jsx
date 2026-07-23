@@ -126,15 +126,24 @@ function CompareCard({ branch }) {
   </article>
 }
 
+// The batch bound the LIVE parallel dispatch enforces (mirrors the server's
+// MAX_DISPATCH_ROUTES): at least 2 routes (one route is just a single Run branch)
+// and at most 4, so the picker can never assemble an out-of-bounds batch.
+export const MIN_DISPATCH_ROUTES = 2
+export const MAX_DISPATCH_ROUTES = 4
+
 export default function AdvancedPanel({
   unavailable = '', routes = [], streaming = false,
-  branches = [], onRun, onRerun, onCancel, onInspect, inspectingId,
+  branches = [], onRun, onRunDispatch, onRerun, onCancel, onInspect, inspectingId,
   onSave, onReopen, onToggleCompare, compareIds = [],
 }) {
   const [routeId, setRouteId] = useState('')
   const [values, setValues] = useState({})
   const [prompt, setPrompt] = useState('')
   const [instructions, setInstructions] = useState('')
+  // The reviewed routes checked for a LIVE parallel dispatch. Bounded to
+  // MAX_DISPATCH_ROUTES so the picker cannot assemble a batch the server rejects.
+  const [dispatchIds, setDispatchIds] = useState([])
   const [pending, setPending] = useState(null) // { route, stale, carried } — a previewed, not-yet-committed route change
   const [announce, setAnnounce] = useState('')
   const [reopenConfirm, setReopenConfirm] = useState(null) // branch id whose reopen would clobber unsaved editor content
@@ -248,6 +257,30 @@ export default function AdvancedPanel({
     if (!canRun) return
     onRun?.({ route: selectedRoute, routeId, values, prompt: prompt.trim(), instructions: instructions.trim() })
     setAnnounce('Advanced branch run started in the transcript.')
+  }
+
+  // Multi-route dispatch: check a route to include it in the batch. A route already
+  // at the MAX_DISPATCH_ROUTES cap cannot add more; unchecking always works.
+  const toggleDispatchRoute = (id) => {
+    setDispatchIds((current) => {
+      if (current.includes(id)) return current.filter((value) => value !== id)
+      if (current.length >= MAX_DISPATCH_ROUTES) {
+        setAnnounce(`A parallel dispatch runs at most ${MAX_DISPATCH_ROUTES} routes at once.`)
+        return current
+      }
+      return [...current, id]
+    })
+  }
+  // "Run on N routes" is enabled ONLY with at least MIN_DISPATCH_ROUTES checked and
+  // a prompt entered (and not mid-stream / mid-preview) — a single route is just the
+  // ordinary Run branch above.
+  const canDispatch = Boolean(prompt.trim() && !streaming && !pending && dispatchIds.length >= MIN_DISPATCH_ROUTES)
+  const runDispatch = () => {
+    if (!canDispatch) return
+    // Preserve the panel's checked order so the assembled batch is deterministic.
+    const routeIds = routes.map((route) => route.route_id).filter((id) => dispatchIds.includes(id))
+    onRunDispatch?.({ routeIds, prompt: prompt.trim(), instructions: instructions.trim() })
+    setAnnounce(`Parallel dispatch started across ${routeIds.length} routes in the transcript.`)
   }
 
   const reopen = (branch) => {
@@ -376,6 +409,36 @@ export default function AdvancedPanel({
         ? <button type="button" className="adv-cancel" aria-label="Cancel advanced run" onClick={onCancel}>Cancel run</button>
         : <button type="button" className="adv-run" aria-label="Run advanced branch" disabled={!canRun} onClick={run}>Run branch</button>}
     </div>
+
+    {/* LIVE parallel multi-route dispatch: fan the SAME prompt/instructions across
+        2..MAX_DISPATCH_ROUTES reviewed routes at once, each streaming as its own
+        `mode="advanced"` sibling in the shared transcript. The checkbox list picks
+        the batch; "Run on N routes" enables only with >=2 checked and a prompt. */}
+    <fieldset className="adv-dispatch" disabled={Boolean(pending)}>
+      <legend>Run across multiple routes</legend>
+      <p className="adv-muted" id="adv-dispatch-desc">
+        Pick 2–{MAX_DISPATCH_ROUTES} reviewed routes to run this prompt on in parallel and compare side by side.
+      </p>
+      <ul className="adv-dispatch-list" aria-label="Routes for parallel dispatch" aria-describedby="adv-dispatch-desc">
+        {routes.map((route) => {
+          const checked = dispatchIds.includes(route.route_id)
+          const capped = !checked && dispatchIds.length >= MAX_DISPATCH_ROUTES
+          return <li key={route.route_id} className="adv-dispatch-item">
+            <label className="adv-dispatch-label">
+              <input type="checkbox" checked={checked} disabled={capped}
+                aria-label={`Include ${route.display_name || route.route_id} in the parallel dispatch`}
+                onChange={() => toggleDispatchRoute(route.route_id)} />
+              <span>{route.display_name || route.route_id}</span>
+            </label>
+          </li>
+        })}
+      </ul>
+      <button type="button" className="adv-dispatch-run"
+        aria-label={`Run on ${dispatchIds.length} routes`}
+        disabled={!canDispatch} onClick={runDispatch}>
+        Run on {dispatchIds.length} route{dispatchIds.length === 1 ? '' : 's'}
+      </button>
+    </fieldset>
 
     {branches.length > 0 && <section className="adv-branches" aria-label="Advanced branches">
       <h3 className="adv-subhead">Branches in this transcript</h3>

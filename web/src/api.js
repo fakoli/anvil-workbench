@@ -439,6 +439,115 @@ export async function runAdvancedBranch({
   return { ...state, trace, turnId, branchId: settledBranchId }
 }
 
+// Stream ONE shared prompt across N reviewed advanced routes CONCURRENTLY, forking
+// N `mode="advanced"` sibling turns under one parent (advanced/dispatch). The
+// server multiplexes every branch onto ONE newline-delimited stream, each frame
+// tagged by `branch_id`: an initial `{kind:'dispatch', branches:[...]}` frame
+// announces the N columns, then interleaved per-branch `delta`/`terminal` frames.
+//
+// Each branch's wire seq starts at 1, so each needs its OWN reducer state — a
+// single shared reducer would read a second branch's seq-1 frame as a stale
+// duplicate and drop it. We therefore keep a Map<branch_id, reducerState> and fold
+// each branch's frames through the SAME `reduceStreamState` in isolation, calling
+// `onBranchState(branch_id, state, {turnId, trace})` on every update so the caller
+// can render N live side-by-side columns. Returns the final per-branch results so
+// the settled siblings feed the existing "Build comparison".
+//
+// Cancellation is exposed through the caller-owned `signal`: aborting tears down
+// THIS fetch, which the server observes to settle ALL N branches cancelled. A 503
+// before the stream degrades truthfully (ADVANCED_NOT_CONFIGURED); any other
+// transport failure throws so the caller renders a failed (not merely interrupted)
+// batch.
+export async function runAdvancedDispatch({
+  conversationId, parentTurnId, routes, prompt, instructions,
+  structuredOutputMode, signal, onDispatch, onBranchState,
+} = {}) {
+  const body = { parent_turn_id: parentTurnId, prompt, routes }
+  if (instructions) body.instructions = instructions
+  if (structuredOutputMode) body.structured_output_mode = structuredOutputMode
+
+  let response
+  try {
+    response = await jsonPostWithSignal(
+      `${CONVERSATIONS}/${encodeURIComponent(conversationId)}/advanced/dispatch`, body, signal,
+    )
+  } catch (error) {
+    if (signal?.aborted || error?.name === 'AbortError') return []
+    throw new Error('The advanced dispatch could not be started')
+  }
+  if (response.status === 503) throw new Error(ADVANCED_NOT_CONFIGURED)
+  if (!response.ok || !response.body) throw new Error('The advanced dispatch could not be started')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  // branch_id -> { state, routeId, turnId, trace }. A PER-BRANCH reducer state is
+  // essential: every branch's seq restarts at 1.
+  const branches = new Map()
+  const order = []
+  let buffer = ''
+
+  const ensure = (branchId, seed = {}) => {
+    let entry = branches.get(branchId)
+    if (!entry) {
+      entry = { state: initialStreamState(), routeId: null, turnId: null, trace: null, ...seed }
+      branches.set(branchId, entry)
+      order.push(branchId)
+    }
+    return entry
+  }
+
+  const applyLine = (line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return
+    let frame
+    try { frame = JSON.parse(trimmed) } catch { return }
+    if (frame.kind === 'dispatch') {
+      // The announce frame names every branch up front so the caller renders N
+      // columns before a single delta arrives.
+      for (const branch of frame.branches || []) {
+        ensure(branch.branch_id, { routeId: branch.route_id, turnId: branch.turn_id })
+      }
+      onDispatch?.(frame.branches || [])
+      return
+    }
+    const branchId = frame.branch_id
+    if (!branchId) return
+    const entry = ensure(branchId)
+    if (frame.trace) entry.trace = frame.trace
+    if (frame.turn_id) entry.turnId = frame.turn_id
+    entry.state = reduceStreamState(entry.state, frame)
+    onBranchState?.(branchId, entry.state, { turnId: entry.turnId, trace: entry.trace })
+  }
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let index
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        applyLine(buffer.slice(0, index))
+        buffer = buffer.slice(index + 1)
+      }
+    }
+    applyLine(buffer)
+  } catch (error) {
+    if (!(signal?.aborted || error?.name === 'AbortError')) {
+      throw new Error('The advanced dispatch was interrupted')
+    }
+    // Aborted: fall through and return whatever settled before the disconnect.
+  } finally {
+    reader.releaseLock?.()
+  }
+  return order.map((branchId) => {
+    const entry = branches.get(branchId)
+    return {
+      branchId, routeId: entry.routeId, turnId: entry.turnId, trace: entry.trace,
+      text: entry.state.text, terminal: entry.state.terminal,
+    }
+  })
+}
+
 // --- Advanced model playground: presets + comparison (T006), instruction
 // templates (T009), declared-criterion route ratings (T010) -------------------
 //

@@ -7,7 +7,7 @@ import {
   sendMessage, unarchiveConversation,
   fetchPrdContent, fetchPrdTasks, fetchTaskEligibility,
   transcribeVoice, speakMessage, fetchPreferences, fetchVoiceCatalog,
-  fetchAdvancedRoutes, runAdvancedBranch, ADVANCED_NOT_CONFIGURED,
+  fetchAdvancedRoutes, runAdvancedBranch, runAdvancedDispatch, ADVANCED_NOT_CONFIGURED,
   fetchAdvancedPresets, resolveAdvancedPreset, buildAdvancedComparison,
   fetchAdvancedTemplates, resolveAdvancedTemplate, renderAdvancedDeclaredInstructions,
   fetchRatingCriteria, recordAdvancedRating, fetchRatingAggregates,
@@ -1826,6 +1826,11 @@ function ChatView({ append }) {
   const [renamingId, setRenamingId] = useState(null)
   const [confirmingDeleteId, setConfirmingDeleteId] = useState(null)
   const abortRef = useRef(null)
+  // The LIVE parallel dispatch runs N branches at once and is NOT gated on the
+  // single `streamingTurn`/`abortRef` slot; it owns its OWN batch AbortController so
+  // a new dispatch (or an unmount) can tear down an in-flight batch, which the
+  // server observes to settle ALL N branches cancelled.
+  const dispatchAbortRef = useRef(null)
   const seqRef = useRef(0)
   // Latest-wins guard for the conversation list/search (a11y #9): every fetch
   // claims a monotonic ticket; a resolved fetch applies its result only if it is
@@ -1987,7 +1992,10 @@ function ChatView({ append }) {
   const select = async (id) => {
     // Switching conversations aborts any in-flight stream so its settled answer
     // cannot land in — or announce for — the newly selected conversation (#2).
+    // Both the single-turn stream AND an in-flight advanced dispatch batch are
+    // aborted, so a backgrounded batch can't keep running (and holding its slot).
     abortRef.current?.abort()
+    dispatchAbortRef.current?.abort()
     selectedIdRef.current = id
     setSelectedId(id); setStreamingTurn(null); setLifecycle(''); setRenamingId(null); setConfirmingDeleteId(null)
     try { const value = await getConversation(id); if (selectedIdRef.current === id) setTurns(value.turns || []) }
@@ -2008,7 +2016,7 @@ function ChatView({ append }) {
     setConfirmingDeleteId(null)
     try {
       await deleteConversation(id)
-      if (selectedId === id) { abortRef.current?.abort(); selectedIdRef.current = null; setSelectedId(null); setTurns([]); setStreamingTurn(null); setLifecycle('') }
+      if (selectedId === id) { abortRef.current?.abort(); dispatchAbortRef.current?.abort(); selectedIdRef.current = null; setSelectedId(null); setTurns([]); setStreamingTurn(null); setLifecycle('') }
       await refreshList(query, includeArchived); focusRail()
     }
     catch { append('The conversation could not be deleted.') }
@@ -2134,6 +2142,90 @@ function ChatView({ append }) {
       if (abortRef.current === controller) abortRef.current = null
     }
   }
+  // Run ONE shared prompt across N reviewed routes CONCURRENTLY. Unlike the single
+  // Run branch above this is NOT gated on the one `streamingTurn`/`abortRef` slot:
+  // it forks N `mode="advanced"` siblings under the SAME parent, tracks a row per
+  // branch keyed by the server `branch_id`, streams each live from `onBranchState`,
+  // and on settle adopts each branch's server `turn_id` (so a follow-on Retry/Fork/
+  // Run on any of them references the real server turn). All N land in `advBranches`
+  // so the EXISTING "Build comparison" works over them unchanged. One AbortController
+  // covers the whole batch.
+  const runAdvancedDispatchFromConfig = async ({ routeIds, prompt, instructions }) => {
+    if (!selectedId || !Array.isArray(routeIds) || routeIds.length < 2) return
+    const conversationId = selectedId
+    const isCurrent = () => selectedIdRef.current === conversationId
+    const parentTurnId = turns.length ? turns[turns.length - 1].id : null
+    const ordinal = (seqRef.current += 1)
+    // One shared user turn shows the fanned-out prompt; the N assistant siblings
+    // stream below it.
+    const userTurn = { id: `local-adv-dispatch-user-${ordinal}`, role: 'user', status: 'complete', content: [{ text: prompt }], lineage: { kind: 'branch' }, mode: 'advanced' }
+    setTurns((current) => [...current, userTurn])
+    const routesPayload = routeIds.map((id) => ({ route_id: id, controls: {} }))
+    // Track only THIS batch's ids so the settle/error paths never touch a sibling
+    // single-run's rows.
+    const batchBranchIds = new Set()
+    const batchTurnIds = new Set()
+    dispatchAbortRef.current?.abort()
+    const controller = new AbortController(); dispatchAbortRef.current = controller
+    setLifecycle(`Parallel dispatch streaming across ${routeIds.length} routes`)
+    try {
+      const results = await runAdvancedDispatch({
+        conversationId, parentTurnId, routes: routesPayload, prompt, instructions,
+        signal: controller.signal,
+        onDispatch: (announced) => {
+          if (!isCurrent()) return
+          announced.forEach((b) => { batchBranchIds.add(b.branch_id); batchTurnIds.add(b.turn_id) })
+          // Append a streaming assistant sibling per branch (keyed by the SERVER
+          // turn id the dispatch frame already carries) and a matching branch row.
+          setTurns((current) => [...current, ...announced.map((b) => ({
+            id: b.turn_id, role: 'assistant', status: 'streaming', content: [{ text: '' }],
+            lineage: { kind: 'branch' }, mode: 'advanced',
+          }))])
+          setAdvBranches((current) => [...current, ...announced.map((b, index) => ({
+            id: b.branch_id, label: `Dispatch ${ordinal}.${index + 1}`, routeId: b.route_id,
+            controlsValues: {}, prompt, instructions, status: 'streaming', text: '',
+            trace: null, turnId: b.turn_id, saved: false,
+          }))])
+        },
+        onBranchState: (branchId, state, { turnId, trace }) => {
+          if (!isCurrent()) return
+          const status = state.terminal ? terminalToStatus(state.terminal) : 'streaming'
+          if (turnId) setTurns((current) => current.map((turn) => (turn.id === turnId
+            ? { ...turn, content: [{ text: state.text }], status } : turn)))
+          setAdvBranches((current) => current.map((branch) => (branch.id === branchId
+            ? { ...branch, status, text: state.text, trace: trace || branch.trace, turnId: turnId || branch.turnId }
+            : branch)))
+        },
+      })
+      if (!isCurrent()) return
+      // Final settle: adopt each branch's server turn id + terminal status/trace so a
+      // follow-on fork references the real server turn, never a local id.
+      setAdvBranches((current) => current.map((branch) => {
+        const result = results.find((item) => item.branchId === branch.id)
+        if (!result) return branch
+        return {
+          ...branch, status: terminalToStatus(result.terminal), text: result.text,
+          trace: result.trace || branch.trace, turnId: result.turnId || branch.turnId, branchId: result.branchId,
+        }
+      }))
+      setTurns((current) => current.map((turn) => {
+        const result = results.find((item) => item.turnId === turn.id)
+        if (!result) return turn
+        return { ...turn, id: result.turnId || turn.id, content: [{ text: result.text }], status: terminalToStatus(result.terminal), fresh: true }
+      }))
+      setLifecycle(`Parallel dispatch settled across ${results.length} routes`)
+    } catch {
+      if (!isCurrent()) return
+      // Mark only THIS batch's still-streaming branches/turns failed.
+      setAdvBranches((current) => current.map((branch) => (batchBranchIds.has(branch.id) && branch.status === 'streaming' ? { ...branch, status: 'failed' } : branch)))
+      setTurns((current) => current.map((turn) => (batchTurnIds.has(turn.id) && turn.status === 'streaming' ? { ...turn, status: 'failed' } : turn)))
+      setLifecycle('Parallel dispatch failed')
+      append('The parallel dispatch failed. No partial attempt was recorded as complete.')
+    } finally {
+      if (dispatchAbortRef.current === controller) dispatchAbortRef.current = null
+    }
+  }
+
   // Retry re-runs an identical attempt; fork runs a variant from the same config —
   // both are new sibling turns in the one transcript (no duplicate transcript).
   const rerunAdvanced = (branch, mode) => {
@@ -2188,7 +2280,8 @@ function ChatView({ append }) {
       <DeliveryContext context={selected?.context} />
       {advanced && <AdvancedPanel
         unavailable={advUnavailable} routes={advRoutes} streaming={streaming}
-        branches={advBranches} onRun={runAdvancedFromConfig} onRerun={rerunAdvanced} onCancel={cancel}
+        branches={advBranches} onRun={runAdvancedFromConfig} onRunDispatch={runAdvancedDispatchFromConfig}
+        onRerun={rerunAdvanced} onCancel={cancel}
         onInspect={setAdvInspectingId} inspectingId={advInspectingId}
         onSave={saveAdvancedBranch} onReopen={reopenAdvancedBranch}
         onToggleCompare={toggleAdvancedCompare} compareIds={advCompareIds} />}
