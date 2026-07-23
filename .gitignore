@@ -8,3 +8,5 @@ web/dist/
 web/*.png
 .env
 post-session-findings/
+# /graphify knowledge-graph output (local dev tool, ~27M — never commit)
+graphify-out/

@@ -64,7 +64,8 @@ The full model-facing design is [runtime inference](docs/architecture/RUNTIME-IN
 | --- | --- |
 | HTTP API and browser projection | `workbench/api.py`, `web/` |
 | Session/workflow validation | `workbench/workflows.py`, `workbench/models.py` |
-| Durable records, approvals, audit | `workbench/store.py` |
+| Durable core (runs, sessions, bridges, leases, audit) | `workbench/store.py`, `workbench/store_base.py` |
+| Per-domain stores (receipts + approvals, skill adoption, preferences, plugin prefs) | `workbench/operation_store.py`, `workbench/skill_adoption_store.py`, `workbench/preference_store.py`, `workbench/plugin_preference_store.py` (all re-exported through `store.py`) |
 | Local bridge and Codex/GitHub/State execution | `workbench/bridge.py`, `workbench/cli.py` |
 | Anvil Serving client and evidence | `workbench/router.py`, `workbench/retrieval.py` |
 | Skill discovery/digest checks | `workbench/skills.py` |
