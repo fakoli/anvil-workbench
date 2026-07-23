@@ -1555,6 +1555,58 @@ describe('Voice page (speech-to-speech) dedicated tab (live-qualification)', () 
     expect(within(log).getByRole('button', { name: 'Replay this spoken reply' })).toBeTruthy()
   })
 
+  it('renders the assistant transcript (#281) into the current turn bubble as it streams', async () => {
+    const user = await renderVoice()
+    const socket = await connectVoice(user)
+    const log = screen.getByRole('log', { name: 'Live transcript' })
+    // The assistant reply carries spoken WORDS (session requested audio+text).
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio_transcript.delta', delta: 'Pending: ' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio_transcript.delta', delta: 'two reviews.' }) }) })
+    // The real spoken words render into the assistant bubble (not the placeholder).
+    expect(await within(log).findByText('Pending: two reviews.')).toBeTruthy()
+    // Audio still plays and Replay remains available for the live turn.
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
+    expect(within(log).getByRole('button', { name: 'Replay this spoken reply' })).toBeTruthy()
+  })
+
+  it('persists the REAL assistant transcript (#281) — not the placeholder — when words arrived', async () => {
+    const user = await renderVoice()
+    await user.click(await screen.findByRole('button', { name: 'Open Router planning' }))
+    const socket = await connectVoice(user)
+    await act(async () => { socket.onmessage?.(transcription('what is pending')) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio_transcript.delta', delta: 'Two reviews are pending.' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio_transcript.done', transcript: 'Two reviews are pending.' }) }) })
+    // Audio also streamed for the same turn (playback is unaffected by the transcript).
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.done' }) }) })
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(2))
+    const asstCall = appendTurn.mock.calls.find((call) => call[1].role === 'assistant')
+    // The assistant turn persists the ACTUAL spoken text, AS TEXT — never the
+    // audio-only placeholder, and never any audio.
+    expect(asstCall[1].content).toEqual([{ kind: 'text', text: 'Two reviews are pending.' }])
+    expect(asstCall[1].content[0].text).not.toMatch(/spoken reply/i)
+    const serialized = JSON.stringify(appendTurn.mock.calls)
+    expect(serialized).not.toMatch(/audio_base64|audio_format|"audio"/)
+  })
+
+  it('persists the audio-only placeholder when the assistant reply carried NO transcript', async () => {
+    const user = await renderVoice()
+    await user.click(await screen.findByRole('button', { name: 'Open Router planning' }))
+    const socket = await connectVoice(user)
+    await act(async () => { socket.onmessage?.(transcription('what is pending')) })
+    // Audio-only reply: no output_audio_transcript.* events arrive.
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.created' }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.output_audio.delta', delta: btoa('\x01\x02\x03\x04') }) }) })
+    await act(async () => { socket.onmessage?.({ data: JSON.stringify({ type: 'response.done' }) }) })
+    await waitFor(() => expect(appendTurn).toHaveBeenCalledTimes(2))
+    const asstCall = appendTurn.mock.calls.find((call) => call[1].role === 'assistant')
+    // Falls back to the spoken-reply placeholder (still text-only, never audio).
+    expect(asstCall[1].content[0].kind).toBe('text')
+    expect(asstCall[1].content[0].text).toMatch(/spoken reply/i)
+  })
+
   it('clears the LIVE view on disconnect (the saved conversation remains in the list)', async () => {
     const user = await renderVoice()
     const socket = await connectVoice(user)

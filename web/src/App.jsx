@@ -412,6 +412,11 @@ function VoicePage({ data, append }) {
   // bubble can Replay its own turn's audio. This is transient in-memory only —
   // never persisted anywhere.
   const chunkBufRef = useRef(new Map())
+  // The assistant's spoken WORDS, keyed by assistant turn id — accumulated from the
+  // `response.output_audio_transcript.delta` stream (#281) so the bubble shows the
+  // real reply as it streams AND the persisted turn keeps the actual text (never the
+  // placeholder) when a transcript arrived. Text only; audio is never persisted.
+  const assistantTextRef = useRef(new Map())
   const currentAssistantRef = useRef(null)
   const currentUserRef = useRef(null)
   const turnSeqRef = useRef(0)
@@ -601,22 +606,46 @@ function VoicePage({ data, append }) {
     const id = `voice-assistant-${(turnSeqRef.current += 1)}`
     currentAssistantRef.current = id
     chunkBufRef.current.set(id, [])
+    assistantTextRef.current.set(id, '')
     // `live` marks a turn whose audio is buffered this session — only those offer
-    // Replay. Text stays empty so the render falls back to the spoken-reply note;
-    // a loaded/historical assistant turn instead shows its stored placeholder text.
+    // Replay. Text stays empty until the assistant-transcript stream (#281) fills
+    // it; until then the render falls back to the spoken-reply note. A loaded/
+    // historical assistant turn instead shows its stored text/placeholder.
     setTranscript((current) => [...current, { id, role: 'assistant', text: '', status: 'streaming', live: true }])
     setAnnounce('Assistant is replying by voice.')
   }
-  // A spoken reply has settled: mark its bubble complete and persist an audio-only
-  // TEXT placeholder (never the audio) to the SAME conversation the triggering
-  // utterance was bound to — captured at settle time, so a switch cannot split the
-  // exchange. Then close the exchange so the next utterance re-binds.
+  // Stream the assistant's spoken WORDS into the CURRENT assistant bubble as they
+  // arrive (#281 `response.output_audio_transcript.delta`), correlated by the same
+  // current-turn id the audio playback uses. Audio and Replay are unchanged.
+  const appendAssistantTranscript = (delta) => {
+    if (typeof delta !== 'string' || !delta) return
+    if (!currentAssistantRef.current) beginAssistantTurn()
+    const id = currentAssistantRef.current
+    const next = (assistantTextRef.current.get(id) || '') + delta
+    assistantTextRef.current.set(id, next)
+    setTranscript((current) => current.map((turn) => (turn.id === id ? { ...turn, text: next } : turn)))
+  }
+  // Finalize the assistant transcript on `.done`: when the event carries the full
+  // transcript, adopt it as authoritative (covers any missed delta); otherwise keep
+  // the accumulated deltas. Completion of the turn itself is driven by response.done.
+  const finalizeAssistantTranscript = (finalText) => {
+    const id = currentAssistantRef.current
+    if (!id || typeof finalText !== 'string' || !finalText) return
+    assistantTextRef.current.set(id, finalText)
+    setTranscript((current) => current.map((turn) => (turn.id === id ? { ...turn, text: finalText } : turn)))
+  }
+  // A spoken reply has settled: mark its bubble complete and persist the turn AS
+  // TEXT (never audio) to the SAME conversation the triggering utterance was bound
+  // to — captured at settle time, so a switch cannot split the exchange. Persist the
+  // ACTUAL transcript when one arrived (#281); fall back to the audio-only
+  // placeholder only when no words were received. Then close the exchange.
   const completeAssistantTurn = () => {
     const id = currentAssistantRef.current
     if (!id) return
     setTranscript((current) => current.map((turn) => (turn.id === id ? { ...turn, status: 'complete' } : turn)))
+    const spoken = (assistantTextRef.current.get(id) || '').trim()
     currentAssistantRef.current = null
-    persistVoiceTurn('assistant', VOICE_SPOKEN_PLACEHOLDER, utteranceRef.current?.dest)
+    persistVoiceTurn('assistant', spoken || VOICE_SPOKEN_PLACEHOLDER, utteranceRef.current?.dest)
     utteranceRef.current = null
   }
   // Load a selected conversation's stored turns into the transcript (or clear it
@@ -628,7 +657,7 @@ function VoicePage({ data, append }) {
       closePlayback(); if (mountedRef.current) setSpeaking(false)
       if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response.cancel' }))
     }
-    currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map()
+    currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map(); assistantTextRef.current = new Map()
     // Keep the owner ONLY while a user utterance is still open — its completed STT
     // is a straggler that must still route to the origin conversation. A finished
     // exchange's owner is stale here and is dropped so the next utterance in the
@@ -650,6 +679,11 @@ function VoicePage({ data, append }) {
       return
     }
     if (type === 'response.created') { beginAssistantTurn(); return }
+    // The assistant's spoken words (#281): stream them into the current bubble, and
+    // finalize on `.done`. These arrive only when the session requests audio+text
+    // (this page does). Audio playback and Replay are unaffected.
+    if (type === 'response.output_audio_transcript.delta') { appendAssistantTranscript(message.delta); return }
+    if (type === 'response.output_audio_transcript.done') { finalizeAssistantTranscript(message.transcript); return }
     if (type === 'response.done' || type === 'response.completed') { completeAssistantTurn(); return }
     if (type === 'conversation.item.input_audio_transcription.delta') {
       // Capture the utterance's owner at its first STT event; render the partial
@@ -699,7 +733,7 @@ function VoicePage({ data, append }) {
       if (captureMode === 'handsfree') openMic('handsfree')
     }
     socket.onmessage = handleMessage
-    socket.onclose = () => { teardownAll(); currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map(); setTranscript([]); setConnection('disconnected'); setAnnounce(disconnectMessage()) }
+    socket.onclose = () => { teardownAll(); currentAssistantRef.current = null; currentUserRef.current = null; chunkBufRef.current = new Map(); assistantTextRef.current = new Map(); setTranscript([]); setConnection('disconnected'); setAnnounce(disconnectMessage()) }
     socket.onerror = () => setAnnounce('Voice relay is unavailable. The session and workflow remain unchanged.')
   }
   const disconnect = () => {
