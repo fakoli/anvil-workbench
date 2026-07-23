@@ -518,6 +518,23 @@ def sandbox_response(base_url: str, token: str, model: str, text: str) -> dict[s
 #: no raw-provider path -- a failure settles as a terminal Serving outcome.
 _SERVING_RESPONSES_PATH = "/responses"
 
+#: The ONLY request fields Anvil Serving's ``/v1/responses`` accepts.  The hub's
+#: bounded request (:func:`workbench.chat_stream.build_bounded_request` and the
+#: advanced-mode :func:`workbench.advanced_runtime.build_advanced_request`) also
+#: carries an internal correlation field -- ``route_id`` -- for hub-side
+#: audit/keying; it is NOT part of the Serving Responses schema, and Serving
+#: fail-closes an unknown field with a 400 ``unsupported_feature`` (rejecting the
+#: whole request, not ignoring the field).  The transport therefore projects the
+#: outbound body to exactly this allowlist so an internal field can never leak to
+#: Serving and break the stream.  This MUST list every field the request builders
+#: legitimately send -- notably advanced mode's ``instructions`` (R003: the system
+#: prompt, kept separate from the user ``input``) -- or a real field would be
+#: silently stripped.  Extend this set (never send outside it) if a builder gains a
+#: Serving-supported field.
+_SERVING_RESPONSES_FIELDS = frozenset(
+    {"model", "input", "instructions", "stream", "max_output_tokens", "temperature", "reasoning"}
+)
+
 #: Hard ceilings on the relayed Serving Responses SSE stream, mirroring the
 #: in-relay bounds in :mod:`workbench.chat_stream` and the byte ceilings the voice
 #: functions enforce: a misbehaving upstream cannot stream unboundedly or smuggle
@@ -585,7 +602,11 @@ def stream_responses(
     """
     if not base_url or not token:
         raise RouterError("Anvil Serving route access is not configured")
-    body = json.dumps(dict(request), separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    # Project to exactly the Serving-supported Responses fields.  The hub's request
+    # carries internal correlation fields (e.g. ``route_id``) that Serving rejects
+    # with a 400 ``unsupported_feature``; sending them would fail-close every turn.
+    payload = {key: request[key] for key in request if key in _SERVING_RESPONSES_FIELDS}
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "text/event-stream",

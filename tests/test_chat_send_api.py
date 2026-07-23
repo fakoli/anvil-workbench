@@ -812,6 +812,66 @@ def test_stream_responses_not_configured_raises_router_error():
         list(stream_responses("", "", {}, _FakeCancel()))
 
 
+def test_stream_responses_strips_internal_fields_serving_rejects(monkeypatch):
+    # The hub's bounded request carries ``route_id`` (an internal correlation
+    # field); Serving's /v1/responses fail-closes an unknown field with a 400
+    # ``unsupported_feature``, rejecting the whole request.  The transport must
+    # project the outbound body to the Serving-supported allowlist so every
+    # supported field survives and no internal field ever reaches the wire.
+    body = b"data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n"
+    captured = _patch_urlopen(monkeypatch, body)
+    request = {
+        "model": "chat",
+        "route_id": "route.chat",  # internal-only; Serving rejects it
+        "input": "hi",
+        "stream": True,
+        "max_output_tokens": 16,
+        "temperature": 0.4,
+        "reasoning": {"effort": "low"},
+    }
+    events = list(stream_responses(ROUTER_BASE_URL, ROUTER_TOKEN, request, _FakeCancel()))
+    assert events == [{"type": "response.completed"}]
+    sent = json.loads(captured["body"].decode("utf-8"))
+    assert "route_id" not in sent  # would 400 every turn if leaked
+    assert sent == {
+        "model": "chat",
+        "input": "hi",
+        "stream": True,
+        "max_output_tokens": 16,
+        "temperature": 0.4,
+        "reasoning": {"effort": "low"},
+    }
+
+
+def test_stream_responses_keeps_advanced_instructions_and_strips_route_id(monkeypatch):
+    # Advanced mode's build_advanced_request emits ``instructions`` (R003: the
+    # system prompt, kept separate from ``input``) -- a legitimate Serving field
+    # the router accepts.  The allowlist must let it through while still stripping
+    # the internal ``route_id``; a too-narrow allowlist would silently swallow the
+    # system prompt (the exact bug class R003 guards against).
+    body = b"data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n"
+    captured = _patch_urlopen(monkeypatch, body)
+    request = {
+        "model": "chat",
+        "route_id": "route.chat",  # internal-only; Serving rejects it
+        "input": "hi",
+        "instructions": "Be terse.",  # R003 system prompt; Serving accepts it
+        "stream": True,
+        "max_output_tokens": 16,
+    }
+    list(stream_responses(ROUTER_BASE_URL, ROUTER_TOKEN, request, _FakeCancel()))
+    sent = json.loads(captured["body"].decode("utf-8"))
+    assert "route_id" not in sent
+    assert sent["instructions"] == "Be terse."  # system prompt must survive
+    assert sent == {
+        "model": "chat",
+        "input": "hi",
+        "instructions": "Be terse.",
+        "stream": True,
+        "max_output_tokens": 16,
+    }
+
+
 def test_serving_responses_transport_relays_parsed_events(monkeypatch):
     body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"yo\"}\n\ndata: [DONE]\n\n"
     _patch_urlopen(monkeypatch, body)
