@@ -234,6 +234,63 @@ def route_tier_signals(base_url: str, token: str, limit: int = 50) -> dict[str, 
     return {"totals": totals, "records": records}
 
 
+#: Anvil Serving's first-class per-tier health probe (anvil-serving#292), served
+#: UNDER ``/v1`` (``{router}/v1/health/tiers``) -- so it is read against the
+#: OPERATOR-configured base directly (the base already ends in ``/v1``), unlike the
+#: root ``/health``.  It is a REAL per-tier probe (not derived from routing), so it
+#: is PREFERRED over :func:`route_tier_signals` when the router serves it.
+_ROUTER_TIER_HEALTH_PATH = "/health/tiers"
+_MAX_HEALTH_TIERS = 64
+#: An upper bound on a reported probe latency (1 hour), so a misbehaving upstream
+#: cannot smuggle an absurd integer through the popover.
+_MAX_HEALTH_LATENCY_MS = 3_600_000
+
+
+def route_tier_health(base_url: str, token: str) -> dict[str, Any]:
+    """Read Anvil Serving's first-class per-tier health probe (anvil-serving#292).
+
+    Talks only to the operator-configured router base (``{base}/health/tiers``, i.e.
+    ``{router}/v1/health/tiers``) via the bounded, redirect-free :func:`_request` --
+    never a raw model-serve host/port.  Unlike :func:`route_tier_signals` (which
+    DERIVES a per-tier status from the routing log) this is a LIVE per-tier probe the
+    router runs itself, so the model-health projection PREFERS it.
+
+    Each row is scrubbed and bounded exactly like the decision-signal fields: ``id``,
+    ``role`` and ``status`` are short safe tokens; ``last_check`` an RFC3339-ish
+    timestamp; ``latency_ms`` a bounded non-negative int; ``reason`` a
+    credential/endpoint-scrubbed, length-clamped category string.  A row without a
+    safe ``id`` AND ``status`` is dropped.  A body that is not ``{"tiers": [...]}``
+    raises :class:`RouterError` so the caller can FALL BACK to the decision-derived
+    signals (an older router that does not serve this endpoint).
+    """
+    value = _request(base_url, token, "GET", _ROUTER_TIER_HEALTH_PATH)
+    tiers_raw = value.get("tiers") if isinstance(value, dict) else None
+    if not isinstance(tiers_raw, list):
+        raise RouterError("Anvil Serving tier-health response has an unexpected shape")
+    tiers: list[dict[str, Any]] = []
+    for row in tiers_raw[:_MAX_HEALTH_TIERS]:
+        if not isinstance(row, dict):
+            continue
+        tier_id = _safe_token(row.get("id"))
+        status = _safe_token(row.get("status"))
+        if tier_id is None or status is None:
+            continue
+        latency = row.get("latency_ms")
+        reason = row.get("reason")
+        tiers.append({
+            "id": tier_id,
+            "role": _safe_token(row.get("role")),
+            "status": status,
+            "last_check": _safe_timestamp(row.get("last_check")),
+            "latency_ms": latency
+            if isinstance(latency, int) and not isinstance(latency, bool) and 0 <= latency <= _MAX_HEALTH_LATENCY_MS
+            else None,
+            "reason": redact_config_text(reason)[:_MAX_SIGNAL_REASON_CHARS]
+            if isinstance(reason, str) and reason else None,
+        })
+    return {"tiers": tiers}
+
+
 #: The two provenance values a route-resolution mark distinguishes: a route the
 #: caller EXPLICITLY selected, versus one DEFAULTED from a stored preference.  A
 #: decision that reports neither is surfaced with ``provenance = None`` — a mark
