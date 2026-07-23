@@ -41,6 +41,11 @@ class Settings:
     #: (chat-first-voice T003.1).  Parsed and fail-closed validated by
     #: :mod:`workbench.chat_routes`; unset means no chat route is allowed.
     chat_routes: str = ""
+    #: Operator-reviewed JSON array of allowed Advanced-mode route capabilities
+    #: (advanced-branch.v1 ``route_capability`` shape; AMP T002).  Parsed and
+    #: fail-closed validated by :mod:`workbench.advanced_routes`; unset means the
+    #: Advanced route allowlist is empty (the surface serves ``{"routes": []}``).
+    advanced_routes: str = ""
     #: Operator-reviewed local paths to the signed reviewed plugin catalog and the
     #: enable-only capability profile (reviewed-tools-plugins T002).  They are the
     #: operator-declared trust root for :class:`workbench.plugin_host.PluginHostService`,
@@ -90,6 +95,7 @@ class Settings:
             allow_insecure_dev_actor=values.get("WORKBENCH_ALLOW_INSECURE_DEV_ACTOR", "").lower() in {"1", "true", "yes"},
             chat_content_hash_key=values.get("WORKBENCH_CHAT_HASH_KEY", ""),
             chat_routes=values.get("WORKBENCH_CHAT_ROUTES", "").strip(),
+            advanced_routes=values.get("WORKBENCH_ADVANCED_ROUTES", "").strip(),
             plugin_catalog_file=values.get("WORKBENCH_PLUGIN_CATALOG_FILE", "").strip(),
             plugin_capability_file=values.get("WORKBENCH_PLUGIN_CAPABILITY_FILE", "").strip(),
             plugin_openapi_document_file=values.get("WORKBENCH_PLUGIN_OPENAPI_DOCUMENT_FILE", "").strip(),
