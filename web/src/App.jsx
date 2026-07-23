@@ -2113,7 +2113,11 @@ function ChatView({ append }) {
       if (!isCurrent()) return
       const status = terminalToStatus(state.terminal)
       const trace = state.trace || capturedTrace
-      const settledTurn = { ...assistant, content: [{ text: state.text }], status, fresh: true }
+      // Adopt the server's persisted assistant turn_id (the advanced-run terminal
+      // carries it) over this optimistic local id, so a follow-on Retry / Branch /
+      // chained Run on this advanced turn references the real server turn -- not a
+      // local id the server 404/409s (mirrors the ordinary send-completion fix).
+      const settledTurn = { ...assistant, id: state.turnId || assistant.id, content: [{ text: state.text }], status, fresh: true }
       setTurns((current) => [...current, settledTurn]); setStreamingTurn(null)
       setLifecycle(`Advanced branch ${status}`)
       setAdvBranches((current) => current.map((branch) => (branch.id === branchLocalId
