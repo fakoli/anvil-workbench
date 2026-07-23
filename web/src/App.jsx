@@ -44,8 +44,8 @@ const emptyData = {
 // (chat-first-voice T004.4): the "Assistant" group leads, and the "Deliver" group
 // — the supervised PRD→merge loop that is the product's point — is contiguous
 // directly below it. Group order IS render order; item order within a group IS
-// render order. Group labels show in the vertical rail and are hidden when the
-// rail collapses to a horizontal strip (chat/voice/explorer/settings/plugins).
+// render order. The rail is a vertical column at every width, so the group labels
+// render consistently on every route (see the grouped-rail note in styles.css).
 const navGroups = [
   ['Assistant', [['Chat', '◇'], ['Voice', '⏺']]],
   ['Deliver', [['Deliver', '⌘'], ['Runs', '↗'], ['Approvals', '✓']]],
@@ -1032,8 +1032,15 @@ function RunsView({ data, refresh, onNewSession, onStartSession, onDirective, ap
   const activeSession = sessions.find((session) => session.id === activeRun?.session_id) || sessions[0]
   const orphanRuns = runs.filter((run) => !run.session_id)
   const [input, setInput] = useState('')
-  const directions = (data.directives || []).filter((event) => !activeSession || event.session_id === activeSession.id)
-  const submit = async (event) => { event.preventDefault(); if (!activeSession || !input.trim()) return; const text = input.trim(); try { await onDirective(activeSession.id, text); setInput('') } catch { append('Direction was not recorded. No future work packet was changed.') } }
+  // The directions composer binds to an EXPLICIT target session, defaulting to the
+  // active one. With multiple concurrent sessions this prevents a direction typed
+  // while looking at session B from silently landing on session A (the session
+  // owning the only running run) — the operator picks the target, and the composer
+  // header names it, so the binding is never implicit.
+  const [pickedSessionId, setPickedSessionId] = useState('')
+  const targetSession = sessions.find((session) => session.id === pickedSessionId) || activeSession
+  const directions = (data.directives || []).filter((event) => !targetSession || event.session_id === targetSession.id)
+  const submit = async (event) => { event.preventDefault(); if (!targetSession || !input.trim()) return; const text = input.trim(); try { await onDirective(targetSession.id, text); setInput('') } catch { append('Direction was not recorded. No future work packet was changed.') } }
   return <section className="workspace-view">
     <span className="crumb">Runs / sessions & bridge-supervised</span>
     <div className="view-heading"><div><h1>Runs</h1><p>Each session owns a durable workflow cursor and a worktree lease; its runs are correlated to a State task and route. A lease prevents two sessions editing the same configured worktree.</p></div><div className="view-heading-actions"><button className="session-action" onClick={onNewSession} disabled={!data.projects[0]}>New concurrent session</button><button className="ghost-button" onClick={refresh}>Refresh</button></div></div>
@@ -1057,11 +1064,11 @@ function RunsView({ data, refresh, onNewSession, onStartSession, onDirective, ap
       {orphanRuns.length ? <section className="run-session" aria-label="Unassigned runs"><header className="run-session-head"><div><b>Unassigned runs</b><small>runs with no session</small></div></header><div className="data-list">{orphanRuns.map((run) => <article className="run-row" key={run.id}><div><b>{runTitle(run, null)}</b><small>run {run.id}{run.task_id ? ` · task ${run.task_id}` : ''}</small></div><Status tone={tone(run.status)}>{run.status}</Status></article>)}</div></section> : null}
     </div>
     <section className="run-directions" aria-label="Delivery directions">
-      <h2>Directions{activeSession ? ` · ${activeSession.title}` : ''}</h2>
+      <div className="run-directions-head"><h2>Directions{targetSession ? ` · ${targetSession.title}` : ''}</h2>{sessions.length > 1 ? <label className="run-directions-target">Direct<select aria-label="Direct which session" value={targetSession?.id || ''} onChange={(event) => setPickedSessionId(event.target.value)}>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title}</option>)}</select></label> : null}</div>
       {directions.length
         ? <div className="conversation">{directions.map((message) => <article className="message human" key={message.id}><div className="message-head"><span>OP</span><b>Recorded direction</b><small>event {message.sequence}</small></div><p>{message.data?.content}</p></article>)}</div>
-        : <p className="evidence-empty">No recorded delivery directions for {activeSession ? 'this session' : 'any session'} yet.</p>}
-      <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!activeSession} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={activeSession ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!activeSession || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form>
+        : <p className="evidence-empty">No recorded delivery directions for {targetSession ? 'this session' : 'any session'} yet.</p>}
+      <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!targetSession} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={targetSession ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!targetSession || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form>
     </section>
   </section>
 }
@@ -2616,11 +2623,14 @@ function ExplorerView({ data, append, onDeliverNext }) {
     if (window.location.hash.startsWith('#explorer/')) window.location.hash = ''
     if (had) {
       setAnnounce('Closed detail')
-      // Return focus to the invoking task row (a11y #9), not the first project
-      // button in document order — a keyboard user deep in a second PRD is not
-      // teleported to the top. Fall back to the first focusable rail control.
+      // Return focus to the invoking task row (a11y #9), not the top of the rail —
+      // a keyboard user deep in a second PRD is not teleported. The fallback is
+      // ORDER-INDEPENDENT: it targets the plan controls (a project button or the
+      // Open-PRD control) explicitly, never a bare first `button`, so an unrelated
+      // control added above them in the rail — e.g. the deliver-action bar's
+      // high-privilege "Deliver next task" — can never silently steal close-focus.
       const invoker = invokedScopedId && railRef.current?.querySelector(`[data-explorer-task="${invokedScopedId}"]`)
-      const target = invoker || railRef.current?.querySelector('.explorer-open-prd, input, button')
+      const target = invoker || railRef.current?.querySelector('.explorer-project, .explorer-open-prd')
       target?.focus()
     }
   }
@@ -2661,7 +2671,7 @@ function ExplorerView({ data, append, onDeliverNext }) {
       <p className="explorer-intro">Browse the Project → PRD → plan → task lineage from the redacted projection, then deliver the next ranked task. Its live run trace lives in Runs.</p>
       <section className="explorer-deliver-bar" aria-label="Deliver action">
         <span className="explorer-deliver-status">{activeRun ? <>Active: <b>{activeRun.task_id ? `task ${activeRun.task_id}` : `run ${activeRun.id}`}</b> <Status tone={tone(activeRun.status)}>{activeRun.status}</Status></> : 'No active delivery run.'}</span>
-        <button className="session-action" onClick={onDeliverNext} disabled={!projects[0]}>Deliver next task</button>
+        <button className="session-action" onClick={() => onDeliverNext(selectedProjectId)} disabled={!projects[0]}>Deliver next task</button>
       </section>
       <section aria-label="Projects" className="explorer-projects">
         <p className="explorer-section-title">Projects</p>
@@ -2687,7 +2697,7 @@ function ExplorerView({ data, append, onDeliverNext }) {
 }
 
 function App() {
-  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false); const [deliverOpen, setDeliverOpen] = useState(false); const [navOpen, setNavOpen] = useState(false)
+  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false); const [deliverOpen, setDeliverOpen] = useState(false); const [deliverProjectId, setDeliverProjectId] = useState(null); const [navOpen, setNavOpen] = useState(false)
   const load = async () => { const value = await bootstrap(); setData({ ...emptyData, ...value, sandbox: { ...emptyData.sandbox, ...(value.sandbox || {}) }, voice: { ...emptyData.voice, ...(value.voice || {}) } }); return value }
   useEffect(() => { load().catch(() => setNotice('Workbench hub is unavailable; no local mock delivery is shown.')) }, [])
   const createDelivery = async (payload) => { try { const project = await createProject(payload); setData((current) => ({ ...current, projects: [project, ...current.projects] })); setNewDeliveryOpen(false); setNotice(`Created ${project.name}. Register its bridge locally before starting a run.`); await load() } catch { setNotice('Project could not be created. No bridge or run was started.') } }
@@ -2725,7 +2735,7 @@ function App() {
         : active === 'Settings'
         ? <div className="settings-grid"><SettingsView data={data} append={setNotice} /><ConfigurationView data={data} append={setNotice} /></div>
         : active === 'Deliver'
-        ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} onDeliverNext={() => setDeliverOpen(true)} /></div>
+        ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} onDeliverNext={(projectId) => { setDeliverProjectId(projectId || null); setDeliverOpen(true) }} /></div>
         : active === 'Plugins'
         ? <div className="pc-grid"><PluginCatalogView data={data} append={setNotice} /></div>
         : <div className="main-grid">
@@ -2738,7 +2748,7 @@ function App() {
     {newSessionOpen && <NewSession project={data.projects[0]} skills={data.skills.filter((skill) => skill.bridge_id === data.projects[0]?.bridge_id)} onClose={() => setNewSessionOpen(false)} onCreate={createConcurrentSession} />}
     {startSession && <StartSession session={startSession.session} workflow={startSession.workflow} onClose={() => setStartSession(null)} onStart={startConcurrentSession} />}
     {guideOpen && <Onboarding data={data} onClose={() => setGuideOpen(false)} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onNewSession={() => setNewSessionOpen(true)} />}
-    {deliverOpen && <DeliverSheet project={data.projects[0]} workflows={data.workflows} sessions={data.sessions} runs={data.runs} onClose={() => setDeliverOpen(false)} onDeliver={deliverCandidate} />}
+    {deliverOpen && <DeliverSheet project={data.projects.find((item) => item.id === deliverProjectId) || data.projects[0]} workflows={data.workflows} sessions={data.sessions} runs={data.runs} onClose={() => setDeliverOpen(false)} onDeliver={deliverCandidate} />}
   </div>
 }
 

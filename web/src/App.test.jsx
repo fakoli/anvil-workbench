@@ -268,6 +268,34 @@ describe('Workbench delivery cockpit', () => {
     expect(notice).not.toContain('Direction recorded')
   })
 
+  it('binds a recorded direction to the explicitly picked session, not the globally active one', async () => {
+    // Two concurrent sessions: A owns the only running run, B is idle. The merged
+    // Runs surface shows both as cards but has one composer; without an explicit
+    // target it would silently bind to A (the active session). The picker makes B
+    // selectable so a direction meant for B is not misrouted to A.
+    bootstrap.mockResolvedValue({
+      ...fixture,
+      sessions: [
+        { id: 'session_a', project_id: 'project_1', title: 'Session A', worktree_id: 'wt-a', status: 'active' },
+        { id: 'session_b', project_id: 'project_1', title: 'Session B', worktree_id: 'wt-b', status: 'active' },
+      ],
+      workflows: [
+        { id: 'wf_a', project_id: 'project_1', session_id: 'session_a', version: 1, status: 'running', cursor: [] },
+        { id: 'wf_b', project_id: 'project_1', session_id: 'session_b', version: 1, status: 'draft', cursor: [] },
+      ],
+      runs: [{ id: 'run_a', project_id: 'project_1', session_id: 'session_a', task_id: 'TASK-A', model: 'planning', status: 'running' }],
+      directives: [],
+    })
+    const user = userEvent.setup(); await renderLive()
+    const picker = screen.getByRole('combobox', { name: 'Direct which session' })
+    expect(picker.value).toBe('session_a') // defaults to the active (running) session
+    await user.selectOptions(picker, 'session_b')
+    await user.type(screen.getByRole('textbox', { name: 'Add direction to this delivery' }), 'Direction for B.')
+    await user.click(screen.getByRole('button', { name: 'Send delivery direction' }))
+    expect(addDirective).toHaveBeenCalledWith('session_b', 'Direction for B.')
+    expect(addDirective).not.toHaveBeenCalledWith('session_a', 'Direction for B.')
+  })
+
   it('operates routes, evidence, skills, and sandbox through their dedicated APIs', async () => {
     const user = userEvent.setup(); await renderLive()
     await user.click(screen.getByRole('button', { name: 'Routes' })); await user.click(screen.getByRole('button', { name: 'Refresh decisions' })); expect(fetchRoutes).toHaveBeenCalled()

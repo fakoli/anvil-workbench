@@ -119,6 +119,21 @@ delivery slice end-to-end) and §2 (qualify a local model that emits executable
 function calls) — both blocked on fakoli/anvil#178 and model-executability, not on
 this hub's browser code.
 
+### Adversarial review of the IA consolidation (three-lens panel)
+
+The consolidation was put through a three-lens adversarial panel (regression /
+accessibility / UX-intent-and-CSS). Dispositions:
+
+| Lens | Finding | Disposition |
+| --- | --- | --- |
+| a11y | Closing a PRD-read pane teleported keyboard focus to the new high-privilege "Deliver next task" button (it became the first `<button>` in the rail, winning the `closeDetail` combined-selector fallback). | **Fixed.** The fallback now targets `.explorer-project, .explorer-open-prd` explicitly — order-independent, so a control added above the plan controls can never steal close-focus. |
+| CSS | The §4 group labels were hidden on the desktop surfaces the operator lives on (Chat/Deliver/Settings/…): a `@media(min-width:901px)` rule dissolved the groups for a horizontal strip that the ≤900px off-canvas drawer overrides and that therefore never exists. | **Fixed.** Removed the inverted rule; the rail is vertical at every width, so labels now render consistently on every route (browser-verified). |
+| regression | RunsView showed every session as a card but bound its one directions composer to the globally-active session, so a direction typed while viewing session B could land on session A. | **Fixed.** An explicit target-session picker (shown when >1 session) defaults to the active session and names it; covered by a new two-session regression test. |
+| regression | "Deliver next task" opened the sheet against `projects[0]`, ignoring the Explorer's selected project. | **Fixed.** The selected project id is threaded through to the DeliverSheet. |
+| CSS | The `.session-empty` state lost its card styling after SessionsView was removed (it was a `.session-list` descendant). | **Fixed.** Re-scoped under `.runs-groups`. |
+| CSS | Dead cockpit/SessionsView CSS (`.delivery`, `.flow-card`, `.steps`, `.session-list`, …) remains. | **Deferred + flagged.** The dead rules are interleaved with live rules on dense shared lines; excising them safely is a separate low-risk cleanup, not bundled here. |
+| UX (judgment) | The Deliver merge is spatial, not interactive: the selected task in the detail pane has no deliver control; only "deliver the next ranked head." | **Flagged, not changed.** Delivering an arbitrary selected task tensions with the DeliverSheet's deliberate "never skip a blocked head" safety; a per-task deliver affordance is a follow-up design decision. |
+
 ## 2026-07-23 UX refinements (product-ux-review §4 Tier-1)
 
 Three information-architecture/legibility changes from the independent product-UX
