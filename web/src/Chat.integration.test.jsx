@@ -425,25 +425,29 @@ describe('Criterion 3 — titles and state drive the hierarchy; ids are secondar
   })
 })
 
-// --- Criterion 4: Chat first in nav; Delivery reachable lower -----------------
-describe('Criterion 4 — Chat is first in navigation and Delivery remains reachable', () => {
-  it('renders Chat before Delivery in the one primary nav and keeps Delivery reachable at a narrow viewport', async () => {
+// --- Criterion 4: Chat first in nav; Deliver reachable lower ------------------
+describe('Criterion 4 — Chat is first in navigation and Deliver remains reachable', () => {
+  it('renders Chat before Deliver in the one primary nav and keeps Deliver reachable at a narrow viewport', async () => {
     const { user } = await land('returning')
     const chat = screen.getByRole('button', { name: 'Chat' })
-    const delivery = screen.getByRole('button', { name: 'Delivery' })
-    // Real rendered order: Chat precedes Delivery (Delivery follows Chat in the DOM).
-    expect(chat.compareDocumentPosition(delivery) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    // Both live in the same primary <nav>; Delivery sits below Chat.
-    expect(chat.parentElement.tagName).toBe('NAV')
-    expect(chat.parentElement).toBe(delivery.parentElement)
+    const deliver = screen.getByRole('button', { name: 'Deliver' })
+    // Real rendered order: Chat precedes Deliver (Deliver follows Chat in the DOM).
+    expect(chat.compareDocumentPosition(deliver) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // Both live in the one primary <nav>, now organized into journey groups
+    // (product-ux-review §4): Chat heads the first group, Deliver the next, so
+    // they sit in sibling group wrappers under the same <nav> — Deliver still
+    // directly below Chat's group, both reachable from one nav.
+    expect(chat.closest('nav')).toBeTruthy()
+    expect(chat.closest('nav')).toBe(deliver.closest('nav'))
+    expect(chat.parentElement).not.toBe(deliver.parentElement) // distinct groups
     // The app's responsive nav is CSS-only (no JS prunes items by width), so a
-    // narrow viewport keeps Delivery in the DOM and reachable. Prove reachability
-    // by activating it — the workspace switches to the Delivery cockpit.
+    // narrow viewport keeps Deliver in the DOM and reachable. Prove reachability
+    // by activating it — the workspace switches to the Plan & deliver surface.
     Object.defineProperty(window, 'innerWidth', { configurable: true, writable: true, value: 375 })
     window.dispatchEvent(new Event('resize'))
-    expect(delivery.disabled).toBe(false)
-    await user.click(delivery)
-    expect(await screen.findByText('Delivery cockpit')).toBeTruthy()
+    expect(deliver.disabled).toBe(false)
+    await user.click(deliver)
+    expect(await screen.findByText('Plan & deliver')).toBeTruthy()
   })
 })
 

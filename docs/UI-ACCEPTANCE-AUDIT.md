@@ -91,6 +91,79 @@ Serving and rendered its response; Voice correctly showed disabled without a
 relay. This is a **render/transport observation, not a rendered-browser
 qualification** of any surface — the per-surface deferrals above still stand.
 
+## 2026-07-23 IA consolidation (product-ux-review §3/§4)
+
+The full information-architecture collapse the review calls for (rec §3), reducing
+the rail from **13 surfaces to 11 in 4 journey groups** and eliminating the
+"two answers to where's my plan" and "two views of one run graph" confusions. All
+**component-proven** (vitest, network mocked, 345/345) and build-clean; the
+rendered-browser interaction + console-health pass remains deferred to a live hub.
+
+- **Deliver = Delivery + Explorer merged.** One surface: the a11y-audited Explorer
+  plan-browser is the primary content (its focus management, latest-wins
+  eligibility, Escape-to-close, and scoped-id URL are preserved unchanged), with a
+  compact deliver-action bar (`Deliver next task` + active-run status) on top. The
+  old Delivery cockpit is gone; its live run trace/directions moved to Runs. The
+  surface reuses the `explorer-active` shell class, so no layout CSS was rewritten.
+- **Runs = Sessions + Runs merged.** One surface: sessions ARE the grouping (each
+  shows its workflow cursor, its runs, and its Start-delivery action), with the
+  session-scoped directions composer and the live Trace aside. The standalone
+  Sessions tab is gone.
+- **Journey groups.** Rail is now `Assistant` (Chat, Voice) / `Deliver` (Deliver,
+  Runs, Approvals) / `Inspect` (Evidence, Routes, Skills, Plugins, Sandbox) /
+  `Configure` (Settings) — the review's "demote to secondary/inspection" made
+  structural. Chat stays first and default (chat-first-voice T004.4).
+
+Out of scope here (infra / other-repo, not UX): the review's rec §1 (close one live
+delivery slice end-to-end) and §2 (qualify a local model that emits executable
+function calls) — both blocked on fakoli/anvil#178 and model-executability, not on
+this hub's browser code.
+
+### Adversarial review of the IA consolidation (three-lens panel)
+
+The consolidation was put through a three-lens adversarial panel (regression /
+accessibility / UX-intent-and-CSS). Dispositions:
+
+| Lens | Finding | Disposition |
+| --- | --- | --- |
+| a11y | Closing a PRD-read pane teleported keyboard focus to the new high-privilege "Deliver next task" button (it became the first `<button>` in the rail, winning the `closeDetail` combined-selector fallback). | **Fixed.** The fallback now targets `.explorer-project, .explorer-open-prd` explicitly — order-independent, so a control added above the plan controls can never steal close-focus. |
+| CSS | The §4 group labels were hidden on the desktop surfaces the operator lives on (Chat/Deliver/Settings/…): a `@media(min-width:901px)` rule dissolved the groups for a horizontal strip that the ≤900px off-canvas drawer overrides and that therefore never exists. | **Fixed.** Removed the inverted rule; the rail is vertical at every width, so labels now render consistently on every route (browser-verified). |
+| regression | RunsView showed every session as a card but bound its one directions composer to the globally-active session, so a direction typed while viewing session B could land on session A. | **Fixed.** An explicit target-session picker (shown when >1 session) defaults to the active session and names it; covered by a new two-session regression test. |
+| regression | "Deliver next task" opened the sheet against `projects[0]`, ignoring the Explorer's selected project. | **Fixed.** The selected project id is threaded through to the DeliverSheet. |
+| CSS | The `.session-empty` state lost its card styling after SessionsView was removed (it was a `.session-list` descendant). | **Fixed.** Re-scoped under `.runs-groups`. |
+| CSS | Dead cockpit/SessionsView CSS (`.delivery`, `.flow-card`, `.steps`, `.session-list`, …) remains. | **Deferred + flagged.** The dead rules are interleaved with live rules on dense shared lines; excising them safely is a separate low-risk cleanup, not bundled here. |
+| UX (judgment) | The Deliver merge is spatial, not interactive: the selected task in the detail pane has no deliver control; only "deliver the next ranked head." | **Flagged, not changed.** Delivering an arbitrary selected task tensions with the DeliverSheet's deliberate "never skip a blocked head" safety; a per-task deliver affordance is a follow-up design decision. |
+
+## 2026-07-23 UX refinements (product-ux-review §4 Tier-1)
+
+Three information-architecture/legibility changes from the independent product-UX
+review, all **component-proven** (vitest, network mocked) and build-clean; the
+rendered-browser interaction + console-health pass remains deferred to a live hub.
+
+- **Single authorize home.** Authorization now lives only on the **Approvals**
+  surface: a selectable pending list beside a binding-detail pane that authorizes
+  in place. The Delivery **Trace** aside no longer authorizes — it mirrors the
+  selected grant read-only (payload labelled *"Approval payload preview"*) and its
+  button navigates to Approvals. Selecting an approval (list row or Trace link)
+  routes to Approvals, never to Delivery. Proven: the hash-bound-approval scenario
+  authorizes the selected grant (`approval_1`) and never the decoy, scoped to the
+  Approvals detail region.
+- **Honest not-configured panels.** The Advanced chat and Advanced playground
+  `unavailable` states now render a first-class `.config-note` card that names why
+  (the run/dispatch execution path is **unwired in this build**, not merely unset)
+  and the one wireable lever (`WORKBENCH_ADVANCED_ROUTES` for route discovery;
+  injected stores for preset/template/rating), matching the Sandbox/Routes
+  quality bar. Proven: the advanced-degrade scenario asserts the truthful copy.
+- **Journey-grouped rail.** The 13-item flat rail is grouped into
+  **Assistant / Deliver / Inspect / Configure**. Chat stays first and default
+  (chat-first-voice T004.4); the Deliver group is contiguous directly below it.
+  Group labels show in the vertical rail and dissolve (`display:contents`) when a
+  wide route collapses the rail to a horizontal strip. Proven: Chat still precedes
+  Delivery in one primary `<nav>`, now in sibling group wrappers.
+
+Verification: `npm test` **345 / 345 passed**, `npm run build` clean,
+`docker compose --env-file .env.example config -q` clean.
+
 ## Re-run recipe
 
 ```powershell

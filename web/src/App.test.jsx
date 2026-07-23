@@ -189,13 +189,15 @@ beforeEach(() => {
   resetChatMocks()
 })
 
-// Chat is the default surface now, so the delivery suite navigates to Delivery
-// first. This keeps the delivery assertions faithful while proving Chat-default.
+// Chat is the default surface; the run/session/directions/Trace cockpit now lives
+// on the merged Runs surface (product-ux-review §4), so the delivery suite
+// navigates there first. This keeps the cockpit assertions faithful while proving
+// Chat-default.
 async function renderLive() {
   const user = userEvent.setup()
   render(<App />)
-  await user.click(await screen.findByRole('button', { name: 'Delivery' }))
-  await screen.findByRole('heading', { name: 'Task TASK-1' })
+  await user.click(await screen.findByRole('button', { name: 'Runs' }))
+  await screen.findByRole('heading', { name: 'Runs' })
 }
 
 // Render the default Chat surface and wait for its conversation list to load.
@@ -214,7 +216,7 @@ async function openConversation(user, turns) {
 describe('Workbench delivery cockpit', () => {
   it('gives every main navigation button a live operating surface', async () => {
     const user = userEvent.setup(); await renderLive()
-    const views = [['Sessions', 'Concurrent sessions'], ['Runs', 'Runs'], ['Routes', 'Routes'], ['Approvals', 'Approvals'], ['Evidence', 'Evidence'], ['Skills', 'Reviewed skills'], ['Sandbox', 'Model sandbox']]
+    const views = [['Deliver', 'Delivery explorer'], ['Runs', 'Runs'], ['Routes', 'Routes'], ['Approvals', 'Approvals'], ['Evidence', 'Evidence'], ['Skills', 'Reviewed skills'], ['Sandbox', 'Model sandbox']]
     for (const [button, heading] of views) { await user.click(screen.getByRole('button', { name: button })); expect(screen.getByRole('heading', { name: heading })).toBeTruthy() }
   })
 
@@ -266,6 +268,34 @@ describe('Workbench delivery cockpit', () => {
     expect(notice).not.toContain('Direction recorded')
   })
 
+  it('binds a recorded direction to the explicitly picked session, not the globally active one', async () => {
+    // Two concurrent sessions: A owns the only running run, B is idle. The merged
+    // Runs surface shows both as cards but has one composer; without an explicit
+    // target it would silently bind to A (the active session). The picker makes B
+    // selectable so a direction meant for B is not misrouted to A.
+    bootstrap.mockResolvedValue({
+      ...fixture,
+      sessions: [
+        { id: 'session_a', project_id: 'project_1', title: 'Session A', worktree_id: 'wt-a', status: 'active' },
+        { id: 'session_b', project_id: 'project_1', title: 'Session B', worktree_id: 'wt-b', status: 'active' },
+      ],
+      workflows: [
+        { id: 'wf_a', project_id: 'project_1', session_id: 'session_a', version: 1, status: 'running', cursor: [] },
+        { id: 'wf_b', project_id: 'project_1', session_id: 'session_b', version: 1, status: 'draft', cursor: [] },
+      ],
+      runs: [{ id: 'run_a', project_id: 'project_1', session_id: 'session_a', task_id: 'TASK-A', model: 'planning', status: 'running' }],
+      directives: [],
+    })
+    const user = userEvent.setup(); await renderLive()
+    const picker = screen.getByRole('combobox', { name: 'Direct which session' })
+    expect(picker.value).toBe('session_a') // defaults to the active (running) session
+    await user.selectOptions(picker, 'session_b')
+    await user.type(screen.getByRole('textbox', { name: 'Add direction to this delivery' }), 'Direction for B.')
+    await user.click(screen.getByRole('button', { name: 'Send delivery direction' }))
+    expect(addDirective).toHaveBeenCalledWith('session_b', 'Direction for B.')
+    expect(addDirective).not.toHaveBeenCalledWith('session_a', 'Direction for B.')
+  })
+
   it('operates routes, evidence, skills, and sandbox through their dedicated APIs', async () => {
     const user = userEvent.setup(); await renderLive()
     await user.click(screen.getByRole('button', { name: 'Routes' })); await user.click(screen.getByRole('button', { name: 'Refresh decisions' })); expect(fetchRoutes).toHaveBeenCalled()
@@ -276,7 +306,7 @@ describe('Workbench delivery cockpit', () => {
   })
 
   it('creates sessions with selected bridge-published skills and starts the bridge workflow', async () => {
-    const user = userEvent.setup(); await renderLive(); await user.click(screen.getByRole('button', { name: 'Sessions' })); await user.click(screen.getByRole('button', { name: 'New concurrent session' }))
+    const user = userEvent.setup(); await renderLive(); await user.click(screen.getByRole('button', { name: 'New concurrent session' }))
     await user.type(screen.getByRole('textbox', { name: 'Session title' }), 'Checkout'); await user.clear(screen.getByRole('textbox', { name: 'Configured worktree id' })); await user.type(screen.getByRole('textbox', { name: 'Configured worktree id' }), 'checkout'); await user.click(screen.getByRole('checkbox', { name: 'anvil:review' })); await user.click(screen.getByRole('button', { name: 'Create session' }))
     expect(createSession).toHaveBeenCalledWith({ project_id: 'project_1', title: 'Checkout', worktree_id: 'checkout', skills: ['anvil:review'] })
     await user.click(screen.getByRole('button', { name: 'Start delivery Router qualification' })); await user.type(screen.getByRole('textbox', { name: 'State task id' }), 'TASK-2'); await user.click(screen.getByRole('button', { name: 'Start bridge delivery' })); expect(startWorkflow).toHaveBeenCalledWith('workflow_1', { task_id: 'TASK-2', model: 'planning' })
@@ -288,11 +318,16 @@ describe('Workbench delivery cockpit', () => {
     await user.click(screen.getByRole('button', { name: 'New delivery' })); await user.type(screen.getByRole('textbox', { name: 'Project name' }), 'Checkout'); await user.click(screen.getByRole('button', { name: 'Create project' })); expect(createProject).toHaveBeenCalledWith({ name: 'Checkout', state_root: '.anvil' })
     await user.click(screen.getByRole('button', { name: 'Operator menu' })); expect(screen.getByRole('region', { name: 'Operator menu' })).toBeTruthy(); await user.click(screen.getByRole('button', { name: 'Close menu' }))
     await user.click(screen.getByRole('button', { name: 'Notifications' })); expect(screen.getByRole('region', { name: 'Notifications' })).toBeTruthy(); await user.click(screen.getByRole('button', { name: 'Mark viewed' })); expect(screen.getByText(/marked viewed/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Authorize selected action' }).disabled).toBe(true)
+    // Authorization has ONE home (Approvals). The Delivery Trace mirrors the
+    // selection read-only and only links there — it never authorizes in place.
+    expect(screen.getByRole('button', { name: /Go to Approvals/ })).toBeTruthy()
     await user.click(screen.getByRole('button', { name: 'Approvals' })); await user.click(screen.getByRole('button', { name: 'Review action approval_1' }))
-    expect(screen.getByLabelText('Selected approval payload').textContent).toContain('codex/review')
-    expect(screen.getByText('run_1')).toBeTruthy(); expect(screen.getByText('default')).toBeTruthy()
-    await user.click(screen.getByRole('button', { name: 'Authorize selected action' })); expect(approve).toHaveBeenCalledWith('approval_1'); expect(approve).not.toHaveBeenCalledWith('approval_decoy')
+    // The Trace aside mirrors the same binding read-only beside the list, so scope
+    // the authorize-home assertions to the Approvals detail region.
+    const detail = screen.getByRole('region', { name: 'Selected approval' })
+    expect(within(detail).getByLabelText('Selected approval payload').textContent).toContain('codex/review')
+    expect(within(detail).getByText('run_1')).toBeTruthy(); expect(within(detail).getByText('default')).toBeTruthy()
+    await user.click(within(detail).getByRole('button', { name: 'Authorize this action' })); expect(approve).toHaveBeenCalledWith('approval_1'); expect(approve).not.toHaveBeenCalledWith('approval_decoy')
   })
 
   it('does not offer voice capture without a configured private relay, on its own Voice page', async () => {
@@ -307,8 +342,11 @@ describe('Workbench delivery cockpit', () => {
 
   it('shows a truthful empty state instead of a seeded delivery when the hub has no projects', async () => {
     bootstrap.mockResolvedValueOnce({ projects: [] }); const user = userEvent.setup(); render(<App />)
-    await user.click(await screen.findByRole('button', { name: 'Delivery' }))
-    expect(await screen.findByRole('heading', { name: 'Start a private delivery' })).toBeTruthy(); expect(screen.getByText(/no synthetic delivery/)).toBeTruthy()
+    await user.click(await screen.findByRole('button', { name: 'Deliver' }))
+    // The merged Deliver surface degrades truthfully: no fabricated project/plan,
+    // and the deliver action is disabled until a real project exists.
+    expect(await screen.findByRole('heading', { name: 'Delivery explorer' })).toBeTruthy(); expect(screen.getByText(/No projects yet/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Deliver next task' }).disabled).toBe(true)
   })
 })
 
@@ -601,9 +639,11 @@ describe('Chat transcript, composer, and streaming (T004.3)', () => {
     expect(await screen.findByText('kept answer')).toBeTruthy()
     await user.click(screen.getByRole('button', { name: 'Toggle Advanced mode' }))
     expect(screen.getByRole('region', { name: 'Advanced controls' })).toBeTruthy()
-    // Degrades truthfully: the not-configured sentinel plus the unchanged note.
+    // Degrades truthfully: the not-configured sentinel plus a first-class card
+    // that names why (the run/dispatch path is unwired in this build, not merely
+    // unset) and the one wireable lever, keeping the transcript unchanged.
     expect(await screen.findByText('The advanced playground is not configured for this hub')).toBeTruthy()
-    expect(screen.getByText(/not configured in this build/)).toBeTruthy()
+    expect(screen.getByText(/not wired to an endpoint in this build/)).toBeTruthy()
     expect(screen.getByText('kept answer')).toBeTruthy() // transcript unchanged by Advanced mode
     await user.click(screen.getByRole('button', { name: 'Toggle Advanced mode' }))
     expect(screen.getByText('kept answer')).toBeTruthy()
@@ -1017,16 +1057,16 @@ describe('Chat routing, navigation, and accessibility (T004.4)', () => {
     expect(screen.getByRole('combobox', { name: 'Chat route' }).value).toBe('route.deep')
   })
 
-  it('makes Chat first and default while Delivery stays reachable lower in the nav', async () => {
+  it('makes Chat first and default while Deliver stays reachable lower in the nav', async () => {
     const user = await renderChat()
     const chatNav = screen.getByRole('button', { name: 'Chat' })
-    const deliveryNav = screen.getByRole('button', { name: 'Delivery' })
+    const deliverNav = screen.getByRole('button', { name: 'Deliver' })
     expect(chatNav.getAttribute('aria-current')).toBe('page') // Chat selected by default
-    expect(deliveryNav.getAttribute('aria-current')).toBeNull()
-    // Chat precedes Delivery in document order (first in the nav).
-    expect(chatNav.compareDocumentPosition(deliveryNav) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    await user.click(deliveryNav)
-    expect(await screen.findByRole('heading', { name: 'Task TASK-1' })).toBeTruthy()
+    expect(deliverNav.getAttribute('aria-current')).toBeNull()
+    // Chat precedes Deliver in document order (first in the nav).
+    expect(chatNav.compareDocumentPosition(deliverNav) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    await user.click(deliverNav)
+    expect(await screen.findByRole('heading', { name: 'Delivery explorer' })).toBeTruthy()
   })
 
   it('scopes the narrow-layout relax to the chat route and keeps actions reachable (responsive #4)', async () => {
@@ -1040,9 +1080,9 @@ describe('Chat routing, navigation, and accessibility (T004.4)', () => {
     const del = screen.getByRole('button', { name: 'Delete Router planning' })
     expect(del).toBeTruthy()
     expect(del.style.display).not.toBe('none') // not removed from the layout
-    // Delivery keeps its own 980px assumption: the class is dropped off-route.
-    await user.click(screen.getByRole('button', { name: 'Delivery' }))
-    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    // Off the chat route the class is dropped: Runs keeps its own 980px assumption.
+    await user.click(screen.getByRole('button', { name: 'Runs' }))
+    await screen.findByRole('heading', { name: 'Runs' })
     expect(document.querySelector('.app-shell').classList.contains('chat-active')).toBe(false)
   })
 
@@ -1537,9 +1577,9 @@ describe('Voice page (speech-to-speech) dedicated tab (live-qualification)', () 
     expect(screen.getByText(/session_1/)).toBeTruthy() // session-bound (relay-only)
     // It is NOT chat: no message composer lives on this page.
     expect(screen.queryByRole('textbox', { name: 'Message composer' })).toBeNull()
-    // Delivery no longer renders the realtime panel (it moved here).
-    await user.click(screen.getByRole('button', { name: 'Delivery' }))
-    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    // The Deliver surface does not render the realtime panel (it lives here).
+    await user.click(screen.getByRole('button', { name: 'Deliver' }))
+    await screen.findByRole('heading', { name: 'Delivery explorer' })
     expect(screen.queryByRole('button', { name: 'Hold to talk' })).toBeNull()
     expect(document.querySelector('.realtime-voice')).toBeNull()
   })
@@ -2057,7 +2097,7 @@ function setupTwoPrds() {
 async function renderExplorer() {
   const user = userEvent.setup()
   render(<App />)
-  await user.click(await screen.findByRole('button', { name: 'Explorer' }))
+  await user.click(await screen.findByRole('button', { name: 'Deliver' }))
   await screen.findByRole('heading', { name: 'Delivery explorer' })
   await screen.findByRole('button', { name: 'Select project Workbench qualification' })
   return user
@@ -2200,7 +2240,7 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     bootstrap.mockResolvedValueOnce({ projects: [] })
     const user = userEvent.setup()
     render(<App />)
-    await user.click(await screen.findByRole('button', { name: 'Explorer' }))
+    await user.click(await screen.findByRole('button', { name: 'Deliver' }))
     expect(await screen.findByText(/No projects yet/)).toBeTruthy()
     expect(screen.getByRole('textbox', { name: 'Open a PRD by id' }).disabled).toBe(true)
   })
@@ -2276,17 +2316,18 @@ describe('Delivery explorer (plan-task-delivery T003)', () => {
     await waitFor(() => expect(live.textContent).toMatch(/No tasks match/)) // empty result announced
   })
 
-  it('applies the narrow-posture shell class on the Explorer route and drops it off-route (#5)', async () => {
+  it('applies the narrow-posture shell class on the Deliver route and drops it off-route (#5)', async () => {
     setupTwoPrds()
     const user = await renderExplorer()
     const shell = document.querySelector('.app-shell')
-    // The Explorer route stamps `explorer-active`: the ≤900px rule unfixes the nav
-    // rail under this class so it cannot pin a narrow column or let the live region
-    // paint over the rail buttons. The class is scoped, so it drops off-route.
+    // The Deliver route (the merged plan browser) stamps `explorer-active`: the
+    // ≤900px rule unfixes the nav rail under this class so it cannot pin a narrow
+    // column or let the live region paint over the rail buttons. The class is
+    // scoped, so it drops off-route (here, on Runs).
     expect(shell.classList.contains('explorer-active')).toBe(true)
     expect(shell.classList.contains('chat-active')).toBe(false)
-    await user.click(screen.getByRole('button', { name: 'Delivery' }))
-    await screen.findByRole('heading', { name: 'Task TASK-1' })
+    await user.click(screen.getByRole('button', { name: 'Runs' }))
+    await screen.findByRole('heading', { name: 'Runs' })
     expect(document.querySelector('.app-shell').classList.contains('explorer-active')).toBe(false)
   })
 })
@@ -2313,6 +2354,9 @@ describe('Deliver controls (plan-task-delivery T006)', () => {
   })
 
   async function openSheet(user) {
+    // The "Deliver next task" opener lives on the merged Deliver surface
+    // (product-ux-review §4); renderLive lands on Runs, so route to Deliver first.
+    await user.click(screen.getByRole('button', { name: 'Deliver' }))
     await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
     return screen.getByRole('dialog', { name: 'Deliver next task' })
   }
@@ -2350,7 +2394,9 @@ describe('Deliver controls (plan-task-delivery T006)', () => {
     expect(startWorkflow).toHaveBeenCalledTimes(1)
     expect(startWorkflow).toHaveBeenCalledWith('workflow_1', { task_id: 'T001', model: 'planning' }, { signal: expect.any(AbortSignal) })
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Deliver next task' })).toBeNull())
-    expect(await screen.findByRole('heading', { name: 'Task T001' })).toBeTruthy() // routed to the resulting run
+    // Routed to the resulting run, now visible on the merged Runs surface.
+    expect(await screen.findByRole('heading', { name: 'Runs' })).toBeTruthy()
+    expect((await screen.findAllByText(/task T001/)).length).toBeGreaterThan(0)
   })
 
   it('previews exactly one State-ranked candidate and never a batch of tasks', async () => {
@@ -2430,6 +2476,7 @@ describe('Deliver controls (plan-task-delivery T006)', () => {
 
   it('opens a focus-managed setup sheet closable by a visible Close and by Escape', async () => {
     const user = userEvent.setup(); await renderLive()
+    await user.click(screen.getByRole('button', { name: 'Deliver' }))
     await user.click(screen.getByRole('button', { name: 'Deliver next task' }))
     const dialog = screen.getByRole('dialog', { name: 'Deliver next task' })
     await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true)) // focus moved into the sheet

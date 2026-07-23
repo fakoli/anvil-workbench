@@ -39,11 +39,18 @@ const emptyData = {
   voice: { available: false, transport: 'not_configured', retains_transcripts: false },
 }
 
-// Chat is first and selected by default; Delivery stays reachable directly below
-// it (chat-first-voice T004.4). The order here IS the rendered nav order.
-const nav = [
-  ['Chat', '◇'], ['Voice', '⏺'], ['Delivery', '⌘'], ['Explorer', '▦'], ['Sessions', '◫'], ['Runs', '↗'], ['Routes', '⌁'], ['Approvals', '✓'], ['Settings', '⚙'],
-  ['Evidence', '◈'], ['Skills', '✦'], ['Plugins', '⧉'], ['Sandbox', '□'],
+// The rail is grouped by the operator's journey, not by which subsystem built a
+// surface (product-ux-review §4). Chat stays FIRST and selected by default
+// (chat-first-voice T004.4): the "Assistant" group leads, and the "Deliver" group
+// — the supervised PRD→merge loop that is the product's point — is contiguous
+// directly below it. Group order IS render order; item order within a group IS
+// render order. The rail is a vertical column at every width, so the group labels
+// render consistently on every route (see the grouped-rail note in styles.css).
+const navGroups = [
+  ['Assistant', [['Chat', '◇'], ['Voice', '⏺']]],
+  ['Deliver', [['Deliver', '⌘'], ['Runs', '↗'], ['Approvals', '✓']]],
+  ['Inspect', [['Evidence', '◈'], ['Routes', '⌁'], ['Skills', '✦'], ['Plugins', '⧉'], ['Sandbox', '□']]],
+  ['Configure', [['Settings', '⚙']]],
 ]
 
 function Mark() { return <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span> }
@@ -63,7 +70,7 @@ function Rail({ active, setActive, onNewDelivery, onProfile, closeNav }) {
   const go = (label) => { setActive(label); closeNav?.() }
   return <aside className="rail">
     <div className="brand"><Mark /><span>Anvil<br /><em>Workbench</em></span></div>
-    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} title={label} aria-current={active === label ? 'page' : undefined} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => go(label)}><b aria-hidden="true">{glyph}</b><span className="nav-label">{label}</span></button>)}</nav>
+    <nav>{navGroups.map(([group, items]) => <div className="nav-group" key={group}><p className="nav-group-label" aria-hidden="true">{group}</p>{items.map(([label, glyph]) => <button key={label} aria-label={label} title={label} aria-current={active === label ? 'page' : undefined} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => go(label)}><b aria-hidden="true">{glyph}</b><span className="nav-label">{label}</span></button>)}</div>)}</nav>
     <div className="rail-footer"><button className="new-run" onClick={onNewDelivery}><span aria-hidden="true">+</span> New delivery</button><button className="profile" aria-label="Operator menu" onClick={onProfile}><span>AW</span><div><strong>Operator</strong><small>tailnet owner</small></div><b aria-hidden="true">···</b></button></div>
   </aside>
 }
@@ -1000,36 +1007,94 @@ function VoicePage({ data, append }) {
   </div>
 }
 
-function Delivery({ data, append, onDirective, onGuide, onDeliverNext }) {
-  const project = data.projects[0]
-  const run = data.runs.find((item) => ['queued', 'running'].includes(item.status)) || data.runs[0]
-  const session = data.sessions.find((item) => item.id === run?.session_id) || data.sessions[0]
-  const messages = (data.directives || []).filter((event) => !session || event.session_id === session.id)
-  const [input, setInput] = useState('')
-  const submit = async (event) => { event.preventDefault(); if (!session || !input.trim()) return; const text = input.trim(); try { await onDirective(session.id, text); setInput('') } catch { append('Direction was not recorded. No future work packet was changed.') } }
-  if (!project) return <main className="delivery empty-delivery"><span className="crumb">Delivery / setup required</span><h1>Start a private delivery</h1><p>Workbench has no synthetic delivery. Create a project, register its local bridge, publish reviewed skills, then create a session.</p><button className="session-action" onClick={onGuide}>Open setup guide</button></main>
-  return <main className="delivery"><header className="project-header"><div><span className="crumb">Delivery / {project.name}</span><h1>{run?.task_id ? `Task ${run.task_id}` : 'No active task'}</h1><p>PRD → State plan → local Codex run → evidence → approved PR</p></div><div className="project-header-actions"><button className="session-action" onClick={onDeliverNext}>Deliver next task</button><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'ready for session'}</Status></div></header>
-    <section className="flow-card"><div className="flow-top"><span className="thread-avatar">A</span><div><strong>Delivery operator</strong><small>{run ? `${run.model} through Anvil Serving` : 'Waiting for a bridge-supervised run'}</small></div><Status tone={run ? tone(run.status) : 'amber'}>{run?.status || 'idle'}</Status></div><ol className="steps"><li className={run ? 'complete' : 'current'}><span>{run ? '✓' : '1'}</span><div><b>{run ? 'State work packet requested' : 'Create a session'}</b><small>{run ? `${run.id} is bound to the bridge and its configured worktree.` : 'A session creates a durable workflow and lease boundary.'}</small></div></li><li className={run?.status === 'evidenced' ? 'complete' : run ? 'current' : ''}><span>{run?.status === 'evidenced' ? '✓' : '2'}</span><div><b>Bridge edits and verifies locally</b><small>Redacted transcripts and State evidence return through the bridge.</small></div></li><li className={run?.status === 'evidenced' ? 'current' : ''}><span>3</span><div><b>Review evidence and authorize a hash-bound action</b><small>GitHub remains local to the bridge and requires approval.</small></div></li></ol></section>
-    <section className="conversation" aria-label="Delivery directions">{messages.length ? messages.map((message) => <article className="message human" key={message.id}><div className="message-head"><span>OP</span><b>Recorded direction</b><small>event {message.sequence}</small></div><p>{message.data?.content}</p></article>) : <p className="evidence-empty">No recorded delivery directions for this session yet.</p>}</section>
-    <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!session} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={session ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!session || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form>
-  </main>
-}
-
-function Trace({ data, setActive, append, refresh, selectedApprovalId, clearApproval }) {
-  const run = data.runs[0]; const approval = data.approvals.find((item) => item.id === selectedApprovalId && item.status === 'pending'); const [expanded, setExpanded] = useState(false); const [busy, setBusy] = useState(false)
-  const authorize = async () => { if (!approval) return; setBusy(true); try { await approve(approval.id); clearApproval(); append('Approval recorded. The local bridge may consume this exact action once.'); await refresh() } catch { append('Approval was not recorded. The bridge remains unable to create a PR.') } finally { setBusy(false) } }
-  return <aside className="trace"><section className="trace-head"><div><span>Live trace</span><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router unavailable'}</Status></div><button aria-label="Show correlation trace" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? '−' : '↗'}</button></section><section className="trace-body"><TraceStep label="Intent" value={run?.task_id || 'No task selected'} detail={run ? `run ${run.id}` : 'Start a session to request a State work packet.'} done={Boolean(run)} /><TraceStep label="Route" value={run?.model || 'No route selected'} detail={data.router_configured ? 'decision lookup is available in Routes' : 'router token or URL is missing'} done={Boolean(run && data.router_configured)} /><TraceStep label="Skills" value={data.skills?.length ? `${data.skills.length} bridge-published` : 'No skills published'} detail="Only selected local skills enter a work packet." done={Boolean(data.skills?.length)} /><TraceStep label="Verify" value={run?.status === 'evidenced' ? 'evidence submitted' : 'independent gate pending'} detail="The bridge submits evidence to State before approval." current={run?.status !== 'evidenced'} />{expanded && <div className="raw-trace"><code>workbench_run_id: {run?.id || 'not assigned'}</code><code>task_id: {run?.task_id || 'not assigned'}</code><code>request_id: written by Serving if the model request succeeds</code></div>}</section><section className="evidence-mini"><header><span>Evidence packet</span><button onClick={() => setActive('Evidence')}>View all</button></header><p className="evidence-empty">{run?.status === 'evidenced' ? 'Use Evidence search to inspect cited, redacted artifacts.' : 'Awaiting independent bridge evidence.'}</p></section><section className="approval-card"><div className="approval-title"><span>Approval</span><Status tone={approval ? 'amber' : 'green'}>{approval ? 'selected' : 'selection required'}</Status></div><h2>{approval ? approval.action_type.replaceAll('_', ' ') : 'Select an approval to review'}</h2>{approval ? <><dl className="approval-binding"><div><dt>Approval id</dt><dd>{approval.id}</dd></div><div><dt>Payload hash</dt><dd>{approval.payload_hash}</dd></div><div><dt>Run</dt><dd>{approval.payload?.run_id || 'not bound'}</dd></div><div><dt>Worktree</dt><dd>{approval.payload?.worktree_id || 'not bound'}</dd></div></dl><pre aria-label="Selected approval payload">{JSON.stringify(approval.payload, null, 2)}</pre></> : <p>Open Approvals and choose one pending action. Workbench never guesses which grant you intended.</p>}<p className="muted">Approval is a one-time release; the bridge checks this exact safe payload and binding before it can change GitHub.</p><button disabled={busy || !approval} onClick={authorize}>{busy ? 'Authorizing…' : 'Authorize selected action'} <span aria-hidden="true">→</span></button></section></aside>
+// The Trace's approval card is READ-ONLY: it mirrors the currently-selected
+// approval so an operator watching the run can see what is pending, but the
+// authorize action lives in exactly one home — the Approvals surface. The card's
+// button navigates there rather than authorizing in place (product-ux-review §4,
+// "give the approve action exactly one home").
+function Trace({ data, setActive, selectedApprovalId }) {
+  const run = data.runs[0]; const approval = data.approvals.find((item) => item.id === selectedApprovalId && item.status === 'pending'); const [expanded, setExpanded] = useState(false)
+  return <aside className="trace"><section className="trace-head"><div><span>Live trace</span><Status tone={data.router_configured ? 'green' : 'amber'}>{data.router_configured ? 'router configured' : 'router unavailable'}</Status></div><button aria-label="Show correlation trace" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? '−' : '↗'}</button></section><section className="trace-body"><TraceStep label="Intent" value={run?.task_id || 'No task selected'} detail={run ? `run ${run.id}` : 'Start a session to request a State work packet.'} done={Boolean(run)} /><TraceStep label="Route" value={run?.model || 'No route selected'} detail={data.router_configured ? 'decision lookup is available in Routes' : 'router token or URL is missing'} done={Boolean(run && data.router_configured)} /><TraceStep label="Skills" value={data.skills?.length ? `${data.skills.length} bridge-published` : 'No skills published'} detail="Only selected local skills enter a work packet." done={Boolean(data.skills?.length)} /><TraceStep label="Verify" value={run?.status === 'evidenced' ? 'evidence submitted' : 'independent gate pending'} detail="The bridge submits evidence to State before approval." current={run?.status !== 'evidenced'} />{expanded && <div className="raw-trace"><code>workbench_run_id: {run?.id || 'not assigned'}</code><code>task_id: {run?.task_id || 'not assigned'}</code><code>request_id: written by Serving if the model request succeeds</code></div>}</section><section className="evidence-mini"><header><span>Evidence packet</span><button onClick={() => setActive('Evidence')}>View all</button></header><p className="evidence-empty">{run?.status === 'evidenced' ? 'Use Evidence search to inspect cited, redacted artifacts.' : 'Awaiting independent bridge evidence.'}</p></section><section className="approval-card"><div className="approval-title"><span>Approval</span><Status tone={approval ? 'amber' : 'green'}>{approval ? 'selected' : 'none selected'}</Status></div><h2>{approval ? approval.action_type.replaceAll('_', ' ') : 'No approval selected'}</h2>{approval ? <><dl className="approval-binding"><div><dt>Approval id</dt><dd>{approval.id}</dd></div><div><dt>Payload hash</dt><dd>{approval.payload_hash}</dd></div><div><dt>Run</dt><dd>{approval.payload?.run_id || 'not bound'}</dd></div><div><dt>Worktree</dt><dd>{approval.payload?.worktree_id || 'not bound'}</dd></div></dl><pre aria-label="Approval payload preview">{JSON.stringify(approval.payload, null, 2)}</pre></> : <p>Pick a pending action in Approvals to review its binding here. Workbench never guesses which grant you intended.</p>}<p className="muted">Authorization happens in Approvals — a one-time release the bridge checks against this exact payload and binding before it can change GitHub.</p><button onClick={() => setActive('Approvals')}>{approval ? 'Open in Approvals' : 'Go to Approvals'} <span aria-hidden="true">→</span></button></section></aside>
 }
 
 function TraceStep({ label, value, detail, done, current }) { return <div className={`trace-step ${done ? 'done' : ''} ${current ? 'current' : ''}`}><i>{done ? '✓' : current ? '●' : '○'}</i><div><small>{label}</small><b>{value}</b><span>{detail}</span></div></div> }
 
-function SessionsView({ data, onNewSession, onStartSession }) { const sessions = data.sessions || []; const workflows = data.workflows || []; return <section className="workspace-view"><span className="crumb">Sessions / durable harness contexts</span><div className="view-heading"><div><h1>Concurrent sessions</h1><p>Each session has its own workflow cursor. Worktree leases prevent concurrent sessions from editing the same configured worktree.</p></div><button className="session-action" onClick={onNewSession} disabled={!data.projects[0]}>New concurrent session</button></div><div className="session-list">{sessions.length ? sessions.map((session) => { const workflow = workflows.find((item) => item.session_id === session.id); const activeRun = data.runs?.some((run) => run.session_id === session.id && ['queued', 'running'].includes(run.status)); return <article key={session.id}><div><b>{session.title}</b><small>{session.worktree_id} · {session.id}</small></div><span>{workflow ? `workflow v${workflow.version} · ${workflow.status}` : 'workflow pending'}</span><Status tone={activeRun ? 'green' : tone(workflow?.status)}>{activeRun ? 'active run' : session.status}</Status><button aria-label={`Start delivery ${session.title}`} disabled={!workflow || activeRun || workflow.status !== 'draft'} onClick={() => onStartSession(session, workflow)}>Start delivery</button></article> }) : <article className="session-empty"><b>No harness session yet</b><span>Create a project and bridge, then create a session.</span></article>}</div></section> }
-
-function RunsView({ data, refresh }) { return <section className="workspace-view"><span className="crumb">Runs / bridge-supervised</span><div className="view-heading"><div><h1>Runs</h1><p>Every row is a durable Workbench run, correlated to a State task and selected model.</p></div><button className="session-action" onClick={refresh}>Refresh runs</button></div><div className="data-list">{data.runs.length ? data.runs.map((run) => { const session = data.sessions?.find((item) => item.id === run.session_id); return <article className="run-row" key={run.id}><div><b>{runTitle(run, session)}</b><small>run {run.id}{run.task_id ? ` · task ${run.task_id}` : ''}</small></div><Status tone={tone(run.status)}>{run.status}</Status></article> }) : <article><b>No delivery runs yet</b><span>Start a session workflow to create a bridge command.</span><Status tone="amber">idle</Status></article>}</div></section> }
+// Runs (product-ux-review §4): the merged Sessions + Runs surface. Sessions ARE
+// the grouping — each shows its workflow cursor, its runs, and a Start-delivery
+// action — and the session-scoped directions composer (moved from the old
+// Delivery cockpit) records a direction into only the NEXT bridge work packet for
+// the active session. The live run Trace renders in the aside beside this surface.
+function RunsView({ data, refresh, onNewSession, onStartSession, onDirective, append }) {
+  const sessions = data.sessions || []
+  const workflows = data.workflows || []
+  const runs = data.runs || []
+  const activeRun = runs.find((run) => ['queued', 'running'].includes(run.status)) || runs[0]
+  const activeSession = sessions.find((session) => session.id === activeRun?.session_id) || sessions[0]
+  const orphanRuns = runs.filter((run) => !run.session_id)
+  const [input, setInput] = useState('')
+  // The directions composer binds to an EXPLICIT target session, defaulting to the
+  // active one. With multiple concurrent sessions this prevents a direction typed
+  // while looking at session B from silently landing on session A (the session
+  // owning the only running run) — the operator picks the target, and the composer
+  // header names it, so the binding is never implicit.
+  const [pickedSessionId, setPickedSessionId] = useState('')
+  const targetSession = sessions.find((session) => session.id === pickedSessionId) || activeSession
+  const directions = (data.directives || []).filter((event) => !targetSession || event.session_id === targetSession.id)
+  const submit = async (event) => { event.preventDefault(); if (!targetSession || !input.trim()) return; const text = input.trim(); try { await onDirective(targetSession.id, text); setInput('') } catch { append('Direction was not recorded. No future work packet was changed.') } }
+  return <section className="workspace-view">
+    <span className="crumb">Runs / sessions & bridge-supervised</span>
+    <div className="view-heading"><div><h1>Runs</h1><p>Each session owns a durable workflow cursor and a worktree lease; its runs are correlated to a State task and route. A lease prevents two sessions editing the same configured worktree.</p></div><div className="view-heading-actions"><button className="session-action" onClick={onNewSession} disabled={!data.projects[0]}>New concurrent session</button><button className="ghost-button" onClick={refresh}>Refresh</button></div></div>
+    <div className="runs-groups">
+      {sessions.length ? sessions.map((session) => {
+        const workflow = workflows.find((item) => item.session_id === session.id)
+        const sessionRuns = runs.filter((run) => run.session_id === session.id)
+        const hasActive = sessionRuns.some((run) => ['queued', 'running'].includes(run.status))
+        return <section className="run-session" key={session.id} aria-label={`Session ${session.title}`}>
+          <header className="run-session-head">
+            <div><b>{session.title}</b><small>{session.worktree_id} · {session.id}</small></div>
+            <span>{workflow ? `workflow v${workflow.version} · ${workflow.status}` : 'workflow pending'}</span>
+            <Status tone={hasActive ? 'green' : tone(workflow?.status)}>{hasActive ? 'active run' : session.status}</Status>
+            <button aria-label={`Start delivery ${session.title}`} disabled={!workflow || hasActive || workflow.status !== 'draft'} onClick={() => onStartSession(session, workflow)}>Start delivery</button>
+          </header>
+          <div className="data-list">{sessionRuns.length
+            ? sessionRuns.map((run) => <article className="run-row" key={run.id}><div><b>{runTitle(run, session)}</b><small>run {run.id}{run.task_id ? ` · task ${run.task_id}` : ''}</small></div><Status tone={tone(run.status)}>{run.status}</Status></article>)
+            : <article className="run-row"><div><b>No runs yet for this session</b><small>Start delivery to create a bridge command.</small></div><Status tone="amber">idle</Status></article>}</div>
+        </section>
+      }) : <article className="session-empty"><b>No harness session yet</b><span>Create a project and bridge, then create a session.</span></article>}
+      {orphanRuns.length ? <section className="run-session" aria-label="Unassigned runs"><header className="run-session-head"><div><b>Unassigned runs</b><small>runs with no session</small></div></header><div className="data-list">{orphanRuns.map((run) => <article className="run-row" key={run.id}><div><b>{runTitle(run, null)}</b><small>run {run.id}{run.task_id ? ` · task ${run.task_id}` : ''}</small></div><Status tone={tone(run.status)}>{run.status}</Status></article>)}</div></section> : null}
+    </div>
+    <section className="run-directions" aria-label="Delivery directions">
+      <div className="run-directions-head"><h2>Directions{targetSession ? ` · ${targetSession.title}` : ''}</h2>{sessions.length > 1 ? <label className="run-directions-target">Direct<select aria-label="Direct which session" value={targetSession?.id || ''} onChange={(event) => setPickedSessionId(event.target.value)}>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title}</option>)}</select></label> : null}</div>
+      {directions.length
+        ? <div className="conversation">{directions.map((message) => <article className="message human" key={message.id}><div className="message-head"><span>OP</span><b>Recorded direction</b><small>event {message.sequence}</small></div><p>{message.data?.content}</p></article>)}</div>
+        : <p className="evidence-empty">No recorded delivery directions for {targetSession ? 'this session' : 'any session'} yet.</p>}
+      <form className="composer" onSubmit={submit}><textarea aria-label="Add direction to this delivery" value={input} disabled={!targetSession} onChange={(event) => setInput(event.target.value)} rows="2" placeholder={targetSession ? 'Add a direction for the next work packet…' : 'Create a session before adding delivery direction…'} /><div><small>Saved into the next bridge work packet; it does not interrupt a running Codex process.</small><button type="submit" disabled={!targetSession || !input.trim()} aria-label="Send delivery direction">Send <span aria-hidden="true">↵</span></button></div></form>
+    </section>
+  </section>
+}
 
 function RoutesView({ data, append }) { const [routes, setRoutes] = useState([]); const [loaded, setLoaded] = useState(false); const [busy, setBusy] = useState(false); const refresh = async () => { setBusy(true); try { const value = await fetchRoutes(); setRoutes(value.routes || []); setLoaded(true) } catch { append('Route decisions are unavailable. Check the server-held Anvil Serving URL and token.') } finally { setBusy(false) } }; return <section className="workspace-view"><span className="crumb">Routes / Anvil Serving</span><div className="view-heading"><div><h1>Routes</h1><p>Read-only router decision metadata, filtered to Workbench run correlations.</p></div><button className="session-action" onClick={refresh} disabled={!data.router_configured || busy}>{busy ? 'Refreshing…' : 'Refresh decisions'}</button></div>{!data.router_configured ? <div className="sandbox-note"><b>Routes unavailable</b><span>Configure the hub’s Anvil Serving URL and token. The browser never sees either credential.</span></div> : <div className="data-list">{loaded && !routes.length ? <article><b>No correlated decisions yet</b><span>Run a bridge delivery, then refresh after Serving records the request.</span><Status tone="amber">waiting</Status></article> : routes.map((route, index) => <article key={`${route.request_id || index}`}><b>{route.intent || route.model || route.served_model || route.served_tier || 'selected route'}</b><span>{route.workbench_run_id} · {route.task_id || 'no task id'} · {route.request_id || 'no request id'}</span><Status>{route.status || route.tier || route.served_tier || 'recorded'}</Status></article>)}</div>}</section> }
 
-function ApprovalsView({ data, selectApproval }) { const pending = data.approvals.filter((approval) => approval.status === 'pending'); return <section className="workspace-view"><span className="crumb">Approvals / hash-bound</span><h1>Approvals</h1><p>Approval only releases a matching, one-time bridge command; it does not expose a GitHub credential to this browser.</p><div className="data-list">{pending.length ? pending.map((approval) => <article key={approval.id}><b>{approval.action_type.replaceAll('_', ' ')}</b><span>{approval.id} · {approval.payload_hash}</span><button className="inline-action" aria-label={`Review action ${approval.id}`} onClick={() => selectApproval(approval.id)}>Review action</button></article>) : <article><b>No pending approval</b><span>A bridge must submit evidence before a PR action can be requested.</span><Status tone="amber">waiting</Status></article>}</div></section> }
+// Approvals is the SINGLE home for authorization (product-ux-review §4): the
+// list on the left selects a pending grant; the pane on the right shows its full
+// safe binding and authorizes it in place. The Delivery Trace only mirrors this
+// selection read-only and links back here — the action exists in exactly one spot.
+function ApprovalsView({ data, selectApproval, selectedApprovalId, append, refresh }) {
+  const pending = data.approvals.filter((approval) => approval.status === 'pending')
+  const selected = pending.find((approval) => approval.id === selectedApprovalId) || null
+  const [busy, setBusy] = useState(false)
+  const authorize = async () => { if (!selected) return; setBusy(true); try { await approve(selected.id); append('Approval recorded. The local bridge may consume this exact action once.'); await refresh() } catch { append('Approval was not recorded. The bridge remains unable to create a PR.') } finally { setBusy(false) } }
+  return <section className="workspace-view"><span className="crumb">Approvals / hash-bound</span><h1>Approvals</h1><p>Review and authorize both happen here. Authorization releases a matching, one-time bridge command; it never exposes a GitHub credential to this browser.</p>
+    {pending.length
+      ? <div className="approvals-layout">
+          <div className="approvals-list" aria-label="Pending approvals">{pending.map((approval) => <button type="button" aria-pressed={approval.id === selectedApprovalId} key={approval.id} className={`approval-row${approval.id === selectedApprovalId ? ' selected' : ''}`} aria-label={`Review action ${approval.id}`} onClick={() => selectApproval(approval.id)}><b>{approval.action_type.replaceAll('_', ' ')}</b><span>{approval.id} · {approval.payload_hash}</span></button>)}</div>
+          <section className="approval-detail" aria-label="Selected approval">{selected
+            ? <><div className="approval-title"><h2>{selected.action_type.replaceAll('_', ' ')}</h2><Status tone="amber">pending</Status></div><dl className="approval-binding"><div><dt>Approval id</dt><dd>{selected.id}</dd></div><div><dt>Payload hash</dt><dd>{selected.payload_hash}</dd></div><div><dt>Run</dt><dd>{selected.payload?.run_id || 'not bound'}</dd></div><div><dt>Worktree</dt><dd>{selected.payload?.worktree_id || 'not bound'}</dd></div></dl><pre aria-label="Selected approval payload">{JSON.stringify(selected.payload, null, 2)}</pre><p className="approval-note">Authorization is a one-time release; the bridge checks this exact safe payload and binding before it can change GitHub.</p><button className="approval-authorize" disabled={busy} onClick={authorize}>{busy ? 'Authorizing…' : 'Authorize this action'} <span aria-hidden="true">→</span></button></>
+            : <p className="approval-empty-detail">Select a pending action to review its binding and authorize it. Workbench never guesses which grant you intended.</p>}</section>
+        </div>
+      : <div className="data-list"><article><b>No pending approval</b><span>A bridge must submit evidence before a PR action can be requested.</span><Status tone="amber">waiting</Status></article></div>}
+  </section>
+}
 
 function EvidenceView({ data, append }) { const [query, setQuery] = useState(''); const [results, setResults] = useState([]); const [lineage, setLineage] = useState(null); const project = data.projects[0]; const search = async (event) => { event.preventDefault(); if (!project || !query.trim()) return; try { const value = await searchEvidence(project.id, query.trim()); setResults(value.results || []); setLineage(null) } catch { append('Evidence search is unavailable. The graph remains read-only and never approves actions.') } }; const loadLineage = async (taskId) => { try { setLineage(await taskLineage(taskId)) } catch { append('Task lineage is unavailable for that task.') } }; return <section className="workspace-view"><span className="crumb">Evidence / redacted projection</span><h1>Evidence</h1><p>Searches the read-optimized evidence projection. Anvil State remains canonical for task acceptance.</p><form className="query-form" onSubmit={search}><input aria-label="Evidence query" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search evidence and cited artifacts" disabled={!project} /><button disabled={!project || !query.trim()}>Search evidence</button></form><div className="data-list">{results.map((result, index) => <article key={`${result.citation || index}`}><b>{result.title || result.source_id || 'Evidence artifact'}</b><span>{result.citation || result.summary || 'redacted projection result'}</span><Status>cited</Status></article>)}{!results.length && <article><b>No evidence query yet</b><span>Search only returns redacted, cited projection records.</span><Status tone="amber">ready</Status></article>}</div>{data.runs.filter((run) => run.task_id).slice(0, 4).map((run) => <button className="lineage-button" key={run.id} onClick={() => loadLineage(run.task_id)}>Show lineage for {run.task_id}</button>)}{lineage && <pre className="lineage-result">{JSON.stringify(lineage, null, 2)}</pre>}</section> }
 
@@ -1037,7 +1102,7 @@ function SkillsView({ data, append, refresh }) { const project = data.projects[0
 
 function SandboxView({ data, append }) { const [model, setModel] = useState(data.sandbox?.models?.[0] || ''); const [input, setInput] = useState(''); const [result, setResult] = useState(null); const [busy, setBusy] = useState(false); useEffect(() => { setModel(data.sandbox?.models?.[0] || '') }, [data.sandbox]); const submit = async (event) => { event.preventDefault(); setBusy(true); try { setResult(await runSandbox({ model, input })) } catch { append('Sandbox request was not accepted by Anvil Serving. No provider fallback was used.') } finally { setBusy(false) } }; return <section className="workspace-view"><span className="crumb">Sandbox / Serving only</span><h1>Model sandbox</h1><p>A bounded, audited Responses request through Anvil Serving. It is separate from bridge delivery and cannot create a PR, merge, or change policy.</p>{!data.sandbox?.available ? <div className="sandbox-note"><b>Sandbox unavailable</b><span>Set an allowlisted <code>WORKBENCH_SANDBOX_MODELS</code> value plus the hub’s Serving URL and token.</span></div> : <form className="sandbox-form" onSubmit={submit}><label>Allowed route<select aria-label="Sandbox model" value={model} onChange={(event) => setModel(event.target.value)}>{data.sandbox.models.map((item) => <option key={item}>{item}</option>)}</select></label><label>Prompt<textarea aria-label="Sandbox prompt" value={input} onChange={(event) => setInput(event.target.value)} rows="5" placeholder="Ask a bounded, non-mutating model question" /></label><button disabled={busy || !input.trim()}>{busy ? 'Routing…' : 'Run through Anvil Serving'}</button></form>}{result && <section className="sandbox-result"><b>{result.model} · {result.status}</b><pre>{result.output_text || 'The routed response contained no output_text.'}</pre></section>}</section> }
 
-function WorkspaceView({ active, data, onNewSession, onStartSession, append, refresh, selectApproval }) { if (active === 'Sessions') return <SessionsView data={data} onNewSession={onNewSession} onStartSession={onStartSession} />; if (active === 'Runs') return <RunsView data={data} refresh={refresh} />; if (active === 'Routes') return <RoutesView data={data} append={append} />; if (active === 'Approvals') return <ApprovalsView data={data} selectApproval={selectApproval} />; if (active === 'Evidence') return <EvidenceView data={data} append={append} />; if (active === 'Skills') return <SkillsView data={data} append={append} refresh={refresh} />; return <SandboxView data={data} append={append} /> }
+function WorkspaceView({ active, data, onNewSession, onStartSession, onDirective, append, refresh, selectApproval, selectedApprovalId }) { if (active === 'Runs') return <RunsView data={data} refresh={refresh} onNewSession={onNewSession} onStartSession={onStartSession} onDirective={onDirective} append={append} />; if (active === 'Routes') return <RoutesView data={data} append={append} />; if (active === 'Approvals') return <ApprovalsView data={data} selectApproval={selectApproval} selectedApprovalId={selectedApprovalId} append={append} refresh={refresh} />; if (active === 'Evidence') return <EvidenceView data={data} append={append} />; if (active === 'Skills') return <SkillsView data={data} append={append} refresh={refresh} />; return <SandboxView data={data} append={append} /> }
 
 function Modal({ title, children, onClose }) { return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-label={title}><header><h2>{title}</h2><button aria-label={`Close ${title}`} onClick={onClose}>×</button></header>{children}</section></div> }
 
@@ -1300,7 +1365,7 @@ function DeliverEligibility({ eligibility }) {
   </div>
 }
 
-function Onboarding({ data, onClose, setActive, onNewDelivery, onNewSession }) { const project = data.projects[0]; const steps = [{ label: 'Create a Workbench project', complete: Boolean(project), action: () => project ? setActive('Delivery') : onNewDelivery() }, { label: 'Register a project-local bridge', complete: Boolean(project?.bridge_id), action: () => setActive('Skills') }, { label: 'Publish and verify bridge skills', complete: Boolean(data.skills?.length), action: () => setActive('Skills') }, { label: 'Create a harness session', complete: Boolean(data.sessions?.length), action: () => onNewSession() }, { label: 'Run a State task through the bridge', complete: Boolean(data.runs?.length), action: () => setActive('Sessions') }, { label: 'Review evidence before an approval', complete: Boolean(data.runs?.some((run) => run.status === 'evidenced')), action: () => setActive('Evidence') }]; const current = steps.find((step) => !step.complete) || steps.at(-1); const go = () => { current.action(); onClose() }; return <Modal title="Workbench setup guide" onClose={onClose}><p>This guide reflects live hub state. It never marks a bridge, skill, run, or evidence step complete on its own.</p><ol className="onboarding-steps">{steps.map((step, index) => <li key={step.label} className={step.complete ? 'done' : ''}><span>{step.complete ? '✓' : index + 1}</span>{step.label}</li>)}</ol><button className="session-action" onClick={go}>{current.complete ? 'Review completed setup' : `Continue: ${current.label}`}</button></Modal> }
+function Onboarding({ data, onClose, setActive, onNewDelivery, onNewSession }) { const project = data.projects[0]; const steps = [{ label: 'Create a Workbench project', complete: Boolean(project), action: () => project ? setActive('Deliver') : onNewDelivery() }, { label: 'Register a project-local bridge', complete: Boolean(project?.bridge_id), action: () => setActive('Skills') }, { label: 'Publish and verify bridge skills', complete: Boolean(data.skills?.length), action: () => setActive('Skills') }, { label: 'Create a harness session', complete: Boolean(data.sessions?.length), action: () => onNewSession() }, { label: 'Run a State task through the bridge', complete: Boolean(data.runs?.length), action: () => setActive('Runs') }, { label: 'Review evidence before an approval', complete: Boolean(data.runs?.some((run) => run.status === 'evidenced')), action: () => setActive('Evidence') }]; const current = steps.find((step) => !step.complete) || steps.at(-1); const go = () => { current.action(); onClose() }; return <Modal title="Workbench setup guide" onClose={onClose}><p>This guide reflects live hub state. It never marks a bridge, skill, run, or evidence step complete on its own.</p><ol className="onboarding-steps">{steps.map((step, index) => <li key={step.label} className={step.complete ? 'done' : ''}><span>{step.complete ? '✓' : index + 1}</span>{step.label}</li>)}</ol><button className="session-action" onClick={go}>{current.complete ? 'Review completed setup' : `Continue: ${current.label}`}</button></Modal> }
 
 function Notifications({ audit, read, onRead }) { return <section className="notifications" aria-label="Notifications"><header><b>Recent hub activity</b><button onClick={onRead}>Mark viewed</button></header>{read ? <p>All current activity is marked viewed in this browser.</p> : audit.length ? audit.slice(0, 4).map((event) => <p key={event.id}><b>{event.kind}</b><br />{event.actor}</p>) : <p>No Workbench audit events yet.</p>}</section> }
 function ProfileMenu({ data, onClose }) { return <section className="profile-menu" aria-label="Operator menu"><b>{data.actor || 'Allowlisted operator'}</b><span>Tailnet identity verified by the hub</span><small>Project creation and approvals are server-checked. The browser has no bridge, GitHub, or model credential.</small><button onClick={onClose}>Close menu</button></section> }
@@ -2456,8 +2521,12 @@ function ExplorerDetail({ selection, reading, eligibility, detailRef, onClose })
   </section>
 }
 
-function ExplorerView({ data, append }) {
+function ExplorerView({ data, append, onDeliverNext }) {
   const projects = data.projects || []
+  // The merged Deliver surface (product-ux-review §4): the a11y-audited plan
+  // browser IS the surface, with a compact deliver-action bar on top. The active
+  // run is surfaced here for context; its live Trace and directions live on Runs.
+  const activeRun = (data.runs || []).find((item) => ['queued', 'running'].includes(item.status)) || (data.runs || [])[0]
   const [selectedProjectId, setSelectedProjectId] = useState(projects[0]?.id || '')
   const [prdInput, setPrdInput] = useState('')
   const [entries, setEntries] = useState([])
@@ -2554,11 +2623,14 @@ function ExplorerView({ data, append }) {
     if (window.location.hash.startsWith('#explorer/')) window.location.hash = ''
     if (had) {
       setAnnounce('Closed detail')
-      // Return focus to the invoking task row (a11y #9), not the first project
-      // button in document order — a keyboard user deep in a second PRD is not
-      // teleported to the top. Fall back to the first focusable rail control.
+      // Return focus to the invoking task row (a11y #9), not the top of the rail —
+      // a keyboard user deep in a second PRD is not teleported. The fallback is
+      // ORDER-INDEPENDENT: it targets the plan controls (a project button or the
+      // Open-PRD control) explicitly, never a bare first `button`, so an unrelated
+      // control added above them in the rail — e.g. the deliver-action bar's
+      // high-privilege "Deliver next task" — can never silently steal close-focus.
       const invoker = invokedScopedId && railRef.current?.querySelector(`[data-explorer-task="${invokedScopedId}"]`)
-      const target = invoker || railRef.current?.querySelector('.explorer-open-prd, input, button')
+      const target = invoker || railRef.current?.querySelector('.explorer-project, .explorer-open-prd')
       target?.focus()
     }
   }
@@ -2594,14 +2666,18 @@ function ExplorerView({ data, append }) {
 
   return <main className="explorer" aria-label="Delivery explorer">
     <aside className="explorer-rail" ref={railRef}>
-      <span className="crumb">Explorer / PRD → plan → task</span>
+      <span className="crumb">Deliver / plan → task → act</span>
       <h1>Delivery explorer</h1>
-      <p className="explorer-intro">Read-only Project → PRD → plan → task lineage from the redacted delivery projection.</p>
+      <p className="explorer-intro">Browse the Project → PRD → plan → task lineage from the redacted projection, then deliver the next ranked task. Its live run trace lives in Runs.</p>
+      <section className="explorer-deliver-bar" aria-label="Deliver action">
+        <span className="explorer-deliver-status">{activeRun ? <>Active: <b>{activeRun.task_id ? `task ${activeRun.task_id}` : `run ${activeRun.id}`}</b> <Status tone={tone(activeRun.status)}>{activeRun.status}</Status></> : 'No active delivery run.'}</span>
+        <button className="session-action" onClick={() => onDeliverNext(selectedProjectId)} disabled={!projects[0]}>Deliver next task</button>
+      </section>
       <section aria-label="Projects" className="explorer-projects">
         <p className="explorer-section-title">Projects</p>
         {projects.length
           ? <div className="explorer-project-list">{projects.map((project) => <button key={project.id} className={`explorer-project ${selectedProjectId === project.id ? 'selected' : ''}`} aria-pressed={selectedProjectId === project.id} aria-label={`Select project ${project.name}`} onClick={() => setSelectedProjectId(project.id)}><b>{project.name}</b><small>{project.id}</small></button>)}</div>
-          : <p className="explorer-muted">No projects yet. Create one from Delivery.</p>}
+          : <p className="explorer-muted">No projects yet. Create one with the New delivery button, then register its local bridge.</p>}
       </section>
       <form className="explorer-open" onSubmit={(event) => { event.preventDefault(); openPrd() }}>
         <label>Open a PRD by id<input value={prdInput} onChange={(event) => setPrdInput(event.target.value)} placeholder="e.g. release-alpha" disabled={!selectedProjectId} /></label>
@@ -2621,28 +2697,32 @@ function ExplorerView({ data, append }) {
 }
 
 function App() {
-  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false); const [deliverOpen, setDeliverOpen] = useState(false); const [navOpen, setNavOpen] = useState(false)
+  const [active, setActive] = useState('Chat'); const [data, setData] = useState(emptyData); const [notice, setNotice] = useState(''); const [selectedApprovalId, setSelectedApprovalId] = useState(null); const [newDeliveryOpen, setNewDeliveryOpen] = useState(false); const [newSessionOpen, setNewSessionOpen] = useState(false); const [startSession, setStartSession] = useState(null); const [guideOpen, setGuideOpen] = useState(false); const [profileOpen, setProfileOpen] = useState(false); const [notificationsOpen, setNotificationsOpen] = useState(false); const [notificationsRead, setNotificationsRead] = useState(false); const [deliverOpen, setDeliverOpen] = useState(false); const [deliverProjectId, setDeliverProjectId] = useState(null); const [navOpen, setNavOpen] = useState(false)
   const load = async () => { const value = await bootstrap(); setData({ ...emptyData, ...value, sandbox: { ...emptyData.sandbox, ...(value.sandbox || {}) }, voice: { ...emptyData.voice, ...(value.voice || {}) } }); return value }
   useEffect(() => { load().catch(() => setNotice('Workbench hub is unavailable; no local mock delivery is shown.')) }, [])
   const createDelivery = async (payload) => { try { const project = await createProject(payload); setData((current) => ({ ...current, projects: [project, ...current.projects] })); setNewDeliveryOpen(false); setNotice(`Created ${project.name}. Register its bridge locally before starting a run.`); await load() } catch { setNotice('Project could not be created. No bridge or run was started.') } }
-  const createConcurrentSession = async (payload) => { try { const created = await createSession(payload); setData((current) => ({ ...current, sessions: [created.session, ...current.sessions], workflows: [created.workflow, ...current.workflows] })); setNewSessionOpen(false); setActive('Sessions'); setNotice(`Created ${created.session.title}. Start it only after its named worktree is configured on the bridge.`); await load() } catch { setNotice('Session could not be created. No bridge run was started.') } }
-  const startConcurrentSession = async (workflowId, payload) => { try { const result = await startWorkflow(workflowId, payload); setStartSession(null); setActive('Delivery'); setNotice(`Started ${payload.task_id} through the local bridge. The workflow is traceable in this session.`); setData((current) => ({ ...current, runs: [result.run, ...current.runs] })); await load() } catch { setNotice('Workflow did not start. Check the project bridge, published skills, and named worktree configuration.') } }
+  const createConcurrentSession = async (payload) => { try { const created = await createSession(payload); setData((current) => ({ ...current, sessions: [created.session, ...current.sessions], workflows: [created.workflow, ...current.workflows] })); setNewSessionOpen(false); setActive('Runs'); setNotice(`Created ${created.session.title}. Start it only after its named worktree is configured on the bridge.`); await load() } catch { setNotice('Session could not be created. No bridge run was started.') } }
+  const startConcurrentSession = async (workflowId, payload) => { try { const result = await startWorkflow(workflowId, payload); setStartSession(null); setActive('Runs'); setNotice(`Started ${payload.task_id} through the local bridge. The workflow is traceable in Runs.`); setData((current) => ({ ...current, runs: [result.run, ...current.runs] })); await load() } catch { setNotice('Workflow did not start. Check the project bridge, published skills, and named worktree configuration.') } }
   // The one-activation Deliver: start the ranked candidate through the REAL wired
   // POST /api/workflows/{id}/start, then route to the resulting run. Throws on
   // failure so the sheet keeps itself open and announces a truthful error (it
   // does NOT close or fabricate a started run).
   const deliverCandidate = async (workflowId, payload, signal) => {
     const result = await startWorkflow(workflowId, payload, { signal })
-    setDeliverOpen(false); setActive('Delivery')
+    setDeliverOpen(false); setActive('Runs')
     setData((current) => ({ ...current, runs: [result.run, ...current.runs] }))
     setNotice(`Delivering ${payload.task_id} through the local bridge. Its run is ${result.run.id}.`)
     await load()
     return result.run
   }
   const addDirection = async (sessionId, text) => { const result = await addDirective(sessionId, text); if (result.recorded && result.event) { setData((current) => ({ ...current, directives: [...current.directives, result.event] })); setNotice('Direction recorded. It will be included only in the next bridge work packet for this session.') } else { setNotice(`Direction was not recorded (${result.outcome}). No future work packet was changed.`) } await load() }
-  const context = useMemo(() => active === 'Delivery' ? 'Delivery cockpit' : `${active} view`, [active])
-  const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Delivery') }
-  return <div className={`app-shell${navOpen ? ' nav-open' : ''}${active === 'Chat' ? ' chat-active' : ''}${active === 'Voice' ? ' voice-active' : ''}${active === 'Explorer' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
+  const context = useMemo(() => active === 'Deliver' ? 'Plan & deliver' : active === 'Runs' ? 'Runs & sessions' : `${active} view`, [active])
+  // Authorization has ONE home: the Approvals surface. Selecting an approval —
+  // from the Approvals list itself or from the Delivery Trace's "Open in
+  // Approvals" link — routes to Approvals, where the binding is reviewed AND
+  // authorized in place. The Delivery Trace only mirrors the selection read-only.
+  const selectApproval = (approvalId) => { setSelectedApprovalId(approvalId); setActive('Approvals') }
+  return <div className={`app-shell${navOpen ? ' nav-open' : ''}${active === 'Chat' ? ' chat-active' : ''}${active === 'Voice' ? ' voice-active' : ''}${active === 'Deliver' ? ' explorer-active' : ''}${active === 'Settings' ? ' settings-active' : ''}${active === 'Plugins' ? ' plugins-active' : ''}`}>
     <Rail active={active} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onProfile={() => setProfileOpen(!profileOpen)} closeNav={() => setNavOpen(false)} />
     <div className="nav-overlay" aria-hidden="true" onClick={() => setNavOpen(false)} />
     {profileOpen && <ProfileMenu data={data} onClose={() => setProfileOpen(false)} />}
@@ -2654,13 +2734,13 @@ function App() {
         ? <div className="voice-grid"><VoicePage data={data} append={setNotice} /></div>
         : active === 'Settings'
         ? <div className="settings-grid"><SettingsView data={data} append={setNotice} /><ConfigurationView data={data} append={setNotice} /></div>
-        : active === 'Explorer'
-        ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} /></div>
+        : active === 'Deliver'
+        ? <div className="explorer-grid"><ExplorerView data={data} append={setNotice} onDeliverNext={(projectId) => { setDeliverProjectId(projectId || null); setDeliverOpen(true) }} /></div>
         : active === 'Plugins'
         ? <div className="pc-grid"><PluginCatalogView data={data} append={setNotice} /></div>
         : <div className="main-grid">
-            {active === 'Delivery' ? <Delivery data={data} append={setNotice} onDirective={addDirection} onGuide={() => setGuideOpen(true)} onDeliverNext={() => setDeliverOpen(true)} /> : <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} append={setNotice} refresh={load} selectApproval={selectApproval} />}
-            <Trace data={data} setActive={setActive} append={setNotice} refresh={load} selectedApprovalId={selectedApprovalId} clearApproval={() => setSelectedApprovalId(null)} />
+            <WorkspaceView active={active} data={data} onNewSession={() => setNewSessionOpen(true)} onStartSession={(session, workflow) => setStartSession({ session, workflow })} onDirective={addDirection} append={setNotice} refresh={load} selectApproval={selectApproval} selectedApprovalId={selectedApprovalId} />
+            <Trace data={data} setActive={setActive} selectedApprovalId={selectedApprovalId} />
           </div>}
       {notice && <div className="toast" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button></div>}
     </div>
@@ -2668,7 +2748,7 @@ function App() {
     {newSessionOpen && <NewSession project={data.projects[0]} skills={data.skills.filter((skill) => skill.bridge_id === data.projects[0]?.bridge_id)} onClose={() => setNewSessionOpen(false)} onCreate={createConcurrentSession} />}
     {startSession && <StartSession session={startSession.session} workflow={startSession.workflow} onClose={() => setStartSession(null)} onStart={startConcurrentSession} />}
     {guideOpen && <Onboarding data={data} onClose={() => setGuideOpen(false)} setActive={setActive} onNewDelivery={() => setNewDeliveryOpen(true)} onNewSession={() => setNewSessionOpen(true)} />}
-    {deliverOpen && <DeliverSheet project={data.projects[0]} workflows={data.workflows} sessions={data.sessions} runs={data.runs} onClose={() => setDeliverOpen(false)} onDeliver={deliverCandidate} />}
+    {deliverOpen && <DeliverSheet project={data.projects.find((item) => item.id === deliverProjectId) || data.projects[0]} workflows={data.workflows} sessions={data.sessions} runs={data.runs} onClose={() => setDeliverOpen(false)} onDeliver={deliverCandidate} />}
   </div>
 }
 
