@@ -208,8 +208,11 @@ export default function AdvancedPanel({
 
   if (unavailable) {
     return <section className="advanced-panel" aria-label="Advanced controls">
-      <p className="adv-unavailable">{unavailable}</p>
-      <p className="adv-muted">Advanced controls are not configured in this build. The transcript and its route are unchanged.</p>
+      <div className="config-note" role="note">
+        <b>Advanced controls are not available</b>
+        <span>{unavailable}</span>
+        <span>The advanced run/dispatch execution path is not wired to an endpoint in this build, so tuned runs cannot execute here yet — there is no setting that enables it. Reviewed route discovery is served from <code>WORKBENCH_ADVANCED_ROUTES</code> when set. The transcript and its route are unchanged.</span>
+      </div>
     </section>
   }
   if (!routes.length) {

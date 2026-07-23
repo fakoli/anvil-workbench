@@ -57,8 +57,11 @@ export default function AdvancedPlaygroundPanel({
 
   if (unavailable) {
     return <section className="advanced-playground" aria-label="Advanced playground">
-      <p className="adv-unavailable">{unavailable}</p>
-      <p className="adv-muted">The advanced playground extensions are unavailable in this build. The transcript is unchanged.</p>
+      <div className="config-note" role="note">
+        <b>Advanced playground is not available</b>
+        <span>{unavailable}</span>
+        <span>The preset, template, and rating surfaces return 503 until their stores are injected on the hub; no browser setting enables them. The transcript is unchanged.</span>
+      </div>
     </section>
   }
 
