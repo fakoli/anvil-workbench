@@ -62,7 +62,7 @@ function runTitle(run, session) { const intent = titleCase(run.model) || 'Delive
 function Rail({ active, setActive, onNewDelivery, onProfile }) {
   return <aside className="rail">
     <div className="brand"><Mark /><span>Anvil<br /><em>Workbench</em></span></div>
-    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} aria-current={active === label ? 'page' : undefined} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => setActive(label)}><b aria-hidden="true">{glyph}</b>{label}</button>)}</nav>
+    <nav>{nav.map(([label, glyph]) => <button key={label} aria-label={label} title={label} aria-current={active === label ? 'page' : undefined} className={active === label ? 'nav-item selected' : 'nav-item'} onClick={() => setActive(label)}><b aria-hidden="true">{glyph}</b><span className="nav-label">{label}</span></button>)}</nav>
     <div className="rail-footer"><button className="new-run" onClick={onNewDelivery}><span aria-hidden="true">+</span> New delivery</button><button className="profile" aria-label="Operator menu" onClick={onProfile}><span>AW</span><div><strong>Operator</strong><small>tailnet owner</small></div><b aria-hidden="true">···</b></button></div>
   </aside>
 }
@@ -1442,8 +1442,8 @@ function TurnView({ turn, onRetry, onBranch, streamActive, conversationId, autop
     {/* Successor actions are disabled while a stream is in flight (a11y #12): a
         retry/branch cannot be issued against history that is still settling. */}
     {turn.role === 'assistant' && !streaming && <div className="turn-actions">
-      <button aria-label="Retry this response" disabled={streamActive} onClick={() => onRetry(turn)}>Retry</button>
-      <button aria-label="Branch from this response" disabled={streamActive} onClick={() => onBranch(turn)}>Branch</button>
+      <button aria-label="Retry this response" title="Retry" disabled={streamActive} onClick={() => onRetry(turn)}><span aria-hidden="true">↻</span><span className="btn-label">Retry</span></button>
+      <button aria-label="Branch from this response" title="Branch" disabled={streamActive} onClick={() => onBranch(turn)}><span aria-hidden="true">⎇</span><span className="btn-label">Branch</span></button>
       {/* Read-aloud is transient playback that never mutates this message. */}
       {text.trim() && conversationId && <ReadAloud conversationId={conversationId} turn={turn} autoplayPreference={autoplayPreference} />}
     </div>}
