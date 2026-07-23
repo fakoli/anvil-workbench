@@ -66,8 +66,11 @@ occurred. Full evidence and caveats live in
   (as of 2026-07-22; `RelayEvent` emits `delta`/`terminal`, each `seq`-stamped).
   The inline `RelayEvent` `resolution` kind is still **not added**; the mark
   surface `GET /api/chat/route-resolutions` **is** wired and tested.
-- The advanced **run/dispatch execution path** (`advanced_routes`/
-  `advanced_runtime`/`advanced_dispatch`) is **not wired into any HTTP
+- `advanced_routes` **route discovery** is now wired: `GET /api/chat/advanced/routes`
+  serves the read-only `browser_projection` from `WORKBENCH_ADVANCED_ROUTES`
+  (200 `{"routes": []}` when unset, 503 on a malformed catalog), mirroring
+  `/api/chat/routes`. The advanced **run/dispatch execution path**
+  (`advanced_runtime`/`advanced_dispatch`) is **not wired into any HTTP
   endpoint**; advanced preset/template/rating persistence routers are mounted but
   back injected stores that stay `None`→503 by default.
 - The delivery projection, run-context, project-context, and voice-relay routers

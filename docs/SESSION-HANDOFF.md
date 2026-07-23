@@ -174,9 +174,13 @@ record is [UI-ACCEPTANCE-AUDIT.md](UI-ACCEPTANCE-AUDIT.md).
 ### Corrections to the provided final-state summary (verified against the repo)
 
 - There is **no `build_advanced_router` symbol**. The advanced
-  preset/template/rating persistence routers **are mounted** (`create_app`); what
-  is unwired is the advanced **run/dispatch execution path**
-  (`advanced_routes`/`advanced_runtime`/`advanced_dispatch`), which no HTTP
+  preset/template/rating persistence routers **are mounted** (`create_app`), and
+  the read-only **route discovery** surface is now wired too:
+  `GET /api/chat/advanced/routes` serves `advanced_routes.discover_advanced_routes`'s
+  `browser_projection` from `WORKBENCH_ADVANCED_ROUTES` (200 honest empty
+  `{"routes": []}` when unset, 503 on a malformed catalog), mirroring
+  `/api/chat/routes`. What remains unwired is the advanced **run/dispatch
+  execution path** (`advanced_runtime`/`advanced_dispatch`), which no HTTP
   endpoint invokes. The client still degrades to 503 for a run with no route.
 - `RelayEvent` currently emits only `delta`/`terminal`; the `resolution` kind is
   described in the docstring as future work and is **not yet added** (consistent
